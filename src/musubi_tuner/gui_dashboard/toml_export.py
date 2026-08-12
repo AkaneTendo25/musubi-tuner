@@ -252,6 +252,36 @@ def _dataset_entry_to_dict(entry) -> dict:
     return d
 
 
+def _h3_dataset_entry_to_dict(entry) -> dict:
+    """Serialize one dashboard row using MiniMax H3's dataset extensions."""
+    d = _dataset_entry_to_dict(entry)
+    if entry.h3_target_mode != "av":
+        d["h3_target_mode"] = entry.h3_target_mode
+    if entry.h3_image_frame_count is not None:
+        d["h3_image_frame_count"] = int(entry.h3_image_frame_count)
+    if entry.multiple_target:
+        d["multiple_target"] = True
+    if entry.control_video_directory:
+        d["control_video_directory"] = entry.control_video_directory
+    if entry.control_audio_directory:
+        d["control_audio_directory"] = entry.control_audio_directory
+    if entry.control_modality:
+        d["control_modality"] = entry.control_modality
+    control_modalities = _split_path_list(entry.control_modalities)
+    if control_modalities:
+        d["control_modalities"] = control_modalities
+    probabilities = (
+        entry.control_modality_probability_av,
+        entry.control_modality_probability_video,
+        entry.control_modality_probability_audio,
+    )
+    if any(value is not None for value in probabilities):
+        if any(value is None for value in probabilities):
+            raise ValueError("H3 control modality probabilities require AV, video, and audio values")
+        d["control_modality_probabilities"] = [float(value) for value in probabilities]
+    return d
+
+
 def build_dataset_toml_document(config: ProjectConfig) -> dict:
     doc: dict = {
         "general": {
@@ -265,6 +295,27 @@ def build_dataset_toml_document(config: ProjectConfig) -> dict:
         doc["validation_datasets"] = [_dataset_entry_to_dict(e) for e in config.dataset.validation_datasets]
 
     return doc
+
+
+def build_h3_dataset_toml_document(config: ProjectConfig, *, include_training: bool, include_validation: bool) -> dict:
+    """Build an H3 config, whose adapter reads every row from ``datasets``.
+
+    The generic dashboard TOML keeps validation rows in ``validation_datasets``.
+    H3's adapter intentionally accepts the standard Musubi ``datasets`` key only,
+    so cache, training, and validation receive purpose-specific documents.
+    """
+    rows = []
+    if include_training:
+        rows.extend(config.dataset.datasets)
+    if include_validation:
+        rows.extend(config.dataset.validation_datasets)
+    return {
+        "general": {
+            "enable_bucket": config.dataset.general.enable_bucket,
+            "bucket_no_upscale": config.dataset.general.bucket_no_upscale,
+        },
+        "datasets": [_h3_dataset_entry_to_dict(entry) for entry in rows],
+    }
 
 
 def _write_dataset_toml(config: ProjectConfig, output_path: Path) -> Path:
@@ -283,6 +334,44 @@ def build_dataset_toml_path(config: ProjectConfig) -> Path:
 
 def export_dataset_toml(config: ProjectConfig) -> Path:
     return _write_dataset_toml(config, build_dataset_toml_path(config))
+
+
+def _write_h3_dataset_toml(config: ProjectConfig, output_path: Path, *, include_training: bool, include_validation: bool) -> Path:
+    doc = build_h3_dataset_toml_document(
+        config,
+        include_training=include_training,
+        include_validation=include_validation,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(render_toml(doc), encoding="utf-8")
+    return output_path
+
+
+def export_h3_cache_dataset_toml(config: ProjectConfig) -> Path:
+    return _write_h3_dataset_toml(
+        config,
+        Path(config.project_dir) / "h3_cache_dataset_config.toml",
+        include_training=True,
+        include_validation=True,
+    )
+
+
+def export_h3_training_dataset_toml(config: ProjectConfig) -> Path:
+    return _write_h3_dataset_toml(
+        config,
+        Path(config.project_dir) / "h3_training_dataset_config.toml",
+        include_training=True,
+        include_validation=False,
+    )
+
+
+def export_h3_validation_dataset_toml(config: ProjectConfig) -> Path:
+    return _write_h3_dataset_toml(
+        config,
+        Path(config.project_dir) / "h3_validation_dataset_config.toml",
+        include_training=False,
+        include_validation=True,
+    )
 
 
 # ---- Conditioning recipe (composable [video]/[audio] conditions built in the GUI) ----

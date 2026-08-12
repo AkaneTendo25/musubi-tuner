@@ -94,6 +94,108 @@ def _first_training_dataset(config: dict) -> dict:
     return next((d for d in datasets if d.get("type") in ("video", "image")), datasets[0])
 
 
+def _training_datasets(config: dict) -> list[dict]:
+    """Return every configured training dataset row."""
+    datasets = config.get("dataset", {}).get("datasets", [])
+    return [dataset for dataset in datasets if isinstance(dataset, dict)] or [{}]
+
+
+def _h3_temporal_latents(frame_count: int) -> tuple[int, int]:
+    """Return H3 video/audio latent lengths for a dashboard frame count.
+
+    Invalid, partially edited UI values are aligned upward for estimation. The
+    command validator still rejects them before launch.
+    """
+    if frame_count <= 1:
+        return 1, 0
+    frame_count = max(frame_count, 5)
+    frame_count += (5 - frame_count % 17) % 17
+    return ((frame_count - 5) // 17) * 5 + 2, (10 * frame_count + 3) // 6
+
+
+def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
+    """Approximate the largest packed H3 sequence represented by one row."""
+    dataset_type = str(dataset.get("type", "video"))
+    target_mode = str(dataset.get("h3_target_mode", "av"))
+    if dataset_type == "image":
+        target_mode = "video"
+    elif dataset_type == "audio":
+        target_mode = "audio"
+
+    width = max(_coerce_int(dataset.get("resolution_w", 768), 768), 64)
+    height = max(_coerce_int(dataset.get("resolution_h", 512), 512), 64)
+    frames = max(
+        _coerce_int(
+            dataset.get("h3_image_frame_count", 1) if dataset_type == "image" else dataset.get("target_frames", 124),
+            1 if dataset_type == "image" else 124,
+        ),
+        1,
+    )
+    video_latents, audio_latents = _h3_temporal_latents(frames)
+    rows_per_video_frame = max(height // 32, 1) * max(width // 32, 1)
+    video_rows = video_latents * rows_per_video_frame if target_mode in {"av", "video"} else 0
+    audio_rows = 2 * audio_latents if target_mode in {"av", "audio"} else 0
+
+    condition_rows = 0
+    task = str(caching.get("h3_task", "t2va"))
+    if task in {"i2va", "l2va"}:
+        condition_rows += rows_per_video_frame
+    elif task == "fl2va":
+        condition_rows += 2 * rows_per_video_frame
+    elif task in {"ref2va", "ref2va_omni"}:
+        # Exact reference shapes live in the cache, not project JSON. Use the
+        # strongest contract the TOML exposes: paired directories are video
+        # references, while the generic directory is conservatively one still.
+        modality = str(dataset.get("control_modality", "av") or "av")
+        if dataset.get("control_video_directory"):
+            reference_frames = max(_coerce_int(dataset.get("reference_frames", frames), frames), 1)
+            ref_video_latents, ref_audio_latents = _h3_temporal_latents(reference_frames)
+            if modality in {"av", "video"}:
+                condition_rows += ref_video_latents * rows_per_video_frame
+            if modality in {"av", "audio"} and dataset.get("control_audio_directory"):
+                condition_rows += 2 * ref_audio_latents
+        elif dataset.get("control_directory"):
+            condition_rows += rows_per_video_frame
+
+    keyframe_count = max(_coerce_int(training.get("h3_keyframe_random_count", 0), 0), 0)
+    if not keyframe_count:
+        keyframe_count = len([value for value in str(training.get("h3_keyframe_anchors", "")).split(",") if value.strip()])
+    condition_rows += keyframe_count * rows_per_video_frame
+    if str(training.get("h3_extension_route", "condition_rows")) == "condition_rows":
+        condition_rows += max(_coerce_int(training.get("h3_extension_video_frames", 0), 0), 0) * rows_per_video_frame
+        condition_rows += 2 * max(_coerce_int(training.get("h3_extension_audio_latents", 0), 0), 0)
+
+    # Prompt length varies by caption and visual presentation. A modest text
+    # allowance keeps short/image/audio estimates from collapsing to zero.
+    return max(video_rows + audio_rows + condition_rows + 256, 256)
+
+
+def _h3_base_size_gb(training: dict) -> float:
+    rank_value = training.get("h3_adaln_rank")
+    rank = _coerce_int(rank_value, 0) if rank_value not in (None, "") else 0
+    convrot_billions = 20.1
+    adaln_billions = 0.077 * rank / 16 if rank > 0 else 13.0
+    params_billions = convrot_billions + adaln_billions
+    gib_per_billion_bytes = 1e9 / (1024**3)
+    if training.get("int8_convrot_base"):
+        return 19.53
+    if training.get("h3_convrot_int8"):
+        return (convrot_billions * 1.04 + adaln_billions * 2) * gib_per_billion_bytes
+    if training.get("fp8_base") or training.get("fp8_scaled"):
+        return params_billions * 1.04 * gib_per_billion_bytes
+    return params_billions * 2 * gib_per_billion_bytes
+
+
+def _h3_lora_size_gb(training: dict) -> float:
+    """BF16 size of the actual H3 attention+MLP LoRA target set."""
+    rank = max(_coerce_int(training.get("network_dim", 16), 16), 1)
+    # Per block: qkv, attention output, SwiGLU input, and FFN output.
+    parameters_per_rank = 50 * (26_880 + 12_544 + 34_048 + 19_712)
+    if training.get("h3_lora_token_refiner"):
+        parameters_per_rank += 2 * (26_880 + 12_544 + 34_048 + 19_712)
+    return parameters_per_rank * rank * 2 / (1024**3)
+
+
 @lru_cache(maxsize=1)
 def _detect_local_gpu_name() -> str | None:
     """Return the selected CUDA GPU name without importing a CUDA runtime."""
@@ -167,7 +269,13 @@ def _estimate_training_step_time_sec(config: dict, gpu_name: str | None = None) 
         dataset = _first_training_dataset(config)
 
         if training.get("model_type") == "minimax_h3":
-            return _estimate_h3_training_step_time_sec(training, dataset) * _gpu_time_coefficient(gpu_name)
+            caching = config.get("caching", {})
+            datasets = _training_datasets(config)
+            # Directory cardinality is unavailable without scanning every
+            # source. Use the heaviest configured row: it gives users a safe
+            # iteration estimate and matches the bucket that defines peak VRAM.
+            dataset = max(datasets, key=lambda row: _h3_dataset_rows(training, caching, row))
+            return _estimate_h3_training_step_time_sec(training, dataset, caching) * _gpu_time_coefficient(gpu_name)
 
         mode = str(training.get("ltx2_mode", "video")).lower()
         res_w = max(_coerce_int(dataset.get("resolution_w", 768), 768), 64)
@@ -221,7 +329,7 @@ def _estimate_training_step_time_sec(config: dict, gpu_name: str | None = None) 
         return None
 
 
-def _estimate_h3_training_step_time_sec(training: dict, dataset: dict) -> float:
+def _estimate_h3_training_step_time_sec(training: dict, dataset: dict, caching: dict | None = None) -> float:
     """Estimate an H3 LoRA optimizer step from the normalized reference curve.
 
     The 832x480x124 reference is calibrated from real BF16 LoRA runs. Factors
@@ -229,13 +337,16 @@ def _estimate_h3_training_step_time_sec(training: dict, dataset: dict) -> float:
     part of an optimizer step. Extra no-grad teacher forwards affect time but
     are deliberately not treated as equivalent activation-memory multipliers.
     """
-    res_w = max(_coerce_int(dataset.get("resolution_w", 768), 768), 64)
-    res_h = max(_coerce_int(dataset.get("resolution_h", 512), 512), 64)
-    frames = max(_coerce_int(dataset.get("target_frames", 33), 33), 1)
     batch_size = max(_coerce_int(dataset.get("batch_size", training.get("train_batch_size", 1)), 1), 1)
     grad_accum = max(_coerce_int(training.get("gradient_accumulation_steps", 1), 1), 1)
 
-    work_scale = (res_w * res_h * frames) / (832 * 480 * 124)
+    packed_rows = _h3_dataset_rows(training, caching or {}, dataset)
+    reference_rows = _h3_dataset_rows(
+        {},
+        {"h3_task": "t2va"},
+        {"type": "video", "h3_target_mode": "av", "resolution_w": 832, "resolution_h": 480, "target_frames": 124},
+    )
+    work_scale = packed_rows / reference_rows
     # 10.6 s is the fitted unswapped compute intercept. The fully checkpointed,
     # reusable-offload, pinned 48-block reference evaluates to ~22 s/step.
     step_time = 10.6 * max(work_scale, 0.04) ** 0.90 * batch_size * grad_accum
@@ -518,6 +629,11 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
     """
     try:
         training = config.get("training", {})
+        if training.get("model_type") == "minimax_h3":
+            caching = config.get("caching", {})
+            datasets = _training_datasets(config)
+            dataset = max(datasets, key=lambda row: _h3_dataset_rows(training, caching, row))
+            return _calculate_h3_vram_stats(training, caching, dataset)
         ds = _first_training_dataset(config)
 
         # ── DiT weights ──
@@ -696,6 +812,71 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
     except Exception as e:
         logger.warning(f"Failed to calculate VRAM stats: {e}")
         return None
+
+
+def _calculate_h3_vram_stats(training: dict, caching: dict, dataset: dict) -> VRAMStats:
+    """Estimate H3 LoRA peak residency from its actual packed architecture."""
+    dit_base = _h3_base_size_gb(training)
+    total_blocks = 50
+    max_swapped = 50 if training.get("block_swap_h2d_only") and training.get("block_swap_granularity") == "layer" else 48
+    blocks_to_swap = min(max(_coerce_int(training.get("blocks_to_swap", 0), 0), 0), max_swapped)
+    swap_savings = blocks_to_swap * (dit_base / total_blocks) * 0.95
+    model_size_gb = max(dit_base - swap_savings, 1.0)
+
+    lora_size_gb = _h3_lora_size_gb(training)
+    lora_param_count = lora_size_gb * (1024**3) / 2
+    opt_type = str(training.get("optimizer_type", "adamw8bit")).lower()
+    if "4bit" in opt_type:
+        opt_bytes = 5
+    elif "8bit" in opt_type or "fp8" in opt_type:
+        opt_bytes = 6
+    elif opt_type.startswith(("optimi_", "torchoptimi_", "optimi.")):
+        opt_bytes = 10
+    elif "schedulefree" in opt_type or opt_type == "automagic":
+        opt_bytes = 14
+    else:
+        opt_bytes = 12
+    optimizer_size_gb = lora_param_count * opt_bytes / (1024**3)
+    grads_gb = lora_size_gb
+
+    sequence_rows = _h3_dataset_rows(training, caching, dataset)
+    checkpoint_value = training.get("h3_gradient_checkpointing_blocks")
+    checkpoint_blocks = -1 if checkpoint_value in (None, "") else _coerce_int(checkpoint_value, -1)
+    uses_checkpointing = bool(training.get("gradient_checkpointing", True)) and checkpoint_blocks != 0
+    checkpointed = 0 if not uses_checkpointing else total_blocks if checkpoint_blocks < 0 else min(checkpoint_blocks, total_blocks)
+    standard = total_blocks - checkpointed
+    activation_units = total_blocks * 10 if not uses_checkpointing else checkpointed * 2 + standard * 10
+    activations_gb = sequence_rows * 5376 * 2 * activation_units / (1024**3)
+    if training.get("gradient_checkpointing_cpu_offload") and uses_checkpointing:
+        activations_gb *= 0.35
+
+    # Latents, packed projections, attention workspaces, and allocator slack.
+    fixed_buffers_gb = 2.5
+    activations_gb = max(0.3, activations_gb + fixed_buffers_gb)
+    grad_accum = max(_coerce_int(training.get("gradient_accumulation_steps", 1), 1), 1)
+    grad_accum_gb = grads_gb * 0.4 if grad_accum > 1 else 0.0
+    crepa_gb = 0.15 if training.get("crepa") else 0.0
+
+    # Guidance and preservation are sequential no-grad forwards. They change
+    # average time, not the graph high-water mark.
+    overhead_gb = grad_accum_gb + crepa_gb
+    peak_training_gb = model_size_gb + lora_size_gb + optimizer_size_gb + grads_gb + activations_gb + overhead_gb
+    peak_sampling_gb = model_size_gb + 0.3 + activations_gb * 0.3
+    return VRAMStats(
+        peak_training_gb=round(peak_training_gb, 2),
+        peak_sampling_gb=round(peak_sampling_gb, 2),
+        model_size_gb=round(model_size_gb, 2),
+        optimizer_size_gb=round(optimizer_size_gb, 2),
+        activations_gb=round(activations_gb, 2),
+        breakdown={
+            "model": round(model_size_gb, 2),
+            "lora": round(lora_size_gb, 2),
+            "optimizer": round(optimizer_size_gb, 2),
+            "gradients": round(grads_gb, 2),
+            "activations": round(activations_gb, 2),
+            "overhead": round(overhead_gb, 2),
+        },
+    )
 
 
 @router.get("", response_model=ProjectStats)

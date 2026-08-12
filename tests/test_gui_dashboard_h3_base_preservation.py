@@ -1,14 +1,23 @@
 import sys
 from pathlib import Path
 
+import tomllib
+
 from musubi_tuner.gui_dashboard.command_builder import (
     build_cache_latents_cmd,
     build_cache_text_cmd,
     build_inference_cmd,
     build_training_cmd,
 )
-from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
-from musubi_tuner.gui_dashboard.validation import validate_inference_config, validate_training_config
+from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
+from musubi_tuner.gui_dashboard.validation import (
+    validate_cache_latents_config,
+    validate_cache_text_config,
+    validate_inference_config,
+    validate_training_config,
+)
+from musubi_tuner.minimax_h3_cache_latents import create_parser as create_cache_latents_parser
+from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_text_parser
 from musubi_tuner.minimax_h3_generate_video import create_parser as create_inference_parser
 from musubi_tuner.minimax_h3_train_network import create_parser
 
@@ -207,6 +216,8 @@ def test_h3_performance_controls_are_forwarded_to_trainer(tmp_path: Path) -> Non
     config = _h3_config(tmp_path)
     training = config.training
     training.h3_fused_qk_norm_rope = True
+    training.h3_fused_indexed_adaln = True
+    training.h3_fused_swiglu = True
     training.h3_attn_auto_dispatch = True
     training.h3_int8_attention = "train"
     training.h3_lora_token_refiner = True
@@ -225,6 +236,8 @@ def test_h3_performance_controls_are_forwarded_to_trainer(tmp_path: Path) -> Non
     parsed = create_parser().parse_args(command[script_index + 1 :])
 
     assert parsed.h3_fused_qk_norm_rope is True
+    assert parsed.h3_fused_indexed_adaln is True
+    assert parsed.h3_fused_swiglu is True
     assert parsed.h3_attn_auto_dispatch is True
     assert parsed.h3_int8_attention == "train"
     assert parsed.h3_lora_token_refiner is True
@@ -298,6 +311,69 @@ def test_h3_mask_minimum_must_be_positive(tmp_path: Path) -> None:
     report = validate_training_config(config)
 
     assert "training.h3_mask_min_fraction" in report["field_errors"]
+
+
+def test_h3_audio_only_masking_round_trips_without_video_mask_mode(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_mask_audio = True
+    config.training.h3_mask_min_fraction = 0.2
+    config.training.h3_mask_max_fraction = 0.6
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+
+    assert parsed.h3_mask_mode == "off"
+    assert parsed.h3_mask_audio is True
+    assert parsed.h3_mask_min_fraction == 0.2
+    assert parsed.h3_mask_max_fraction == 0.6
+
+
+def test_h3_paired_reference_directories_must_be_complete(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [DatasetEntry(type="image", directory="train", control_video_directory="reference_video")]
+
+    report = validate_cache_latents_config(config)
+
+    assert "dataset.datasets[0].control_video_directory" in report["field_errors"]
+
+
+def test_h3_dataset_frame_grid_and_audio_target_mode_are_validated(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [
+        DatasetEntry(type="video", directory="video", target_frames=33),
+        DatasetEntry(type="audio", directory="audio", h3_target_mode="av"),
+    ]
+
+    report = validate_cache_latents_config(config)
+
+    assert "dataset.datasets[0].target_frames" in report["field_errors"]
+    assert "dataset.datasets[1].h3_target_mode" in report["field_errors"]
+
+
+def test_h3_combined_reference_modality_controls_required_vaes(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_audio_vae = ""
+    config.dataset.datasets = [
+        DatasetEntry(type="image", directory="train", control_directory="references", control_modality="video")
+    ]
+
+    assert "caching.h3_audio_vae" not in validate_cache_latents_config(config)["field_errors"]
+
+    config.dataset.datasets[0].control_modality = "av"
+    assert "caching.h3_audio_vae" in validate_cache_latents_config(config)["field_errors"]
+
+
+def test_h3_training_sample_text_visual_limit_round_trips(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_text_visual_max_pixels = 1_048_576
+    config.training.sample_prompts = "sample_prompts.txt"
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+
+    assert parsed.h3_text_visual_max_pixels == 1_048_576
 
 
 def test_h3_performance_quantization_controls_are_forwarded(tmp_path: Path) -> None:
@@ -459,6 +535,166 @@ def test_h3_inference_controls_round_trip_through_real_parser(tmp_path: Path) ->
     assert parsed.compile_fallback_to_eager is True
     assert parsed.inductor_config == ["max_autotune=true"]
     assert parsed.h3_fused_qk_norm_rope is True
+
+
+def test_h3_dashboard_emits_visible_attention_schedule_and_network_controls(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    training = config.training
+    training.flash_attn = True
+    training.h3_timestep_sampling = "logsnr"
+    training.weighting_scheme = "cosmap"
+    training.min_timestep = 100
+    training.max_timestep = 900
+    training.preserve_distribution_shape = True
+    training.num_timestep_buckets = 8
+    training.lr_warmup_steps = 32
+    training.lr_scheduler_num_cycles = 2
+    training.network_dropout = 0.1
+    training.rank_dropout = 0.2
+    training.module_dropout = 0.3
+    training.network_args = "include_patterns=['.*to_v.*']"
+    training.save_precision = "bf16"
+    training.log_grad_metrics = True
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+
+    assert parsed.flash_attn is True
+    assert parsed.sdpa is False
+    assert parsed.timestep_sampling == "logsnr"
+    assert parsed.weighting_scheme == "cosmap"
+    assert (parsed.min_timestep, parsed.max_timestep) == (100, 900)
+    assert parsed.preserve_distribution_shape is True
+    assert parsed.num_timestep_buckets == 8
+    assert parsed.lr_warmup_steps == 32
+    assert parsed.lr_scheduler_num_cycles == 2
+    assert parsed.network_dropout == 0.1
+    assert "rank_dropout=0.2" in parsed.network_args
+    assert "module_dropout=0.3" in parsed.network_args
+    assert parsed.save_precision == "bf16"
+    assert parsed.log_grad_metrics is True
+
+
+def test_h3_dashboard_rejects_multiple_attention_backends(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.sdpa = True
+    config.training.flash_attn = True
+
+    report = validate_training_config(config)
+
+    assert "training.flash_attn" in report["field_errors"]
+
+
+def test_h3_cache_toml_contains_training_and_validation_rows_under_datasets(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [
+        DatasetEntry(type="image", directory="train", control_video_directory="train_refs", h3_target_mode="video")
+    ]
+    config.dataset.validation_datasets = [
+        DatasetEntry(type="audio", directory="validation", h3_target_mode="audio", cache_directory="validation_cache")
+    ]
+
+    command = build_cache_latents_cmd(config)
+    dataset_path = Path(command[command.index("--dataset_config") + 1])
+    document = tomllib.loads(dataset_path.read_text(encoding="utf-8"))
+
+    assert "validation_datasets" not in document
+    assert len(document["datasets"]) == 2
+    assert document["datasets"][0]["control_video_directory"] == "train_refs"
+    assert document["datasets"][1]["h3_target_mode"] == "audio"
+
+
+def test_h3_validation_uses_separate_dataset_toml_and_full_cli(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [DatasetEntry(type="video", directory="train", target_frames=124)]
+    config.dataset.validation_datasets = [DatasetEntry(type="video", directory="validation", target_frames=124)]
+    training = config.training
+    training.validate_at_start = True
+    training.validate_every_n_steps = 25
+    training.validation_seed = 123
+    training.validation_timestep_bins = 6
+    training.validation_min_timestep = 100
+    training.validation_max_timestep = 900
+    training.max_validation_items = 8
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+    training_doc = tomllib.loads(Path(parsed.dataset_config).read_text(encoding="utf-8"))
+    validation_doc = tomllib.loads(Path(parsed.validation_dataset_config).read_text(encoding="utf-8"))
+
+    assert len(training_doc["datasets"]) == 1
+    assert training_doc["datasets"][0]["video_directory"] == "train"
+    assert len(validation_doc["datasets"]) == 1
+    assert validation_doc["datasets"][0]["video_directory"] == "validation"
+    assert parsed.validate_at_start is True
+    assert parsed.validate_every_n_steps == 25
+    assert parsed.validation_seed == 123
+    assert parsed.validation_timestep_bins == 6
+    assert (parsed.validation_min_timestep, parsed.validation_max_timestep) == (100, 900)
+    assert parsed.max_validation_items == 8
+    assert validate_training_config(config)["ok"] is True
+
+
+def test_h3_cache_streaming_and_conditioned_image_controls_round_trip(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [DatasetEntry(type="image", directory="images", h3_image_frame_count=22)]
+    caching = config.caching
+    caching.h3_task = "fl2va"
+    caching.h3_image_mode = "first"
+    caching.h3_image_frame_count = 22
+    caching.h3_text_visual_max_pixels = 1_048_576
+    caching.h3_text_encoder_quantization = "nvfp4_awq"
+    caching.h3_text_encoder_blocks_to_stream = 40
+    caching.h3_nvfp4_scaled_mm = True
+
+    latent_command = build_cache_latents_cmd(config)
+    latent_script = next(index for index, value in enumerate(latent_command) if value.endswith("minimax_h3_cache_latents.py"))
+    latent_args = create_cache_latents_parser().parse_args(latent_command[latent_script + 1 :])
+    text_command = build_cache_text_cmd(config)
+    text_script = next(
+        index for index, value in enumerate(text_command) if value.endswith("minimax_h3_cache_text_encoder_outputs.py")
+    )
+    text_args = create_cache_text_parser().parse_args(text_command[text_script + 1 :])
+
+    assert (latent_args.h3_image_mode, latent_args.h3_image_frame_count) == ("first", 22)
+    assert text_args.h3_image_mode == "first"
+    assert text_args.h3_text_encoder_blocks_to_stream == 40
+    assert text_args.h3_nvfp4_scaled_mm is True
+    assert text_args.h3_text_visual_max_pixels == 1_048_576
+    assert validate_cache_latents_config(config)["ok"] is True
+    assert validate_cache_text_config(config)["ok"] is True
+
+
+def test_h3_image_inference_uses_image_output_and_does_not_require_audio_vae(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_audio_vae = ""
+    inference = config.inference
+    inference.model_type = "minimax_h3"
+    inference.h3_model = config.training.h3_model
+    inference.prompt = "still image"
+    inference.output_name = "still"
+    inference.h3_image_mode = "first"
+    inference.h3_first_frame = "first.png"
+    inference.h3_image_frame_count = 22
+    inference.h3_select_frame = 5
+    inference.h3_text_encoder_quantization = "nvfp4_awq"
+    inference.h3_text_encoder_blocks_to_stream = 30
+    inference.h3_nvfp4_scaled_mm = True
+
+    command = build_inference_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_generate_video.py"))
+    parsed = create_inference_parser().parse_args(command[script_index + 1 :])
+
+    assert parsed.output.suffix == ".png"
+    assert parsed.audio_vae is None
+    assert parsed.h3_image_mode == "first"
+    assert parsed.h3_image_frame_count == 22
+    assert parsed.h3_select_frame == 5
+    assert parsed.h3_text_encoder_blocks_to_stream == 30
+    assert parsed.h3_nvfp4_scaled_mm is True
+    assert validate_inference_config(config)["ok"] is True
 
 
 def test_advanced_cli_escape_hatches_reach_each_h3_process(tmp_path: Path) -> None:

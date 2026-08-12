@@ -20,6 +20,9 @@ from musubi_tuner.gui_dashboard.toml_export import (
     conditioning_recipe_is_active,
     export_conditioning_toml,
     export_dataset_toml,
+    export_h3_cache_dataset_toml,
+    export_h3_training_dataset_toml,
+    export_h3_validation_dataset_toml,
 )
 from musubi_tuner.gui_dashboard.training_dashboard_state import get_latest_local_autoresume_state
 from musubi_tuner.model_defaults import (
@@ -342,7 +345,7 @@ def _h3_cache_common_args(cmd: list[str], section) -> None:
 
 
 def _build_h3_cache_latents_cmd(config: ProjectConfig) -> list[str]:
-    toml_path = export_dataset_toml(config)
+    toml_path = export_h3_cache_dataset_toml(config)
     c = config.caching
     cmd = [
         sys.executable,
@@ -350,20 +353,24 @@ def _build_h3_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         _find_script("minimax_h3_cache_latents.py"),
         "--dataset_config",
         str(toml_path),
-        "--vae",
-        c.h3_video_vae,
     ]
+    if c.h3_video_vae:
+        cmd += ["--vae", c.h3_video_vae]
     if c.h3_audio_vae:
         cmd += ["--audio_vae", c.h3_audio_vae]
     if c.vae_dtype:
         cmd += ["--vae_dtype", c.vae_dtype]
+    if c.h3_image_mode != "none":
+        cmd += ["--h3_image_mode", c.h3_image_mode]
+    if c.h3_image_frame_count is not None:
+        cmd += ["--h3_image_frame_count", str(c.h3_image_frame_count)]
     _h3_cache_common_args(cmd, c)
     cmd += _split_cli_args(c.cache_latents_extra_args)
     return cmd
 
 
 def _build_h3_cache_text_cmd(config: ProjectConfig) -> list[str]:
-    toml_path = export_dataset_toml(config)
+    toml_path = export_h3_cache_dataset_toml(config)
     c = config.caching
     cmd = [
         sys.executable,
@@ -382,6 +389,16 @@ def _build_h3_cache_text_cmd(config: ProjectConfig) -> list[str]:
     ]
     if c.h3_text_encoder_quantization != "none":
         cmd += ["--text_encoder_quantization", c.h3_text_encoder_quantization]
+    if c.h3_text_encoder_blocks_to_stream:
+        cmd += ["--h3_text_encoder_blocks_to_stream", str(c.h3_text_encoder_blocks_to_stream)]
+    if c.h3_nvfp4_scaled_mm:
+        cmd.append("--h3_nvfp4_scaled_mm")
+    if c.h3_image_mode != "none":
+        cmd += ["--h3_image_mode", c.h3_image_mode]
+    if c.h3_image_frame_count is not None:
+        cmd += ["--h3_image_frame_count", str(c.h3_image_frame_count)]
+    if c.h3_text_visual_max_pixels:
+        cmd += ["--h3_text_visual_max_pixels", str(c.h3_text_visual_max_pixels)]
     if c.h3_cache_guidance_empty:
         cmd.append("--cache_guidance_empty")
     _h3_cache_common_args(cmd, c)
@@ -395,7 +412,10 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
     output_dir = Path(s.output_dir or "output")
     output_name = s.output_name or "h3_sample"
     output_path = output_dir / output_name
-    if output_path.suffix.lower() not in {".mp4", ".mov", ".webm"}:
+    if s.h3_image_mode != "none":
+        if output_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            output_path = output_path.with_suffix(".png")
+    elif output_path.suffix.lower() not in {".mp4", ".mov", ".webm"}:
         output_path = output_path.with_suffix(".mp4")
     cmd = [
         sys.executable,
@@ -403,14 +423,6 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
         _find_script("minimax_h3_generate_video.py"),
         "--model",
         s.h3_model,
-        "--text_encoder",
-        s.h3_text_encoder or c.h3_text_encoder,
-        "--tokenizer",
-        s.h3_tokenizer or c.h3_tokenizer,
-        "--vae",
-        s.h3_video_vae or c.h3_video_vae,
-        "--audio_vae",
-        s.h3_audio_vae or c.h3_audio_vae,
         "--prompt",
         s.prompt,
         "--output",
@@ -420,11 +432,32 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
         "--ratio",
         s.h3_ratio,
     ]
+    for flag, value in (
+        ("--text_encoder", s.h3_text_encoder or c.h3_text_encoder),
+        ("--tokenizer", s.h3_tokenizer or c.h3_tokenizer),
+        ("--vae", s.h3_video_vae or c.h3_video_vae),
+        ("--audio_vae", s.h3_audio_vae or c.h3_audio_vae),
+    ):
+        if value:
+            cmd += [flag, value]
     text_encoder_quantization = (
         s.h3_text_encoder_quantization if s.h3_text_encoder_quantization != "none" else c.h3_text_encoder_quantization
     )
     if text_encoder_quantization != "none":
         cmd += ["--text_encoder_quantization", text_encoder_quantization]
+    text_encoder_blocks_to_stream = s.h3_text_encoder_blocks_to_stream or c.h3_text_encoder_blocks_to_stream
+    if text_encoder_blocks_to_stream:
+        cmd += ["--h3_text_encoder_blocks_to_stream", str(text_encoder_blocks_to_stream)]
+    if s.h3_nvfp4_scaled_mm or c.h3_nvfp4_scaled_mm:
+        cmd.append("--h3_nvfp4_scaled_mm")
+    if s.h3_image_mode != "none":
+        cmd += ["--h3_image_mode", s.h3_image_mode]
+        cmd += ["--h3_image_frame_count", str(s.h3_image_frame_count)]
+        if s.h3_select_frame:
+            cmd += ["--h3_select_frame", str(s.h3_select_frame)]
+    text_visual_max_pixels = s.h3_text_visual_max_pixels or c.h3_text_visual_max_pixels
+    if text_visual_max_pixels:
+        cmd += ["--h3_text_visual_max_pixels", str(text_visual_max_pixels)]
     for weight in _split_cli_args(s.lora_weight):
         cmd += ["--lora_weight", weight]
     multipliers = _split_cli_args(str(s.lora_multiplier)) if s.lora_weight else []
@@ -496,7 +529,7 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
 
 
 def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
-    toml_path = export_dataset_toml(config)
+    toml_path = export_h3_training_dataset_toml(config)
     t = config.training
     c = config.caching
     sample_prompts = _effective_training_sample_prompts(config)
@@ -514,7 +547,12 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--network_dim", str(t.network_dim)]
     if t.network_alpha != 1:
         cmd += ["--network_alpha", str(t.network_alpha)]
-    cmd.append("--sdpa")
+    if t.flash3:
+        cmd.append("--flash3")
+    elif t.flash_attn:
+        cmd.append("--flash_attn")
+    else:
+        cmd.append("--sdpa")
     if t.fp8_base or t.fp8_scaled:
         cmd.append("--fp8_base")
         if t.h3_fp8_quantization_mode != "block":
@@ -534,6 +572,10 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_adaln_rank", str(t.h3_adaln_rank)]
     if t.h3_fused_qk_norm_rope:
         cmd.append("--h3_fused_qk_norm_rope")
+    if t.h3_fused_indexed_adaln:
+        cmd.append("--h3_fused_indexed_adaln")
+    if t.h3_fused_swiglu:
+        cmd.append("--h3_fused_swiglu")
     if t.h3_attn_auto_dispatch:
         cmd.append("--h3_attn_auto_dispatch")
     if t.h3_int8_attention != "off":
@@ -573,8 +615,9 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_keyframe_random_count", str(t.h3_keyframe_random_count)]
     if t.reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(t.reference_image_short_edge)]
-    if t.h3_mask_mode != "off":
-        cmd += ["--h3_mask_mode", t.h3_mask_mode]
+    if t.h3_mask_mode != "off" or t.h3_mask_audio:
+        if t.h3_mask_mode != "off":
+            cmd += ["--h3_mask_mode", t.h3_mask_mode]
         if t.h3_mask_audio:
             cmd.append("--h3_mask_audio")
         if t.h3_mask_min_fraction != 0.25:
@@ -592,8 +635,9 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             crepa_args.append(f"teacher_block={t.h3_crepa_teacher_block_idx}")
         if t.crepa_mode == "dino" and t.crepa_dino_model != "dinov2_vitb14":
             crepa_args.append(f"dino_model={t.crepa_dino_model}")
-        if t.crepa_lambda != 0.1:
-            crepa_args.append(f"weight={t.crepa_lambda}")
+        # H3's native CREPA default is 0.05 while the shared dashboard field
+        # historically defaulted to 0.1. Always pass the visible value.
+        crepa_args.append(f"weight={t.crepa_lambda}")
         cmd.append("--crepa")
         cmd += crepa_args
     if t.h3_guidance_distillation_scale is not None:
@@ -606,6 +650,21 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_base_preservation_loss_weight", str(t.h3_base_preservation_loss_weight)]
         if t.h3_base_preservation_probability != 1.0:
             cmd += ["--h3_base_preservation_probability", str(t.h3_base_preservation_probability)]
+    if t.network_weights:
+        cmd += ["--network_weights", t.network_weights]
+    if t.dim_from_weights:
+        cmd.append("--dim_from_weights")
+    if t.network_dropout is not None:
+        cmd += ["--network_dropout", str(t.network_dropout)]
+    if t.scale_weight_norms is not None:
+        cmd += ["--scale_weight_norms", str(t.scale_weight_norms)]
+    network_args = _split_cli_args(t.network_args)
+    if t.rank_dropout is not None:
+        network_args.append(f"rank_dropout={t.rank_dropout}")
+    if t.module_dropout is not None:
+        network_args.append(f"module_dropout={t.module_dropout}")
+    if network_args:
+        cmd += ["--network_args", *network_args]
     if t.learning_rate is not None:
         cmd += ["--learning_rate", str(t.learning_rate)]
     if t.optimizer_type:
@@ -613,14 +672,55 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
     if t.optimizer_args:
         cmd += ["--optimizer_args", *_split_cli_args(t.optimizer_args)]
     cmd += ["--lr_scheduler", t.lr_scheduler]
+    if t.lr_warmup_steps:
+        cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
+    if t.lr_decay_steps:
+        cmd += ["--lr_decay_steps", str(t.lr_decay_steps)]
+    if t.lr_scheduler_num_cycles not in (None, 1):
+        cmd += ["--lr_scheduler_num_cycles", str(t.lr_scheduler_num_cycles)]
+    if t.lr_scheduler_power not in (None, 1.0):
+        cmd += ["--lr_scheduler_power", str(t.lr_scheduler_power)]
+    if t.lr_scheduler_min_lr_ratio is not None:
+        cmd += ["--lr_scheduler_min_lr_ratio", str(t.lr_scheduler_min_lr_ratio)]
+    if t.lr_scheduler_timescale is not None:
+        cmd += ["--lr_scheduler_timescale", str(t.lr_scheduler_timescale)]
+    if t.lr_scheduler_type:
+        cmd += ["--lr_scheduler_type", t.lr_scheduler_type]
+    if t.lr_scheduler_args:
+        cmd += ["--lr_scheduler_args", *_split_cli_args(t.lr_scheduler_args)]
     cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
+    cmd += ["--timestep_sampling", t.h3_timestep_sampling]
+    if t.sigmoid_scale not in (None, 1.0):
+        cmd += ["--sigmoid_scale", str(t.sigmoid_scale)]
+    if t.weighting_scheme != "none":
+        cmd += ["--weighting_scheme", t.weighting_scheme]
+    if t.logit_mean not in (None, 0.0):
+        cmd += ["--logit_mean", str(t.logit_mean)]
+    if t.logit_std not in (None, 1.0):
+        cmd += ["--logit_std", str(t.logit_std)]
+    if t.mode_scale not in (None, 1.29):
+        cmd += ["--mode_scale", str(t.mode_scale)]
+    if t.min_timestep is not None:
+        cmd += ["--min_timestep", str(int(t.min_timestep))]
+    if t.max_timestep is not None:
+        cmd += ["--max_timestep", str(int(t.max_timestep))]
+    if t.preserve_distribution_shape:
+        cmd.append("--preserve_distribution_shape")
+    if t.num_timestep_buckets is not None:
+        cmd += ["--num_timestep_buckets", str(t.num_timestep_buckets)]
+    if t.show_timesteps:
+        cmd += ["--show_timesteps", t.show_timesteps]
     if t.max_train_epochs is not None:
         cmd += ["--max_train_epochs", str(t.max_train_epochs)]
     else:
         cmd += ["--max_train_steps", str(t.max_train_steps)]
     if t.seed is not None:
         cmd += ["--seed", str(t.seed)]
+    if t.max_data_loader_n_workers is not None:
+        cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
+    if t.persistent_data_loader_workers:
+        cmd.append("--persistent_data_loader_workers")
     if t.blocks_to_swap is not None:
         cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
     if t.gradient_checkpointing or t.blockwise_checkpointing:
@@ -637,7 +737,7 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--use_pinned_memory_for_block_swap")
     if getattr(t, "block_swap_h2d_only", False):
         cmd.append("--block_swap_h2d_only")
-    if getattr(t, "block_swap_ring_size", 1) != 1:
+    if getattr(t, "block_swap_ring_size", 2) != 2:
         cmd += ["--block_swap_ring_size", str(t.block_swap_ring_size)]
     if t.block_swap_granularity != "block":
         cmd += ["--block_swap_granularity", t.block_swap_granularity]
@@ -661,6 +761,14 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--save_state")
     if t.save_state_on_train_end:
         cmd.append("--save_state_on_train_end")
+    if t.save_precision:
+        cmd += ["--save_precision", t.save_precision]
+    if t.log_grad_metrics:
+        cmd.append("--log_grad_metrics")
+    if t.training_comment:
+        cmd += ["--training_comment", t.training_comment]
+    if t.no_metadata:
+        cmd.append("--no_metadata")
     if t.log_with:
         cmd += ["--log_with", t.log_with]
     if t.log_with and t.logging_dir:
@@ -699,10 +807,38 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         ]
         if c.h3_text_encoder_quantization != "none":
             cmd += ["--text_encoder_quantization", c.h3_text_encoder_quantization]
+        if c.h3_text_encoder_blocks_to_stream:
+            cmd += ["--h3_text_encoder_blocks_to_stream", str(c.h3_text_encoder_blocks_to_stream)]
+        if c.h3_nvfp4_scaled_mm:
+            cmd.append("--h3_nvfp4_scaled_mm")
+        if c.h3_text_visual_max_pixels:
+            cmd += ["--h3_text_visual_max_pixels", str(c.h3_text_visual_max_pixels)]
     if t.sample_at_first:
         cmd.append("--sample_at_first")
     if t.offload_optimizer_during_validation:
         cmd.append("--offload_optimizer_during_validation")
+    validation_requested = bool(t.validate_at_start or t.validate_every_n_steps or t.validate_every_n_epochs)
+    validation_config = t.validation_dataset_config
+    if not validation_config and validation_requested and config.dataset.validation_datasets:
+        validation_config = str(export_h3_validation_dataset_toml(config))
+    if validation_config:
+        cmd += ["--validation_dataset_config", validation_config]
+    if t.validate_every_n_steps is not None:
+        cmd += ["--validate_every_n_steps", str(t.validate_every_n_steps)]
+    if t.validate_every_n_epochs is not None:
+        cmd += ["--validate_every_n_epochs", str(t.validate_every_n_epochs)]
+    if t.validate_at_start:
+        cmd.append("--validate_at_start")
+    if t.validation_seed is not None:
+        cmd += ["--validation_seed", str(t.validation_seed)]
+    if t.validation_timestep_bins != 4:
+        cmd += ["--validation_timestep_bins", str(t.validation_timestep_bins)]
+    if t.validation_min_timestep != 0:
+        cmd += ["--validation_min_timestep", str(t.validation_min_timestep)]
+    if t.validation_max_timestep != 1000:
+        cmd += ["--validation_max_timestep", str(t.validation_max_timestep)]
+    if t.max_validation_items is not None:
+        cmd += ["--max_validation_items", str(t.max_validation_items)]
     if t.base_weights:
         cmd += ["--base_weights", *_split_cli_args(t.base_weights)]
     if t.base_weights_multiplier:

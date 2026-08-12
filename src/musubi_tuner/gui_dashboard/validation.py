@@ -184,10 +184,15 @@ def _dataset_source_label(index: int) -> str:
 
 
 def _validate_dataset_entry(
-    entry: DatasetEntry, index: int, *, errors: list[dict[str, Any]], warnings: list[dict[str, Any]]
+    entry: DatasetEntry,
+    index: int,
+    *,
+    errors: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+    collection: str = "datasets",
 ) -> None:
-    field_base = f"dataset.datasets[{index}]"
-    label = _dataset_source_label(index)
+    field_base = f"dataset.{collection}[{index}]"
+    label = ("Validation " if collection == "validation_datasets" else "") + _dataset_source_label(index)
 
     has_directory = _has_text(entry.directory)
     has_jsonl = _has_text(entry.jsonl_file)
@@ -224,6 +229,187 @@ def _validate_dataset_entry(
                 page="dataset",
             )
         )
+
+
+def _validate_h3_dataset_entry(
+    entry: DatasetEntry,
+    index: int,
+    *,
+    errors: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+    collection: str = "datasets",
+) -> None:
+    _validate_dataset_entry(
+        entry,
+        index,
+        errors=errors,
+        warnings=warnings,
+        collection=collection,
+    )
+    field_base = f"dataset.{collection}[{index}]"
+    label = ("Validation " if collection == "validation_datasets" else "") + _dataset_source_label(index)
+    modalities = [part.strip().lower() for part in entry.control_modalities.replace(",", ";").split(";") if part.strip()]
+    invalid_modalities = sorted(set(modalities) - {"av", "video", "audio"})
+    if invalid_modalities:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.control_modalities",
+                f"{label}: unknown H3 reference modality: {', '.join(invalid_modalities)}.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if entry.control_modality and modalities:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.control_modalities",
+                f"{label}: choose one fixed reference modality or an ordered modality list, not both.",
+                label=label,
+                page="dataset",
+            )
+        )
+    probabilities = (
+        entry.control_modality_probability_av,
+        entry.control_modality_probability_video,
+        entry.control_modality_probability_audio,
+    )
+    if any(value is not None for value in probabilities):
+        if any(value is None for value in probabilities):
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.control_modality_probability_av",
+                    f"{label}: AV, video, and audio reference probabilities must all be set.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+        else:
+            numeric = tuple(float(value) for value in probabilities)
+            if any(not math.isfinite(value) or value < 0 for value in numeric) or not math.isclose(
+                sum(numeric), 1.0, rel_tol=0.0, abs_tol=1e-6
+            ):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"{field_base}.control_modality_probability_av",
+                        f"{label}: H3 reference probabilities must be non-negative and sum to 1.",
+                        label=label,
+                        page="dataset",
+                    )
+                )
+        if entry.control_modality or modalities:
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.control_modality_probability_av",
+                    f"{label}: stochastic reference probabilities cannot be combined with a fixed modality policy.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+    if entry.control_directory and (entry.control_video_directory or entry.control_audio_directory):
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.control_directory",
+                f"{label}: use the legacy combined control directory or paired video/audio directories, not both.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if bool(entry.control_video_directory) != bool(entry.control_audio_directory):
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.control_video_directory",
+                f"{label}: paired H3 reference video and audio directories must be specified together.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if entry.h3_image_frame_count is not None and (entry.h3_image_frame_count < 5 or (entry.h3_image_frame_count - 5) % 17 != 0):
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.h3_image_frame_count",
+                f"{label}: H3 conditioned-image frame count must satisfy frame_count % 17 == 5.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if entry.type == "video" and (entry.target_frames < 5 or (entry.target_frames - 5) % 17 != 0):
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.target_frames",
+                f"{label}: H3 video target frames must satisfy frame_count % 17 == 5 (for example 124).",
+                label=label,
+                page="dataset",
+            )
+        )
+    if entry.type == "audio" and entry.h3_target_mode != "audio":
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.h3_target_mode",
+                f"{label}: an audio dataset requires Audio only target modalities.",
+                label=label,
+                page="dataset",
+            )
+        )
+
+
+def _h3_required_vaes(config: ProjectConfig) -> tuple[bool, bool]:
+    requires_video = False
+    requires_audio = False
+    rows = list(config.dataset.datasets or []) + list(config.dataset.validation_datasets or [])
+    for entry in rows:
+        target_mode = "video" if entry.type == "image" else entry.h3_target_mode
+        requires_video |= target_mode != "audio"
+        requires_audio |= entry.type in {"video", "audio"} and target_mode != "video"
+
+        # Paired directories always describe one video stream plus its explicit
+        # audio stream.  A combined reference directory can contain images,
+        # videos, or audio, so use its modality policy when one is provided and
+        # conservatively require both decoders when its contents are unknown.
+        if entry.control_video_directory or entry.control_audio_directory:
+            requires_video = True
+            requires_audio = True
+        has_combined_references = bool(entry.control_directory or entry.extra_control_directories)
+        if has_combined_references:
+            fixed_modes = [entry.control_modality] if entry.control_modality else []
+            fixed_modes.extend(
+                value.strip().lower() for value in re.split(r"[;,]", entry.control_modalities or "") if value.strip()
+            )
+            probabilities = (
+                entry.control_modality_probability_av,
+                entry.control_modality_probability_video,
+                entry.control_modality_probability_audio,
+            )
+            if fixed_modes:
+                requires_video |= any(mode in {"av", "video"} for mode in fixed_modes)
+                requires_audio |= any(mode in {"av", "audio"} for mode in fixed_modes)
+            elif any(value is not None for value in probabilities):
+                av_probability, video_probability, audio_probability = probabilities
+                requires_video |= bool((av_probability or 0) > 0 or (video_probability or 0) > 0)
+                requires_audio |= bool((av_probability or 0) > 0 or (audio_probability or 0) > 0)
+            else:
+                requires_video = True
+                requires_audio = True
+
+        # Uncached reference sources need their respective encoder. Cached
+        # references themselves do not create an additional VAE requirement.
+        requires_audio |= any(
+            _has_text(value)
+            for value in (
+                entry.reference_audio_directory,
+                entry.extra_reference_audio_directories,
+            )
+        )
+    return requires_video, requires_audio
 
 
 def _has_training_gemma_source(config: ProjectConfig) -> bool:
@@ -466,6 +652,17 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        selected_attention_backends = sum(bool(value) for value in (t.sdpa, t.flash_attn, t.flash3))
+        if selected_attention_backends > 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.flash_attn",
+                    "Choose one H3 attention backend: SDPA, FlashAttention 2, or FlashAttention 3.",
+                    label="H3 Attention Backend",
+                    page="training",
+                )
+            )
         if t.int8_convrot_base and (t.fp8_base or t.fp8_scaled):
             message = "MiniMax H3 INT8 ConvRot and FP8 base loading are mutually exclusive."
             errors.append(
@@ -492,6 +689,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         "H3 guidance training requires cached empty-text conditioning.",
                         label="H3 Cache Guidance Empty",
                         page="caching",
+                    )
+                )
+            if float(t.network_dropout or 0.0) > 0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.network_dropout",
+                        "H3 guidance-consistent training cannot replay neuron dropout across different prompt lengths. Use rank or module dropout instead.",
+                        label="Network Dropout",
+                        page="training",
                     )
                 )
         preservation_weight = float(t.h3_base_preservation_loss_weight)
@@ -537,7 +744,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     _make_issue(
                         "error",
                         f"training.{field}",
-                        f"{label} must be finite and between 0 and {1 if field == 'h3_caption_dropout_rate' else 'infinity'}.",
+                        f"{label} must be finite and lie in [0, 1].",
                         label=label,
                         page="training",
                     )
@@ -552,7 +759,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="caching",
                 )
             )
-        if t.h3_mask_mode != "off" and not 0 < t.h3_mask_min_fraction <= t.h3_mask_max_fraction <= 1:
+        if (t.h3_mask_mode != "off" or t.h3_mask_audio) and not (0 < t.h3_mask_min_fraction <= t.h3_mask_max_fraction <= 1):
             errors.append(
                 _make_issue(
                     "error",
@@ -569,6 +776,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     "training.h3_keyframe_random_count",
                     "Choose explicit H3 keyframe anchors or a random count, not both.",
                     label="H3 Keyframes",
+                    page="training",
+                )
+            )
+        if t.h3_keyframe_random_count < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_keyframe_random_count",
+                    "H3 random keyframe count cannot be negative.",
+                    label="H3 Random Keyframes",
                     page="training",
                 )
             )
@@ -635,6 +852,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_frame_sigma_jitter > 0 and t.weighting_scheme in {"sigma_sqrt", "cosmap"}:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.weighting_scheme",
+                    "H3 frame sigma jitter does not support per-frame sigma_sqrt or cosmap weighting.",
+                    label="H3 Weighting Scheme",
+                    page="training",
+                )
+            )
         if (t.h3_keyframe_anchors or t.h3_keyframe_random_count) and config.caching.h3_task != "t2va":
             errors.append(
                 _make_issue(
@@ -652,6 +879,70 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     "training.h3_adaln_rank",
                     "H3 AdaLN rank must be at least 1.",
                     label="H3 AdaLN Rank",
+                    page="training",
+                )
+            )
+        if t.h3_image_flow_shift is not None and t.h3_image_flow_shift <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_image_flow_shift",
+                    "H3 image flow shift must be positive.",
+                    label="H3 Image Flow Shift",
+                    page="training",
+                )
+            )
+        for field, value, label in (
+            ("h3_shift_video", t.h3_shift_video, "H3 Video Shift"),
+            ("h3_shift_audio", t.h3_shift_audio, "H3 Audio Shift"),
+        ):
+            if not math.isfinite(float(value)) or not 0.01 <= float(value) <= 100.0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"training.{field}",
+                        f"{label} must be finite and lie in [0.01, 100].",
+                        label=label,
+                        page="training",
+                    )
+                )
+        if t.h3_extension_video_frames < 0 or t.h3_extension_audio_latents < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_extension_video_frames",
+                    "H3 extension context lengths cannot be negative.",
+                    label="H3 Extension Context",
+                    page="training",
+                )
+            )
+        if t.reference_image_short_edge < 32:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.reference_image_short_edge",
+                    "H3 reference image short edge must be at least 32 pixels.",
+                    label="H3 Reference Short Edge",
+                    page="training",
+                )
+            )
+        if t.h3_attn_auto_dispatch and not t.sdpa:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_attn_auto_dispatch",
+                    "H3 attention auto-dispatch requires SDPA.",
+                    label="H3 Attention Auto-dispatch",
+                    page="training",
+                )
+            )
+        if t.blocks_to_swap is not None and t.blocks_to_swap < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.blocks_to_swap",
+                    "H3 blocks to swap cannot be negative.",
+                    label="Blocks to Swap",
                     page="training",
                 )
             )
@@ -771,6 +1062,56 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.discrete_flow_shift != 1.0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.discrete_flow_shift",
+                    "H3 requires discrete flow shift 1.0; use H3 Video Shift and H3 Audio Shift for modality schedules.",
+                    label="Discrete Flow Shift",
+                    page="training",
+                )
+            )
+        if t.min_timestep is not None and not 0 <= t.min_timestep <= 999:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.min_timestep",
+                    "H3 minimum timestep must be between 0 and 999.",
+                    label="Minimum Timestep",
+                    page="training",
+                )
+            )
+        if t.max_timestep is not None and not 1 <= t.max_timestep <= 1000:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.max_timestep",
+                    "H3 maximum timestep must be between 1 and 1000.",
+                    label="Maximum Timestep",
+                    page="training",
+                )
+            )
+        if t.min_timestep is not None and t.max_timestep is not None and t.min_timestep >= t.max_timestep:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.max_timestep",
+                    "H3 maximum timestep must be greater than the minimum timestep.",
+                    label="Maximum Timestep",
+                    page="training",
+                )
+            )
+        if t.num_timestep_buckets is not None and t.num_timestep_buckets < 2:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.num_timestep_buckets",
+                    "H3 timestep bucketing requires at least 2 buckets.",
+                    label="Timestep Buckets",
+                    page="training",
+                )
+            )
         unsupported_quantization = (
             ("int8_base", "int8 Base"),
             ("int8_base_dynamic", "int8 Base (dynamic)"),
@@ -833,8 +1174,117 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                             page="caching",
                         )
                     )
+        if not config.dataset.datasets and not any(
+            _has_text(value) for value in (t.dataset_config, t.dataset_manifest, t.config_file)
+        ):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "dataset.datasets",
+                    "Add at least one H3 training dataset or provide an external dataset/config manifest.",
+                    label="Training Datasets",
+                    page="dataset",
+                )
+            )
         for index, entry in enumerate(config.dataset.datasets):
-            _validate_dataset_entry(entry, index, errors=errors, warnings=warnings)
+            _validate_h3_dataset_entry(entry, index, errors=errors, warnings=warnings)
+        for index, entry in enumerate(config.dataset.validation_datasets):
+            _validate_h3_dataset_entry(
+                entry,
+                index,
+                errors=errors,
+                warnings=warnings,
+                collection="validation_datasets",
+            )
+        validation_requested = bool(t.validate_at_start or t.validate_every_n_steps or t.validate_every_n_epochs)
+        has_validation_config = bool(_has_text(t.validation_dataset_config) or config.dataset.validation_datasets)
+        if validation_requested and not has_validation_config:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "dataset.validation_datasets",
+                    "H3 validation requires a validation dataset row or an external validation dataset config.",
+                    label="Validation Datasets",
+                    page="dataset",
+                )
+            )
+        if _has_text(t.validation_dataset_config) and not validation_requested:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.validation_dataset_config",
+                    "H3 validation dataset config requires Validate at Start or a validation interval.",
+                    label="Validation Dataset Config",
+                    page="training",
+                )
+            )
+        validation_options_changed = bool(
+            t.validation_seed is not None
+            or t.validation_timestep_bins != 4
+            or t.validation_min_timestep != 0
+            or t.validation_max_timestep != 1000
+            or t.max_validation_items is not None
+        )
+        if validation_options_changed and not validation_requested:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.validation_timestep_bins",
+                    "H3 validation options require Validate at Start or a validation interval.",
+                    label="Validation Options",
+                    page="training",
+                )
+            )
+        if t.validate_every_n_steps is not None and t.validate_every_n_steps < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.validate_every_n_steps",
+                    "Validate Every N Steps must be at least 1.",
+                    label="Validation Step Interval",
+                    page="training",
+                )
+            )
+        if t.validate_every_n_epochs is not None and t.validate_every_n_epochs < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.validate_every_n_epochs",
+                    "Validate Every N Epochs must be at least 1.",
+                    label="Validation Epoch Interval",
+                    page="training",
+                )
+            )
+        if t.validation_timestep_bins < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.validation_timestep_bins",
+                    "Validation timestep bins must be at least 1.",
+                    label="Validation Timestep Bins",
+                    page="training",
+                )
+            )
+        if not 0 <= t.validation_min_timestep < t.validation_max_timestep <= 1000:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.validation_min_timestep",
+                    "Validation timestep range must satisfy 0 <= minimum < maximum <= 1000.",
+                    label="Validation Timestep Range",
+                    page="training",
+                )
+            )
+        if t.max_validation_items is not None and t.max_validation_items < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.max_validation_items",
+                    "Maximum validation items must be at least 1.",
+                    label="Maximum Validation Items",
+                    page="training",
+                )
+            )
         return _build_report(errors, warnings)
     _validate_generated_av_metrics(t, page="training", errors=errors)
     if _has_text(getattr(t, "lr_group_scheduler_args", "")):
@@ -3011,17 +3461,67 @@ def validate_cache_latents_config(config: ProjectConfig) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     if c.model_type == "minimax_h3":
-        if not _has_text(c.h3_video_vae):
+        requires_video, requires_audio = _h3_required_vaes(config)
+        if requires_video and not _has_text(c.h3_video_vae):
             errors.append(
                 _make_issue(
-                    "error", "caching.h3_video_vae", "MiniMax H3 video VAE is required.", label="H3 Video VAE", page="caching"
+                    "error",
+                    "caching.h3_video_vae",
+                    "MiniMax H3 video VAE is required by the configured visual targets or references.",
+                    label="H3 Video VAE",
+                    page="caching",
                 )
             )
-        image_only = bool(config.dataset.datasets) and all(entry.type == "image" for entry in config.dataset.datasets)
-        if not image_only and not _has_text(c.h3_audio_vae):
+        if requires_audio and not _has_text(c.h3_audio_vae):
             errors.append(
                 _make_issue(
-                    "error", "caching.h3_audio_vae", "MiniMax H3 audio VAE is required.", label="H3 Audio VAE", page="caching"
+                    "error",
+                    "caching.h3_audio_vae",
+                    "MiniMax H3 audio VAE is required by the configured audio targets or references.",
+                    label="H3 Audio VAE",
+                    page="caching",
+                )
+            )
+        if not config.dataset.datasets and not config.dataset.validation_datasets:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "dataset.datasets",
+                    "Add at least one H3 training or validation dataset before caching latents.",
+                    label="Datasets",
+                    page="dataset",
+                )
+            )
+        for collection, rows in (
+            ("datasets", config.dataset.datasets),
+            ("validation_datasets", config.dataset.validation_datasets),
+        ):
+            for index, entry in enumerate(rows):
+                _validate_h3_dataset_entry(
+                    entry,
+                    index,
+                    errors=errors,
+                    warnings=warnings,
+                    collection=collection,
+                )
+        if c.h3_image_mode != "none" and c.h3_task != "fl2va":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_image_mode",
+                    "H3 conditioned-image caching requires the FL2VA task.",
+                    label="H3 Image Mode",
+                    page="caching",
+                )
+            )
+        if c.h3_image_frame_count is not None and (c.h3_image_frame_count < 5 or (c.h3_image_frame_count - 5) % 17 != 0):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_image_frame_count",
+                    "H3 image frame count must satisfy frame_count % 17 == 5.",
+                    label="H3 Image Frame Count",
+                    page="caching",
                 )
             )
         return _build_report(errors, warnings)
@@ -3099,6 +3599,46 @@ def validate_cache_text_config(config: ProjectConfig) -> dict[str, Any]:
                     "caching.device",
                     "MiniMax H3 quantized text-encoder modes require a CUDA device.",
                     label="Device",
+                    page="caching",
+                )
+            )
+        if not 0 <= c.h3_text_encoder_blocks_to_stream <= 50:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_text_encoder_blocks_to_stream",
+                    "H3 text-encoder streamed blocks must be between 0 and 50.",
+                    label="H3 Text Encoder Blocks To Stream",
+                    page="caching",
+                )
+            )
+        if c.h3_nvfp4_scaled_mm and c.h3_text_encoder_quantization != "nvfp4_awq":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_nvfp4_scaled_mm",
+                    "H3 NVFP4 scaled_mm requires NVFP4/AWQ text-encoder quantization.",
+                    label="H3 NVFP4 scaled_mm",
+                    page="caching",
+                )
+            )
+        if c.h3_text_visual_max_pixels < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_text_visual_max_pixels",
+                    "H3 text visual pixel cap must be non-negative.",
+                    label="H3 Text Visual Max Pixels",
+                    page="caching",
+                )
+            )
+        if c.h3_image_mode != "none" and c.h3_task != "fl2va":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_image_mode",
+                    "H3 conditioned-image text caching requires the FL2VA task.",
+                    label="H3 Image Mode",
                     page="caching",
                 )
             )
@@ -3266,12 +3806,14 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
                     "error", "inference.prompt", "Prompt is required for MiniMax H3 inference.", label="Prompt", page="inference"
                 )
             )
-        for field, fallback, label in (
+        required_components = [
             ("h3_text_encoder", config.caching.h3_text_encoder, "H3 Text Encoder"),
             ("h3_tokenizer", config.caching.h3_tokenizer, "H3 Tokenizer"),
             ("h3_video_vae", config.caching.h3_video_vae, "H3 Video VAE"),
-            ("h3_audio_vae", config.caching.h3_audio_vae, "H3 Audio VAE"),
-        ):
+        ]
+        if i.h3_image_mode == "none":
+            required_components.append(("h3_audio_vae", config.caching.h3_audio_vae, "H3 Audio VAE"))
+        for field, fallback, label in required_components:
             if not _has_text(getattr(i, field)) and not _has_text(fallback):
                 errors.append(_make_issue("error", f"inference.{field}", f"{label} is required.", label=label, page="inference"))
         if not 5 <= i.h3_duration <= 15:
@@ -3321,6 +3863,92 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
                     "inference.h3_block_swap_ring_size",
                     "H3 block-swap ring size must be at least 1.",
                     label="H3 Block Swap Ring Size",
+                    page="inference",
+                )
+            )
+        if not 0 <= i.h3_text_encoder_blocks_to_stream <= 50:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_text_encoder_blocks_to_stream",
+                    "H3 text-encoder streamed blocks must be between 0 and 50.",
+                    label="H3 Text Encoder Blocks To Stream",
+                    page="inference",
+                )
+            )
+        effective_text_quantization = (
+            i.h3_text_encoder_quantization
+            if i.h3_text_encoder_quantization != "none"
+            else config.caching.h3_text_encoder_quantization
+        )
+        if (i.h3_nvfp4_scaled_mm or config.caching.h3_nvfp4_scaled_mm) and effective_text_quantization != "nvfp4_awq":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_nvfp4_scaled_mm",
+                    "H3 NVFP4 scaled_mm requires NVFP4/AWQ text-encoder quantization.",
+                    label="H3 NVFP4 scaled_mm",
+                    page="inference",
+                )
+            )
+        if i.h3_text_visual_max_pixels < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_text_visual_max_pixels",
+                    "H3 text visual pixel cap must be non-negative.",
+                    label="H3 Text Visual Max Pixels",
+                    page="inference",
+                )
+            )
+        if i.h3_image_mode == "first":
+            if not _has_text(i.h3_first_frame):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "inference.h3_first_frame",
+                        "H3 first-image mode requires a first-frame image.",
+                        label="First Frame",
+                        page="inference",
+                    )
+                )
+            if _has_text(i.h3_last_frame) and i.h3_last_frame != i.h3_first_frame:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "inference.h3_last_frame",
+                        "H3 first-image mode does not accept a different last-frame image.",
+                        label="Last Frame",
+                        page="inference",
+                    )
+                )
+        if i.h3_image_mode == "first_last" and not (_has_text(i.h3_first_frame) and _has_text(i.h3_last_frame)):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_image_mode",
+                    "H3 first/last-image mode requires both endpoint images.",
+                    label="H3 Image Mode",
+                    page="inference",
+                )
+            )
+        if i.h3_image_mode != "none" and (i.h3_image_frame_count < 5 or (i.h3_image_frame_count - 5) % 17 != 0):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_image_frame_count",
+                    "H3 image frame count must satisfy frame_count % 17 == 5.",
+                    label="H3 Image Frame Count",
+                    page="inference",
+                )
+            )
+        if i.h3_image_mode != "none" and not 0 <= i.h3_select_frame < i.h3_image_frame_count:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_select_frame",
+                    "H3 selected output frame must be inside the generated image-frame range.",
+                    label="H3 Select Frame",
                     page="inference",
                 )
             )

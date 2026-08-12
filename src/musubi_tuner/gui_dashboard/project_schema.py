@@ -115,6 +115,17 @@ class DatasetEntry(BaseModel):
     frame_stride: Optional[int] = None
     source_fps: Optional[float] = None
     target_fps: Optional[float] = None
+    # MiniMax H3 dataset controls. They are ignored by non-H3 builders.
+    h3_target_mode: Literal["av", "video", "audio"] = "av"
+    h3_image_frame_count: Optional[int] = None
+    multiple_target: bool = False
+    control_video_directory: str = ""
+    control_audio_directory: str = ""
+    control_modality: Literal["", "av", "video", "audio"] = ""
+    control_modalities: str = ""
+    control_modality_probability_av: Optional[float] = None
+    control_modality_probability_video: Optional[float] = None
+    control_modality_probability_audio: Optional[float] = None
 
 
 class DatasetConfig(BaseModel):
@@ -134,6 +145,11 @@ class CachingConfig(BaseModel):
     h3_task: Literal["t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"] = "t2va"
     h3_text_encoder_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none"
+    h3_text_encoder_blocks_to_stream: int = 0
+    h3_nvfp4_scaled_mm: bool = False
+    h3_text_visual_max_pixels: int = 0
+    h3_image_mode: Literal["none", "first", "first_last"] = "none"
+    h3_image_frame_count: Optional[int] = None
     h3_cache_guidance_empty: bool = False
     h3_reference_image_short_edge: int = 2048
     cache_batch_size: Optional[int] = None
@@ -260,6 +276,8 @@ class TrainingConfig(BaseModel):
     h3_int8_attention: Literal["off", "aux", "train"] = "off"
     h3_lora_token_refiner: bool = False
     h3_fused_qk_norm_rope: bool = False
+    h3_fused_indexed_adaln: bool = False
+    h3_fused_swiglu: bool = False
     h3_adaln_rank: Optional[int] = None
     h3_fp8_quantization_mode: Literal["block", "channel", "tensor"] = "block"
     h3_convrot_int8: bool = False
@@ -449,6 +467,20 @@ class TrainingConfig(BaseModel):
     max_train_steps: int = 1600
     max_train_epochs: Optional[int] = None
     timestep_sampling: str = "sigma"
+    h3_timestep_sampling: Literal[
+        "sigma",
+        "uniform",
+        "sigmoid",
+        "shift",
+        "flux_shift",
+        "flux2_shift",
+        "ideogram4_shift",
+        "qwen_shift",
+        "krea2_shift",
+        "logsnr",
+        "qinglong_flux",
+        "qinglong_qwen",
+    ] = "uniform"
     discrete_flow_shift: float = 1.0
     weighting_scheme: str = "none"
     seed: Optional[int] = None
@@ -627,6 +659,13 @@ class TrainingConfig(BaseModel):
     # Validation
     validate_every_n_steps: Optional[int] = None
     validate_every_n_epochs: Optional[int] = None
+    validation_dataset_config: str = ""
+    validate_at_start: bool = False
+    validation_seed: Optional[int] = None
+    validation_timestep_bins: int = 4
+    validation_min_timestep: int = 0
+    validation_max_timestep: int = 1000
+    max_validation_items: Optional[int] = None
     offload_optimizer_during_validation: bool = False
 
     # Output
@@ -1122,6 +1161,12 @@ class InferenceConfig(BaseModel):
     h3_video_vae: str = ""
     h3_audio_vae: str = ""
     h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none"
+    h3_text_encoder_blocks_to_stream: int = 0
+    h3_nvfp4_scaled_mm: bool = False
+    h3_text_visual_max_pixels: int = 0
+    h3_image_mode: Literal["none", "first", "first_last"] = "none"
+    h3_image_frame_count: int = 5
+    h3_select_frame: int = 0
     h3_duration: int = 5
     h3_ratio: Literal["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"] = "16:9"
     h3_first_frame: str = ""
