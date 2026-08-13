@@ -254,6 +254,9 @@ class TrainingConfig(BaseModel):
     h3_shift_video: float = 12.0
     h3_shift_audio: float = 3.0
     h3_frame_sigma_jitter: float = 0.0
+    h3_timestep_focus_min: float = 0.4
+    h3_timestep_focus_max: float = 0.8
+    h3_timestep_focus_probability: float = 0.0
     h3_caption_dropout_rate: float = 0.0
     h3_observed_modality: Optional[Literal["video", "audio", "random"]] = None
     h3_image_flow_shift: Optional[float] = None

@@ -665,6 +665,27 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
     if t.model_type == "minimax_h3":
+        allowed_h3_timestep_sampling = {"uniform", "sigmoid", "shift", "logsnr", "sigma"}
+        if t.h3_timestep_sampling not in allowed_h3_timestep_sampling:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_timestep_sampling",
+                    "H3 timestep sampling must use an unshifted base distribution: uniform, sigmoid, shift, logsnr, or sigma.",
+                    label="H3 Timestep Sampling",
+                    page="training",
+                )
+            )
+        if t.num_timestep_buckets is not None and t.h3_timestep_sampling == "sigma":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.num_timestep_buckets",
+                    "H3 sigma sampling does not consume timestep buckets; use uniform or disable bucketing.",
+                    label="Timestep Buckets",
+                    page="training",
+                )
+            )
         cache_task = config.caching.h3_task
         compatible_tasks = {"t2va", "i2va", "fl2va", "l2va"} if t.h3_training_mode == "fl2va" else {t.h3_training_mode}
         if cache_task not in compatible_tasks:
@@ -775,6 +796,48 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        focus_probability = float(t.h3_timestep_focus_probability)
+        if not 0.0 <= focus_probability <= 1.0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_timestep_focus_probability",
+                    "H3 timestep focus probability must be between 0 and 1.",
+                    label="H3 Timestep Focus Probability",
+                    page="training",
+                )
+            )
+        if focus_probability > 0:
+            if not 0.0 <= t.h3_timestep_focus_min < t.h3_timestep_focus_max <= 1.0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_timestep_focus_min",
+                        "H3 timestep focus must satisfy 0 <= minimum < maximum <= 1.",
+                        label="H3 Timestep Focus Band",
+                        page="training",
+                    )
+                )
+            if t.h3_timestep_sampling != "uniform":
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_timestep_sampling",
+                        "H3 timestep focus requires uniform timestep sampling.",
+                        label="H3 Timestep Sampling",
+                        page="training",
+                    )
+                )
+            if t.min_timestep is not None or t.max_timestep is not None:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_timestep_focus_probability",
+                        "H3 timestep focus cannot be combined with minimum or maximum timestep clipping.",
+                        label="H3 Timestep Focus Probability",
+                        page="training",
+                    )
+                )
         for field, value, label in (
             ("h3_frame_sigma_jitter", t.h3_frame_sigma_jitter, "H3 Frame Sigma Jitter"),
             ("h3_caption_dropout_rate", t.h3_caption_dropout_rate, "H3 Caption Dropout"),

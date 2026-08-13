@@ -597,6 +597,15 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_shift_audio", str(t.h3_shift_audio)]
     if t.h3_frame_sigma_jitter:
         cmd += ["--h3_frame_sigma_jitter", str(t.h3_frame_sigma_jitter)]
+    if t.h3_timestep_focus_probability:
+        cmd += [
+            "--h3_timestep_focus_min",
+            str(t.h3_timestep_focus_min),
+            "--h3_timestep_focus_max",
+            str(t.h3_timestep_focus_max),
+            "--h3_timestep_focus_probability",
+            str(t.h3_timestep_focus_probability),
+        ]
     if t.h3_caption_dropout_rate:
         cmd += ["--h3_caption_dropout_rate", str(t.h3_caption_dropout_rate)]
     if t.h3_observed_modality:

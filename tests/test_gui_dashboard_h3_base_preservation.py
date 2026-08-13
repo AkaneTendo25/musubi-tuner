@@ -333,6 +333,31 @@ def test_h3_frame_sigma_jitter_rejects_out_of_range_and_conditioning(tmp_path: P
     assert "training.h3_frame_sigma_jitter" in report["field_errors"]
 
 
+def test_h3_timestep_focus_round_trips_and_validates(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    training = config.training
+    training.h3_timestep_focus_probability = 0.25
+    training.h3_timestep_focus_min = 0.4
+    training.h3_timestep_focus_max = 0.8
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+    assert parsed.h3_timestep_focus_probability == 0.25
+    assert parsed.h3_timestep_focus_min == 0.4
+    assert parsed.h3_timestep_focus_max == 0.8
+
+    training.h3_timestep_sampling = "logsnr"
+    report = validate_training_config(config)
+    assert "training.h3_timestep_sampling" in report["field_errors"]
+
+    training.h3_timestep_focus_probability = 0
+    training.h3_timestep_sampling = "sigma"
+    training.num_timestep_buckets = 8
+    report = validate_training_config(config)
+    assert "training.num_timestep_buckets" in report["field_errors"]
+
+
 def test_h3_conditioning_modes_reject_conflicts_and_wrong_cache(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.caching.h3_task = "i2va"
