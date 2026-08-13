@@ -62,6 +62,48 @@ def test_dashboard_rejects_conditioning_cache_from_another_h3_partition(tmp_path
     assert "caching.h3_task" in report["field_errors"]
 
 
+def test_dashboard_validates_dataloader_transfer_settings(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.max_data_loader_n_workers = -1
+    config.training.dataloader_prefetch_factor = 0
+
+    report = validate_training_config(config)
+
+    assert "training.max_data_loader_n_workers" in report["field_errors"]
+    assert "training.dataloader_prefetch_factor" in report["field_errors"]
+
+
+def test_dashboard_warns_about_worker_only_settings_with_no_workers(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.max_data_loader_n_workers = 0
+    config.training.dataloader_prefetch_factor = 3
+    config.training.persistent_data_loader_workers = True
+
+    report = validate_training_config(config)
+
+    assert "training.dataloader_prefetch_factor" not in report["field_errors"]
+    assert "training.persistent_data_loader_workers" not in report["field_errors"]
+    assert "training.dataloader_prefetch_factor" in report["field_warnings"]
+    assert "training.persistent_data_loader_workers" in report["field_warnings"]
+
+
+def test_h3_dashboard_dataloader_transfer_settings_round_trip(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.max_data_loader_n_workers = 2
+    config.training.persistent_data_loader_workers = True
+    config.training.dataloader_pin_memory = True
+    config.training.dataloader_prefetch_factor = 3
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+
+    assert parsed.max_data_loader_n_workers == 2
+    assert parsed.persistent_data_loader_workers is True
+    assert parsed.dataloader_pin_memory is True
+    assert parsed.dataloader_prefetch_factor == 3
+
+
 def test_dashboard_reference_size_defaults_match_h3_cli(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
 

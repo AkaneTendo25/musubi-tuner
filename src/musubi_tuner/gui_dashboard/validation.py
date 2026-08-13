@@ -623,6 +623,47 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     t = config.training
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    if t.max_data_loader_n_workers is not None and t.max_data_loader_n_workers < 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.max_data_loader_n_workers",
+                "DataLoader worker count cannot be negative.",
+                label="DataLoader Workers",
+                page="training",
+            )
+        )
+    if t.dataloader_prefetch_factor is not None and t.dataloader_prefetch_factor < 1:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.dataloader_prefetch_factor",
+                "DataLoader prefetch factor must be at least 1.",
+                label="DataLoader Prefetch Factor",
+                page="training",
+            )
+        )
+    if t.max_data_loader_n_workers == 0:
+        if t.dataloader_prefetch_factor is not None:
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "training.dataloader_prefetch_factor",
+                    "DataLoader prefetch factor is ignored when the worker count is 0.",
+                    label="DataLoader Prefetch Factor",
+                    page="training",
+                )
+            )
+        if t.persistent_data_loader_workers:
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "training.persistent_data_loader_workers",
+                    "Persistent DataLoader workers are ignored when the worker count is 0.",
+                    label="Persistent DataLoader Workers",
+                    page="training",
+                )
+            )
     if t.model_type == "minimax_h3":
         cache_task = config.caching.h3_task
         compatible_tasks = {"t2va", "i2va", "fl2va", "l2va"} if t.h3_training_mode == "fl2va" else {t.h3_training_mode}

@@ -717,10 +717,7 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--max_train_steps", str(t.max_train_steps)]
     if t.seed is not None:
         cmd += ["--seed", str(t.seed)]
-    if t.max_data_loader_n_workers is not None:
-        cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
-    if t.persistent_data_loader_workers:
-        cmd.append("--persistent_data_loader_workers")
+    _append_dataloader_args(cmd, t)
     if t.blocks_to_swap is not None:
         cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
     if t.gradient_checkpointing or t.blockwise_checkpointing:
