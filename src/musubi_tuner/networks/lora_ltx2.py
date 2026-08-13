@@ -51,6 +51,8 @@ def build_keyframe_extension(
     dtype: torch.dtype,
     reference_downscale_factor: int = 1,
     collapse_to_single_pixel_frame: bool = False,
+    scale_factors: Optional[SpatioTemporalScaleFactors] = None,
+    positions_dtype: Optional[torch.dtype] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int]:
     """Patchify keyframe guide latents and compute positions for token-append conditioning.
 
@@ -158,7 +160,7 @@ def build_keyframe_extension(
         # Float32 to avoid bf16/fp16 precision loss in `+= frame_idx` and `/= frame_rate`.
         g_positions = get_pixel_coords(
             latent_coords=g_coords,
-            scale_factors=SpatioTemporalScaleFactors.default(),
+            scale_factors=scale_factors or SpatioTemporalScaleFactors.default(),
             causal_fix=(g_frame_idx == 0),
         ).to(dtype=torch.float32)
         g_positions[:, 0, ...] = g_positions[:, 0, ...] + float(g_frame_idx)
@@ -170,7 +172,7 @@ def build_keyframe_extension(
         if reference_downscale_factor != 1:
             g_positions[:, 1, ...] *= reference_downscale_factor
             g_positions[:, 2, ...] *= reference_downscale_factor
-        g_positions = g_positions.to(dtype=dtype)
+        g_positions = g_positions.to(dtype=positions_dtype or dtype)
 
         g_count = int(g_tokens.shape[1])
         if g_strength_is_per_sample:
@@ -608,7 +610,11 @@ class LTX2Wrapper(nn.Module):
             )
             video_positions = get_pixel_coords(
                 latent_coords=latent_coords,
-                scale_factors=SpatioTemporalScaleFactors.default(),
+                scale_factors=(
+                    transformer_options.get("video_scale_factors", SpatioTemporalScaleFactors.default())
+                    if isinstance(transformer_options, dict)
+                    else SpatioTemporalScaleFactors.default()
+                ),
                 causal_fix=True,
             ).to(dtype=self._positions_dtype or video_latents.dtype)
             video_positions[:, 0, ...] = video_positions[:, 0, ...] / float(frame_rate)
@@ -649,6 +655,8 @@ class LTX2Wrapper(nn.Module):
                     patchifier=self._video_patchifier,
                     device=video_latents.device,
                     dtype=video_latents.dtype,
+                    scale_factors=transformer_options.get("video_scale_factors"),
+                    positions_dtype=self._positions_dtype,
                 )
                 if appended_video_token_count > 0:
                     video_tokens = torch.cat([video_tokens, appended_tokens], dim=1)

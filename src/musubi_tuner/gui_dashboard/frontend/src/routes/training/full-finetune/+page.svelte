@@ -502,7 +502,7 @@
 					<FormSelect fieldPath="full_finetune.ltx_version" value={t.ltx_version || '2.3'} options={['2.0', '2.3', '2.5']} onchange={(e) => update('ltx_version', e.target.value)} />
 				</div>
 				<div class="grid grid-cols-2 gap-2">
-					<FormSelect fieldPath="full_finetune.ltx_version_check_mode" value={t.ltx_version_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} />
+					<FormSelect fieldPath="full_finetune.ltx_version_check_mode" value={t.ltx_version_check_mode || (t.ltx_version === '2.5' ? 'error' : 'warn')} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} />
 					<FormSelect fieldPath="full_finetune.vae_dtype" value={t.vae_dtype || ''} options={[{ value: '', label: 'Default' }, 'bfloat16', 'float16', 'float32']} onchange={(e) => update('vae_dtype', e.target.value || null)} />
 				</div>
 			</div>

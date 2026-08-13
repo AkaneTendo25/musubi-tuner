@@ -24,6 +24,7 @@ dependencies = [
     "tqdm==4.67.1",
     "torch-optimi==0.3.3",
     "transformers>=5.8.0,<5.15",
+    "imageio-ffmpeg>=0.6,<0.7",
     "voluptuous==0.15.2",
     # Wan2.1
     "ftfy==6.3.1",

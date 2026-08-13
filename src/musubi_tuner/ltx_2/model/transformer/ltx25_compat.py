@@ -55,19 +55,23 @@ def capabilities_from_state_dict_keys(
     if has_keyframe_embedding and "native_dtype_adaln" not in explicit:
         resolved = replace(resolved, native_dtype_adaln=True)
 
-    # Quantized checkpoints may not expose ordinary Linear bias keys, so only
-    # infer bias-free blocks when their corresponding dense weight is present.
+    # The keyframe embedding identifies the released 2.5 architecture even in
+    # metadata-free quantized layouts with backend-specific Linear keys.
     if "ff_bias" not in explicit:
         has_video_ff_weight = any(key.endswith(".ff.net.0.proj.weight") for key in key_set)
         has_video_ff_bias = any(key.endswith(".ff.net.0.proj.bias") for key in key_set)
         if has_video_ff_weight:
             resolved = replace(resolved, ff_bias=has_video_ff_bias)
+        elif has_keyframe_embedding:
+            resolved = replace(resolved, ff_bias=False)
 
     if "audio_ff_bias" not in explicit:
         has_audio_ff_weight = any(key.endswith(".audio_ff.net.0.proj.weight") for key in key_set)
         has_audio_ff_bias = any(key.endswith(".audio_ff.net.0.proj.bias") for key in key_set)
         if has_audio_ff_weight:
             resolved = replace(resolved, audio_ff_bias=has_audio_ff_bias)
+        elif has_keyframe_embedding:
+            resolved = replace(resolved, audio_ff_bias=True)
 
     return resolved
 

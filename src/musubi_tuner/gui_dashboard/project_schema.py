@@ -227,7 +227,7 @@ class TrainingConfig(BaseModel):
     dataset_config: str = ""
     ltx2_mode: Literal["video", "av", "audio"] = "video"
     ltx_version: Literal["2.0", "2.3", "2.5"] = "2.3"
-    ltx_version_check_mode: Literal["off", "warn", "error"] = "warn"
+    ltx_version_check_mode: Optional[Literal["off", "warn", "error"]] = None
     debug_dataset: bool = False
     fp8_base: bool = False
     fp8_scaled: bool = False
@@ -832,7 +832,7 @@ class TrainingConfig(BaseModel):
     uncertainty_lr: Optional[float] = None
     ogm_ge_alpha: float = 0.3
     ogm_ge_noise_std: float = 0.0
-    independent_audio_timestep: bool = False
+    independent_audio_timestep: Optional[bool] = None
     audio_silence_regularizer: bool = False
     audio_silence_regularizer_weight: float = 1.0
     audio_supervision_mode: Literal["off", "warn", "error"] = "off"
@@ -1367,7 +1367,7 @@ class RLConfig(BaseModel):
 
 
 class ProjectConfig(BaseModel):
-    version: int = 3
+    version: int = 4
     name: str = "New Project"
     project_dir: str = ""
     model_dir: str = ""  # directory where downloaded models are stored
@@ -1460,6 +1460,12 @@ class ProjectConfig(BaseModel):
                         if is_historical_default:
                             section.pop(key, None)
 
+                if source_version < 4 and section_name in ("training", "full_finetune"):
+                    if section.get("ltx_version_check_mode") == "warn":
+                        section.pop("ltx_version_check_mode", None)
+                    if section_name == "training" and section.get("independent_audio_timestep") is False:
+                        section.pop("independent_audio_timestep", None)
+
                 if section_name in ("training", "full_finetune") and not section.get("output_dir"):
                     section["output_dir"] = get_ltx2_training_output_dir_default()
                 if not section.get("ltx2_checkpoint"):
@@ -1484,7 +1490,7 @@ class ProjectConfig(BaseModel):
                     if has_old_generation_values and "sampling_preset" not in section:
                         section["sampling_preset"] = "legacy"
                 data[section_name] = section
-            data["version"] = max(source_version, 3)
+            data["version"] = max(source_version, 4)
         return data
 
     def save(self, path: Optional[Path] = None):

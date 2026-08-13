@@ -502,7 +502,7 @@
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormSelect fieldPath="training.ltx_version" value={t.ltx_version || '2.3'} options={['2.0', '2.3', '2.5']} onchange={(e) => update('ltx_version', e.target.value)} tooltip="Target LTX version behavior" />
-							<FormSelect fieldPath="training.ltx_version_check_mode" value={t.ltx_version_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} tooltip="Behavior when the checkpoint and selected LTX version do not match." />
+							<FormSelect fieldPath="training.ltx_version_check_mode" value={t.ltx_version_check_mode || (t.ltx_version === '2.5' ? 'error' : 'warn')} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} tooltip="Behavior when the checkpoint and selected LTX version do not match. Defaults to error for 2.5 and warn for older versions." />
 						</div>
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle fieldPath="training.fp8_base" checked={t.fp8_base ?? false} onchange={(e) => update('fp8_base', e.target.checked)} tooltip="FP8 precision (VRAM savings)" />

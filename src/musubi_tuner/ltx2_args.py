@@ -322,11 +322,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx_version_check_mode",
         type=str,
-        default="warn",
+        default=None,
         choices=["off", "warn", "error"],
         help=(
             "How strictly to enforce --ltx_version vs checkpoint metadata consistency. "
-            "'warn' logs mismatches, 'error' stops startup, 'off' disables checks."
+            "'warn' logs mismatches, 'error' stops startup, 'off' disables checks. "
+            "Defaults to 'error' for LTX-2.5 and 'warn' for older versions."
         ),
     )
     parser.add_argument(
@@ -837,8 +838,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
     parser.add_argument(
         "--independent_audio_timestep",
-        action="store_true",
-        help="Sample independent timesteps for audio noising/conditioning in AV and audio modes.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Sample independent timesteps for audio noising/conditioning in AV and audio modes. "
+            "Defaults on for LTX-2.5 AV training and off for older versions; use "
+            "--no-independent_audio_timestep to request legacy coupled AV noise explicitly."
+        ),
     )
     parser.add_argument(
         "--preserve_audio_timing",

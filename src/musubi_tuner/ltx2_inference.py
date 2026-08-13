@@ -1624,8 +1624,15 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str) -> None:
         return
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        logger.warning("Unable to mux audio/video: ffmpeg is not available")
-        return
+        try:
+            import imageio_ffmpeg
+
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except (ImportError, RuntimeError, OSError) as exc:
+            raise RuntimeError(
+                "Unable to mux LTX audio/video: no FFmpeg executable is available. "
+                "Reinstall project dependencies with `pip install -e .`."
+            ) from exc
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     result = subprocess.run(
         [
@@ -1653,7 +1660,7 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str) -> None:
         check=False,
     )
     if result.returncode != 0:
-        logger.warning("Unable to mux audio/video with ffmpeg: %s", result.stderr.strip())
+        raise RuntimeError(f"Unable to mux audio/video with FFmpeg: {result.stderr.strip()}")
 
 
 def cleanup_cuda(device: torch.device) -> None:

@@ -584,7 +584,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Audio Options</div>
 					<div class="grid grid-cols-3 gap-x-4 gap-y-1 mb-2">
-						<FormToggle fieldPath="training.independent_audio_timestep" checked={$projectConfig?.training?.independent_audio_timestep ?? false} onchange={(e) => updateTraining('independent_audio_timestep', e.target.checked)} tooltip="Independent timesteps for audio noising" />
+						<FormToggle fieldPath="training.independent_audio_timestep" checked={$projectConfig?.training?.independent_audio_timestep ?? (($projectConfig?.training?.ltx_version === '2.5') && ($projectConfig?.training?.ltx2_mode === 'av'))} onchange={(e) => updateTraining('independent_audio_timestep', e.target.checked)} tooltip="Independent timesteps for audio noising. Defaults on for LTX-2.5 AV and off for older versions." />
 						<FormToggle fieldPath="training.audio_silence_regularizer" checked={$projectConfig?.training?.audio_silence_regularizer ?? false} onchange={(e) => updateTraining('audio_silence_regularizer', e.target.checked)} tooltip="Synthetic silence for missing audio" />
 						<FormToggle fieldPath="training.audio_dop" checked={$projectConfig?.training?.audio_dop ?? false} onchange={(e) => updateTraining('audio_dop', e.target.checked)} tooltip="Preserve base model audio predictions" />
 					</div>

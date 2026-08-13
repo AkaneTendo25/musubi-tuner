@@ -382,6 +382,8 @@ def infer_ltx2_transformer_config_from_weights(model_path: str) -> Dict[str, Any
         if is_ltx25:
             tcfg.update(
                 {
+                    "ff_bias": False,
+                    "audio_ff_bias": True,
                     "positional_embedding_theta": 10000.0,
                     "positional_embedding_max_pos": [20, 2048, 2048],
                     "audio_positional_embedding_max_pos": [20],

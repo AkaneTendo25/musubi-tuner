@@ -111,6 +111,7 @@ from musubi_tuner.ltx2_av_attention_loss import (
     install_av_attention_loss_recorders,
 )
 from musubi_tuner.tread import TREADRouter, default_ltx_tread_route, parse_tread_args
+from musubi_tuner.ltx_2.types import SpatioTemporalScaleFactors
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -133,6 +134,54 @@ IC_LORA_STRATEGIES = (
 # keyframe is appended via `build_keyframe_extension`.
 AV_CROSS_ATTENTION_MODES = ("both", "a2v_only", "v2a_only", "none")
 VIDEO_ANCHOR_STRATEGIES = ("endpoints", "random", "endpoints_random")
+
+
+def _video_scale_factors_from_vae(vae, fallback_type):
+    """Use checkpoint-configured VAE geometry, retaining legacy defaults as fallback."""
+    for candidate in (vae, getattr(vae, "decoder", None)):
+        factors = getattr(candidate, "video_downscale_factors", None)
+        if factors is not None:
+            return factors
+    temporal = int(getattr(vae, "temporal_downsample_factor", 8))
+    spatial = int(getattr(vae, "spatial_downsample_factor", 32))
+    return fallback_type(time=temporal, height=spatial, width=spatial)
+
+
+def _video_scale_factors_from_checkpoint(path: Optional[str]) -> SpatioTemporalScaleFactors:
+    """Read VAE compression geometry without materializing the VAE weights."""
+    if not path:
+        return SpatioTemporalScaleFactors.default()
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt") as handle:
+            config = json.loads((handle.metadata() or {}).get("config", "{}"))
+        vae_config = config.get("vae", {})
+        decoder_config = vae_config.get("decoder", {})
+        patch_size = int(decoder_config.get("patch_size", 1))
+        time_factor = 1
+        height_factor = patch_size
+        width_factor = patch_size
+        saw_stride = False
+        for item in decoder_config.get("upsamples", []):
+            stride = item[0] if isinstance(item, (list, tuple)) and item else None
+            if isinstance(stride, (list, tuple)) and len(stride) == 3:
+                saw_stride = True
+                time_factor *= int(stride[0])
+                height_factor *= int(stride[1])
+                width_factor *= int(stride[2])
+        if not saw_stride:
+            raise ValueError("VAE metadata does not declare decoder upsample strides")
+        if min(time_factor, height_factor, width_factor) <= 0:
+            raise ValueError("VAE scale factors must be positive")
+        return SpatioTemporalScaleFactors(time=time_factor, height=height_factor, width=width_factor)
+    except Exception as exc:
+        logger.warning("Could not derive scale factors from video VAE %s; using 8x32x32 defaults: %s", path, exc)
+        return SpatioTemporalScaleFactors.default()
+
+
+def _ltx_position_dtype(version: str, network_dtype: torch.dtype) -> torch.dtype:
+    return torch.float32 if version == "2.5" else network_dtype
 
 
 def _ltx25_generated_keyframe_mask(transformer, accelerator, tokens: torch.Tensor, keyframe_tokens: int):
@@ -1317,6 +1366,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._logged_audio_only_timestep_shift: bool = False
         self._audio_only_sequence_resolution: int = 64
         self._ltx2_checkpoint_config: Optional[Dict[str, Any]] = None
+        self._video_scale_factors = SpatioTemporalScaleFactors.default()
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
         self._timestep_logging_context: Optional[Dict[str, torch.Tensor]] = None
@@ -2804,7 +2854,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         return self._ltx2_checkpoint_config
 
     def _validate_ltx_version_consistency(self, args: argparse.Namespace) -> None:
-        check_mode = str(getattr(args, "ltx_version_check_mode", "warn") or "warn").lower()
+        configured_mode = getattr(args, "ltx_version_check_mode", None)
+        check_mode = str(configured_mode or ("error" if self._ltx_version == "2.5" else "warn")).lower()
         if check_mode == "off":
             return
         if check_mode not in {"warn", "error"}:
@@ -3944,10 +3995,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             raise ValueError(f"Invalid ltx_version: {ltx_version}. Expected '2.0', '2.3', or '2.5'.")
         self._ltx_version = ltx_version
         args.ltx_version = ltx_version
-        ltx_version_check_mode = str(getattr(args, "ltx_version_check_mode", "warn") or "warn").lower()
+        configured_version_check = getattr(args, "ltx_version_check_mode", None)
+        ltx_version_check_mode = str(configured_version_check or ("error" if self._ltx_version == "2.5" else "warn")).lower()
         if ltx_version_check_mode not in {"off", "warn", "error"}:
             raise ValueError(f"ltx_version_check_mode must be one of ['off', 'warn', 'error']. Got: {ltx_version_check_mode}")
         args.ltx_version_check_mode = ltx_version_check_mode
+        self._video_scale_factors = _video_scale_factors_from_checkpoint(
+            getattr(args, "ltx2_video_vae", None) or getattr(args, "vae", None)
+        )
         self._validate_ltx_version_consistency(args)
 
         self._audio_video = self._ltx_mode in {"av", "audio"}
@@ -4088,7 +4143,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         args.shifted_logit_min_shift = shifted_logit_min_shift
         args.shifted_logit_max_shift = shifted_logit_max_shift
 
-        args.independent_audio_timestep = bool(getattr(args, "independent_audio_timestep", False))
+        configured_independent_audio = getattr(args, "independent_audio_timestep", None)
+        args.independent_audio_timestep = (
+            self._ltx_version == "2.5" and self._ltx_mode == "av"
+            if configured_independent_audio is None
+            else bool(configured_independent_audio)
+        )
         args.audio_silence_regularizer = bool(getattr(args, "audio_silence_regularizer", False))
         audio_silence_regularizer_weight = float(getattr(args, "audio_silence_regularizer_weight", 1.0))
         if audio_silence_regularizer_weight < 0.0:
@@ -4735,6 +4795,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         decoder.requires_grad_(False)
 
         vae = _LTX2VideoVAE(decoder)
+        self._video_scale_factors = _video_scale_factors_from_vae(vae, SpatioTemporalScaleFactors)
         self._update_latent_norm_base_from_vae(vae)
         return vae
 
@@ -5652,7 +5713,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 audio_loss_mask=audio_loss_mask,
                 device=accelerator.device,
             )
-            resolved_transformer_options: Dict[str, Any] = {"patches_replace": {}}
+            resolved_transformer_options: Dict[str, Any] = {
+                "patches_replace": {},
+                "video_scale_factors": self._video_scale_factors,
+            }
             ref_audio_seq_len = 0
 
             if audio_ref_ic_enabled:
@@ -6265,7 +6329,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
-            from musubi_tuner.ltx_2.types import SpatioTemporalScaleFactors, VideoLatentShape
+            from musubi_tuner.ltx_2.types import VideoLatentShape
             from musubi_tuner.networks.lora_ltx2 import build_keyframe_extension, build_temporal_causal_attention_mask
 
             patchifier = VideoLatentPatchifier(patch_size=1)
@@ -6345,9 +6409,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             ref_positions = get_pixel_coords(
                 latent_coords=ref_coords,
-                scale_factors=SpatioTemporalScaleFactors.default(),
+                scale_factors=self._video_scale_factors,
                 causal_fix=True,
-            ).to(dtype=network_dtype)
+            ).to(dtype=_ltx_position_dtype(self._ltx_version, network_dtype))
             ref_positions[:, 0, ...] = ref_positions[:, 0, ...] / float(frame_rate_v2v)
             if reference_downscale_factor != 1:
                 ref_positions = ref_positions.clone()
@@ -6373,9 +6437,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             tgt_positions = get_pixel_coords(
                 latent_coords=tgt_coords,
-                scale_factors=SpatioTemporalScaleFactors.default(),
+                scale_factors=self._video_scale_factors,
                 causal_fix=True,
-            ).to(dtype=network_dtype)
+            ).to(dtype=_ltx_position_dtype(self._ltx_version, network_dtype))
             tgt_positions[:, 0, ...] = tgt_positions[:, 0, ...] / float(frame_rate_v2v)
 
             combined_positions = torch.cat([ref_positions, tgt_positions], dim=2)
@@ -6407,6 +6471,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 device=accelerator.device,
                 dtype=network_dtype,
                 reference_downscale_factor=reference_downscale_factor,
+                scale_factors=self._video_scale_factors,
+                positions_dtype=_ltx_position_dtype(self._ltx_version, network_dtype),
             )
             if kf_count > 0:
                 combined_tokens = torch.cat([combined_tokens, kf_tokens], dim=1)
@@ -6511,7 +6577,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
-            from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
+            from musubi_tuner.ltx_2.types import AudioLatentShape, VideoLatentShape
             from musubi_tuner.networks.lora_ltx2 import (
                 _split_av_context,
                 build_keyframe_extension,
@@ -6662,9 +6728,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             ref_video_pos = get_pixel_coords(
                 latent_coords=ref_coords,
-                scale_factors=SpatioTemporalScaleFactors.default(),
+                scale_factors=self._video_scale_factors,
                 causal_fix=True,
-            ).to(dtype=network_dtype)
+            ).to(dtype=_ltx_position_dtype(self._ltx_version, network_dtype))
             ref_video_pos[:, 0, ...] = ref_video_pos[:, 0, ...] / float(av_ic_frame_rate)
             if reference_downscale_factor != 1:
                 ref_video_pos = ref_video_pos.clone()
@@ -6688,9 +6754,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             tgt_video_pos = get_pixel_coords(
                 latent_coords=tgt_coords,
-                scale_factors=SpatioTemporalScaleFactors.default(),
+                scale_factors=self._video_scale_factors,
                 causal_fix=True,
-            ).to(dtype=network_dtype)
+            ).to(dtype=_ltx_position_dtype(self._ltx_version, network_dtype))
             tgt_video_pos[:, 0, ...] = tgt_video_pos[:, 0, ...] / float(av_ic_frame_rate)
             video_combined_pos = torch.cat([ref_video_pos, tgt_video_pos], dim=2)
             prefixed_video_force_keep_mask = None
@@ -6720,6 +6786,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 device=accelerator.device,
                 dtype=network_dtype,
                 reference_downscale_factor=reference_downscale_factor,
+                scale_factors=self._video_scale_factors,
+                positions_dtype=_ltx_position_dtype(self._ltx_version, network_dtype),
             )
             if kf_count > 0:
                 video_combined_tokens = torch.cat([video_combined_tokens, kf_tokens], dim=1)
@@ -7289,7 +7357,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
-            from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
+            from musubi_tuner.ltx_2.types import AudioLatentShape, VideoLatentShape
             from musubi_tuner.networks.lora_ltx2 import (
                 _split_av_context,
                 build_keyframe_extension,
@@ -7376,9 +7444,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             ref_video_pos = get_pixel_coords(
                 latent_coords=ref_coords,
-                scale_factors=SpatioTemporalScaleFactors.default(),
+                scale_factors=self._video_scale_factors,
                 causal_fix=True,
-            ).to(dtype=network_dtype)
+            ).to(dtype=_ltx_position_dtype(self._ltx_version, network_dtype))
             ref_video_pos[:, 0, ...] = ref_video_pos[:, 0, ...] / float(frame_rate_vref)
             if reference_downscale_factor != 1:
                 ref_video_pos = ref_video_pos.clone()
@@ -7402,9 +7470,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             tgt_video_pos = get_pixel_coords(
                 latent_coords=tgt_coords,
-                scale_factors=SpatioTemporalScaleFactors.default(),
+                scale_factors=self._video_scale_factors,
                 causal_fix=True,
-            ).to(dtype=network_dtype)
+            ).to(dtype=_ltx_position_dtype(self._ltx_version, network_dtype))
             tgt_video_pos[:, 0, ...] = tgt_video_pos[:, 0, ...] / float(frame_rate_vref)
             video_combined_pos = torch.cat([ref_video_pos, tgt_video_pos], dim=2)
             prefixed_video_force_keep_mask = None
@@ -7434,6 +7502,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 device=accelerator.device,
                 dtype=network_dtype,
                 reference_downscale_factor=reference_downscale_factor,
+                scale_factors=self._video_scale_factors,
+                positions_dtype=_ltx_position_dtype(self._ltx_version, network_dtype),
             )
             if kf_count > 0:
                 video_combined_tokens = torch.cat([video_combined_tokens, kf_tokens], dim=1)
@@ -7674,7 +7744,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         video_conditioning_mask_tokens = None
         video_loss_mask = None
-        transformer_options = {"patches_replace": {}}
+        transformer_options = {
+            "patches_replace": {},
+            "video_scale_factors": self._video_scale_factors,
+        }
         if video_conditioning_enabled is not None:
             # First-frame conditioning is not dataset masked-loss. It keeps latent frame 0 clean
             # and excludes that clean conditioning frame from denoising loss; the shared loss

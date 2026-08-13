@@ -40,6 +40,17 @@ DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
 
 
+def _video_scale_factors_from_vae(vae, fallback_type):
+    """Resolve pixel/latent geometry from the selected VAE checkpoint."""
+    for candidate in (vae, getattr(vae, "decoder", None)):
+        factors = getattr(candidate, "video_downscale_factors", None)
+        if factors is not None:
+            return factors
+    temporal = int(getattr(vae, "temporal_downsample_factor", 8))
+    spatial = int(getattr(vae, "spatial_downsample_factor", 32))
+    return fallback_type(time=temporal, height=spatial, width=spatial)
+
+
 # --- Latent-guide prompt-line extension (--gl / --gk) -----------------------
 # We don't add these to hv_train_network.line_to_prompt_dict to keep that file
 # model-agnostic. Instead, we re-parse the prompt lines after load_prompts.
@@ -4023,6 +4034,7 @@ class LTX2SamplingMixin:
         transformer_offload_device = transformer_offload_device or torch.device("cpu")
         original_vae_device = getattr(vae, "device", torch.device("cpu"))
         original_vae_dtype = getattr(vae, "dtype", torch.float32)
+        position_dtype = torch.float32 if str(getattr(args, "ltx_version", "2.3")) == "2.5" else dit_dtype
 
         patchifier = VideoLatentPatchifier(patch_size=1)
         stepper = EulerDiffusionStep()
@@ -4100,9 +4112,9 @@ class LTX2SamplingMixin:
             )
             ref_positions = get_pixel_coords(
                 latent_coords=ref_coords,
-                scale_factors=SpatioTemporalScaleFactors.default(),
+                scale_factors=_video_scale_factors_from_vae(vae, SpatioTemporalScaleFactors),
                 causal_fix=True,
-            ).to(dtype=dit_dtype)
+            ).to(dtype=position_dtype)
             ref_positions[:, 0, ...] = ref_positions[:, 0, ...] / frame_rate_v2v
             if reference_downscale_factor != 1:
                 ref_positions = ref_positions.clone()
@@ -4126,9 +4138,9 @@ class LTX2SamplingMixin:
         )
         tgt_positions = get_pixel_coords(
             latent_coords=tgt_coords,
-            scale_factors=SpatioTemporalScaleFactors.default(),
+            scale_factors=_video_scale_factors_from_vae(vae, SpatioTemporalScaleFactors),
             causal_fix=True,
-        ).to(dtype=dit_dtype)
+        ).to(dtype=position_dtype)
         tgt_positions[:, 0, ...] = tgt_positions[:, 0, ...] / frame_rate_v2v
 
         target_seq_len = int(tgt_positions.shape[2])
@@ -4162,6 +4174,8 @@ class LTX2SamplingMixin:
                 device=transformer_device,
                 dtype=dit_dtype,
                 reference_downscale_factor=reference_downscale_factor,
+                scale_factors=_video_scale_factors_from_vae(vae, SpatioTemporalScaleFactors),
+                positions_dtype=position_dtype,
             )
             if keyframe_count:
                 combined_positions = torch.cat([combined_positions, keyframe_positions], dim=2)
@@ -4539,6 +4553,7 @@ class LTX2SamplingMixin:
         transformer_offload_device = transformer_offload_device or torch.device("cpu")
         original_vae_device = getattr(vae, "device", torch.device("cpu"))
         original_vae_dtype = getattr(vae, "dtype", torch.float32)
+        position_dtype = torch.float32 if str(getattr(args, "ltx_version", "2.3")) == "2.5" else dit_dtype
         resolved_ic_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
         av_cross_attention_mode = _normalize_av_cross_attention_mode(getattr(args, "av_cross_attention_mode", "both"))
         av_ic_a2v_enabled = av_cross_attention_mode in {"both", "a2v_only"}
@@ -4592,9 +4607,9 @@ class LTX2SamplingMixin:
         )
         ref_video_pos = get_pixel_coords(
             latent_coords=ref_video_coords,
-            scale_factors=SpatioTemporalScaleFactors.default(),
+            scale_factors=_video_scale_factors_from_vae(vae, SpatioTemporalScaleFactors),
             causal_fix=True,
-        ).to(dtype=dit_dtype)
+        ).to(dtype=position_dtype)
         ref_video_pos[:, 0, ...] = ref_video_pos[:, 0, ...] / frame_rate_sample
         if reference_downscale_factor != 1:
             ref_video_pos = ref_video_pos.clone()
@@ -4617,9 +4632,9 @@ class LTX2SamplingMixin:
         )
         tgt_video_pos = get_pixel_coords(
             latent_coords=tgt_video_coords,
-            scale_factors=SpatioTemporalScaleFactors.default(),
+            scale_factors=_video_scale_factors_from_vae(vae, SpatioTemporalScaleFactors),
             causal_fix=True,
-        ).to(dtype=dit_dtype)
+        ).to(dtype=position_dtype)
         tgt_video_pos[:, 0, ...] = tgt_video_pos[:, 0, ...] / frame_rate_sample
         video_combined_pos = torch.cat([ref_video_pos, tgt_video_pos], dim=2)
 

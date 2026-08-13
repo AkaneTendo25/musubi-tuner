@@ -1174,7 +1174,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--ltx2_mode", t.ltx2_mode]
     if t.ltx_version != "2.3":
         cmd += ["--ltx_version", t.ltx_version]
-    if t.ltx_version_check_mode != "warn":
+    if t.ltx_version_check_mode is not None:
         cmd += ["--ltx_version_check_mode", t.ltx_version_check_mode]
     if t.vae_dtype:
         cmd += ["--vae_dtype", t.vae_dtype]
@@ -2154,8 +2154,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
                 cmd += ["--ogm_ge_alpha", str(t.ogm_ge_alpha)]
             if t.ogm_ge_noise_std != 0.0:
                 cmd += ["--ogm_ge_noise_std", str(t.ogm_ge_noise_std)]
-    if t.independent_audio_timestep:
+    if t.independent_audio_timestep is True:
         cmd.append("--independent_audio_timestep")
+    elif t.independent_audio_timestep is False:
+        cmd.append("--no-independent_audio_timestep")
     if t.audio_silence_regularizer:
         cmd.append("--audio_silence_regularizer")
         if t.audio_silence_regularizer_weight != 1.0:
@@ -2268,7 +2270,7 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--ltx2_mode", t.ltx2_mode]
     if t.ltx_version != "2.3":
         cmd += ["--ltx_version", t.ltx_version]
-    if t.ltx_version_check_mode != "warn":
+    if t.ltx_version_check_mode is not None:
         cmd += ["--ltx_version_check_mode", t.ltx_version_check_mode]
     if t.vae_dtype:
         cmd += ["--vae_dtype", t.vae_dtype]
