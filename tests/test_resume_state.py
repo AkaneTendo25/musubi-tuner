@@ -320,6 +320,51 @@ def test_accelerator_uses_training_seed_for_seedable_sampler(monkeypatch):
     dataloader_config = captured_kwargs["dataloader_config"]
     assert dataloader_config.use_seedable_sampler is True
     assert dataloader_config.data_seed == 1234
+    assert dataloader_config.non_blocking is False
+
+
+def test_accelerator_enables_non_blocking_transfers_with_pinned_dataloader(monkeypatch):
+    captured_kwargs = {}
+
+    class Accelerator:
+        device = torch.device("cpu")
+
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(accelerator_setup, "Accelerator", Accelerator)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    args = SimpleNamespace(
+        logging_dir=None,
+        log_prefix=None,
+        log_with=None,
+        gradient_accumulation_steps=1,
+        mixed_precision=None,
+        dynamo_backend="NO",
+        ddp_gradient_as_bucket_view=False,
+        ddp_static_graph=False,
+        seed=1234,
+        dataloader_pin_memory=True,
+    )
+
+    accelerator_setup.prepare_accelerator(args)
+
+    assert captured_kwargs["dataloader_config"].non_blocking is True
+
+
+def test_dataloader_extra_kwargs_are_opt_in_and_worker_aware(caplog):
+    args = SimpleNamespace(dataloader_pin_memory=True, dataloader_prefetch_factor=3)
+
+    assert accelerator_setup.dataloader_extra_kwargs(args, 2) == {"pin_memory": True, "prefetch_factor": 3}
+    assert accelerator_setup.dataloader_extra_kwargs(args, 0) == {"pin_memory": True}
+    assert "--max_data_loader_n_workers is 0" in caplog.text
+
+
+def test_dataloader_extra_kwargs_reject_invalid_prefetch_factor():
+    args = SimpleNamespace(dataloader_pin_memory=False, dataloader_prefetch_factor=0)
+
+    with pytest.raises(ValueError, match="at least 1"):
+        accelerator_setup.dataloader_extra_kwargs(args, 1)
 
 
 def test_legacy_resume_infers_epoch_without_claiming_batch_position():

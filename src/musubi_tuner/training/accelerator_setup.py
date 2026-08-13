@@ -3,6 +3,7 @@
 from datetime import timedelta
 import argparse
 import gc
+import logging
 import os
 import time
 
@@ -10,6 +11,8 @@ import torch
 from packaging.version import Version
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
 from accelerate.utils import DataLoaderConfiguration, TorchDynamoPlugin, DynamoBackend
+
+logger = logging.getLogger(__name__)
 
 
 def clean_memory_on_device(device: torch.device):
@@ -44,6 +47,23 @@ class collator_class:
         # set epoch for validation
         dataset.set_current_epoch(self.current_epoch.value)
         return examples[0]  # batch size is always 1, so we unwrap it here
+
+
+def dataloader_extra_kwargs(args: argparse.Namespace, n_workers: int) -> dict:
+    """Return opt-in DataLoader transfer settings without changing old defaults."""
+    extra: dict = {}
+    if getattr(args, "dataloader_pin_memory", False):
+        extra["pin_memory"] = True
+
+    prefetch_factor = getattr(args, "dataloader_prefetch_factor", None)
+    if prefetch_factor is not None:
+        if prefetch_factor < 1:
+            raise ValueError("--dataloader_prefetch_factor must be at least 1")
+        if n_workers > 0:
+            extra["prefetch_factor"] = prefetch_factor
+        else:
+            logger.warning("Ignoring --dataloader_prefetch_factor because --max_data_loader_n_workers is 0")
+    return extra
 
 
 def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
@@ -110,12 +130,17 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
             dynamic=args.dynamo_dynamic,
         )
 
+    dataloader_config = DataLoaderConfiguration(
+        use_seedable_sampler=True,
+        data_seed=args.seed,
+        non_blocking=bool(getattr(args, "dataloader_pin_memory", False)),
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision if args.mixed_precision else None,
         log_with=log_with,
         project_dir=logging_dir,
-        dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True, data_seed=args.seed),
+        dataloader_config=dataloader_config,
         dynamo_plugin=dynamo_plugin,
         kwargs_handlers=kwargs_handlers,
     )

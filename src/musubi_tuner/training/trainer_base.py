@@ -55,6 +55,7 @@ from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_
 from musubi_tuner.training.accelerator_setup import (
     clean_memory_on_device,
     collator_class,
+    dataloader_extra_kwargs,
     prepare_accelerator,
 )
 from musubi_tuner.training.resume_utils import (
@@ -1751,7 +1752,8 @@ class NetworkTrainer:
             generator=dataloader_generator,
             collate_fn=collator,
             num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
+            persistent_workers=bool(args.persistent_data_loader_workers and n_workers > 0),
+            **dataloader_extra_kwargs(args, n_workers),
         )
 
         # calculate max_train_steps
