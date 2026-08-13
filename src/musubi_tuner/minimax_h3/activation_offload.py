@@ -92,6 +92,11 @@ class ReusableActivationOffloader:
         with torch.cuda.stream(self._stream):
             self._stream.wait_event(handle.d2h_event)
             handle.gpu.copy_(handle.cpu, non_blocking=True)
+            # The tensor is allocated from the compute stream's pool but the
+            # asynchronous writer is this private stream. Record that use so
+            # the caching allocator cannot recycle the storage before the
+            # prefetched copy has completed.
+            handle.gpu.record_stream(self._stream)
             handle.h2d_event = torch.cuda.Event()
             handle.h2d_event.record(self._stream)
 

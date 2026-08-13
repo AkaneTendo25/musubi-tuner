@@ -585,6 +585,8 @@ class NetworkTrainer:
         noise_scheduler: FlowMatchDiscreteScheduler,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        return_noisy: bool = True,
     ):
         batch_size = noise.shape[0]
 
@@ -783,7 +785,7 @@ class NetworkTrainer:
 
             timesteps = t * 1000.0
             t = t.view(-1, 1, 1, 1, 1) if latents.ndim == 5 else t.view(-1, 1, 1, 1)
-            noisy_model_input = (1 - t) * latents + t * noise
+            noisy_model_input = (1 - t) * latents + t * noise if return_noisy else None
 
             timesteps += 1  # 1 to 1000
         else:
@@ -805,7 +807,7 @@ class NetworkTrainer:
 
             # Add noise according to flow matching.
             sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
-            noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents
+            noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents if return_noisy else None
 
         # print(f"actual timesteps: {timesteps}")
         return noisy_model_input, timesteps

@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from musubi_tuner import cache_latents
@@ -30,6 +31,21 @@ def dino_cache_path(latent_cache_path: str | Path) -> Path:
     if not path.name.endswith(suffix):
         raise ValueError(f"unexpected MiniMax H3 latent-cache name: {path}")
     return path.with_name(path.name[: -len(suffix)] + "_mmh3_dino.safetensors")
+
+
+def _latent_cache_identity(latent_cache_path: str | Path) -> dict[str, str]:
+    stat = Path(latent_cache_path).stat()
+    return {"latent_cache_size": str(stat.st_size), "latent_cache_mtime_ns": str(stat.st_mtime_ns)}
+
+
+def _dino_cache_is_current(path: Path, latent_cache_path: str | Path, dino_model: str) -> bool:
+    try:
+        with safe_open(path, framework="pt") as handle:
+            metadata = handle.metadata() or {}
+        expected = {"dino_model": dino_model, **_latent_cache_identity(latent_cache_path)}
+        return all(metadata.get(key) == value for key, value in expected.items())
+    except (OSError, ValueError):
+        return False
 
 
 def _load_model(name: str, repo: Path | None, hub_dir: Path | None) -> torch.nn.Module:
@@ -112,7 +128,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         for _, batch in dataset.retrieve_latent_cache_batches(workers):
             for item in batch:
                 output = dino_cache_path(item.latent_cache_path)
-                if args.skip_existing and output.is_file():
+                if (
+                    args.skip_existing
+                    and output.is_file()
+                    and _dino_cache_is_current(output, item.latent_cache_path, args.dino_model)
+                ):
                     skipped += 1
                     continue
                 features = extract_features(model, item.content, device, args.dino_batch_size)
@@ -121,6 +141,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "frames": str(features.shape[0]),
                     "patches": str(features.shape[1]),
                     "channels": str(features.shape[2]),
+                    # Tie the auxiliary features to the exact latent cache they
+                    # accompany. Re-caching target media must not silently leave
+                    # an older DINO representation paired by filename alone.
+                    **_latent_cache_identity(item.latent_cache_path),
                 }
                 _save_features(output, features, metadata, atomic=args.atomic_cache_writes)
                 cached += 1

@@ -9,6 +9,8 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
 
+from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+
 import musubi_tuner.minimax_h3.model as h3_model
 import musubi_tuner.minimax_h3_train_network as h3_train_network
 from musubi_tuner.dataset.bucket import BucketBatchManager
@@ -64,7 +66,12 @@ from musubi_tuner.minimax_h3.training import (
     shift_sigma,
     unshift_sigma,
 )
-from musubi_tuner.minimax_h3_cache_dino_features import _save_features, dino_cache_path
+from musubi_tuner.minimax_h3_cache_dino_features import (
+    _dino_cache_is_current,
+    _latent_cache_identity,
+    _save_features,
+    dino_cache_path,
+)
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
 from musubi_tuner.networks import lora_minimax_h3
 
@@ -152,6 +159,17 @@ def test_h3_dino_cache_write_is_complete_and_metadata_bearing(tmp_path, atomic):
     with safe_open(path, framework="pt") as handle:
         assert handle.metadata() == {"dino_model": "probe"}
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_h3_dino_cache_identity_detects_rebuilt_latents(tmp_path):
+    latent = tmp_path / "clip_mmh3.safetensors"
+    dino = dino_cache_path(latent)
+    save_file({"latents": torch.zeros(1)}, latent)
+    _save_features(dino, torch.zeros(1, 1, 1), {"dino_model": "probe", **_latent_cache_identity(latent)}, atomic=False)
+    assert _dino_cache_is_current(dino, latent, "probe")
+
+    save_file({"latents": torch.zeros(2)}, latent)
+    assert not _dino_cache_is_current(dino, latent, "probe")
 
 
 @pytest.mark.parametrize(
@@ -1528,13 +1546,21 @@ def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_chan
             H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"]),
         },
     )
-    save_file({"h3_dino_features": torch.zeros(2, 4, 384, dtype=torch.float16)}, dino_path)
+    dino_metadata = {
+        "dino_model": "dinov2_vitb14",
+        "frames": "2",
+        "patches": "4",
+        "channels": "384",
+        **_latent_cache_identity(latent_path),
+    }
+    save_file({"h3_dino_features": torch.zeros(2, 4, 384, dtype=torch.float16)}, dino_path, metadata=dino_metadata)
 
     latent_path_2 = tmp_path / "sample2_mmh3.safetensors"
     text_path_2 = tmp_path / "sample2_mmh3_te.safetensors"
     dino_path_2 = tmp_path / "sample2_mmh3_dino.safetensors"
     shutil.copyfile(latent_path, latent_path_2)
-    shutil.copyfile(dino_path, dino_path_2)
+    copied_metadata = {**dino_metadata, **_latent_cache_identity(latent_path_2)}
+    save_file({"h3_dino_features": torch.zeros(2, 4, 384, dtype=torch.float16)}, dino_path_2, metadata=copied_metadata)
     item_2 = ItemInfo("sample2", "longer caption", (64, 64), (64, 64), latent_cache_path=str(latent_path_2))
     item_2.text_encoder_output_cache_path = str(text_path_2)
     save_text_encoder_output_cache_minimax_h3(
@@ -3016,6 +3042,63 @@ def test_h3_trainer_rejects_composed_discrete_flow_shift():
 
     with pytest.raises(ValueError, match="h3_shift_video"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("sampling", ["flux_shift", "qwen_shift", "krea2_shift", "ideogram4_shift", "qinglong_flux"])
+def test_h3_trainer_rejects_pre_shifted_timestep_sampling(sampling):
+    args = create_parser().parse_args(["--sdpa", "--timestep_sampling", sampling])
+
+    with pytest.raises(ValueError, match="resolution-dependent shift"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_timestep_focus_is_exact_uniform_mixture():
+    base = (torch.arange(10_000, dtype=torch.float64) + 0.5) / 10_000
+    focused = h3_train_network._apply_timestep_focus(base, 0.4, 0.8, 0.25)
+
+    assert focused.min() >= 0.0
+    assert focused.max() < 1.0
+    assert ((focused >= 0.4) & (focused < 0.8)).double().mean().item() == pytest.approx(0.55, abs=1e-4)
+
+
+def test_h3_timestep_focus_is_opt_in_and_requires_uniform_full_range():
+    parser = create_parser()
+    default = parser.parse_args(["--sdpa"])
+    assert default.h3_timestep_focus_probability == 0.0
+
+    incompatible = parser.parse_args(["--sdpa", "--timestep_sampling", "logsnr", "--h3_timestep_focus_probability", "0.25"])
+    with pytest.raises(ValueError, match="requires --timestep_sampling uniform"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(incompatible)
+
+    clipped = parser.parse_args(["--sdpa", "--h3_timestep_focus_probability", "0.25", "--min_timestep", "100"])
+    with pytest.raises(ValueError, match="cannot be combined"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(clipped)
+
+
+def test_h3_rejects_timestep_buckets_when_sampler_ignores_them():
+    args = create_parser().parse_args(["--sdpa", "--timestep_sampling", "sigma", "--num_timestep_buckets", "8"])
+
+    with pytest.raises(ValueError, match="not consumed"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_common_sampler_can_skip_discarded_noisy_tensor_without_changing_timesteps():
+    trainer = MiniMaxH3NetworkTrainer()
+    args = create_parser().parse_args(["--sdpa"])
+    scheduler = FlowMatchDiscreteScheduler(shift=1.0, reverse=True, solver="euler")
+    latents = torch.zeros(1, 2, 1, 2, 2)
+    noise = torch.ones_like(latents)
+
+    noisy, timesteps = trainer.get_noisy_model_input_and_timesteps(
+        args, noise, latents, [0.375], scheduler, torch.device("cpu"), torch.float32
+    )
+    skipped, skipped_timesteps = trainer.get_noisy_model_input_and_timesteps(
+        args, noise, latents, [0.375], scheduler, torch.device("cpu"), torch.float32, return_noisy=False
+    )
+
+    assert skipped is None
+    torch.testing.assert_close(skipped_timesteps, timesteps)
+    torch.testing.assert_close(noisy, torch.full_like(noisy, 0.375))
 
 
 @pytest.mark.parametrize("bad_shift", ["0.0", "0.001", "1000.0"])

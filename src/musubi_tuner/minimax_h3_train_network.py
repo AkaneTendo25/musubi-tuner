@@ -103,6 +103,19 @@ _DIRECT_SIGMA_SAMPLING = {
     "flux2_shift",
 }
 
+_H3_BASE_TIMESTEP_SAMPLING = {"sigma", "uniform", "sigmoid", "shift", "logsnr"}
+
+
+def _apply_timestep_focus(base: torch.Tensor, low: float, high: float, probability: float) -> torch.Tensor:
+    """Map one uniform draw to a uniform/background mixture without another RNG draw."""
+    if probability <= 0.0:
+        return base
+    if probability >= 1.0:
+        return low + (high - low) * base
+    focused = low + (high - low) * (base / probability)
+    background = (base - probability) / (1.0 - probability)
+    return torch.where(base < probability, focused, background)
+
 
 class _H3DecoderBundle(torch.nn.Module):
     def __init__(self, video_decoder: torch.nn.Module, audio_decoder: torch.nn.Module) -> None:
@@ -546,6 +559,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "MiniMax H3 requires --discrete_flow_shift 1.0; set the per-modality shifts with "
                 "--h3_shift_video / --h3_shift_audio instead (defaults 12.0 / 3.0)"
             )
+        if args.timestep_sampling not in _H3_BASE_TIMESTEP_SAMPLING:
+            raise ValueError(
+                f"MiniMax H3 --timestep_sampling {args.timestep_sampling!r} applies a model-specific or "
+                "resolution-dependent shift before H3's own video/audio shifts. Use uniform (recommended), "
+                "sigmoid, shift, logsnr, or sigma."
+            )
+        if args.num_timestep_buckets is not None and args.timestep_sampling == "sigma":
+            raise ValueError(
+                "MiniMax H3 --num_timestep_buckets is not consumed by --timestep_sampling sigma; "
+                "use the recommended --timestep_sampling uniform or disable bucketing"
+            )
+        focus_probability = float(args.h3_timestep_focus_probability)
+        if not 0.0 <= focus_probability <= 1.0:
+            raise ValueError("--h3_timestep_focus_probability must lie in [0, 1]")
+        if focus_probability > 0.0:
+            if args.timestep_sampling != "uniform":
+                raise ValueError("--h3_timestep_focus_probability requires --timestep_sampling uniform")
+            if not 0.0 <= args.h3_timestep_focus_min < args.h3_timestep_focus_max <= 1.0:
+                raise ValueError("H3 timestep focus bounds must satisfy 0 <= min < max <= 1")
+            if args.min_timestep is not None or args.max_timestep is not None:
+                raise ValueError("H3 timestep focus cannot be combined with --min_timestep or --max_timestep")
         for name in ("h3_shift_video", "h3_shift_audio"):
             value = float(getattr(args, name))
             if not 0.01 <= value <= 100.0:
@@ -1602,9 +1636,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 scheduler_args.discrete_flow_shift = args.h3_image_flow_shift
 
         _, scheduler_timesteps = super().get_noisy_model_input_and_timesteps(
-            scheduler_args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+            scheduler_args,
+            noise,
+            latents,
+            batch["timesteps"],
+            noise_scheduler,
+            accelerator.device,
+            dit_dtype,
+            return_noisy=False,
         )
         base_sigma = self._base_sigma(scheduler_args, noise_scheduler, scheduler_timesteps, accelerator.device, dit_dtype)
+        if not is_image:
+            base_sigma = _apply_timestep_focus(
+                base_sigma,
+                args.h3_timestep_focus_min,
+                args.h3_timestep_focus_max,
+                args.h3_timestep_focus_probability,
+            )
         inputs = prepare_joint_noisy_inputs(
             video_latents,
             audio_latents,
@@ -1872,6 +1920,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
             "ss_h3_timestep_sampling": args.timestep_sampling,
+            "ss_h3_timestep_focus_min": str(args.h3_timestep_focus_min),
+            "ss_h3_timestep_focus_max": str(args.h3_timestep_focus_max),
+            "ss_h3_timestep_focus_probability": str(args.h3_timestep_focus_probability),
             "ss_h3_crepa": self._crepa_config.to_json() if self._crepa_config is not None else "disabled",
         }
 
@@ -2001,6 +2052,27 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "perturb the area normalization of the spatial RoPE grids by up to this fraction each step, drawn "
             "log-uniformly from [1/(1+j), 1+j], so fixed-resolution data still trains a range of token spacings. "
             "0 disables it"
+        ),
+    )
+    parser.add_argument(
+        "--h3_timestep_focus_min",
+        type=float,
+        default=0.4,
+        help="lower edge of the unshifted base-sigma focus band",
+    )
+    parser.add_argument(
+        "--h3_timestep_focus_max",
+        type=float,
+        default=0.8,
+        help="upper edge of the unshifted base-sigma focus band",
+    )
+    parser.add_argument(
+        "--h3_timestep_focus_probability",
+        type=float,
+        default=0.0,
+        help=(
+            "probability of sampling video/AV batches uniformly from the focus band instead of the full base-sigma "
+            "range; image batches retain their resolution-aware schedule, and 0 preserves H3's default distribution"
         ),
     )
     parser.add_argument(

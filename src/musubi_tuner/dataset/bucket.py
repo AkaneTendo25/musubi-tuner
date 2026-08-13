@@ -271,6 +271,16 @@ class BucketBatchManager:
                             "Re-run minimax_h3_cache_dino_features.py with the selected dino_model."
                         )
                     features = handle.get_tensor("h3_dino_features")
+                latent_stat = os.stat(item_info.latent_cache_path)
+                expected_identity = {
+                    "latent_cache_size": str(latent_stat.st_size),
+                    "latent_cache_mtime_ns": str(latent_stat.st_mtime_ns),
+                }
+                if any(metadata.get(key) != value for key, value in expected_identity.items()):
+                    raise ValueError(
+                        f"MiniMax H3 DINO cache {dino_path} does not match its latent cache. "
+                        "Re-run minimax_h3_cache_dino_features.py after rebuilding or moving latent caches."
+                    )
                 expected_shape = tuple(int(metadata[key]) for key in ("frames", "patches", "channels") if key in metadata)
                 if expected_shape and (len(expected_shape) != 3 or tuple(features.shape) != expected_shape):
                     raise ValueError(f"MiniMax H3 DINO cache metadata does not match its tensor shape: {dino_path}")
