@@ -250,7 +250,7 @@ class TrainingConfig(BaseModel):
     h3_loss_balance: Literal["token", "modality"] = "modality"
     h3_video_loss_weight: float = 1.0
     h3_audio_loss_weight: float = 1.0
-    h3_spatial_density_jitter: float = 0.2
+    h3_spatial_density_jitter: float = 0.0
     h3_shift_video: float = 12.0
     h3_shift_audio: float = 3.0
     h3_frame_sigma_jitter: float = 0.0

@@ -158,15 +158,15 @@ def test_training_uses_accelerate_from_dashboard_python(tmp_path: Path) -> None:
     assert command[:3] == [sys.executable, "-m", "accelerate.commands.launch"]
 
 
-def test_h3_spatial_density_jitter_defaults_to_point_two(tmp_path: Path) -> None:
+def test_h3_spatial_density_jitter_defaults_to_off(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
 
     command = build_training_cmd(config)
     script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
     parsed = create_parser().parse_args(command[script_index + 1 :])
 
-    assert config.training.h3_spatial_density_jitter == 0.2
-    assert parsed.h3_spatial_density_jitter == 0.2
+    assert config.training.h3_spatial_density_jitter == 0.0
+    assert parsed.h3_spatial_density_jitter == 0.0
 
 
 def test_h3_spatial_density_jitter_custom_value_is_forwarded(tmp_path: Path) -> None:
@@ -187,6 +187,19 @@ def test_h3_spatial_density_jitter_rejects_negative_value(tmp_path: Path) -> Non
     report = validate_training_config(config)
 
     assert "training.h3_spatial_density_jitter" in report["field_errors"]
+
+
+def test_h3_modality_loss_weights_must_be_nonnegative_and_not_both_zero(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_audio_loss_weight = -0.1
+
+    report = validate_training_config(config)
+    assert "training.h3_audio_loss_weight" in report["field_errors"]
+
+    config.training.h3_audio_loss_weight = 0.0
+    config.training.h3_video_loss_weight = 0.0
+    report = validate_training_config(config)
+    assert "training.h3_video_loss_weight" in report["field_errors"]
 
 
 def test_h3_base_preservation_default_is_not_forwarded(tmp_path: Path) -> None:

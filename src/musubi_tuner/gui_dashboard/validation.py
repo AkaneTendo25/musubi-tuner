@@ -796,6 +796,31 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        modality_loss_weights = (
+            ("h3_video_loss_weight", float(t.h3_video_loss_weight), "H3 Video Loss Weight"),
+            ("h3_audio_loss_weight", float(t.h3_audio_loss_weight), "H3 Audio Loss Weight"),
+        )
+        for field, value, label in modality_loss_weights:
+            if not math.isfinite(value) or value < 0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"training.{field}",
+                        f"{label} must be finite and non-negative.",
+                        label=label,
+                        page="training",
+                    )
+                )
+        if all(math.isfinite(value) and value == 0 for _, value, _ in modality_loss_weights):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_video_loss_weight",
+                    "At least one H3 modality loss weight must be positive.",
+                    label="H3 Modality Loss Weights",
+                    page="training",
+                )
+            )
         focus_probability = float(t.h3_timestep_focus_probability)
         if not 0.0 <= focus_probability <= 1.0:
             errors.append(
