@@ -825,9 +825,6 @@ class _NativeTrainingBackend:
         else:
             audio_rows = pack_audio_latents(audio_hidden_states)
             num_audio_latents = int(audio_hidden_states.shape[-1])
-        is_image_target = video_hidden_states is not None and latent_frames == 1 and audio_hidden_states is None
-        if is_image_target and self.mode == "fl2va" and task != "t2va":
-            raise ValueError("MiniMax H3 FL2VA image training requires --task t2va caches")
         if self.mode in ("ref2va", "ref2va_omni"):
             references, reference_video, reference_audio = self._reference_cache(
                 batch,

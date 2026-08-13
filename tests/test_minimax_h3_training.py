@@ -1169,6 +1169,50 @@ def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
 
 
+@pytest.mark.parametrize("text_tags", ([1, 0, 1], [1, 0, 0, 1]))
+def test_native_h3_fl2va_conditioned_image_runs_single_latent_target(text_tags):
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=1,
+        attention_head_dim=8,
+        hidden_size=8,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=16,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=8,
+        time_embed_dim=8,
+        rope_freq_dim=1,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer, mode="fl2va")
+    video = torch.randn(1, 4, 1, 2, 2)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(len(text_tags), 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor(text_tags)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["fl2va"])],
+        H3_KEYFRAME_VIDEO_ROWS_KEY: [torch.randn(2, 16)],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        video,
+        None,
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+    )
+    loss = prediction.video.square().mean()
+    loss.backward()
+
+    assert prediction.video.shape == video.shape
+    assert prediction.audio is None
+    assert torch.isfinite(loss)
+
+
 def test_native_h3_l2va_selects_last_cached_keyframe_rows():
     batch = {H3_KEYFRAME_VIDEO_ROWS_KEY: [torch.stack((torch.zeros(16), torch.ones(16)))]}
     backend = _NativeTrainingBackend(SimpleNamespace(config=SimpleNamespace()), mode="fl2va")
