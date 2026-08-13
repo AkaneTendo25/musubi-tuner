@@ -39,7 +39,7 @@ Two released transformers, with different conditioning contracts:
 1. Follow the upstream Musubi Tuner [installation instructions](https://github.com/kohya-ss/musubi-tuner#installation), including its Python and PyTorch requirements.
 2. Prepare a TOML dataset using the shared upstream [dataset configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md). The H3-specific task and media requirements are listed in [Task contracts](#task-contracts) and [Dataset](#dataset) below.
 3. Configure Accelerate as described in the upstream [usage guide](https://github.com/kohya-ss/musubi-tuner#configuration-of-accelerate).
-4. Download the H3 checkpoints, run [Pre-caching](#pre-caching), and then start [Training](#training). The [training dashboard](#training-dashboard) is an optional proof-of-concept interface for the same commands.
+4. Download the H3 checkpoints, run [Pre-caching](#pre-caching), and then start [Training](#training). The [training dashboard](#training-dashboard) provides the same H3 caching, training, validation, sampling, and inference controls.
 
 Common installation, dataset, Accelerate, and environment setup is intentionally not duplicated here. This page documents only the MiniMax H3 files, contracts, and commands that differ from upstream Musubi Tuner.
 
@@ -310,7 +310,8 @@ H3 is guidance-distilled, so direct LoRA training can be inefficient or alter it
 strategies address different goals:
 
 1. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base. Add
-   `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with automatic inverse-probability scaling.
+   `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with inverse-probability loss scaling. This
+   preserves the expected loss, but rare larger updates are not optimizer-equivalent to applying the dense loss every step.
 2. If a compatible de-distillation training adapter is provided, load it through `--base_weights` while training the concept
    LoRA, then remove it for inference. One community example is
    [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter).
@@ -420,10 +421,12 @@ the model checkpoint. Requests received during gradient accumulation wait for th
 | `--h3_gradient_checkpointing_cpu_offload_pin_memory` | off | Pin CPU-offloaded checkpoint activations for faster transfers. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and substantial free system RAM. |
 | `--h3_reusable_activation_offload` | off | Reuse pinned CPU checkpoint buffers and prefetch activations in reverse block order. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and sufficient free system RAM. |
 | `--h3_gradient_checkpointing_blocks N` | all 50 | Checkpoint only the last N main blocks. This explicit speed/VRAM trade-off requires `--gradient_checkpointing` and resident eager blocks. |
-| `--h3_shift_video` / `--h3_shift_audio` | `12.0` / `3.0` | Per-modality flow shift. Both derive from one shared coordinate, so changing one never desynchronizes the other. |
-| `--timestep_sampling` | `uniform` | Use `uniform`, `sigmoid`, or `logsnr`. The dynamic-shift modes double-shift the schedule and ignore H3's temporal extent. |
+| `--h3_shift_video` / `--h3_shift_audio` | `12.0` / `3.0` | Released per-modality flow shifts. Both derive from one shared coordinate; keep the defaults unless reproducing a measured experiment. |
+| `--timestep_sampling` | `uniform` | Shape of the shared unshifted schedule. Keep `uniform` unless deliberately testing a different distribution. `sigmoid`, `logsnr`, and `sigma` are experimental alternatives; `shift` with H3's required `--discrete_flow_shift 1` is equivalent to sigmoid sampling. Model-specific dynamic-shift modes are rejected because H3 applies its own video/audio shifts afterward. |
 | `--discrete_flow_shift` | `1.0` | Must stay at the default; H3 applies its own shifts. |
 | `--h3_image_flow_shift` | auto | Fixed shift for image batches only. |
+| `--h3_timestep_focus_probability` | `0` | Optional video/AV curriculum: draw this fraction of the uniform base schedule from `--h3_timestep_focus_min` through `--h3_timestep_focus_max` (defaults `0.4` and `0.8`) while retaining full-range samples. Image batches keep their resolution-aware schedule. Requires `uniform` and cannot be combined with min/max timestep clipping. |
+| `--num_timestep_buckets` | off | Stratifies base timesteps across an epoch to reduce sampling imbalance; it does not change the intended distribution or make a step faster. It is incompatible with `--timestep_sampling sigma`. |
 | `--h3_video_loss_weight` / `--h3_audio_loss_weight` | `1.0` | Modality weights. `--h3_loss_balance token` switches from equal modality means to element weighting. |
 
 ### Memory and speed
@@ -510,6 +513,12 @@ attention workspaces, adapter rank, gradients, and optimizer state.
 Use `--h3_gradient_checkpointing_cpu_offload_pin_memory` only when the host has substantial free RAM. Long Ref2VA sequences can
 require substantial pinned memory in addition to model-loading and dataset memory.
 
+DataLoader tuning affects cache delivery, not transformer compute. Increase `--max_data_loader_n_workers` only when storage or
+CPU loading leaves the GPU idle; `--persistent_data_loader_workers` avoids restarting those workers each epoch, and
+`--dataloader_prefetch_factor N` controls queued batches per worker. `--dataloader_pin_memory` enables pinned batch buffers and
+non-blocking device copies, but consumes locked host RAM. These options are off/default-controlled unless explicitly set and
+normally do not speed up an H3 run whose cached batches already keep the GPU busy.
+
 ### Training modes
 
 These modes use target-derived conditioning and therefore use a `t2va` conditioning cache. For observed-modality training,
@@ -556,7 +565,7 @@ not add a complete H3 forward.
 | `--h3_guidance_distillation_scale 4` | Guidance-consistent objective using cached empty-text conditioning. A scale of `4` is recommended; `3` is generally too weak. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
 | `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
 | `--h3_base_preservation_loss_weight 0.02` | Recommended starting value. Penalizes drift from the frozen base's prediction and anchors to whichever base is loaded, quantized or not. |
-| `--h3_base_preservation_probability 0.25` | Evaluate preservation on a synchronized random fraction of batches and scale active losses by `1 / probability`. `1` is exact every-batch preservation; `0.25`–`0.5` is the recommended faster range. |
+| `--h3_base_preservation_probability 0.25` | Evaluate preservation on a synchronized random fraction of batches and scale active losses by `1 / probability`. `1` applies the objective every batch; `0.25`–`0.5` is a faster approximation whose rare scaled updates interact differently with clipping and adaptive optimizers. |
 | `--crepa` | Temporal representation alignment for video training. |
 
 Treat `--h3_base_preservation_loss_weight 0.02` as an initial value rather than a universal setting. Its effect depends on
