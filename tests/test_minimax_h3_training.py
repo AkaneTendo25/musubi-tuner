@@ -3062,6 +3062,47 @@ def test_h3_trainer_rejects_invalid_modality_loss_weights(extra_args, message):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
+@pytest.mark.parametrize(
+    "extra_args, message",
+    [
+        (["--h3_observed_modality", "video", "--h3_audio_loss_weight", "0"], "trains audio"),
+        (["--h3_observed_modality", "audio", "--h3_video_loss_weight", "0"], "trains video"),
+    ],
+)
+def test_h3_observed_modality_requires_weight_on_generated_side(extra_args, message):
+    args = create_parser().parse_args(["--sdpa", *extra_args])
+
+    with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_dataset_loss_coverage_rejects_zero_weight_target_modes():
+    config = {
+        "general": {"h3_target_mode": "video"},
+        "datasets": [
+            {"video_directory": "/video"},
+            {"audio_directory": "/audio", "h3_target_mode": "audio"},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="dataset 1.*video"):
+        h3_train_network._validate_dataset_loss_coverage(config, video_weight=0.0, audio_weight=1.0)
+    with pytest.raises(ValueError, match="dataset 2.*audio"):
+        h3_train_network._validate_dataset_loss_coverage(config, video_weight=1.0, audio_weight=0.0)
+
+
+def test_h3_dataset_loss_coverage_accepts_active_and_image_targets():
+    config = {
+        "general": {"h3_target_mode": "audio"},
+        "datasets": [
+            {"video_directory": "/av", "h3_target_mode": "av"},
+            {"image_directory": "/images"},
+        ],
+    }
+
+    h3_train_network._validate_dataset_loss_coverage(config, video_weight=1.0, audio_weight=0.0)
+
+
 @pytest.mark.parametrize("sampling", ["flux_shift", "qwen_shift", "krea2_shift", "ideogram4_shift", "qinglong_flux"])
 def test_h3_trainer_rejects_pre_shifted_timestep_sampling(sampling):
     args = create_parser().parse_args(["--sdpa", "--timestep_sampling", sampling])

@@ -117,6 +117,20 @@ def _apply_timestep_focus(base: torch.Tensor, low: float, high: float, probabili
     return torch.where(base < probability, focused, background)
 
 
+def _validate_dataset_loss_coverage(user_config: dict, *, video_weight: float, audio_weight: float) -> None:
+    """Reject dataset rows that can never contribute to the configured objective."""
+    general = user_config.get("general", {})
+    for index, dataset in enumerate(user_config.get("datasets", [])):
+        is_image = bool(dataset.get("image_directory") or dataset.get("image_jsonl_file"))
+        is_audio = bool(dataset.get("audio_directory") or dataset.get("audio_jsonl_file"))
+        mode = "video" if is_image else dataset.get("h3_target_mode", general.get("h3_target_mode", "av"))
+        if is_audio:
+            mode = "audio"
+        active = (mode in {"av", "video"} and video_weight > 0) or (mode in {"av", "audio"} and audio_weight > 0)
+        if not active:
+            raise ValueError(f"H3 dataset {index + 1} has target mode {mode!r}, but its configured modality loss weight is zero")
+
+
 class _H3DecoderBundle(torch.nn.Module):
     def __init__(self, video_decoder: torch.nn.Module, audio_decoder: torch.nn.Module) -> None:
         super().__init__()
@@ -225,6 +239,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         logger.info("Load dataset config from %s", args.dataset_config)
         user_config = config_utils.load_user_config(args.dataset_config)
+        _validate_dataset_loss_coverage(
+            user_config,
+            video_weight=float(getattr(args, "h3_video_loss_weight", 1.0)),
+            audio_weight=float(getattr(args, "h3_audio_loss_weight", 1.0)),
+        )
         train_dataset_group, _ = create_h3_dataset_group(
             user_config,
             args,
@@ -595,6 +614,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError(f"--{name} must be finite and non-negative")
         if not any(value > 0 for value in modality_loss_weights.values()):
             raise ValueError("at least one of --h3_video_loss_weight or --h3_audio_loss_weight must be positive")
+        if args.h3_observed_modality == "video" and modality_loss_weights["h3_audio_loss_weight"] == 0:
+            raise ValueError("--h3_observed_modality video trains audio and therefore requires --h3_audio_loss_weight > 0")
+        if args.h3_observed_modality == "audio" and modality_loss_weights["h3_video_loss_weight"] == 0:
+            raise ValueError("--h3_observed_modality audio trains video and therefore requires --h3_video_loss_weight > 0")
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
         if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
