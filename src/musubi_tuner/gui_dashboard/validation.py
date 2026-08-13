@@ -821,6 +821,26 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_observed_modality == "video" and t.h3_audio_loss_weight == 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_audio_loss_weight",
+                    "Video-observed H3 training generates audio and requires a positive audio loss weight.",
+                    label="H3 Audio Loss Weight",
+                    page="training",
+                )
+            )
+        if t.h3_observed_modality == "audio" and t.h3_video_loss_weight == 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_video_loss_weight",
+                    "Audio-observed H3 training generates video and requires a positive video loss weight.",
+                    label="H3 Video Loss Weight",
+                    page="training",
+                )
+            )
         focus_probability = float(t.h3_timestep_focus_probability)
         if not 0.0 <= focus_probability <= 1.0:
             errors.append(
@@ -1317,6 +1337,20 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             )
         for index, entry in enumerate(config.dataset.datasets):
             _validate_h3_dataset_entry(entry, index, errors=errors, warnings=warnings)
+            target_mode = "video" if entry.type == "image" else "audio" if entry.type == "audio" else entry.h3_target_mode
+            has_active_loss = (target_mode in {"av", "video"} and t.h3_video_loss_weight > 0) or (
+                target_mode in {"av", "audio"} and t.h3_audio_loss_weight > 0
+            )
+            if not has_active_loss:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"dataset.datasets.{index}.h3_target_mode",
+                        f"Dataset {index + 1} targets {target_mode}, but its configured H3 modality loss weight is zero.",
+                        label=f"Dataset {index + 1} Target Mode",
+                        page="dataset",
+                    )
+                )
         for index, entry in enumerate(config.dataset.validation_datasets):
             _validate_h3_dataset_entry(
                 entry,

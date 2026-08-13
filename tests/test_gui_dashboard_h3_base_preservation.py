@@ -202,6 +202,22 @@ def test_h3_modality_loss_weights_must_be_nonnegative_and_not_both_zero(tmp_path
     assert "training.h3_video_loss_weight" in report["field_errors"]
 
 
+def test_h3_modality_loss_weights_cover_observed_and_dataset_targets(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_observed_modality = "video"
+    config.training.h3_audio_loss_weight = 0.0
+
+    report = validate_training_config(config)
+    assert "training.h3_audio_loss_weight" in report["field_errors"]
+
+    config.training.h3_observed_modality = None
+    config.training.h3_audio_loss_weight = 1.0
+    config.training.h3_video_loss_weight = 0.0
+    config.dataset.datasets = [DatasetEntry(type="image", directory=str(tmp_path / "images"))]
+    report = validate_training_config(config)
+    assert "dataset.datasets.0.h3_target_mode" in report["field_errors"]
+
+
 def test_h3_base_preservation_default_is_not_forwarded(tmp_path: Path) -> None:
     command = build_training_cmd(_h3_config(tmp_path))
 
