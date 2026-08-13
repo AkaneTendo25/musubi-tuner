@@ -113,6 +113,32 @@ def _h3_temporal_latents(frame_count: int) -> tuple[int, int]:
     return ((frame_count - 5) // 17) * 5 + 2, (10 * frame_count + 3) // 6
 
 
+def _h3_spatial_rows(width: int, height: int) -> int:
+    """Return packed H3 rows for one visual latent frame."""
+    return max(height // 32, 1) * max(width // 32, 1)
+
+
+def _h3_reference_video_rows_per_frame(width: int, height: int) -> int:
+    """Mirror the fixed 768-short-edge, 768x1344-cap reference-video policy."""
+    width = max(width, 1)
+    height = max(height, 1)
+    ratio = width / height
+    if ratio >= 1:
+        resolved_width, resolved_height = 768.0 * ratio, 768.0
+    else:
+        resolved_width, resolved_height = 768.0, 768.0 / ratio
+    maximum_pixels = 768 * 1344
+    if resolved_width * resolved_height > maximum_pixels:
+        scale = (maximum_pixels / (resolved_width * resolved_height)) ** 0.5
+        resolved_width *= scale
+        resolved_height *= scale
+    # references._multiple_size rounds each dimension to the H3 16-pixel
+    # canvas; packing then groups each 2x2 latent patch, hence /32 rows.
+    resolved_width = max(16, round(resolved_width / 16) * 16)
+    resolved_height = max(16, round(resolved_height / 16) * 16)
+    return _h3_spatial_rows(resolved_width, resolved_height)
+
+
 def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
     """Approximate the largest packed H3 sequence represented by one row."""
     dataset_type = str(dataset.get("type", "video"))
@@ -132,7 +158,7 @@ def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
         1,
     )
     video_latents, audio_latents = _h3_temporal_latents(frames)
-    rows_per_video_frame = max(height // 32, 1) * max(width // 32, 1)
+    rows_per_video_frame = _h3_spatial_rows(width, height)
     video_rows = video_latents * rows_per_video_frame if target_mode in {"av", "video"} else 0
     audio_rows = 2 * audio_latents if target_mode in {"av", "audio"} else 0
 
@@ -151,11 +177,16 @@ def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
             reference_frames = max(_coerce_int(dataset.get("reference_frames", frames), frames), 1)
             ref_video_latents, ref_audio_latents = _h3_temporal_latents(reference_frames)
             if modality in {"av", "video"}:
-                condition_rows += ref_video_latents * rows_per_video_frame
+                condition_rows += ref_video_latents * _h3_reference_video_rows_per_frame(width, height)
             if modality in {"av", "audio"} and dataset.get("control_audio_directory"):
                 condition_rows += 2 * ref_audio_latents
         elif dataset.get("control_directory"):
-            condition_rows += rows_per_video_frame
+            # Directory controls may contain images or videos and their source
+            # aspect ratios are not represented in project JSON. A square image
+            # at the configured short edge is the least surprising estimate;
+            # video references use a separate fixed 768-short-edge policy.
+            short_edge = max(_coerce_int(training.get("reference_image_short_edge", 2048), 2048), 16)
+            condition_rows += _h3_spatial_rows(short_edge, short_edge)
 
     keyframe_count = max(_coerce_int(training.get("h3_keyframe_random_count", 0), 0), 0)
     if not keyframe_count:
@@ -194,6 +225,45 @@ def _h3_lora_size_gb(training: dict) -> float:
     if training.get("h3_lora_token_refiner"):
         parameters_per_rank += 2 * (26_880 + 12_544 + 34_048 + 19_712)
     return parameters_per_rank * rank * 2 / (1024**3)
+
+
+def _h3_crepa_memory_gb(training: dict, dataset: dict) -> float:
+    """Estimate CREPA parameters, optimizer state, and retained activations."""
+    if not training.get("crepa"):
+        return 0.0
+    hidden = 5376
+    mode = str(training.get("crepa_mode", "backbone"))
+    dino_dims = {
+        "dinov2_vits14": 384,
+        "dinov2_vitb14": 768,
+        "dinov2_vitl14": 1024,
+        "dinov2_vitg14": 1536,
+    }
+    output = hidden if mode == "backbone" else dino_dims.get(str(training.get("crepa_dino_model", "dinov2_vitb14")), 768)
+    parameter_count = hidden * hidden + hidden + hidden * output + output
+    parameter_gb = parameter_count * 4 / (1024**3)
+    optimizer = str(training.get("optimizer_type", "adamw8bit")).lower()
+    optimizer_bytes = 2 if ("8bit" in optimizer or "4bit" in optimizer or "fp8" in optimizer) else 8
+    state_gb = parameter_count * optimizer_bytes / (1024**3)
+
+    dataset_type = str(dataset.get("type", "video"))
+    if dataset_type == "image" or str(dataset.get("h3_target_mode", "av")) == "audio":
+        activation_gb = 0.0
+    else:
+        width = max(_coerce_int(dataset.get("resolution_w", 768), 768), 64)
+        height = max(_coerce_int(dataset.get("resolution_h", 512), 512), 64)
+        frames = max(_coerce_int(dataset.get("target_frames", 124), 124), 1)
+        video_latents, _ = _h3_temporal_latents(frames)
+        target_rows = video_latents * _h3_spatial_rows(width, height)
+        # Student rows are retained in BF16. The FP32 two-layer projector keeps
+        # its input/hidden/output tensors for backward; backbone mode projects
+        # before spatial pooling, so it has the larger row-dependent footprint.
+        projected_rows = target_rows if mode == "backbone" else target_rows
+        activation_bytes = target_rows * hidden * 2 + projected_rows * (hidden * 2 + output) * 4
+        activation_gb = activation_bytes / (1024**3)
+    # FP32 projector parameters and gradients are resident in addition to the
+    # main LoRA accounting above.
+    return 2 * parameter_gb + state_gb + activation_gb
 
 
 @lru_cache(maxsize=1)
@@ -855,7 +925,7 @@ def _calculate_h3_vram_stats(training: dict, caching: dict, dataset: dict) -> VR
     activations_gb = max(0.3, activations_gb + fixed_buffers_gb)
     grad_accum = max(_coerce_int(training.get("gradient_accumulation_steps", 1), 1), 1)
     grad_accum_gb = grads_gb * 0.4 if grad_accum > 1 else 0.0
-    crepa_gb = 0.15 if training.get("crepa") else 0.0
+    crepa_gb = _h3_crepa_memory_gb(training, dataset)
 
     # Guidance and preservation are sequential no-grad forwards. They change
     # average time, not the graph high-water mark.
