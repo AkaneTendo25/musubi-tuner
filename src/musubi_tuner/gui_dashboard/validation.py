@@ -1011,6 +1011,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_sigma_sqrt_max_weight <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_sigma_sqrt_max_weight",
+                    "H3 sigma-sqrt maximum weight must be positive.",
+                    label="Sigma-sqrt Max Weight",
+                    page="training",
+                )
+            )
         if (t.h3_keyframe_anchors or t.h3_keyframe_random_count) and config.caching.h3_task != "t2va":
             errors.append(
                 _make_issue(

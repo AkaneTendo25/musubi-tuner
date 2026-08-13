@@ -3212,6 +3212,32 @@ def test_h3_trainer_rejects_out_of_range_modality_shift(bad_shift):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
+def test_h3_sigma_sqrt_weighting_is_bounded():
+    args = create_parser().parse_args(["--sdpa", "--weighting_scheme", "sigma_sqrt"])
+    trainer = MiniMaxH3NetworkTrainer()
+
+    trainer.handle_model_specific_args(args)
+    weights = trainer._sample_weight(args, torch.tensor([0.0, 0.1, 0.5, 1.0]))
+
+    torch.testing.assert_close(weights, torch.tensor([10.0, 10.0, 4.0, 1.0]))
+
+
+def test_h3_trainer_rejects_nonpositive_sigma_sqrt_cap():
+    args = create_parser().parse_args(["--sdpa", "--h3_sigma_sqrt_max_weight", "0"])
+
+    with pytest.raises(ValueError, match="must be positive"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_sigma_sqrt_cap_is_recorded_in_checkpoint_metadata():
+    args = create_parser().parse_args(["--sdpa", "--h3_sigma_sqrt_max_weight", "8"])
+    trainer = MiniMaxH3NetworkTrainer()
+
+    trainer.handle_model_specific_args(args)
+
+    assert trainer.extra_metadata(args)["ss_h3_sigma_sqrt_max_weight"] == "8.0"
+
+
 def test_h3_trainer_rejects_negative_block_swap_count():
     args = create_parser().parse_args(["--sdpa", "--blocks_to_swap", "-1"])
 
@@ -3229,6 +3255,7 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.discrete_flow_shift == 1.0
     assert args.h3_shift_video == 12.0
     assert args.h3_shift_audio == 3.0
+    assert args.h3_sigma_sqrt_max_weight == 10.0
     assert args.h3_loss_balance == "modality"
     assert args.h3_guidance_distillation_scale is None
     assert args.h3_guidance_loss_form == "normalized"

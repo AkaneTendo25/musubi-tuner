@@ -253,6 +253,7 @@ class TrainingConfig(BaseModel):
     h3_spatial_density_jitter: float = 0.0
     h3_shift_video: float = 12.0
     h3_shift_audio: float = 3.0
+    h3_sigma_sqrt_max_weight: float = 10.0
     h3_frame_sigma_jitter: float = 0.0
     h3_timestep_focus_min: float = 0.4
     h3_timestep_focus_max: float = 0.8

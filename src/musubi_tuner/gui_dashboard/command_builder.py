@@ -595,6 +595,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_shift_video", str(t.h3_shift_video)]
     if t.h3_shift_audio != 3.0:
         cmd += ["--h3_shift_audio", str(t.h3_shift_audio)]
+    if t.h3_sigma_sqrt_max_weight != 10.0:
+        cmd += ["--h3_sigma_sqrt_max_weight", str(t.h3_sigma_sqrt_max_weight)]
     if t.h3_frame_sigma_jitter:
         cmd += ["--h3_frame_sigma_jitter", str(t.h3_frame_sigma_jitter)]
     if t.h3_timestep_focus_probability:

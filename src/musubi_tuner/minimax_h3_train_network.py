@@ -798,6 +798,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 f"--h3_frame_sigma_jitter cannot be combined with --weighting_scheme {args.weighting_scheme}: "
                 "per-frame weighting is not supported"
             )
+        if args.h3_sigma_sqrt_max_weight <= 0:
+            raise ValueError("MiniMax H3 --h3_sigma_sqrt_max_weight must be positive")
         if args.h3_guidance_distillation_scale is not None and float(getattr(args, "network_dropout", 0.0) or 0.0) > 0:
             raise ValueError(
                 "H3 guidance-consistent training cannot replay --network_dropout across different prompt lengths; "
@@ -1426,7 +1428,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def _sample_weight(self, args: argparse.Namespace, sigma: torch.Tensor) -> torch.Tensor | None:
         if args.weighting_scheme == "sigma_sqrt":
-            return sigma.clamp_min(1e-6).pow(-2.0)
+            # H3 samples a continuous base coordinate, so the generic
+            # sigma^-2 weighting has no finite upper bound. Clamp sigma at
+            # the equivalent configured maximum before taking the inverse.
+            sigma_floor = float(args.h3_sigma_sqrt_max_weight) ** -0.5
+            return sigma.clamp_min(sigma_floor).pow(-2.0)
         if args.weighting_scheme == "cosmap":
             return 2.0 / (math.pi * (1.0 - 2.0 * sigma + 2.0 * sigma.square()))
         return None
@@ -2049,6 +2055,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
+            "ss_h3_sigma_sqrt_max_weight": str(args.h3_sigma_sqrt_max_weight),
             "ss_h3_timestep_sampling": args.timestep_sampling,
             "ss_h3_timestep_focus_min": str(args.h3_timestep_focus_min),
             "ss_h3_timestep_focus_max": str(args.h3_timestep_focus_max),
@@ -2452,6 +2459,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=AUDIO_FLOW_SHIFT,
         help="exponential flow shift for the target audio stream (H3 released schedule: 3.0)",
+    )
+    parser.add_argument(
+        "--h3_sigma_sqrt_max_weight",
+        type=float,
+        default=10.0,
+        help="maximum inverse-square loss weight used by --weighting_scheme sigma_sqrt (default: 10.0)",
     )
     parser.set_defaults(
         network_module="networks.lora_minimax_h3",

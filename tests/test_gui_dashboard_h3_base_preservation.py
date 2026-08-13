@@ -537,6 +537,15 @@ def test_h3_performance_validation_matches_trainer_constraints(tmp_path: Path) -
     assert "training.h3_gradient_checkpointing_cpu_offload_pin_memory" in report["field_errors"]
 
 
+def test_h3_dashboard_rejects_nonpositive_sigma_sqrt_cap(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_sigma_sqrt_max_weight = 0
+
+    report = validate_training_config(config)
+
+    assert "training.h3_sigma_sqrt_max_weight" in report["field_errors"]
+
+
 def test_h3_native_conditioning_controls_round_trip_through_real_parser(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     training = config.training
@@ -545,6 +554,7 @@ def test_h3_native_conditioning_controls_round_trip_through_real_parser(tmp_path
     training.h3_frame_sigma_jitter = 0.1
     training.h3_shift_video = 10.0
     training.h3_shift_audio = 2.5
+    training.h3_sigma_sqrt_max_weight = 8.0
     training.h3_caption_dropout_rate = 0.2
     training.h3_image_flow_shift = 3.0
     training.h3_extension_video_frames = 2
@@ -569,6 +579,7 @@ def test_h3_native_conditioning_controls_round_trip_through_real_parser(tmp_path
     assert parsed.h3_frame_sigma_jitter == 0.1
     assert parsed.h3_shift_video == 10.0
     assert parsed.h3_shift_audio == 2.5
+    assert parsed.h3_sigma_sqrt_max_weight == 8.0
     assert parsed.h3_caption_dropout_rate == 0.2
     assert parsed.h3_image_flow_shift == 3.0
     assert parsed.h3_extension_video_frames == 2
