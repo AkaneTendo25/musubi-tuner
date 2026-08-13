@@ -3044,6 +3044,24 @@ def test_h3_trainer_rejects_composed_discrete_flow_shift():
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
+@pytest.mark.parametrize(
+    "extra_args, message",
+    [
+        (["--h3_video_loss_weight", "-0.1"], "h3_video_loss_weight"),
+        (["--h3_audio_loss_weight", "nan"], "h3_audio_loss_weight"),
+        (
+            ["--h3_video_loss_weight", "0", "--h3_audio_loss_weight", "0"],
+            "at least one",
+        ),
+    ],
+)
+def test_h3_trainer_rejects_invalid_modality_loss_weights(extra_args, message):
+    args = create_parser().parse_args(["--sdpa", *extra_args])
+
+    with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
 @pytest.mark.parametrize("sampling", ["flux_shift", "qwen_shift", "krea2_shift", "ideogram4_shift", "qinglong_flux"])
 def test_h3_trainer_rejects_pre_shifted_timestep_sampling(sampling):
     args = create_parser().parse_args(["--sdpa", "--timestep_sampling", sampling])

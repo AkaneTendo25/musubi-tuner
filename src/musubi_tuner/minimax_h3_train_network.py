@@ -586,6 +586,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError(f"--{name} must be in [0.01, 100.0], got {value}")
         if args.h3_image_flow_shift is not None and args.h3_image_flow_shift <= 0:
             raise ValueError("MiniMax H3 --h3_image_flow_shift must be positive when specified")
+        modality_loss_weights = {
+            "h3_video_loss_weight": float(args.h3_video_loss_weight),
+            "h3_audio_loss_weight": float(args.h3_audio_loss_weight),
+        }
+        for name, value in modality_loss_weights.items():
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"--{name} must be finite and non-negative")
+        if not any(value > 0 for value in modality_loss_weights.values()):
+            raise ValueError("at least one of --h3_video_loss_weight or --h3_audio_loss_weight must be positive")
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
         if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
