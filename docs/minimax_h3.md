@@ -227,12 +227,6 @@ commands and use `--task fl2va` for text caching. `h3_image_frame_count` in the 
 source fingerprint, so changed/reordered targets or controls are rebuilt under `--skip_existing` and mismatched cache pairs
 are rejected during training. `--h3_text_visual_max_pixels` limits only the images presented to Qwen3-VL.
 
-`--reference_image_short_edge` (default 2048) resizes Ref2VA reference images to the given short edge before encoding.
-The released pipeline uses 2048; lowering it (e.g. to 768, the reference-video size) cuts the reference token count
-roughly quadratically at the cost of fine reference detail. The same value must be passed to both caching scripts,
-training, and inference — non-default caches carry the value in their keys, and the trainer refuses a mismatched
-reference cache.
-
 ```shell
 # First-frame I2V
 python minimax_h3_cache_text_encoder_outputs.py \
@@ -671,7 +665,9 @@ python minimax_h3_generate_video.py \
 | `--first_frame` / `--last_frame` | Keyframe conditioning at the ends. |
 | `--keyframe INDEX:PATH` | Keyframe at an arbitrary latent frame, repeatable. |
 | `--reference_image` / `--reference_video` / `--reference_audio` | Ref2VA references; audio must accompany an image or video. A reference video's own soundtrack is included automatically, so do not also pass it as `--reference_audio`. Requires the Ref2VA checkpoint. |
-| `--reference_image_short_edge` | Short edge reference images are resized to (default 2048). Use the value the LoRA was trained with. |
+| `--reference_image_size_mode` | Ref2VA image sizing: `short_edge` keeps the released behavior; `target_area` preserves aspect ratio and uses approximately the target output area. |
+| `--reference_image_short_edge` | Reference-image short edge in `short_edge` mode (default 2048). |
+| `--reference_image_max_pixels` | Optional pixel-area cap in `target_area` mode; `0` uses the target output area. |
 | `--lora_weight` / `--lora_multiplier` | Attach saved adapters. |
 | `--steps` | Sigma grid points including terminal zero, so `20` runs 19 evaluations. |
 

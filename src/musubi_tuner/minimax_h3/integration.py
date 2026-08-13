@@ -29,6 +29,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_KEYFRAME_VIDEO_ROWS_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
     H3_REFERENCE_AUDIO_ROWS_KEY,
+    H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
+    H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_KINDS_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
@@ -72,6 +74,7 @@ from musubi_tuner.minimax_h3.packing import (
 )
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_IMAGE_SIZE_MODE,
     H3ReferenceKind,
     prepare_references,
     trim_reference_frames,
@@ -85,11 +88,22 @@ from musubi_tuner.utils.model_utils import dtype_to_str, str_to_dtype
 logger = logging.getLogger(__name__)
 
 
-def _validate_inference_lora_metadata(path: Path, mode: str, reference_image_short_edge: int) -> None:
+def _validate_inference_lora_metadata(
+    path: Path,
+    mode: str,
+    reference_image_short_edge: int,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
+) -> None:
     with safe_open(path, framework="pt") as handle:
         metadata = handle.metadata() or {}
     trained_mode = metadata.get("ss_h3_training_mode")
     saved_reference_size = metadata.get("ss_h3_reference_image_short_edge")
+    saved_size_mode = metadata.get("ss_h3_reference_image_size_mode", REFERENCE_IMAGE_SIZE_MODE)
+    try:
+        saved_max_pixels = int(metadata.get("ss_h3_reference_image_max_pixels", "0"))
+    except ValueError as exc:
+        raise ValueError(f"invalid ss_h3_reference_image_max_pixels metadata in {path}") from exc
     if trained_mode in {"ref2va", "ref2va_omni"} and saved_reference_size is not None:
         try:
             saved_reference_size_int = int(saved_reference_size)
@@ -99,6 +113,12 @@ def _validate_inference_lora_metadata(path: Path, mode: str, reference_image_sho
             raise ValueError(
                 f"H3 LoRA {path} was trained with reference_image_short_edge={saved_reference_size_int}, "
                 f"but inference requested {reference_image_short_edge}"
+            )
+    if trained_mode in {"ref2va", "ref2va_omni"} and mode in {"ref2va", "ref2va_omni"}:
+        if saved_size_mode != reference_image_size_mode or saved_max_pixels != reference_image_max_pixels:
+            raise ValueError(
+                f"H3 LoRA {path} was trained with reference sizing {saved_size_mode}/{saved_max_pixels}, "
+                f"but inference requested {reference_image_size_mode}/{reference_image_max_pixels}"
             )
     adaln_rank = metadata.get("ss_h3_adaln_rank")
     if adaln_rank not in {None, "full"}:
@@ -117,13 +137,22 @@ def create_latent_encoder(
     device: str | None,
     dtype: str,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
 ):
     """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
     output_dtype = str_to_dtype(dtype)
     video_encoder = load_video_vae_encoder(video_vae, target_device) if video_vae is not None else None
     audio_encoder = load_audio_vae_encoder(audio_vae, target_device) if audio_vae is not None else None
-    return _NativeLatentEncoder(video_encoder, audio_encoder, output_dtype, reference_image_short_edge)
+    return _NativeLatentEncoder(
+        video_encoder,
+        audio_encoder,
+        output_dtype,
+        reference_image_short_edge,
+        reference_image_size_mode,
+        reference_image_max_pixels,
+    )
 
 
 def create_conditioning_encoder(
@@ -137,6 +166,8 @@ def create_conditioning_encoder(
     blocks_to_stream: int = 0,
     nvfp4_scaled_mm: bool = False,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
     text_visual_max_pixels: int = 0,
 ):
     """Load the released understanding encoder and adapt its hidden-state output to Musubi."""
@@ -152,7 +183,16 @@ def create_conditioning_encoder(
         blocks_to_stream=blocks_to_stream,
         nvfp4_scaled_mm=nvfp4_scaled_mm,
     )
-    return MiniMaxH3ConditioningEncoder(processor, model, output_dtype, task, reference_image_short_edge, text_visual_max_pixels)
+    return MiniMaxH3ConditioningEncoder(
+        processor,
+        model,
+        output_dtype,
+        task,
+        reference_image_short_edge,
+        text_visual_max_pixels,
+        reference_image_size_mode,
+        reference_image_max_pixels,
+    )
 
 
 def create_generator(
@@ -192,6 +232,8 @@ def create_generator(
     inductor_config: tuple[str, ...] = (),
     fused_qk_norm_rope: bool = False,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
     text_visual_max_pixels: int = 0,
 ):
     """Create a sequentially-loaded native FL2VA or Ref2VA generator."""
@@ -232,6 +274,8 @@ def create_generator(
         fused_qk_norm_rope=fused_qk_norm_rope,
         mode="ref2va" if request.mode == "reference" else "fl2va",
         reference_image_short_edge=reference_image_short_edge,
+        reference_image_size_mode=reference_image_size_mode,
+        reference_image_max_pixels=reference_image_max_pixels,
         text_visual_max_pixels=text_visual_max_pixels,
     )
 
@@ -273,6 +317,8 @@ class _NativeGenerator:
         text_encoder_blocks_to_stream: int = 0,
         text_encoder_nvfp4_scaled_mm: bool = False,
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+        reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+        reference_image_max_pixels: int = 0,
         text_visual_max_pixels: int = 0,
     ) -> None:
         self.model = Path(model)
@@ -311,6 +357,8 @@ class _NativeGenerator:
         )
         self.fused_qk_norm_rope = fused_qk_norm_rope
         self.reference_image_short_edge = reference_image_short_edge
+        self.reference_image_size_mode = reference_image_size_mode
+        self.reference_image_max_pixels = reference_image_max_pixels
         self.text_visual_max_pixels = text_visual_max_pixels
         self.mode = mode
 
@@ -357,6 +405,9 @@ class _NativeGenerator:
             quantization=self.text_encoder_quantization,
             blocks_to_stream=self.text_encoder_blocks_to_stream,
             nvfp4_scaled_mm=self.text_encoder_nvfp4_scaled_mm,
+            reference_image_short_edge=self.reference_image_short_edge,
+            reference_image_size_mode=self.reference_image_size_mode,
+            reference_image_max_pixels=self.reference_image_max_pixels,
             text_visual_max_pixels=self.text_visual_max_pixels,
         )
         try:
@@ -395,7 +446,7 @@ class _NativeGenerator:
                 anchors.append(reference.latent_index)
         return images, tuple(anchors)
 
-    def _prepare_references(self, request: H3GenerationRequest):
+    def _prepare_references(self, request: H3GenerationRequest, height: int, width: int):
         modality_by_kind = {
             ReferenceKind.IMAGE: MediaModality.IMAGE,
             ReferenceKind.VIDEO: MediaModality.VIDEO,
@@ -407,8 +458,14 @@ class _NativeGenerator:
             if reference.role is ReferenceRole.REFERENCE
         )
         return prepare_references(
-            SimpleNamespace(h3_media_assets=assets, frame_count=request.temporal_shape.frame_count),
+            SimpleNamespace(
+                h3_media_assets=assets,
+                frame_count=request.temporal_shape.frame_count,
+                bucket_size=(width, height),
+            ),
             self.reference_image_short_edge,
+            self.reference_image_size_mode,
+            self.reference_image_max_pixels,
         )
 
     def _load_transformer(self):
@@ -446,7 +503,13 @@ class _NativeGenerator:
         networks = []
         for index, weights_path in enumerate(self.lora_weights):
             multiplier = self.lora_multipliers[index] if index < len(self.lora_multipliers) else 1.0
-            _validate_inference_lora_metadata(weights_path, self.mode, self.reference_image_short_edge)
+            _validate_inference_lora_metadata(
+                weights_path,
+                self.mode,
+                self.reference_image_short_edge,
+                self.reference_image_size_mode,
+                self.reference_image_max_pixels,
+            )
             weights = load_file(weights_path)
             network = lora_minimax_h3.create_arch_network_from_weights(
                 multiplier,
@@ -486,7 +549,7 @@ class _NativeGenerator:
         references = None
         prepared_references = ()
         if request.mode == "reference":
-            prepared_references = self._prepare_references(request)
+            prepared_references = self._prepare_references(request, height, width)
             conditioning = self._measure(
                 "text_conditioning",
                 lambda: self._encode_prompt(request.prompt, references=prepared_references),
@@ -642,6 +705,8 @@ def create_training_backend(
     base_lora_weights: list[dict[str, torch.Tensor]] | None = None,
     base_lora_multipliers: list[float] | None = None,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
 ):
     """Load the selected released transformer and adapt its training forward to Musubi."""
     if dtype != "bfloat16":
@@ -670,7 +735,9 @@ def create_training_backend(
         base_lora_weights=base_lora_weights,
         base_lora_multipliers=base_lora_multipliers,
     )
-    return _NativeTrainingBackend(transformer, mode, reference_image_short_edge)
+    return _NativeTrainingBackend(
+        transformer, mode, reference_image_short_edge, reference_image_size_mode, reference_image_max_pixels
+    )
 
 
 class _NativeTrainingBackend:
@@ -679,10 +746,14 @@ class _NativeTrainingBackend:
         transformer: torch.nn.Module,
         mode: H3TrainingMode = "fl2va",
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+        reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+        reference_image_max_pixels: int = 0,
     ):
         self.transformer = transformer
         self.mode = mode
         self.reference_image_short_edge = reference_image_short_edge
+        self.reference_image_size_mode = reference_image_size_mode
+        self.reference_image_max_pixels = reference_image_max_pixels
 
     def get_training_transformer(self) -> torch.nn.Module:
         return self.transformer
@@ -762,6 +833,17 @@ class _NativeTrainingBackend:
                         f"H3 Ref2VA text cache uses reference short edge {int(cached_reference_size)}, "
                         f"but training requested {self.reference_image_short_edge}; re-cache text conditioning"
                     )
+            cached_size_mode = batch.get(H3_REFERENCE_IMAGE_SIZE_MODE_KEY)
+            cached_max_pixels = batch.get(H3_REFERENCE_IMAGE_MAX_PIXELS_KEY)
+            expected_size_mode = 0 if self.reference_image_size_mode == "short_edge" else 1
+            if cached_size_mode is None or cached_max_pixels is None:
+                if self.reference_image_size_mode != REFERENCE_IMAGE_SIZE_MODE or self.reference_image_max_pixels:
+                    raise ValueError("legacy H3 Ref2VA text cache lacks reference sizing identity; re-cache conditioning")
+            else:
+                cached_size_mode = self._one_conditioning_item(batch, H3_REFERENCE_IMAGE_SIZE_MODE_KEY, expected_ndim=0)
+                cached_max_pixels = self._one_conditioning_item(batch, H3_REFERENCE_IMAGE_MAX_PIXELS_KEY, expected_ndim=0)
+                if int(cached_size_mode) != expected_size_mode or int(cached_max_pixels) != self.reference_image_max_pixels:
+                    raise ValueError("H3 Ref2VA text cache uses a different reference sizing strategy; re-cache conditioning")
         if text_hidden.ndim != 2 or text_hidden.shape[-1] != config.text_dim:
             raise ValueError(f"H3 {hidden_key} must have shape [tokens, {config.text_dim}]")
         if text_tags.dtype != torch.long or text_tags.shape != (text_hidden.shape[0],):
@@ -1125,7 +1207,9 @@ class _NativeTrainingBackend:
         dtype: torch.dtype,
         reference_modality: Literal["av", "video", "audio"] = "av",
     ) -> tuple[tuple[MiniMaxH3ReferenceGeometry, ...], torch.Tensor, torch.Tensor]:
-        suffix = reference_key_suffix(self.reference_image_short_edge)
+        suffix = reference_key_suffix(
+            self.reference_image_short_edge, self.reference_image_size_mode, self.reference_image_max_pixels
+        )
         kinds_key = f"{H3_REFERENCE_KINDS_KEY}{suffix}"
         video_shapes_key = f"{H3_REFERENCE_VIDEO_SHAPES_KEY}{suffix}"
         audio_lengths_key = f"{H3_REFERENCE_AUDIO_LENGTHS_KEY}{suffix}"
@@ -1244,11 +1328,15 @@ class _NativeLatentEncoder:
         audio_encoder: torch.nn.Module | None,
         output_dtype: torch.dtype,
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+        reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+        reference_image_max_pixels: int = 0,
     ) -> None:
         self.video_encoder = video_encoder
         self.audio_encoder = audio_encoder
         self.output_dtype = output_dtype
         self.reference_image_short_edge = reference_image_short_edge
+        self.reference_image_size_mode = reference_image_size_mode
+        self.reference_image_max_pixels = reference_image_max_pixels
 
     @staticmethod
     def _target_asset(item: Any):
@@ -1345,7 +1433,12 @@ class _NativeLatentEncoder:
         return latents.to(self.output_dtype)
 
     def _encode_references(self, item: Any) -> dict[str, torch.Tensor]:
-        references = prepare_references(item, self.reference_image_short_edge)
+        references = prepare_references(
+            item,
+            self.reference_image_short_edge,
+            self.reference_image_size_mode,
+            self.reference_image_max_pixels,
+        )
         if not references:
             return {}
         video_rows: list[torch.Tensor] = []
@@ -1380,7 +1473,9 @@ class _NativeLatentEncoder:
                 audio_rows.append(pack_audio_latents(audio[None])[0])
 
         dtype_name = dtype_to_str(self.output_dtype)
-        suffix = reference_key_suffix(self.reference_image_short_edge)
+        suffix = reference_key_suffix(
+            self.reference_image_short_edge, self.reference_image_size_mode, self.reference_image_max_pixels
+        )
         tensors = {
             f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64": torch.tensor(kinds, dtype=torch.long),
             f"varlen_{H3_REFERENCE_VIDEO_SHAPES_KEY}{suffix}_int64": torch.tensor(video_shapes, dtype=torch.long),

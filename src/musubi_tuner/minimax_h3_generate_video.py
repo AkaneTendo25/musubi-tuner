@@ -7,7 +7,7 @@ from pathlib import Path
 
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_generator
-from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
+from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, REFERENCE_IMAGE_SIZE_MODES
 from musubi_tuner.minimax_h3.request import SUPPORTED_RATIOS, H3GenerationRequest, make_references
 from musubi_tuner.minimax_h3.weights import inspect_checkpoint
 
@@ -61,6 +61,18 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=REFERENCE_IMAGE_SHORT_EDGE,
         help=("scale every reference image so its short edge reaches this many pixels; match the value the LoRA was trained with"),
+    )
+    parser.add_argument(
+        "--reference_image_size_mode",
+        choices=REFERENCE_IMAGE_SIZE_MODES,
+        default="short_edge",
+        help="reference-image sizing strategy; target_area matches the output canvas area",
+    )
+    parser.add_argument(
+        "--reference_image_max_pixels",
+        type=int,
+        default=0,
+        help="optional target-area reference pixel cap; 0 uses the output canvas area",
     )
     parser.add_argument("--device")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -218,6 +230,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             inductor_config=tuple(args.inductor_config),
             fused_qk_norm_rope=args.h3_fused_qk_norm_rope,
             reference_image_short_edge=args.reference_image_short_edge,
+            reference_image_size_mode=args.reference_image_size_mode,
+            reference_image_max_pixels=args.reference_image_max_pixels,
             text_visual_max_pixels=args.h3_text_visual_max_pixels,
         )
         generator.generate(request)

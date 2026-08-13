@@ -152,6 +152,8 @@ class CachingConfig(BaseModel):
     h3_image_frame_count: Optional[int] = None
     h3_cache_guidance_empty: bool = False
     h3_reference_image_short_edge: int = 2048
+    h3_reference_image_size_mode: Literal["short_edge", "target_area"] = "short_edge"
+    h3_reference_image_max_pixels: int = 0
     cache_batch_size: Optional[int] = None
     gemma_root: str = ""
     gemma_safetensors: str = ""
@@ -271,6 +273,8 @@ class TrainingConfig(BaseModel):
     h3_mask_min_fraction: float = 0.25
     h3_mask_max_fraction: float = 0.75
     reference_image_short_edge: int = 2048
+    reference_image_size_mode: Literal["short_edge", "target_area"] = "short_edge"
+    reference_image_max_pixels: int = 0
     h3_guidance_distillation_scale: Optional[float] = None
     h3_guidance_loss_form: Literal["normalized", "contrastive"] = "normalized"
     h3_guidance_loss_schedule: Literal["sigma", "constant"] = "sigma"
@@ -1180,6 +1184,8 @@ class InferenceConfig(BaseModel):
     h3_reference_audio: str = ""
     h3_keyframes: str = ""
     h3_reference_image_short_edge: int = 2048
+    h3_reference_image_size_mode: Literal["short_edge", "target_area"] = "short_edge"
+    h3_reference_image_max_pixels: int = 0
     h3_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     h3_int8_convrot_base: bool = False
     h3_blocks_to_swap: int = 0

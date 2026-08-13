@@ -17,6 +17,8 @@ from musubi_tuner.minimax_h3.audio import load_audio_asset
 from musubi_tuner.minimax_h3.media import AudioProcessingSpec, MediaAsset, MediaModality, MissingMediaPolicy
 
 REFERENCE_IMAGE_SHORT_EDGE = 2048
+REFERENCE_IMAGE_SIZE_MODE = "short_edge"
+REFERENCE_IMAGE_SIZE_MODES = ("short_edge", "target_area")
 REFERENCE_VIDEO_SHORT_EDGE = 768
 REFERENCE_VIDEO_MAX_PIXELS = 768 * 1344
 REFERENCE_VIDEO_SAMPLE_FPS = 2
@@ -92,11 +94,30 @@ def validate_reference_image_short_edge(short_edge: int) -> int:
     return short_edge
 
 
+def validate_reference_image_sizing(mode: str, max_pixels: int) -> tuple[str, int]:
+    if mode not in REFERENCE_IMAGE_SIZE_MODES:
+        raise ValueError(f"unsupported H3 reference image sizing mode: {mode}")
+    if max_pixels < 0:
+        raise ValueError(f"H3 reference image max pixels must be non-negative, got {max_pixels}")
+    if mode == "short_edge" and max_pixels:
+        raise ValueError("H3 reference image max pixels applies only to target_area sizing")
+    return mode, max_pixels
+
+
 def resolve_reference_image_size(width: int, height: int, short_edge: int = REFERENCE_IMAGE_SHORT_EDGE) -> tuple[int, int]:
     if width <= 0 or height <= 0 or width > 4 * height or height > 4 * width:
         raise ValueError(f"H3 reference image must have a positive 1:4 to 4:1 aspect ratio, got {width}x{height}")
     validate_reference_image_short_edge(short_edge)
     scale = short_edge / min(width, height)
+    return _multiple_size(width * scale, height * scale)
+
+
+def resolve_reference_image_area_size(width: int, height: int, target_pixels: int) -> tuple[int, int]:
+    if width <= 0 or height <= 0 or width > 4 * height or height > 4 * width:
+        raise ValueError(f"H3 reference image must have a positive 1:4 to 4:1 aspect ratio, got {width}x{height}")
+    if target_pixels < CANVAS_MULTIPLE**2:
+        raise ValueError(f"H3 reference image target area must be at least {CANVAS_MULTIPLE**2} pixels")
+    scale = math.sqrt(target_pixels / (width * height))
     return _multiple_size(width * scale, height * scale)
 
 
@@ -160,10 +181,13 @@ def resample_reference_frames(frames: np.ndarray, source_fps: float) -> np.ndarr
     return np.repeat(frames, repeats, axis=0)
 
 
-def _prepare_image(asset: MediaAsset, short_edge: int) -> Image.Image:
+def _prepare_image(asset: MediaAsset, short_edge: int, size_mode: str, target_pixels: int) -> Image.Image:
     with Image.open(asset.path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
-        height, width = resolve_reference_image_size(*image.size, short_edge)
+        if size_mode == "target_area":
+            height, width = resolve_reference_image_area_size(*image.size, target_pixels)
+        else:
+            height, width = resolve_reference_image_size(*image.size, short_edge)
         if image.size != (width, height):
             image = image.resize((width, height), Image.Resampling.LANCZOS)
         return image.copy()
@@ -234,9 +258,24 @@ def trim_reference_frames(frame_count: int) -> int:
     return (frame_count - 5) // 17 * 17 + 5
 
 
-def prepare_references(item: Any, image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE) -> tuple[H3PreparedReference, ...]:
+def prepare_references(
+    item: Any,
+    image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    image_max_pixels: int = 0,
+) -> tuple[H3PreparedReference, ...]:
     assets = reference_assets(item)
     validate_reference_image_short_edge(image_short_edge)
+    validate_reference_image_sizing(image_size_mode, image_max_pixels)
+    target_size = getattr(item, "bucket_size", None) or getattr(item, "original_size", None)
+    if image_size_mode == "target_area":
+        if target_size is None or len(target_size) < 2:
+            raise ValueError("H3 target-area reference sizing requires the target width and height")
+        target_pixels = int(target_size[0]) * int(target_size[1])
+        if image_max_pixels:
+            target_pixels = min(target_pixels, image_max_pixels)
+    else:
+        target_pixels = 0
     target_frames = int(getattr(item, "frame_count", 0) or getattr(item, "content", np.empty((0,))).shape[0])
     if target_frames <= 0:
         targets = [asset for asset in getattr(item, "h3_media_assets", ()) if asset.role == "target"]
@@ -248,7 +287,9 @@ def prepare_references(item: Any, image_short_edge: int = REFERENCE_IMAGE_SHORT_
     for asset in assets:
         kind = _kind(asset)
         if kind is H3ReferenceKind.IMAGE:
-            prepared.append(H3PreparedReference(kind=kind, image=_prepare_image(asset, image_short_edge)))
+            prepared.append(
+                H3PreparedReference(kind=kind, image=_prepare_image(asset, image_short_edge, image_size_mode, target_pixels))
+            )
         elif kind is H3ReferenceKind.VIDEO:
             include_audio = bool(asset.metadata.get("include_audio", True))
             frames = _prepare_video(asset, target_frames)

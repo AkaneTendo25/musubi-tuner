@@ -58,7 +58,7 @@ from musubi_tuner.minimax_h3.masking import (
     video_mask_to_rows,
 )
 from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS
-from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
+from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, REFERENCE_IMAGE_SIZE_MODES
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
     contrastive_guidance_target,
@@ -800,6 +800,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if args.h3_sigma_sqrt_max_weight <= 0:
             raise ValueError("MiniMax H3 --h3_sigma_sqrt_max_weight must be positive")
+        if args.reference_image_max_pixels < 0:
+            raise ValueError("MiniMax H3 --reference_image_max_pixels must be non-negative")
+        if args.reference_image_size_mode == "short_edge" and args.reference_image_max_pixels:
+            raise ValueError("--reference_image_max_pixels applies only to --reference_image_size_mode target_area")
         if args.h3_guidance_distillation_scale is not None and float(getattr(args, "network_dropout", 0.0) or 0.0) > 0:
             raise ValueError(
                 "H3 guidance-consistent training cannot replay --network_dropout across different prompt lengths; "
@@ -1188,6 +1192,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         reference_image_short_edge = int(getattr(args, "reference_image_short_edge", REFERENCE_IMAGE_SHORT_EDGE))
         if reference_image_short_edge != REFERENCE_IMAGE_SHORT_EDGE:
             backend_kwargs["reference_image_short_edge"] = reference_image_short_edge
+        reference_image_size_mode = getattr(args, "reference_image_size_mode", "short_edge")
+        reference_image_max_pixels = int(getattr(args, "reference_image_max_pixels", 0) or 0)
+        if reference_image_size_mode != "short_edge" or reference_image_max_pixels:
+            backend_kwargs["reference_image_size_mode"] = reference_image_size_mode
+            backend_kwargs["reference_image_max_pixels"] = reference_image_max_pixels
         if base_lora_weights:
             backend_kwargs["base_lora_weights"] = base_lora_weights
             backend_kwargs["base_lora_multipliers"] = base_lora_multipliers
@@ -2042,6 +2051,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_convrot_int8_lora_fused": str(args.h3_convrot_int8_lora_fused),
             "ss_h3_adaln_rank": str(args.h3_adaln_rank if args.h3_adaln_rank is not None else "full"),
             "ss_h3_reference_image_short_edge": str(args.reference_image_short_edge),
+            "ss_h3_reference_image_size_mode": args.reference_image_size_mode,
+            "ss_h3_reference_image_max_pixels": str(args.reference_image_max_pixels),
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
@@ -2236,6 +2247,18 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "short edge in pixels the Ref2VA reference caches were built with; it selects the matching reference "
             "cache keys and must equal the value given to latent caching"
         ),
+    )
+    parser.add_argument(
+        "--reference_image_size_mode",
+        choices=REFERENCE_IMAGE_SIZE_MODES,
+        default="short_edge",
+        help="Ref2VA image sizing used by both text and latent caches",
+    )
+    parser.add_argument(
+        "--reference_image_max_pixels",
+        type=int,
+        default=0,
+        help="optional target-area reference pixel cap; 0 uses the target bucket area",
     )
     parser.add_argument(
         "--h3_mask_mode",

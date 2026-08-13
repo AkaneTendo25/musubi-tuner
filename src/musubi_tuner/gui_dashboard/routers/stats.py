@@ -185,8 +185,14 @@ def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
             # aspect ratios are not represented in project JSON. A square image
             # at the configured short edge is the least surprising estimate;
             # video references use a separate fixed 768-short-edge policy.
-            short_edge = max(_coerce_int(training.get("reference_image_short_edge", 2048), 2048), 16)
-            condition_rows += _h3_spatial_rows(short_edge, short_edge)
+            if str(training.get("reference_image_size_mode", "short_edge")) == "target_area":
+                max_pixels = max(_coerce_int(training.get("reference_image_max_pixels", 0), 0), 0)
+                target_pixels = width * height if not max_pixels else min(width * height, max_pixels)
+                side = max(round(target_pixels**0.5 / 16) * 16, 16)
+                condition_rows += _h3_spatial_rows(side, side)
+            else:
+                short_edge = max(_coerce_int(training.get("reference_image_short_edge", 2048), 2048), 16)
+                condition_rows += _h3_spatial_rows(short_edge, short_edge)
 
     keyframe_count = max(_coerce_int(training.get("h3_keyframe_random_count", 0), 0), 0)
     if not keyframe_count:

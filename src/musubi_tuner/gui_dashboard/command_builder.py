@@ -334,6 +334,10 @@ def _h3_cache_common_args(cmd: list[str], section) -> None:
         cmd += ["--batch_size", str(section.cache_batch_size)]
     if section.h3_reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(section.h3_reference_image_short_edge)]
+    if section.h3_reference_image_size_mode != "short_edge":
+        cmd += ["--reference_image_size_mode", section.h3_reference_image_size_mode]
+    if section.h3_reference_image_max_pixels:
+        cmd += ["--reference_image_max_pixels", str(section.h3_reference_image_max_pixels)]
     if section.device:
         cmd += ["--device", section.device]
     if section.skip_existing:
@@ -488,6 +492,10 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
             cmd += [flag, path]
     if s.h3_reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(s.h3_reference_image_short_edge)]
+    if s.h3_reference_image_size_mode != "short_edge":
+        cmd += ["--reference_image_size_mode", s.h3_reference_image_size_mode]
+    if s.h3_reference_image_max_pixels:
+        cmd += ["--reference_image_max_pixels", str(s.h3_reference_image_max_pixels)]
     if s.h3_dtype != "bfloat16":
         cmd += ["--dtype", s.h3_dtype]
     if s.fp8_base:
@@ -626,6 +634,10 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_keyframe_random_count", str(t.h3_keyframe_random_count)]
     if t.reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(t.reference_image_short_edge)]
+    if t.reference_image_size_mode != "short_edge":
+        cmd += ["--reference_image_size_mode", t.reference_image_size_mode]
+    if t.reference_image_max_pixels:
+        cmd += ["--reference_image_max_pixels", str(t.reference_image_max_pixels)]
     if t.h3_mask_mode != "off" or t.h3_mask_audio:
         if t.h3_mask_mode != "off":
             cmd += ["--h3_mask_mode", t.h3_mask_mode]

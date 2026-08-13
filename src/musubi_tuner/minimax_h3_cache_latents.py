@@ -14,7 +14,7 @@ from musubi_tuner.minimax_h3.backend import create_latent_encoder
 from musubi_tuner.minimax_h3.cache import normalize_batch_tensors, save_latent_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
 from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
-from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
+from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, REFERENCE_IMAGE_SIZE_MODES
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,18 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--audio_vae",
         type=Path,
         help="H3 audio VAE checkpoint or Comfy model directory (required for videos, omitted for images)",
+    )
+    parser.add_argument(
+        "--reference_image_size_mode",
+        choices=REFERENCE_IMAGE_SIZE_MODES,
+        default="short_edge",
+        help="Ref2VA image sizing: released short-edge preprocessing or target-bucket area matching",
+    )
+    parser.add_argument(
+        "--reference_image_max_pixels",
+        type=int,
+        default=0,
+        help="optional target-area reference pixel cap; 0 uses the target bucket area",
     )
     parser.add_argument(
         "--reference_image_short_edge",
@@ -75,6 +87,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         device=str(device),
         dtype=args.vae_dtype or "float32",
         reference_image_short_edge=args.reference_image_short_edge,
+        reference_image_size_mode=args.reference_image_size_mode,
+        reference_image_max_pixels=args.reference_image_max_pixels,
     )
 
     def encode(batch: list[ItemInfo]) -> None:

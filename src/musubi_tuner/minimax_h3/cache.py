@@ -10,7 +10,12 @@ from musubi_tuner.dataset.cache_io import save_latent_cache_common, save_text_en
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.architecture import AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS, TEXT_DIM, VIDEO_LATENT_CHANNELS
 from musubi_tuner.minimax_h3.media import MediaModality
-from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, validate_reference_image_short_edge
+from musubi_tuner.minimax_h3.references import (
+    REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_IMAGE_SIZE_MODE,
+    validate_reference_image_short_edge,
+    validate_reference_image_sizing,
+)
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
 H3_AUDIO_LATENTS_KEY = "latents_audio"
@@ -22,6 +27,8 @@ H3_EMPTY_TEXT_HIDDEN_KEY = "mmh3_empty_hidden_states"
 H3_EMPTY_TEXT_TOKEN_TAGS_KEY = "mmh3_empty_token_tags"
 H3_CONDITIONING_TASK_KEY = "mmh3_conditioning_task"
 H3_REFERENCE_IMAGE_SHORT_EDGE_KEY = "mmh3_reference_image_short_edge"
+H3_REFERENCE_IMAGE_SIZE_MODE_KEY = "mmh3_reference_image_size_mode"
+H3_REFERENCE_IMAGE_MAX_PIXELS_KEY = "mmh3_reference_image_max_pixels"
 H3_CONDITIONING_TASK_IDS = {"t2va": 0, "i2va": 1, "fl2va": 2, "ref2va": 3, "ref2va_omni": 4, "l2va": 5}
 H3_KEYFRAME_VIDEO_ROWS_KEY = "mmh3_keyframe_video_rows"
 H3_REFERENCE_KINDS_KEY = "mmh3_reference_kinds"
@@ -40,9 +47,16 @@ def reference_variant_key(key: str, modality: str) -> str:
     return f"{key}_reference_{modality}"
 
 
-def reference_key_suffix(image_short_edge: int) -> str:
+def reference_key_suffix(
+    image_short_edge: int,
+    image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    image_max_pixels: int = 0,
+) -> str:
     """Name reference caches whose pixels were scaled to a non-released short edge."""
     validate_reference_image_short_edge(image_short_edge)
+    validate_reference_image_sizing(image_size_mode, image_max_pixels)
+    if image_size_mode == "target_area":
+        return "_ta" if image_max_pixels == 0 else f"_ta{image_max_pixels}"
     return "" if image_short_edge == REFERENCE_IMAGE_SHORT_EDGE else f"_se{image_short_edge}"
 
 
@@ -197,6 +211,19 @@ def save_text_encoder_output_cache_minimax_h3(
         if reference_size.dtype != torch.long or reference_size.ndim != 0:
             raise ValueError(f"H3 {H3_REFERENCE_IMAGE_SHORT_EDGE_KEY} must be a scalar int64 value")
         validate_reference_image_short_edge(int(reference_size))
+    size_mode_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_IMAGE_SIZE_MODE_KEY]
+    max_pixels_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_IMAGE_MAX_PIXELS_KEY]
+    if bool(size_mode_matches) != bool(max_pixels_matches):
+        raise ValueError("H3 reference sizing cache identity must contain both mode and max-pixel tensors")
+    if size_mode_matches:
+        if len(size_mode_matches) != 1 or len(max_pixels_matches) != 1:
+            raise ValueError("H3 conditioning cache must contain at most one reference sizing identity")
+        size_mode, max_pixels = size_mode_matches[0], max_pixels_matches[0]
+        if size_mode.dtype != torch.long or size_mode.ndim != 0 or int(size_mode) not in (0, 1):
+            raise ValueError(f"H3 {H3_REFERENCE_IMAGE_SIZE_MODE_KEY} must be scalar int64 0 or 1")
+        if max_pixels.dtype != torch.long or max_pixels.ndim != 0 or int(max_pixels) < 0:
+            raise ValueError(f"H3 {H3_REFERENCE_IMAGE_MAX_PIXELS_KEY} must be a non-negative scalar int64")
+        validate_reference_image_sizing("short_edge" if int(size_mode) == 0 else "target_area", int(max_pixels))
     reference_contract_matches = [
         tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_TEMPORAL_CONTRACT_KEY
     ]

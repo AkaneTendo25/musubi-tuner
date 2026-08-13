@@ -73,6 +73,7 @@ from musubi_tuner.minimax_h3.references import (
     reference_modality_variant,
     resample_reference_frames,
     resolve_reference_image_size,
+    resolve_reference_image_area_size,
     resolve_reference_video_size,
     trim_reference_frames,
     validate_reference_image_short_edge,
@@ -999,6 +1000,28 @@ def test_reference_image_short_edge_scales_and_names_the_cache():
     assert resolve_reference_image_size(48, 80, 768) == (1280, 768)
     assert resolve_reference_image_size(96, 96, CANVAS_MULTIPLE) == (CANVAS_MULTIPLE, CANVAS_MULTIPLE)
     assert reference_key_suffix(768) == "_se768"
+
+
+def test_reference_image_target_area_preserves_aspect_and_names_cache_variant():
+    assert resolve_reference_image_area_size(512, 512, 512 * 512) == (512, 512)
+    assert resolve_reference_image_area_size(1024, 512, 512 * 512) == (352, 736)
+    assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, "target_area", 0) == "_ta"
+    assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, "target_area", 262144) == "_ta262144"
+
+
+def test_prepare_reference_target_area_uses_bucket_area_and_optional_cap(tmp_path):
+    path = tmp_path / "reference.png"
+    Image.new("RGB", (1024, 512)).save(path)
+    item = SimpleNamespace(
+        h3_media_assets=(MediaAsset(path, MediaModality.IMAGE, "reference"),),
+        frame_count=5,
+        original_size=(1280, 720),
+        bucket_size=(768, 512),
+    )
+    (bucket_sized,) = h3_references.prepare_references(item, image_size_mode="target_area")
+    (capped,) = h3_references.prepare_references(item, image_size_mode="target_area", image_max_pixels=262144)
+    assert bucket_sized.image.size == (896, 448)
+    assert capped.image.size == (736, 352)
 
 
 @pytest.mark.parametrize("short_edge", (0, -1, -768, CANVAS_MULTIPLE - 1))

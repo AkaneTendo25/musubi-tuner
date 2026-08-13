@@ -18,6 +18,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
+    H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
+    H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
@@ -34,6 +36,7 @@ from musubi_tuner.minimax_h3.component_loader import resolve_nvfp4_awq_text_enco
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_IMAGE_SIZE_MODE,
     H3PreparedReference,
     H3ReferenceKind,
     prepare_references,
@@ -242,6 +245,8 @@ class MiniMaxH3ConditioningEncoder:
         task: Literal["t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"],
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
         text_visual_max_pixels: int = 0,
+        reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+        reference_image_max_pixels: int = 0,
     ) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -250,6 +255,8 @@ class MiniMaxH3ConditioningEncoder:
         self.task = task
         self.reference_image_short_edge = reference_image_short_edge
         self.text_visual_max_pixels = text_visual_max_pixels
+        self.reference_image_size_mode = reference_image_size_mode
+        self.reference_image_max_pixels = reference_image_max_pixels
         # Even T2VA enumerates decoded video crops so its cache filename shares
         # the same crop identity as FL2VA and the corresponding latent cache.
         self.conditioning_requires_content = True
@@ -467,7 +474,14 @@ class MiniMaxH3ConditioningEncoder:
         results = []
         for item in batch:
             references = (
-                prepare_references(item, self.reference_image_short_edge) if self.task in ("ref2va", "ref2va_omni") else None
+                prepare_references(
+                    item,
+                    self.reference_image_short_edge,
+                    self.reference_image_size_mode,
+                    self.reference_image_max_pixels,
+                )
+                if self.task in ("ref2va", "ref2va_omni")
+                else None
             )
             if self.task == "ref2va" and not references:
                 raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
@@ -495,6 +509,10 @@ class MiniMaxH3ConditioningEncoder:
                         tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = empty_tags
             if self.task in ("ref2va", "ref2va_omni"):
                 tensors[H3_REFERENCE_IMAGE_SHORT_EDGE_KEY] = torch.tensor(self.reference_image_short_edge, dtype=torch.long)
+                tensors[H3_REFERENCE_IMAGE_SIZE_MODE_KEY] = torch.tensor(
+                    0 if self.reference_image_size_mode == "short_edge" else 1, dtype=torch.long
+                )
+                tensors[H3_REFERENCE_IMAGE_MAX_PIXELS_KEY] = torch.tensor(self.reference_image_max_pixels, dtype=torch.long)
                 if references and any(reference.kind is H3ReferenceKind.VIDEO for reference in references):
                     tensors[H3_REFERENCE_TEMPORAL_CONTRACT_KEY] = torch.tensor(
                         H3_REFERENCE_TEMPORAL_CONTRACT_VERSION, dtype=torch.long

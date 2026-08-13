@@ -5,7 +5,12 @@ from typing import Any, Literal, Protocol
 
 import torch
 
-from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, validate_reference_image_short_edge
+from musubi_tuner.minimax_h3.references import (
+    REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_IMAGE_SIZE_MODE,
+    validate_reference_image_short_edge,
+    validate_reference_image_sizing,
+)
 from musubi_tuner.minimax_h3.request import H3GenerationRequest
 from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
 
@@ -67,6 +72,13 @@ def _reference_short_edge_kwargs(reference_image_short_edge: int) -> dict[str, i
     return {"reference_image_short_edge": reference_image_short_edge}
 
 
+def _reference_sizing_kwargs(mode: str, max_pixels: int) -> dict[str, Any]:
+    validate_reference_image_sizing(mode, max_pixels)
+    if mode == REFERENCE_IMAGE_SIZE_MODE and max_pixels == 0:
+        return {}
+    return {"reference_image_size_mode": mode, "reference_image_max_pixels": max_pixels}
+
+
 def create_latent_encoder(
     *,
     video_vae: Path,
@@ -74,6 +86,8 @@ def create_latent_encoder(
     device: str | None,
     dtype: str,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
 ) -> H3LatentEncoder:
     """Load the video VAE and, for video datasets, the audio VAE used by latent caching."""
     _validate_dtype(dtype)
@@ -86,6 +100,7 @@ def create_latent_encoder(
         device=device,
         dtype=dtype,
         **_reference_short_edge_kwargs(reference_image_short_edge),
+        **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
     )
 
 
@@ -100,6 +115,8 @@ def create_conditioning_encoder(
     blocks_to_stream: int = 0,
     nvfp4_scaled_mm: bool = False,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
     text_visual_max_pixels: int = 0,
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
@@ -118,6 +135,7 @@ def create_conditioning_encoder(
         **({} if not nvfp4_scaled_mm else {"nvfp4_scaled_mm": True}),
         **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
         **_reference_short_edge_kwargs(reference_image_short_edge),
+        **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
     )
 
 
@@ -158,6 +176,8 @@ def create_generator(
     inductor_config: tuple[str, ...] = (),
     fused_qk_norm_rope: bool = False,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
     text_visual_max_pixels: int = 0,
 ) -> H3Generator:
     """Load only the inference variant and components required by the request."""
@@ -202,6 +222,7 @@ def create_generator(
         fused_qk_norm_rope=fused_qk_norm_rope,
         **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
         **_reference_short_edge_kwargs(reference_image_short_edge),
+        **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
     )
 
 
@@ -228,6 +249,8 @@ def create_training_backend(
     base_lora_weights: list[dict[str, torch.Tensor]] | None = None,
     base_lora_multipliers: list[float] | None = None,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
+    reference_image_max_pixels: int = 0,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -271,4 +294,5 @@ def create_training_backend(
             else {"base_lora_weights": base_lora_weights, "base_lora_multipliers": base_lora_multipliers}
         ),
         **_reference_short_edge_kwargs(reference_image_short_edge),
+        **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
     )
