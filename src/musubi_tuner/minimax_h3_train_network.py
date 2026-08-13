@@ -1418,31 +1418,33 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         item_metrics: list[dict[str, float]] = []
         crepa_alignments: list[float] = []
         for index in range(batch_size):
-            item_loss, metrics = self._process_single_batch(
-                args,
-                accelerator,
-                transformer,
-                network,
-                self._slice_batch_item(batch, index, batch_size),
-                latents[index : index + 1],
-                noise[index : index + 1],
-                noise_scheduler,
-                dit_dtype,
-                network_dtype,
-                vae,
-                global_step,
-                preservation_active_override=preservation_active,
-                crepa_update_similarity_threshold=False,
-            )
-            if "crepa/alignment" in metrics:
-                crepa_alignments.append(metrics["crepa/alignment"])
+            # DDP decides whether to synchronize while its forward hooks run,
+            # so no_sync must cover both the forward and matching backward.
             sync_context = (
                 accelerator.no_sync(network if network is not None else transformer)
                 if index + 1 < batch_size and getattr(accelerator, "num_processes", 1) > 1
                 else nullcontext()
             )
             with sync_context:
+                item_loss, metrics = self._process_single_batch(
+                    args,
+                    accelerator,
+                    transformer,
+                    network,
+                    self._slice_batch_item(batch, index, batch_size),
+                    latents[index : index + 1],
+                    noise[index : index + 1],
+                    noise_scheduler,
+                    dit_dtype,
+                    network_dtype,
+                    vae,
+                    global_step,
+                    preservation_active_override=preservation_active,
+                    crepa_update_similarity_threshold=False,
+                )
                 accelerator.backward(item_loss / batch_size)
+            if "crepa/alignment" in metrics:
+                crepa_alignments.append(metrics["crepa/alignment"])
             losses.append(item_loss.detach())
             item_metrics.append(metrics)
 

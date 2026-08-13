@@ -2095,6 +2095,63 @@ def test_h3_batch_two_matches_two_independent_items_and_averages_gradients():
         assert batched_metrics[key] == pytest.approx(expected)
 
 
+def test_h3_batch_two_wraps_forward_and_backward_in_ddp_no_sync():
+    events = []
+
+    class RecordingAccelerator(_FakeAccelerator):
+        num_processes = 2
+
+        @staticmethod
+        def no_sync(_model):
+            class Context:
+                def __enter__(self):
+                    events.append("enter")
+
+                def __exit__(self, *_args):
+                    events.append("exit")
+
+            return Context()
+
+        @staticmethod
+        def backward(loss):
+            events.append("backward")
+            loss.backward()
+
+    class RecordingBackend(_FakeBackend):
+        def predict_training(self, *args, **kwargs):
+            events.append("forward")
+            return super().predict_training(*args, **kwargs)
+
+    args = create_parser().parse_args([])
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = RecordingBackend()
+    transformer = _ScaleTransformer()
+    video = torch.zeros(2, 24, 2, 2, 2)
+    batch = {
+        H3_AUDIO_LATENTS_KEY: torch.zeros(2, 2, 32, 3),
+        H3_AUDIO_LOSS_MASK_KEY: torch.zeros(2, 3, dtype=torch.bool),
+        "timesteps": [0.5, 0.5],
+    }
+
+    trainer.process_batch(
+        args,
+        RecordingAccelerator(),
+        transformer,
+        None,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+
+    assert events == ["enter", "forward", "backward", "exit", "forward", "backward"]
+
+
 def test_h3_batch_metrics_average_only_items_that_report_each_metric():
     averaged = MiniMaxH3NetworkTrainer._average_batch_metrics([{"loss/total": 2.0, "crepa/alignment": 0.8}, {"loss/total": 4.0}])
     assert averaged == {"loss/total": 3.0, "crepa/alignment": 0.8}
