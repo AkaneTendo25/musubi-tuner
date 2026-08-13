@@ -628,6 +628,10 @@ coordinate; video and audio then receive their own shifts, and image batches use
 image shift as image training. TensorBoard receives `val/loss`, `val/loss/video`, `val/loss/audio`, and `val/loss/bin_NN`. CREPA and base-preservation are excluded, since they are regularizers rather than
 held-out reconstruction quality.
 
+When generated or reference modalities are randomized during training, validation evaluates every enabled task deterministically
+and prefixes metrics with `joint`, `v2a`, `a2v`, and, when applicable, `ref_av`, `ref_video`, or `ref_audio`. This adds validation
+forwards only for the extra tasks; ordinary fixed-task validation keeps its original cost.
+
 ### Sampling during training
 
 ```shell
