@@ -277,6 +277,11 @@
 								<PathInput fieldPath="inference.h3_audio_vae" value={s.h3_audio_vae || ''} oninput={(e) => update('h3_audio_vae', e.target.value)} showFiles placeholder="Uses Caching value when blank" tooltip="H3 audio VAE; blank reuses the Caching page value" />
 							</div>
 							<FormSelect fieldPath="inference.h3_text_encoder_quantization" value={s.h3_text_encoder_quantization || 'none'} options={[{ value: 'none', label: 'Qwen3-VL BF16' }, { value: 'int8', label: 'Qwen3-VL INT8' }, { value: 'nf4', label: 'Qwen3-VL NF4' }, { value: 'nvfp4_awq', label: 'Qwen3-VL NVFP4/AWQ' }]} onchange={(e) => update('h3_text_encoder_quantization', e.target.value)} tooltip="H3 text encoder quantization" />
+							<div class="grid grid-cols-3 gap-2">
+								<FormField label="Text blocks to stream" type="number" fieldPath="inference.h3_text_encoder_blocks_to_stream" value={s.h3_text_encoder_blocks_to_stream ?? 0} oninput={(e) => update('h3_text_encoder_blocks_to_stream', Number(e.target.value))} min={0} max={50} tooltip="Stream this many Qwen3-VL blocks from CPU during prompt encoding. 0 keeps them resident." />
+								<FormToggle label="NVFP4 scaled GEMM" fieldPath="inference.h3_nvfp4_scaled_mm" checked={s.h3_nvfp4_scaled_mm ?? false} onchange={(e) => update('h3_nvfp4_scaled_mm', e.target.checked)} disabled={(s.h3_text_encoder_quantization || 'none') !== 'nvfp4_awq'} tooltip="Use scaled NVFP4 matrix multiplication for a compatible NVFP4/AWQ text encoder." />
+								<FormField label="Visual max pixels" type="number" fieldPath="inference.h3_text_visual_max_pixels" value={s.h3_text_visual_max_pixels ?? 0} oninput={(e) => update('h3_text_visual_max_pixels', Number(e.target.value))} min={0} step={1024} tooltip="Cap pixels passed through Qwen3-VL visual conditioning. 0 uses the encoder default." />
+							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="inference.h3_duration" value={s.h3_duration ?? 5} oninput={(e) => update('h3_duration', Number(e.target.value || 5))} min={5} max={15} tooltip="Video duration in seconds (5-15)" />
 								<FormSelect fieldPath="inference.h3_ratio" value={s.h3_ratio || '16:9'} options={['adaptive', '21:9', '16:9', '4:3', '1:1', '3:4', '9:16']} onchange={(e) => update('h3_ratio', e.target.value)} tooltip="Output aspect ratio" />

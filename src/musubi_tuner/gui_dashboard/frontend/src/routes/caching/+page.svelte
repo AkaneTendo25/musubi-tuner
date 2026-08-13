@@ -570,9 +570,14 @@
 				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Cache Text Encoder</span>
 
 				{#if caching.model_type === 'minimax_h3'}
-					<FormGroup title="Qwen3-VL Quantization" collapsed={false}>
-						<div class="pt-2">
+					<FormGroup title="Qwen3-VL Loading" collapsed={false}>
+						<div class="space-y-2 pt-2">
 							<FormSelect fieldPath="caching.h3_text_encoder_quantization" value={caching.h3_text_encoder_quantization || 'none'} options={[{ value: 'none', label: 'BF16 (~52 GB peak)' }, { value: 'int8', label: 'INT8 (~28 GB peak)' }, { value: 'nf4', label: 'NF4 (~17 GB peak)' }, { value: 'nvfp4_awq', label: 'NVFP4/AWQ (~18 GB peak)' }]} onchange={(e) => updateCaching('h3_text_encoder_quantization', e.target.value)} tooltip="Peak estimates include the official 32B H3 conditioner weights and encode workspace. Cache outputs remain BF16." />
+							<div class="grid grid-cols-3 gap-2">
+								<FormField label="Blocks to stream" type="number" fieldPath="caching.h3_text_encoder_blocks_to_stream" value={caching.h3_text_encoder_blocks_to_stream ?? 0} oninput={(e) => updateCaching('h3_text_encoder_blocks_to_stream', Number(e.target.value))} min={0} max={50} tooltip="Stream this many Qwen3-VL blocks from CPU to reduce peak VRAM. 0 keeps all blocks resident." />
+								<FormToggle label="NVFP4 scaled GEMM" fieldPath="caching.h3_nvfp4_scaled_mm" checked={caching.h3_nvfp4_scaled_mm ?? false} onchange={(e) => updateCaching('h3_nvfp4_scaled_mm', e.target.checked)} disabled={caching.h3_text_encoder_quantization !== 'nvfp4_awq'} tooltip="Use scaled NVFP4 matrix multiplication for a compatible NVFP4/AWQ text encoder." />
+								<FormField label="Visual max pixels" type="number" fieldPath="caching.h3_text_visual_max_pixels" value={caching.h3_text_visual_max_pixels ?? 0} oninput={(e) => updateCaching('h3_text_visual_max_pixels', Number(e.target.value))} min={0} step={1024} tooltip="Cap pixels passed through Qwen3-VL visual conditioning. 0 uses the encoder default." />
+							</div>
 						</div>
 					</FormGroup>
 				{:else}
