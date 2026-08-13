@@ -13,6 +13,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LOSS_MASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
 )
 from musubi_tuner.minimax_h3.training import H3ModelPrediction, shift_sigma
 from musubi_tuner.minimax_h3.validation import (
@@ -459,6 +460,82 @@ def test_h3_validation_observed_modality_is_conditioning_not_a_metric(observed, 
     metrics = accelerator.logged[-1][0]
     assert f"val/loss/{observed}" not in metrics
     assert f"val/loss/{remaining}" in metrics
+
+
+def test_h3_validation_random_observed_mode_reports_every_training_direction_deterministically():
+    args = _validation_args(mode="ref2va_omni")
+    args.h3_observed_modality = "random"
+    batch = {
+        "latents": torch.zeros(1, 24, 2, 2, 2),
+        H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
+        "timesteps": None,
+    }
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ValidationBackend()
+    trainer._validation_dataloader = [(0, batch)]
+    accelerator = _ValidationAccelerator()
+
+    trainer.validate(accelerator, args, _ValidationTransformer(), None, 1, None)
+
+    metrics = accelerator.logged[-1][0]
+    assert "val/joint/loss" in metrics
+    assert "val/joint/loss/video" in metrics
+    assert "val/joint/loss/audio" in metrics
+    assert "val/v2a/loss" in metrics
+    assert "val/v2a/loss/video" not in metrics
+    assert "val/v2a/loss/audio" in metrics
+    assert "val/a2v/loss" in metrics
+    assert "val/a2v/loss/video" in metrics
+    assert "val/a2v/loss/audio" not in metrics
+    first = dict(metrics)
+
+    trainer.validate(accelerator, args, _ValidationTransformer(), None, 2, None)
+
+    assert accelerator.logged[-1][0] == first
+    assert trainer.backend.calls == [("prompt", False)] * 12
+
+
+def test_h3_validation_random_observed_mode_accepts_mixed_single_modality_items():
+    args = _validation_args(mode="ref2va_omni")
+    args.h3_observed_modality = "random"
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ValidationBackend()
+    trainer._validation_dataloader = [
+        (0, {"latents": torch.zeros(1, 24, 2, 2, 2), "timesteps": None}),
+        (1, {H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3), "timesteps": None}),
+    ]
+    accelerator = _ValidationAccelerator()
+
+    trainer.validate(accelerator, args, _ValidationTransformer(), None, 1, None)
+
+    metrics = accelerator.logged[-1][0]
+    assert "val/loss/video" in metrics
+    assert "val/loss/audio" in metrics
+    assert not any(key.startswith("val/v2a/") or key.startswith("val/a2v/") for key in metrics)
+
+
+def test_h3_validation_reports_each_enabled_reference_modality_variant():
+    args = _validation_args(mode="ref2va_omni")
+    batch = {
+        "latents": torch.zeros(1, 24, 2, 2, 2),
+        H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
+        H3_REFERENCE_MODALITY_PROBABILITIES_KEY: torch.tensor([[0.5, 0.5, 0.0]]),
+        "timesteps": None,
+    }
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ValidationBackend()
+    trainer._validation_dataloader = [(0, batch)]
+    accelerator = _ValidationAccelerator()
+
+    trainer.validate(accelerator, args, _ValidationTransformer(), None, 1, None)
+
+    metrics = accelerator.logged[-1][0]
+    assert "val/joint/ref_av/loss" in metrics
+    assert "val/joint/ref_video/loss" in metrics
+    assert not any("ref_audio" in key for key in metrics)
 
 
 def test_h3_validation_fully_masked_batch_produces_no_nan_or_fake_zero_metric():
