@@ -1517,6 +1517,22 @@ def test_joint_loss_masks_audio_padding_and_supports_both_balances():
     torch.testing.assert_close(skipped.loss, torch.tensor(0.0))
 
 
+def test_joint_loss_mask_preserves_reference_gradient():
+    prediction = torch.tensor([[[[[1.0, 2.0, 3.0, 4.0]]]]], requires_grad=True)
+    target = torch.zeros_like(prediction)
+    mask = torch.tensor([[[[True, False, True, False]]]])
+
+    result = joint_prediction_loss(
+        H3ModelPrediction(video=prediction, audio=None),
+        H3ModelPrediction(video=target, audio=None),
+        video_mask=mask,
+    )
+    result.loss.backward()
+
+    torch.testing.assert_close(result.loss, torch.tensor(5.0))
+    torch.testing.assert_close(prediction.grad, torch.tensor([[[[[1.0, 0.0, 3.0, 0.0]]]]]))
+
+
 def test_joint_loss_applies_modality_specific_sample_weights():
     video = torch.zeros(2, 1, 1, 1, 1)
     audio = torch.zeros(2, 1, 1, 1)

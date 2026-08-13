@@ -288,7 +288,10 @@ def _modality_loss(
         if sample_weight.shape != (target.shape[0],):
             raise ValueError("H3 sample weighting must contain one value per batch item")
         squared = squared * _expand_batch_values(sample_weight.float(), squared)
-    total = squared.sum() if valid is None else squared.masked_select(valid).sum()
+    # Avoid ``masked_select`` here: its data-dependent output allocates a second
+    # dense loss buffer and introduces an additional synchronization point.
+    # Multiplication preserves the exact masked sum while keeping a static shape.
+    total = squared.sum() if valid is None else (squared * valid).sum()
     return total / elements, total, elements
 
 
