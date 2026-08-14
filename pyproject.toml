@@ -23,7 +23,10 @@ dependencies = [
     "toml==0.10.2",
     "tqdm==4.67.1",
     "torch-optimi==0.3.3",
-    "transformers>=5.8.0,<5.15",
+    # LTX-2.5 packed Gemma runtime initialization depends on the heterogeneous
+    # per-layer config support added in transformers 5.15. Keep the upper bound
+    # on the next minor until that runtime path has been qualified there.
+    "transformers>=5.15,<5.16",
     "imageio-ffmpeg>=0.6,<0.7",
     "voluptuous==0.15.2",
     # Wan2.1
