@@ -38,6 +38,14 @@ class ReusableActivationOffloader:
     def begin_forward(self) -> None:
         if any(not handle.consumed for handle in self._handles.values()):
             raise RuntimeError("reusable H3 activation buffers cannot start another grad-enabled forward before backward")
+        # A saved tensor can be unpacked more than once, and autograd is not
+        # required to consume equal ordinals in strict block-reverse order.
+        # Retire any speculative copy left behind before its pinned source is
+        # reused by the next forward.
+        for handle in self._handles.values():
+            if handle.gpu is not None:
+                assert handle.h2d_event is not None
+                handle.h2d_event.synchronize()
         self._handles.clear()
 
     @contextmanager
@@ -73,30 +81,25 @@ class ReusableActivationOffloader:
                 return value
             result = self._materialize(value)
             value.consumed = True
-            next_handle = self._handles.get((value.block_index - 1, value.ordinal))
-            if next_handle is not None and next_handle.gpu is None:
-                self._schedule(next_handle)
+            self._prefetch_previous(value)
             return result
 
         with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
             yield
 
+    def _prefetch_previous(self, handle: _OffloadedTensor) -> None:
+        next_handle = self._handles.get((handle.block_index - 1, handle.ordinal))
+        if next_handle is not None and not next_handle.consumed and next_handle.gpu is None:
+            self._schedule(next_handle)
+
     def _schedule(self, handle: _OffloadedTensor) -> None:
-        # Allocate on the consuming compute stream. The private stream only
-        # performs the copy; after its event is waited below, allocation, use,
-        # free, and allocator reuse are all ordered on the compute stream.
-        # Allocating here inside ``self._stream`` without record_stream() lets
-        # the caching allocator recycle the block while recomputation is still
-        # reading it on the compute stream.
-        handle.gpu = torch.empty(handle.cpu.shape, dtype=handle.cpu.dtype, device=handle.device)
         with torch.cuda.stream(self._stream):
             self._stream.wait_event(handle.d2h_event)
+            # Allocation and the asynchronous writer share one stream.  The
+            # consumer is registered in _materialize after it waits for this
+            # copy, giving the caching allocator both sides of the hand-off.
+            handle.gpu = torch.empty(handle.cpu.shape, dtype=handle.cpu.dtype, device=handle.device)
             handle.gpu.copy_(handle.cpu, non_blocking=True)
-            # The tensor is allocated from the compute stream's pool but the
-            # asynchronous writer is this private stream. Record that use so
-            # the caching allocator cannot recycle the storage before the
-            # prefetched copy has completed.
-            handle.gpu.record_stream(self._stream)
             handle.h2d_event = torch.cuda.Event()
             handle.h2d_event.record(self._stream)
 
@@ -104,8 +107,10 @@ class ReusableActivationOffloader:
         if handle.gpu is None:
             self._schedule(handle)
         assert handle.gpu is not None and handle.h2d_event is not None
-        torch.cuda.current_stream(handle.device).wait_event(handle.h2d_event)
+        compute_stream = torch.cuda.current_stream(handle.device)
+        compute_stream.wait_event(handle.h2d_event)
         result = handle.gpu
+        result.record_stream(compute_stream)
         handle.gpu = None
         handle.h2d_event = None
         return result
