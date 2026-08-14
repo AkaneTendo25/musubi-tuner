@@ -3201,6 +3201,20 @@ def test_h3_rejects_timestep_buckets_when_sampler_ignores_them():
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--h3_swiglu_chunk_rows", "-1"], "must be non-negative"),
+        (["--h3_swiglu_chunk_rows", "2048", "--compile"], "not supported with --compile"),
+    ],
+)
+def test_h3_rejects_invalid_swiglu_chunking(extra, message):
+    args = create_parser().parse_args(["--sdpa", *extra])
+
+    with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
 def test_common_sampler_can_skip_discarded_noisy_tensor_without_changing_timesteps():
     trainer = MiniMaxH3NetworkTrainer()
     args = create_parser().parse_args(["--sdpa"])

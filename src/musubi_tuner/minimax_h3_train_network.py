@@ -639,6 +639,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
         )
         args.dit_dtype = model_utils.dtype_to_str(self.dit_dtype)
+        if args.h3_swiglu_chunk_rows < 0:
+            raise ValueError("--h3_swiglu_chunk_rows must be non-negative")
+        if args.h3_swiglu_chunk_rows and args.compile:
+            raise ValueError("--h3_swiglu_chunk_rows is not supported with --compile")
         if args.h3_lora_token_refiner:
             if not args.network_module.endswith("lora_minimax_h3"):
                 raise ValueError("--h3_lora_token_refiner requires --network_module networks.lora_minimax_h3")
@@ -899,6 +903,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             transformer.enable_fused_swiglu()
             if args.compile:
                 logger.warning("--h3_fused_swiglu falls back to the Inductor path inside compiled blocks")
+        set_swiglu_chunk_rows = getattr(transformer, "set_swiglu_chunk_rows", None)
+        if callable(set_swiglu_chunk_rows):
+            set_swiglu_chunk_rows(getattr(args, "h3_swiglu_chunk_rows", 0))
         if args.h3_convrot_int8_lora_fused:
             from musubi_tuner.modules.convrot_int8_utils import enable_convrot_int8_lora_fusion
 
@@ -2037,6 +2044,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
             "ss_h3_fused_indexed_adaln": str(args.h3_fused_indexed_adaln),
             "ss_h3_fused_swiglu": str(args.h3_fused_swiglu),
+            "ss_h3_swiglu_chunk_rows": str(args.h3_swiglu_chunk_rows),
             "ss_h3_int8_attention": args.h3_int8_attention,
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
@@ -2434,6 +2442,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "use an opt-in Triton kernel for the SwiGLU activation in H3 main and token-refiner feed-forward layers; "
             "unsupported cases fall back safely and compiled blocks use their Inductor path"
+        ),
+    )
+    parser.add_argument(
+        "--h3_swiglu_chunk_rows",
+        type=int,
+        default=0,
+        help=(
+            "split each H3 main-block feed-forward operation into at most this many sequence rows to reduce peak VRAM; "
+            "0 disables chunking"
         ),
     )
     parser.add_argument(

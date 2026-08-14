@@ -283,6 +283,26 @@ def test_h3_fused_swiglu_cpu_falls_back_exactly():
     assert feed_forwards and all(module.fused_swiglu for module in feed_forwards)
 
 
+def test_h3_chunked_swiglu_matches_unchunked_forward_and_gradient():
+    torch.manual_seed(16)
+    reference = h3_model.MiniMaxH3FeedForward(hidden_size=16, ffn_dim=24)
+    chunked = h3_model.MiniMaxH3FeedForward(hidden_size=16, ffn_dim=24)
+    chunked.load_state_dict(reference.state_dict())
+    chunked.chunk_rows = 5
+    expected_input = torch.randn(2, 13, 16, requires_grad=True)
+    actual_input = expected_input.detach().clone().requires_grad_(True)
+
+    expected = reference(expected_input)
+    actual = chunked(actual_input)
+    torch.autograd.backward(expected, torch.ones_like(expected))
+    torch.autograd.backward(actual, torch.ones_like(actual))
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+    torch.testing.assert_close(chunked.fc1.weight.grad, reference.fc1.weight.grad)
+    torch.testing.assert_close(chunked.fc2.weight.grad, reference.fc2.weight.grad)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
 def test_h3_fused_swiglu_forward_and_gradient_match_eager():
     from musubi_tuner.minimax_h3.triton_kernels import try_fused_swiglu

@@ -279,8 +279,9 @@ class MiniMaxH3FeedForward(nn.Module):
         self.fc1 = nn.Linear(hidden_size, 2 * ffn_dim, bias=False)
         self.fc2 = nn.Linear(ffn_dim, hidden_size, bias=False)
         self.fused_swiglu = False
+        self.chunk_rows = 0
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_rows(self, hidden_states: torch.Tensor) -> torch.Tensor:
         projected = self.fc1(hidden_states)
         if self.fused_swiglu:
             fused = try_fused_swiglu(projected)
@@ -288,6 +289,14 @@ class MiniMaxH3FeedForward(nn.Module):
                 return self.fc2(fused)
         gate, value = projected.chunk(2, dim=-1)
         return self.fc2(F.silu(gate) * value)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.chunk_rows <= 0 or hidden_states.shape[-2] <= self.chunk_rows:
+            return self._forward_rows(hidden_states)
+        return torch.cat(
+            tuple(self._forward_rows(chunk) for chunk in hidden_states.split(self.chunk_rows, dim=-2)),
+            dim=-2,
+        )
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
@@ -514,6 +523,12 @@ class MiniMaxH3Transformer(nn.Module):
         for module in self.modules():
             if isinstance(module, MiniMaxH3FeedForward):
                 module.fused_swiglu = True
+
+    def set_swiglu_chunk_rows(self, rows: int) -> None:
+        if rows < 0:
+            raise ValueError("H3 SwiGLU chunk rows must be non-negative")
+        for block in self.blocks:
+            block.mlp.chunk_rows = rows
 
     def set_int8_attention_mode(self, mode: str) -> None:
         if mode not in {"off", "aux", "train"}:
