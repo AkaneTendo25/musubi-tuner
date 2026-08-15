@@ -147,6 +147,28 @@ def test_h3_reference_conditioning_increases_estimated_packed_work():
     assert _calculate_vram_stats(conditioned).activations_gb > _calculate_vram_stats(plain).activations_gb
 
 
+def test_h3_video_reference_uses_configured_sizing_in_estimator():
+    small = _config(
+        h3_base_preservation_loss_weight=0.0,
+        reference_video_short_edge=384,
+        reference_video_max_pixels=384 * 672,
+    )
+    large = _config(
+        h3_base_preservation_loss_weight=0.0,
+        reference_video_short_edge=768,
+        reference_video_max_pixels=768 * 1344,
+    )
+    for config in (small, large):
+        config["caching"] = {"h3_task": "ref2va"}
+        config["dataset"]["datasets"][0].update(
+            control_video_directory="references/video",
+            reference_frames=39,
+        )
+
+    assert _estimate_training_step_time_sec(large) > _estimate_training_step_time_sec(small)
+    assert _calculate_vram_stats(large).activations_gb > _calculate_vram_stats(small).activations_gb
+
+
 def test_h3_image_reference_uses_its_own_short_edge_in_estimator():
     small = _config(h3_base_preservation_loss_weight=0.0, reference_image_short_edge=384)
     large = _config(h3_base_preservation_loss_weight=0.0, reference_image_short_edge=2048)

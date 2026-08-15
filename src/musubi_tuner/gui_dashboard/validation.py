@@ -1085,6 +1085,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.reference_video_short_edge < 16 or t.reference_video_max_pixels < 256:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.reference_video_short_edge",
+                    "H3 reference video sizing must use a short edge of at least 16 and at least 256 pixels.",
+                    label="H3 Reference Video Size",
+                    page="training",
+                )
+            )
         if t.h3_attn_auto_dispatch and not t.sdpa:
             errors.append(
                 _make_issue(

@@ -338,6 +338,10 @@ def _h3_cache_common_args(cmd: list[str], section) -> None:
         cmd += ["--reference_image_size_mode", section.h3_reference_image_size_mode]
     if section.h3_reference_image_max_pixels:
         cmd += ["--reference_image_max_pixels", str(section.h3_reference_image_max_pixels)]
+    if section.h3_reference_video_short_edge != 768:
+        cmd += ["--reference_video_short_edge", str(section.h3_reference_video_short_edge)]
+    if section.h3_reference_video_max_pixels != 768 * 1344:
+        cmd += ["--reference_video_max_pixels", str(section.h3_reference_video_max_pixels)]
     if section.device:
         cmd += ["--device", section.device]
     if section.skip_existing:
@@ -496,6 +500,10 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--reference_image_size_mode", s.h3_reference_image_size_mode]
     if s.h3_reference_image_max_pixels:
         cmd += ["--reference_image_max_pixels", str(s.h3_reference_image_max_pixels)]
+    if s.h3_reference_video_short_edge != 768:
+        cmd += ["--reference_video_short_edge", str(s.h3_reference_video_short_edge)]
+    if s.h3_reference_video_max_pixels != 768 * 1344:
+        cmd += ["--reference_video_max_pixels", str(s.h3_reference_video_max_pixels)]
     if s.h3_dtype != "bfloat16":
         cmd += ["--dtype", s.h3_dtype]
     if s.fp8_base:
@@ -638,6 +646,10 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--reference_image_size_mode", t.reference_image_size_mode]
     if t.reference_image_max_pixels:
         cmd += ["--reference_image_max_pixels", str(t.reference_image_max_pixels)]
+    if t.reference_video_short_edge != 768:
+        cmd += ["--reference_video_short_edge", str(t.reference_video_short_edge)]
+    if t.reference_video_max_pixels != 768 * 1344:
+        cmd += ["--reference_video_max_pixels", str(t.reference_video_max_pixels)]
     if t.h3_mask_mode != "off" or t.h3_mask_audio:
         if t.h3_mask_mode != "off":
             cmd += ["--h3_mask_mode", t.h3_mask_mode]

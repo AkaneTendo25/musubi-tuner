@@ -671,6 +671,8 @@ python minimax_h3_generate_video.py \
 | `--reference_image_size_mode` | Ref2VA image sizing: `short_edge` keeps the released behavior; `target_area` preserves aspect ratio and uses approximately the target output area. |
 | `--reference_image_short_edge` | Reference-image short edge in `short_edge` mode (default 2048). |
 | `--reference_image_max_pixels` | Optional pixel-area cap in `target_area` mode; `0` uses the target output area. |
+| `--reference_video_short_edge` | Reference-video short edge (default 768). Lower values reduce Ref2VA reference rows, speed cost, and VRAM. Use the same value for latent caching, text caching, training, and inference. |
+| `--reference_video_max_pixels` | Maximum pixels per reference-video frame after aspect-preserving resize (default 768×1344). Use the same value at every stage. |
 | `--lora_weight` / `--lora_multiplier` | Attach saved adapters. |
 | `--steps` | Sigma grid points including terminal zero, so `20` runs 19 evaluations. |
 

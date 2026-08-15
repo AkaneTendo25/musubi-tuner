@@ -118,16 +118,15 @@ def _h3_spatial_rows(width: int, height: int) -> int:
     return max(height // 32, 1) * max(width // 32, 1)
 
 
-def _h3_reference_video_rows_per_frame(width: int, height: int) -> int:
-    """Mirror the fixed 768-short-edge, 768x1344-cap reference-video policy."""
+def _h3_reference_video_rows_per_frame(width: int, height: int, short_edge: int = 768, maximum_pixels: int = 768 * 1344) -> int:
+    """Mirror the configured H3 reference-video resize policy."""
     width = max(width, 1)
     height = max(height, 1)
     ratio = width / height
     if ratio >= 1:
-        resolved_width, resolved_height = 768.0 * ratio, 768.0
+        resolved_width, resolved_height = float(short_edge) * ratio, float(short_edge)
     else:
-        resolved_width, resolved_height = 768.0, 768.0 / ratio
-    maximum_pixels = 768 * 1344
+        resolved_width, resolved_height = float(short_edge), float(short_edge) / ratio
     if resolved_width * resolved_height > maximum_pixels:
         scale = (maximum_pixels / (resolved_width * resolved_height)) ** 0.5
         resolved_width *= scale
@@ -177,14 +176,18 @@ def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
             reference_frames = max(_coerce_int(dataset.get("reference_frames", frames), frames), 1)
             ref_video_latents, ref_audio_latents = _h3_temporal_latents(reference_frames)
             if modality in {"av", "video"}:
-                condition_rows += ref_video_latents * _h3_reference_video_rows_per_frame(width, height)
+                reference_short_edge = max(_coerce_int(training.get("reference_video_short_edge", 768), 768), 16)
+                reference_max_pixels = max(_coerce_int(training.get("reference_video_max_pixels", 768 * 1344), 768 * 1344), 256)
+                condition_rows += ref_video_latents * _h3_reference_video_rows_per_frame(
+                    width, height, reference_short_edge, reference_max_pixels
+                )
             if modality in {"av", "audio"} and dataset.get("control_audio_directory"):
                 condition_rows += 2 * ref_audio_latents
         elif dataset.get("control_directory"):
             # Directory controls may contain images or videos and their source
             # aspect ratios are not represented in project JSON. A square image
             # at the configured short edge is the least surprising estimate;
-            # video references use a separate fixed 768-short-edge policy.
+            # Video references use their separately configured sizing policy.
             if str(training.get("reference_image_size_mode", "short_edge")) == "target_area":
                 max_pixels = max(_coerce_int(training.get("reference_image_max_pixels", 0), 0), 0)
                 target_pixels = width * height if not max_pixels else min(width * height, max_pixels)

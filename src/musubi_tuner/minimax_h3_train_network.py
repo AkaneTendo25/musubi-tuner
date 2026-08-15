@@ -58,7 +58,12 @@ from musubi_tuner.minimax_h3.masking import (
     video_mask_to_rows,
 )
 from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS
-from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, REFERENCE_IMAGE_SIZE_MODES
+from musubi_tuner.minimax_h3.references import (
+    REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_IMAGE_SIZE_MODES,
+    REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SHORT_EDGE,
+)
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
     contrastive_guidance_target,
@@ -806,6 +811,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 --h3_sigma_sqrt_max_weight must be positive")
         if args.reference_image_max_pixels < 0:
             raise ValueError("MiniMax H3 --reference_image_max_pixels must be non-negative")
+        if args.reference_video_short_edge < 16:
+            raise ValueError("MiniMax H3 --reference_video_short_edge must be at least 16")
+        if args.reference_video_max_pixels < 256:
+            raise ValueError("MiniMax H3 --reference_video_max_pixels must be at least 256")
         if args.h3_max_caption_tokens < 0:
             raise ValueError("MiniMax H3 --h3_max_caption_tokens must be non-negative")
         if args.reference_image_size_mode == "short_edge" and args.reference_image_max_pixels:
@@ -1206,6 +1215,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if reference_image_size_mode != "short_edge" or reference_image_max_pixels:
             backend_kwargs["reference_image_size_mode"] = reference_image_size_mode
             backend_kwargs["reference_image_max_pixels"] = reference_image_max_pixels
+        reference_video_short_edge = int(getattr(args, "reference_video_short_edge", REFERENCE_VIDEO_SHORT_EDGE))
+        reference_video_max_pixels = int(getattr(args, "reference_video_max_pixels", REFERENCE_VIDEO_MAX_PIXELS))
+        if reference_video_short_edge != REFERENCE_VIDEO_SHORT_EDGE or reference_video_max_pixels != REFERENCE_VIDEO_MAX_PIXELS:
+            backend_kwargs["reference_video_short_edge"] = reference_video_short_edge
+            backend_kwargs["reference_video_max_pixels"] = reference_video_max_pixels
         text_visual_max_pixels = int(getattr(args, "h3_text_visual_max_pixels", 0) or 0)
         if text_visual_max_pixels:
             backend_kwargs["text_visual_max_pixels"] = text_visual_max_pixels
@@ -2069,6 +2083,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_reference_image_short_edge": str(args.reference_image_short_edge),
             "ss_h3_reference_image_size_mode": args.reference_image_size_mode,
             "ss_h3_reference_image_max_pixels": str(args.reference_image_max_pixels),
+            "ss_h3_reference_video_short_edge": str(args.reference_video_short_edge),
+            "ss_h3_reference_video_max_pixels": str(args.reference_video_max_pixels),
             "ss_h3_text_visual_max_pixels": str(args.h3_text_visual_max_pixels),
             "ss_h3_max_caption_tokens": str(args.h3_max_caption_tokens),
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
@@ -2277,6 +2293,18 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="optional target-area reference pixel cap; 0 uses the target bucket area",
+    )
+    parser.add_argument(
+        "--reference_video_short_edge",
+        type=int,
+        default=REFERENCE_VIDEO_SHORT_EDGE,
+        help="Ref2VA reference-video short edge used by both text and latent caches (default 768)",
+    )
+    parser.add_argument(
+        "--reference_video_max_pixels",
+        type=int,
+        default=REFERENCE_VIDEO_MAX_PIXELS,
+        help="maximum pixels per Ref2VA reference-video frame (default 768x1344)",
     )
     parser.add_argument(
         "--h3_mask_mode",

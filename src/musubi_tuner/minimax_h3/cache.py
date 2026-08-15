@@ -13,8 +13,11 @@ from musubi_tuner.minimax_h3.media import MediaModality
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
+    REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SHORT_EDGE,
     validate_reference_image_short_edge,
     validate_reference_image_sizing,
+    validate_reference_video_sizing,
 )
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
@@ -31,6 +34,8 @@ H3_CONDITIONING_TASK_KEY = "mmh3_conditioning_task"
 H3_REFERENCE_IMAGE_SHORT_EDGE_KEY = "mmh3_reference_image_short_edge"
 H3_REFERENCE_IMAGE_SIZE_MODE_KEY = "mmh3_reference_image_size_mode"
 H3_REFERENCE_IMAGE_MAX_PIXELS_KEY = "mmh3_reference_image_max_pixels"
+H3_REFERENCE_VIDEO_SHORT_EDGE_KEY = "mmh3_reference_video_short_edge"
+H3_REFERENCE_VIDEO_MAX_PIXELS_KEY = "mmh3_reference_video_max_pixels"
 H3_CONDITIONING_TASK_IDS = {"t2va": 0, "i2va": 1, "fl2va": 2, "ref2va": 3, "ref2va_omni": 4, "l2va": 5}
 H3_KEYFRAME_VIDEO_ROWS_KEY = "mmh3_keyframe_video_rows"
 H3_REFERENCE_KINDS_KEY = "mmh3_reference_kinds"
@@ -53,13 +58,23 @@ def reference_key_suffix(
     image_short_edge: int,
     image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     image_max_pixels: int = 0,
+    video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
 ) -> str:
     """Name reference caches whose pixels were scaled to a non-released short edge."""
     validate_reference_image_short_edge(image_short_edge)
     validate_reference_image_sizing(image_size_mode, image_max_pixels)
+    validate_reference_video_sizing(video_short_edge, video_max_pixels)
+    video_suffix = ""
+    if video_short_edge != REFERENCE_VIDEO_SHORT_EDGE:
+        video_suffix += f"_vse{video_short_edge}"
+    if video_max_pixels != REFERENCE_VIDEO_MAX_PIXELS:
+        video_suffix += f"_vmp{video_max_pixels}"
     if image_size_mode == "target_area":
-        return "_ta" if image_max_pixels == 0 else f"_ta{image_max_pixels}"
-    return "" if image_short_edge == REFERENCE_IMAGE_SHORT_EDGE else f"_se{image_short_edge}"
+        image_suffix = "_ta" if image_max_pixels == 0 else f"_ta{image_max_pixels}"
+    else:
+        image_suffix = "" if image_short_edge == REFERENCE_IMAGE_SHORT_EDGE else f"_se{image_short_edge}"
+    return image_suffix + video_suffix
 
 
 def normalize_batch_tensors(results: Any, expected: int, operation: str) -> tuple[dict[str, torch.Tensor], ...]:
@@ -240,6 +255,23 @@ def save_text_encoder_output_cache_minimax_h3(
         if max_pixels.dtype != torch.long or max_pixels.ndim != 0 or int(max_pixels) < 0:
             raise ValueError(f"H3 {H3_REFERENCE_IMAGE_MAX_PIXELS_KEY} must be a non-negative scalar int64")
         validate_reference_image_sizing("short_edge" if int(size_mode) == 0 else "target_area", int(max_pixels))
+    video_short_edge_matches = [
+        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_VIDEO_SHORT_EDGE_KEY
+    ]
+    video_max_pixels_matches = [
+        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_VIDEO_MAX_PIXELS_KEY
+    ]
+    if bool(video_short_edge_matches) != bool(video_max_pixels_matches):
+        raise ValueError("H3 reference-video sizing cache identity must contain both short-edge and max-pixel tensors")
+    if video_short_edge_matches:
+        if len(video_short_edge_matches) != 1 or len(video_max_pixels_matches) != 1:
+            raise ValueError("H3 conditioning cache must contain at most one reference-video sizing identity")
+        video_short_edge, video_max_pixels = video_short_edge_matches[0], video_max_pixels_matches[0]
+        if video_short_edge.dtype != torch.long or video_short_edge.ndim != 0:
+            raise ValueError(f"H3 {H3_REFERENCE_VIDEO_SHORT_EDGE_KEY} must be a scalar int64 value")
+        if video_max_pixels.dtype != torch.long or video_max_pixels.ndim != 0:
+            raise ValueError(f"H3 {H3_REFERENCE_VIDEO_MAX_PIXELS_KEY} must be a scalar int64 value")
+        validate_reference_video_sizing(int(video_short_edge), int(video_max_pixels))
     reference_contract_matches = [
         tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_TEMPORAL_CONTRACT_KEY
     ]

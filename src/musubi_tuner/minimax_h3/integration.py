@@ -32,6 +32,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
+    H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
+    H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_REFERENCE_KINDS_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
@@ -77,6 +79,8 @@ from musubi_tuner.minimax_h3.packing import (
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
+    REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SHORT_EDGE,
     H3ReferenceKind,
     prepare_references,
     trim_reference_frames,
@@ -96,6 +100,8 @@ def _validate_inference_lora_metadata(
     reference_image_short_edge: int,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     text_visual_max_pixels: int = 0,
 ) -> None:
     with safe_open(path, framework="pt") as handle:
@@ -111,6 +117,11 @@ def _validate_inference_lora_metadata(
         saved_text_visual_max_pixels = int(metadata.get("ss_h3_text_visual_max_pixels", "0"))
     except ValueError as exc:
         raise ValueError(f"invalid ss_h3_text_visual_max_pixels metadata in {path}") from exc
+    try:
+        saved_video_short_edge = int(metadata.get("ss_h3_reference_video_short_edge", str(REFERENCE_VIDEO_SHORT_EDGE)))
+        saved_video_max_pixels = int(metadata.get("ss_h3_reference_video_max_pixels", str(REFERENCE_VIDEO_MAX_PIXELS)))
+    except ValueError as exc:
+        raise ValueError(f"invalid H3 reference-video sizing metadata in {path}") from exc
     if trained_mode in {"ref2va", "ref2va_omni"} and saved_reference_size is not None:
         try:
             saved_reference_size_int = int(saved_reference_size)
@@ -132,6 +143,12 @@ def _validate_inference_lora_metadata(
                 f"H3 LoRA {path} was trained with h3_text_visual_max_pixels={saved_text_visual_max_pixels}, "
                 f"but inference requested {text_visual_max_pixels}"
             )
+        if saved_video_short_edge != reference_video_short_edge or saved_video_max_pixels != reference_video_max_pixels:
+            raise ValueError(
+                f"H3 LoRA {path} was trained with reference-video sizing "
+                f"{saved_video_short_edge}/{saved_video_max_pixels}, but inference requested "
+                f"{reference_video_short_edge}/{reference_video_max_pixels}"
+            )
     adaln_rank = metadata.get("ss_h3_adaln_rank")
     if adaln_rank not in {None, "full"}:
         logger.warning(
@@ -151,6 +168,8 @@ def create_latent_encoder(
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
 ):
     """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
@@ -164,6 +183,8 @@ def create_latent_encoder(
         reference_image_short_edge,
         reference_image_size_mode,
         reference_image_max_pixels,
+        reference_video_short_edge,
+        reference_video_max_pixels,
     )
 
 
@@ -180,6 +201,8 @@ def create_conditioning_encoder(
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     text_visual_max_pixels: int = 0,
     max_caption_tokens: int = 0,
 ):
@@ -205,6 +228,8 @@ def create_conditioning_encoder(
         text_visual_max_pixels=text_visual_max_pixels,
         reference_image_size_mode=reference_image_size_mode,
         reference_image_max_pixels=reference_image_max_pixels,
+        reference_video_short_edge=reference_video_short_edge,
+        reference_video_max_pixels=reference_video_max_pixels,
         max_caption_tokens=max_caption_tokens,
     )
 
@@ -248,6 +273,8 @@ def create_generator(
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     text_visual_max_pixels: int = 0,
 ):
     """Create a sequentially-loaded native FL2VA or Ref2VA generator."""
@@ -290,6 +317,8 @@ def create_generator(
         reference_image_short_edge=reference_image_short_edge,
         reference_image_size_mode=reference_image_size_mode,
         reference_image_max_pixels=reference_image_max_pixels,
+        reference_video_short_edge=reference_video_short_edge,
+        reference_video_max_pixels=reference_video_max_pixels,
         text_visual_max_pixels=text_visual_max_pixels,
     )
 
@@ -333,6 +362,8 @@ class _NativeGenerator:
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
         reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
         reference_image_max_pixels: int = 0,
+        reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+        reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
         text_visual_max_pixels: int = 0,
     ) -> None:
         self.model = Path(model)
@@ -373,6 +404,8 @@ class _NativeGenerator:
         self.reference_image_short_edge = reference_image_short_edge
         self.reference_image_size_mode = reference_image_size_mode
         self.reference_image_max_pixels = reference_image_max_pixels
+        self.reference_video_short_edge = reference_video_short_edge
+        self.reference_video_max_pixels = reference_video_max_pixels
         self.text_visual_max_pixels = text_visual_max_pixels
         self.mode = mode
 
@@ -422,6 +455,8 @@ class _NativeGenerator:
             reference_image_short_edge=self.reference_image_short_edge,
             reference_image_size_mode=self.reference_image_size_mode,
             reference_image_max_pixels=self.reference_image_max_pixels,
+            reference_video_short_edge=self.reference_video_short_edge,
+            reference_video_max_pixels=self.reference_video_max_pixels,
             text_visual_max_pixels=self.text_visual_max_pixels,
         )
         try:
@@ -480,6 +515,8 @@ class _NativeGenerator:
             self.reference_image_short_edge,
             self.reference_image_size_mode,
             self.reference_image_max_pixels,
+            self.reference_video_short_edge,
+            self.reference_video_max_pixels,
         )
 
     def _load_transformer(self):
@@ -523,6 +560,8 @@ class _NativeGenerator:
                 self.reference_image_short_edge,
                 self.reference_image_size_mode,
                 self.reference_image_max_pixels,
+                self.reference_video_short_edge,
+                self.reference_video_max_pixels,
                 self.text_visual_max_pixels,
             )
             weights = load_file(weights_path)
@@ -722,6 +761,8 @@ def create_training_backend(
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     text_visual_max_pixels: int = 0,
     max_caption_tokens: int = 0,
 ):
@@ -758,6 +799,8 @@ def create_training_backend(
         reference_image_short_edge,
         reference_image_size_mode,
         reference_image_max_pixels,
+        reference_video_short_edge,
+        reference_video_max_pixels,
         text_visual_max_pixels,
         max_caption_tokens,
     )
@@ -771,6 +814,8 @@ class _NativeTrainingBackend:
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
         reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
         reference_image_max_pixels: int = 0,
+        reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+        reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
         text_visual_max_pixels: int = 0,
         max_caption_tokens: int = 0,
     ):
@@ -780,6 +825,8 @@ class _NativeTrainingBackend:
         self.max_caption_tokens = max_caption_tokens
         self.reference_image_size_mode = reference_image_size_mode
         self.reference_image_max_pixels = reference_image_max_pixels
+        self.reference_video_short_edge = reference_video_short_edge
+        self.reference_video_max_pixels = reference_video_max_pixels
         self.text_visual_max_pixels = text_visual_max_pixels
 
     def get_training_transformer(self) -> torch.nn.Module:
@@ -890,6 +937,22 @@ class _NativeTrainingBackend:
                 cached_max_pixels = self._one_conditioning_item(batch, H3_REFERENCE_IMAGE_MAX_PIXELS_KEY, expected_ndim=0)
                 if int(cached_size_mode) != expected_size_mode or int(cached_max_pixels) != self.reference_image_max_pixels:
                     raise ValueError("H3 Ref2VA text cache uses a different reference sizing strategy; re-cache conditioning")
+            cached_video_short_edge = batch.get(H3_REFERENCE_VIDEO_SHORT_EDGE_KEY)
+            cached_video_max_pixels = batch.get(H3_REFERENCE_VIDEO_MAX_PIXELS_KEY)
+            if cached_video_short_edge is None or cached_video_max_pixels is None:
+                if (
+                    self.reference_video_short_edge != REFERENCE_VIDEO_SHORT_EDGE
+                    or self.reference_video_max_pixels != REFERENCE_VIDEO_MAX_PIXELS
+                ):
+                    raise ValueError("legacy H3 Ref2VA text cache lacks reference-video sizing identity; re-cache conditioning")
+            else:
+                cached_video_short_edge = self._one_conditioning_item(batch, H3_REFERENCE_VIDEO_SHORT_EDGE_KEY, expected_ndim=0)
+                cached_video_max_pixels = self._one_conditioning_item(batch, H3_REFERENCE_VIDEO_MAX_PIXELS_KEY, expected_ndim=0)
+                if (
+                    int(cached_video_short_edge) != self.reference_video_short_edge
+                    or int(cached_video_max_pixels) != self.reference_video_max_pixels
+                ):
+                    raise ValueError("H3 Ref2VA text cache uses different reference-video sizing; re-cache conditioning")
         if text_hidden.ndim != 2 or text_hidden.shape[-1] != config.text_dim:
             raise ValueError(f"H3 {hidden_key} must have shape [tokens, {config.text_dim}]")
         if text_tags.dtype != torch.long or text_tags.shape != (text_hidden.shape[0],):
@@ -1254,7 +1317,11 @@ class _NativeTrainingBackend:
         reference_modality: Literal["av", "video", "audio"] = "av",
     ) -> tuple[tuple[MiniMaxH3ReferenceGeometry, ...], torch.Tensor, torch.Tensor]:
         suffix = reference_key_suffix(
-            self.reference_image_short_edge, self.reference_image_size_mode, self.reference_image_max_pixels
+            self.reference_image_short_edge,
+            self.reference_image_size_mode,
+            self.reference_image_max_pixels,
+            self.reference_video_short_edge,
+            self.reference_video_max_pixels,
         )
         kinds_key = f"{H3_REFERENCE_KINDS_KEY}{suffix}"
         video_shapes_key = f"{H3_REFERENCE_VIDEO_SHAPES_KEY}{suffix}"
@@ -1376,6 +1443,8 @@ class _NativeLatentEncoder:
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
         reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
         reference_image_max_pixels: int = 0,
+        reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+        reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     ) -> None:
         self.video_encoder = video_encoder
         self.audio_encoder = audio_encoder
@@ -1383,6 +1452,8 @@ class _NativeLatentEncoder:
         self.reference_image_short_edge = reference_image_short_edge
         self.reference_image_size_mode = reference_image_size_mode
         self.reference_image_max_pixels = reference_image_max_pixels
+        self.reference_video_short_edge = reference_video_short_edge
+        self.reference_video_max_pixels = reference_video_max_pixels
 
     @staticmethod
     def _target_asset(item: Any):
@@ -1484,6 +1555,8 @@ class _NativeLatentEncoder:
             self.reference_image_short_edge,
             self.reference_image_size_mode,
             self.reference_image_max_pixels,
+            self.reference_video_short_edge,
+            self.reference_video_max_pixels,
         )
         if not references:
             return {}
@@ -1520,7 +1593,11 @@ class _NativeLatentEncoder:
 
         dtype_name = dtype_to_str(self.output_dtype)
         suffix = reference_key_suffix(
-            self.reference_image_short_edge, self.reference_image_size_mode, self.reference_image_max_pixels
+            self.reference_image_short_edge,
+            self.reference_image_size_mode,
+            self.reference_image_max_pixels,
+            self.reference_video_short_edge,
+            self.reference_video_max_pixels,
         )
         tensors = {
             f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64": torch.tensor(kinds, dtype=torch.long),

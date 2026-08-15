@@ -110,9 +110,18 @@ def test_dashboard_reference_size_defaults_match_h3_cli(tmp_path: Path) -> None:
     assert config.caching.h3_reference_image_short_edge == 2048
     assert config.training.reference_image_short_edge == 2048
     assert config.inference.h3_reference_image_short_edge == 2048
+    assert config.caching.h3_reference_video_short_edge == 768
+    assert config.training.reference_video_short_edge == 768
+    assert config.inference.h3_reference_video_short_edge == 768
+    assert config.caching.h3_reference_video_max_pixels == 768 * 1344
+    assert config.training.reference_video_max_pixels == 768 * 1344
+    assert config.inference.h3_reference_video_max_pixels == 768 * 1344
     assert "--reference_image_short_edge" not in build_cache_latents_cmd(config)
     assert "--reference_image_short_edge" not in build_cache_text_cmd(config)
     assert "--reference_image_short_edge" not in build_training_cmd(config)
+    assert "--reference_video_short_edge" not in build_cache_latents_cmd(config)
+    assert "--reference_video_short_edge" not in build_cache_text_cmd(config)
+    assert "--reference_video_short_edge" not in build_training_cmd(config)
 
 
 def test_dashboard_rejects_custom_keyframes_with_endpoint_task_cache(tmp_path: Path) -> None:
@@ -562,6 +571,8 @@ def test_h3_native_conditioning_controls_round_trip_through_real_parser(tmp_path
     training.h3_extension_route = "per_row_sigma"
     training.h3_keyframe_anchors = "first,last"
     training.reference_image_short_edge = 448
+    training.reference_video_short_edge = 384
+    training.reference_video_max_pixels = 384 * 672
     training.h3_mask_mode = "segment"
     training.h3_mask_audio = True
     training.h3_mask_min_fraction = 0.2
@@ -587,6 +598,8 @@ def test_h3_native_conditioning_controls_round_trip_through_real_parser(tmp_path
     assert parsed.h3_extension_route == "per_row_sigma"
     assert parsed.h3_keyframe_anchors == "first,last"
     assert parsed.reference_image_short_edge == 448
+    assert parsed.reference_video_short_edge == 384
+    assert parsed.reference_video_max_pixels == 384 * 672
     assert parsed.h3_mask_mode == "segment"
     assert parsed.h3_mask_audio is True
     assert parsed.h3_mask_min_fraction == 0.2
@@ -605,6 +618,8 @@ def test_h3_inference_controls_round_trip_through_real_parser(tmp_path: Path) ->
     inference.height = 720
     inference.h3_keyframes = "4:one.png 8:two.png"
     inference.h3_reference_image_short_edge = 448
+    inference.h3_reference_video_short_edge = 384
+    inference.h3_reference_video_max_pixels = 384 * 672
     inference.h3_dtype = "float16"
     inference.h3_int8_convrot_base = True
     inference.h3_blocks_to_swap = 12
@@ -628,6 +643,8 @@ def test_h3_inference_controls_round_trip_through_real_parser(tmp_path: Path) ->
     assert (parsed.width, parsed.height) == (1280, 720)
     assert parsed.keyframe == ["4:one.png", "8:two.png"]
     assert parsed.reference_image_short_edge == 448
+    assert parsed.reference_video_short_edge == 384
+    assert parsed.reference_video_max_pixels == 384 * 672
     assert parsed.dtype == "float16"
     assert parsed.int8_convrot_base is True
     assert parsed.blocks_to_swap == 12

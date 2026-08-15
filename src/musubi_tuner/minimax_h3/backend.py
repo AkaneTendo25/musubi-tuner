@@ -8,8 +8,11 @@ import torch
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
+    REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SHORT_EDGE,
     validate_reference_image_short_edge,
     validate_reference_image_sizing,
+    validate_reference_video_sizing,
 )
 from musubi_tuner.minimax_h3.request import H3GenerationRequest
 from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
@@ -79,6 +82,13 @@ def _reference_sizing_kwargs(mode: str, max_pixels: int) -> dict[str, Any]:
     return {"reference_image_size_mode": mode, "reference_image_max_pixels": max_pixels}
 
 
+def _reference_video_sizing_kwargs(short_edge: int, max_pixels: int) -> dict[str, int]:
+    validate_reference_video_sizing(short_edge, max_pixels)
+    if short_edge == REFERENCE_VIDEO_SHORT_EDGE and max_pixels == REFERENCE_VIDEO_MAX_PIXELS:
+        return {}
+    return {"reference_video_short_edge": short_edge, "reference_video_max_pixels": max_pixels}
+
+
 def create_latent_encoder(
     *,
     video_vae: Path,
@@ -88,6 +98,8 @@ def create_latent_encoder(
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
 ) -> H3LatentEncoder:
     """Load the video VAE and, for video datasets, the audio VAE used by latent caching."""
     _validate_dtype(dtype)
@@ -101,6 +113,7 @@ def create_latent_encoder(
         dtype=dtype,
         **_reference_short_edge_kwargs(reference_image_short_edge),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
+        **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
     )
 
 
@@ -118,6 +131,8 @@ def create_conditioning_encoder(
     max_caption_tokens: int = 0,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     text_visual_max_pixels: int = 0,
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
@@ -138,6 +153,7 @@ def create_conditioning_encoder(
         **_reference_short_edge_kwargs(reference_image_short_edge),
         **({} if max_caption_tokens == 0 else {"max_caption_tokens": max_caption_tokens}),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
+        **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
     )
 
 
@@ -180,6 +196,8 @@ def create_generator(
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     text_visual_max_pixels: int = 0,
 ) -> H3Generator:
     """Load only the inference variant and components required by the request."""
@@ -225,6 +243,7 @@ def create_generator(
         **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
         **_reference_short_edge_kwargs(reference_image_short_edge),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
+        **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
     )
 
 
@@ -254,6 +273,8 @@ def create_training_backend(
     max_caption_tokens: int = 0,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     text_visual_max_pixels: int = 0,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
@@ -300,5 +321,6 @@ def create_training_backend(
         **_reference_short_edge_kwargs(reference_image_short_edge),
         **({} if max_caption_tokens == 0 else {"max_caption_tokens": max_caption_tokens}),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
+        **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
         **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
     )

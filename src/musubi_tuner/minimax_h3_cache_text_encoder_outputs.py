@@ -15,12 +15,19 @@ from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_conditioning_encoder
 from musubi_tuner.minimax_h3.cache import (
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
+    H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     normalize_batch_tensors,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
 from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
-from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, REFERENCE_IMAGE_SIZE_MODES
+from musubi_tuner.minimax_h3.references import (
+    REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_IMAGE_SIZE_MODES,
+    REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SHORT_EDGE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +100,18 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--reference_video_short_edge",
+        type=int,
+        default=REFERENCE_VIDEO_SHORT_EDGE,
+        help="Ref2VA reference-video short edge; keep it equal to latent caching",
+    )
+    parser.add_argument(
+        "--reference_video_max_pixels",
+        type=int,
+        default=REFERENCE_VIDEO_MAX_PIXELS,
+        help="maximum pixels per Ref2VA reference-video frame; keep it equal to latent caching",
+    )
+    parser.add_argument(
         "--cache_guidance_empty",
         action="store_true",
         help="also cache H3's empty-text conditioning for the optional guidance-consistent training objective",
@@ -136,6 +155,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_caption_tokens=args.h3_max_caption_tokens,
         reference_image_size_mode=args.reference_image_size_mode,
         reference_image_max_pixels=args.reference_image_max_pixels,
+        reference_video_short_edge=args.reference_video_short_edge,
+        reference_video_max_pixels=args.reference_video_max_pixels,
         text_visual_max_pixels=args.h3_text_visual_max_pixels,
     )
 
@@ -154,6 +175,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         try:
             with safe_open(path, framework="pt", device="cpu") as handle:
                 keys = set(handle.keys())
+                if args.task in {"ref2va", "ref2va_omni"}:
+                    if H3_REFERENCE_VIDEO_SHORT_EDGE_KEY not in keys or H3_REFERENCE_VIDEO_MAX_PIXELS_KEY not in keys:
+                        return False
+                    if int(handle.get_tensor(H3_REFERENCE_VIDEO_SHORT_EDGE_KEY)) != args.reference_video_short_edge:
+                        return False
+                    if int(handle.get_tensor(H3_REFERENCE_VIDEO_MAX_PIXELS_KEY)) != args.reference_video_max_pixels:
+                        return False
                 if H3_MAX_CAPTION_TOKENS_KEY not in keys:
                     return args.h3_max_caption_tokens == 0
                 return int(handle.get_tensor(H3_MAX_CAPTION_TOKENS_KEY)) == args.h3_max_caption_tokens

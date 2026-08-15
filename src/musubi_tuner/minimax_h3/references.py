@@ -121,17 +121,31 @@ def resolve_reference_image_area_size(width: int, height: int, target_pixels: in
     return _multiple_size(width * scale, height * scale)
 
 
-def resolve_reference_video_size(width: int, height: int) -> tuple[int, int]:
+def validate_reference_video_sizing(short_edge: int, max_pixels: int) -> tuple[int, int]:
+    if short_edge < CANVAS_MULTIPLE:
+        raise ValueError(f"H3 reference video short edge must be at least {CANVAS_MULTIPLE}, got {short_edge}")
+    if max_pixels < CANVAS_MULTIPLE**2:
+        raise ValueError(f"H3 reference video max pixels must be at least {CANVAS_MULTIPLE**2}, got {max_pixels}")
+    return short_edge, max_pixels
+
+
+def resolve_reference_video_size(
+    width: int,
+    height: int,
+    short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+) -> tuple[int, int]:
     if width <= 0 or height <= 0 or width > 4 * height or height > 4 * width:
         raise ValueError(f"H3 reference video must have a positive 1:4 to 4:1 aspect ratio, got {width}x{height}")
+    validate_reference_video_sizing(short_edge, max_pixels)
     ratio = width / height
     if ratio >= 1:
-        resolved_width, resolved_height = REFERENCE_VIDEO_SHORT_EDGE * ratio, float(REFERENCE_VIDEO_SHORT_EDGE)
+        resolved_width, resolved_height = short_edge * ratio, float(short_edge)
     else:
-        resolved_width, resolved_height = float(REFERENCE_VIDEO_SHORT_EDGE), REFERENCE_VIDEO_SHORT_EDGE / ratio
+        resolved_width, resolved_height = float(short_edge), short_edge / ratio
     area = resolved_width * resolved_height
-    if area > REFERENCE_VIDEO_MAX_PIXELS:
-        scale = math.sqrt(REFERENCE_VIDEO_MAX_PIXELS / area)
+    if area > max_pixels:
+        scale = math.sqrt(max_pixels / area)
         resolved_width *= scale
         resolved_height *= scale
     return _multiple_size(resolved_width, resolved_height)
@@ -193,11 +207,11 @@ def _prepare_image(asset: MediaAsset, short_edge: int, size_mode: str, target_pi
         return image.copy()
 
 
-def _prepare_video(asset: MediaAsset, target_frames: int) -> np.ndarray:
+def _prepare_video(asset: MediaAsset, target_frames: int, short_edge: int, max_pixels: int) -> np.ndarray:
     frames, source_fps = _decode_video(asset.path, target_frames)
     frames = resample_reference_frames(frames, source_fps)
     frames = frames[:target_frames]
-    height, width = resolve_reference_video_size(frames.shape[2], frames.shape[1])
+    height, width = resolve_reference_video_size(frames.shape[2], frames.shape[1], short_edge, max_pixels)
     if frames.shape[1:3] != (height, width):
         frames = np.stack(
             [np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS)) for frame in frames]
@@ -263,10 +277,13 @@ def prepare_references(
     image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     image_max_pixels: int = 0,
+    video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
+    video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
 ) -> tuple[H3PreparedReference, ...]:
     assets = reference_assets(item)
     validate_reference_image_short_edge(image_short_edge)
     validate_reference_image_sizing(image_size_mode, image_max_pixels)
+    validate_reference_video_sizing(video_short_edge, video_max_pixels)
     target_size = getattr(item, "bucket_size", None) or getattr(item, "original_size", None)
     if image_size_mode == "target_area":
         if target_size is None or len(target_size) < 2:
@@ -292,7 +309,7 @@ def prepare_references(
             )
         elif kind is H3ReferenceKind.VIDEO:
             include_audio = bool(asset.metadata.get("include_audio", True))
-            frames = _prepare_video(asset, target_frames)
+            frames = _prepare_video(asset, target_frames, video_short_edge, video_max_pixels)
             # The H3 video VAE accepts only 17n+5 frames (or a single image).
             # Trim once at the shared preparation boundary so Qwen's visual
             # presentation, the DiT latent rows, and any paired soundtrack all

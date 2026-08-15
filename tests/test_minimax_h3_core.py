@@ -66,6 +66,8 @@ from musubi_tuner.minimax_h3.packing import (
 )
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SHORT_EDGE,
     H3PreparedReference,
     H3ReferenceKind,
     _reference_audio_asset,
@@ -124,6 +126,29 @@ def test_h3_inference_validates_ref2va_qwen_visual_cap_metadata(tmp_path):
     with pytest.raises(ValueError, match="trained with h3_text_visual_max_pixels=65536"):
         h3_integration._validate_inference_lora_metadata(path, "ref2va", 2048)
     h3_integration._validate_inference_lora_metadata(path, "ref2va", 2048, text_visual_max_pixels=65_536)
+
+
+def test_h3_inference_validates_ref2va_video_sizing_metadata(tmp_path):
+    path = tmp_path / "adapter.safetensors"
+    save_file(
+        {"probe": torch.zeros(1)},
+        path,
+        metadata={
+            "ss_h3_training_mode": "ref2va",
+            "ss_h3_reference_video_short_edge": "384",
+            "ss_h3_reference_video_max_pixels": str(384 * 672),
+        },
+    )
+
+    with pytest.raises(ValueError, match="reference-video sizing"):
+        h3_integration._validate_inference_lora_metadata(path, "ref2va", 2048)
+    h3_integration._validate_inference_lora_metadata(
+        path,
+        "ref2va",
+        2048,
+        reference_video_short_edge=384,
+        reference_video_max_pixels=384 * 672,
+    )
 
 
 def test_public_request_modes_and_limits(tmp_path):
@@ -975,7 +1000,7 @@ def test_h3_reference_video_is_trimmed_before_text_and_paired_audio_preparation(
     monkeypatch.setattr(
         h3_references,
         "_prepare_video",
-        lambda _asset, _target_frames: np.zeros((30, 8, 8, 3), dtype=np.uint8),
+        lambda _asset, _target_frames, _short_edge, _max_pixels: np.zeros((30, 8, 8, 3), dtype=np.uint8),
     )
 
     def prepare_audio(_asset, target_frames):
@@ -1017,6 +1042,20 @@ def test_reference_image_short_edge_scales_and_names_the_cache():
     assert resolve_reference_image_size(48, 80, 768) == (1280, 768)
     assert resolve_reference_image_size(96, 96, CANVAS_MULTIPLE) == (CANVAS_MULTIPLE, CANVAS_MULTIPLE)
     assert reference_key_suffix(768) == "_se768"
+
+
+def test_reference_video_sizing_is_configurable_and_names_the_cache():
+    assert resolve_reference_video_size(512, 512) == (768, 768)
+    assert resolve_reference_video_size(512, 512, 384, 384 * 672) == (384, 384)
+    assert resolve_reference_video_size(1024, 512, 384, 384 * 672) == (352, 704)
+    assert (
+        reference_key_suffix(
+            REFERENCE_IMAGE_SHORT_EDGE,
+            video_short_edge=384,
+            video_max_pixels=384 * 672,
+        )
+        == "_vse384_vmp258048"
+    )
 
 
 def test_reference_image_target_area_preserves_aspect_and_names_cache_variant():
@@ -1065,6 +1104,14 @@ def test_reference_image_short_edge_flag_is_registered_on_every_entrypoint():
         action = next(a for a in parser._actions if a.dest == "reference_image_short_edge")
         assert action.type is int
         assert action.default == REFERENCE_IMAGE_SHORT_EDGE
+
+
+def test_reference_video_sizing_flags_are_registered_on_every_entrypoint():
+    for parser in (create_cache_latents_parser(), create_cache_text_parser(), create_parser()):
+        short_edge = next(a for a in parser._actions if a.dest == "reference_video_short_edge")
+        max_pixels = next(a for a in parser._actions if a.dest == "reference_video_max_pixels")
+        assert short_edge.default == REFERENCE_VIDEO_SHORT_EDGE
+        assert max_pixels.default == REFERENCE_VIDEO_MAX_PIXELS
 
 
 def test_audio_file_decode_resample_and_mask(tmp_path):

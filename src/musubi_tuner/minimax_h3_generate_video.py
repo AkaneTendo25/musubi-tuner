@@ -7,7 +7,12 @@ from pathlib import Path
 
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_generator
-from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, REFERENCE_IMAGE_SIZE_MODES
+from musubi_tuner.minimax_h3.references import (
+    REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_IMAGE_SIZE_MODES,
+    REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SHORT_EDGE,
+)
 from musubi_tuner.minimax_h3.request import SUPPORTED_RATIOS, H3GenerationRequest, make_references
 from musubi_tuner.minimax_h3.weights import inspect_checkpoint
 
@@ -74,6 +79,8 @@ def create_parser() -> argparse.ArgumentParser:
         default=0,
         help="optional target-area reference pixel cap; 0 uses the output canvas area",
     )
+    parser.add_argument("--reference_video_short_edge", type=int, default=REFERENCE_VIDEO_SHORT_EDGE)
+    parser.add_argument("--reference_video_max_pixels", type=int, default=REFERENCE_VIDEO_MAX_PIXELS)
     parser.add_argument("--device")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--fp8_base", action="store_true", help="use weight-only scaled FP8 transformer blocks")
@@ -232,6 +239,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             reference_image_short_edge=args.reference_image_short_edge,
             reference_image_size_mode=args.reference_image_size_mode,
             reference_image_max_pixels=args.reference_image_max_pixels,
+            reference_video_short_edge=args.reference_video_short_edge,
+            reference_video_max_pixels=args.reference_video_max_pixels,
             text_visual_max_pixels=args.h3_text_visual_max_pixels,
         )
         generator.generate(request)
