@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,8 +24,10 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
+    H3_MAX_CAPTION_TOKENS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
+    H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     reference_variant_key,
 )
 from musubi_tuner.minimax_h3.comfy_quant import (
@@ -48,6 +51,37 @@ from musubi_tuner.utils.model_utils import dtype_to_str
 logger = logging.getLogger(__name__)
 
 H3TextEncoderQuantization = Literal["none", "int8", "nf4", "nvfp4_awq"]
+
+
+def _cap_image_pixels(image: Image.Image, max_pixels: int) -> Image.Image:
+    if max_pixels <= 0 or image.width * image.height <= max_pixels:
+        return image
+    scale = (max_pixels / (image.width * image.height)) ** 0.5
+    size = (max(32, int(image.width * scale) // 32 * 32), max(32, int(image.height * scale) // 32 * 32))
+    return image.resize(size, Image.Resampling.LANCZOS)
+
+
+def _cap_reference_visuals(references: tuple[H3PreparedReference, ...], max_pixels: int) -> tuple[H3PreparedReference, ...]:
+    """Create the Qwen-only visual presentation without changing VAE references."""
+    if max_pixels <= 0:
+        return references
+    capped: list[H3PreparedReference] = []
+    for reference in references:
+        if reference.kind is H3ReferenceKind.IMAGE and reference.image is not None:
+            capped.append(replace(reference, image=_cap_image_pixels(reference.image, max_pixels)))
+        elif reference.kind is H3ReferenceKind.VIDEO and reference.frames is not None:
+            height, width = reference.frames.shape[1:3]
+            if height * width <= max_pixels:
+                capped.append(reference)
+            else:
+                capped_size = _cap_image_pixels(Image.fromarray(reference.frames[0]), max_pixels).size
+                frames = np.stack(
+                    [np.asarray(Image.fromarray(frame).resize(capped_size, Image.Resampling.LANCZOS)) for frame in reference.frames]
+                )
+                capped.append(replace(reference, frames=frames))
+        else:
+            capped.append(reference)
+    return tuple(capped)
 
 
 def _text_encoder_key(source_prefix: str) -> str:
@@ -247,6 +281,7 @@ class MiniMaxH3ConditioningEncoder:
         text_visual_max_pixels: int = 0,
         reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
         reference_image_max_pixels: int = 0,
+        max_caption_tokens: int = 0,
     ) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -254,6 +289,7 @@ class MiniMaxH3ConditioningEncoder:
         self.output_dtype = output_dtype
         self.task = task
         self.reference_image_short_edge = reference_image_short_edge
+        self.max_caption_tokens = max_caption_tokens
         self.text_visual_max_pixels = text_visual_max_pixels
         self.reference_image_size_mode = reference_image_size_mode
         self.reference_image_max_pixels = reference_image_max_pixels
@@ -276,6 +312,8 @@ class MiniMaxH3ConditioningEncoder:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if images and references:
             raise ValueError("H3 conditioning accepts keyframes or Ref2VA references, not both")
+        if references:
+            references = _cap_reference_visuals(references, self.text_visual_max_pixels)
         token_ids: list[int] = []
         token_tags: list[int] = []
         pixel_values = None
@@ -361,6 +399,8 @@ class MiniMaxH3ConditioningEncoder:
                 token_tags.extend([int(MiniMaxH3TokenTag.TEXT)] * len(label_ids))
                 token_tags.extend([int(MiniMaxH3TokenTag.VIDEO)] * len(vision_ids))
         prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        if self.max_caption_tokens > 0:
+            prompt_ids = prompt_ids[: self.max_caption_tokens]
         if null_instruction:
             # The unconditional branch must drop the instruction without dropping
             # its rows. H3's media rotary clock originates at the number of text
@@ -491,6 +531,10 @@ class MiniMaxH3ConditioningEncoder:
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
                 H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
+            if self.max_caption_tokens:
+                tensors[H3_MAX_CAPTION_TOKENS_KEY] = torch.tensor(self.max_caption_tokens, dtype=torch.long)
+            if self.text_visual_max_pixels:
+                tensors[H3_TEXT_VISUAL_MAX_PIXELS_KEY] = torch.tensor(self.text_visual_max_pixels, dtype=torch.long)
             probabilities = getattr(item, "h3_reference_modality_probabilities", None)
             if probabilities is not None:
                 if references is None:

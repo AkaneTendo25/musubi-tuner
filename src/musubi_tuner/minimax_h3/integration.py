@@ -37,8 +37,10 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
+    H3_MAX_CAPTION_TOKENS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
+    H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     H3_VIDEO_GEOMETRY_KEY,
     reference_key_suffix,
     reference_variant_key,
@@ -94,6 +96,7 @@ def _validate_inference_lora_metadata(
     reference_image_short_edge: int,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    text_visual_max_pixels: int = 0,
 ) -> None:
     with safe_open(path, framework="pt") as handle:
         metadata = handle.metadata() or {}
@@ -104,6 +107,10 @@ def _validate_inference_lora_metadata(
         saved_max_pixels = int(metadata.get("ss_h3_reference_image_max_pixels", "0"))
     except ValueError as exc:
         raise ValueError(f"invalid ss_h3_reference_image_max_pixels metadata in {path}") from exc
+    try:
+        saved_text_visual_max_pixels = int(metadata.get("ss_h3_text_visual_max_pixels", "0"))
+    except ValueError as exc:
+        raise ValueError(f"invalid ss_h3_text_visual_max_pixels metadata in {path}") from exc
     if trained_mode in {"ref2va", "ref2va_omni"} and saved_reference_size is not None:
         try:
             saved_reference_size_int = int(saved_reference_size)
@@ -119,6 +126,11 @@ def _validate_inference_lora_metadata(
             raise ValueError(
                 f"H3 LoRA {path} was trained with reference sizing {saved_size_mode}/{saved_max_pixels}, "
                 f"but inference requested {reference_image_size_mode}/{reference_image_max_pixels}"
+            )
+        if saved_text_visual_max_pixels != text_visual_max_pixels:
+            raise ValueError(
+                f"H3 LoRA {path} was trained with h3_text_visual_max_pixels={saved_text_visual_max_pixels}, "
+                f"but inference requested {text_visual_max_pixels}"
             )
     adaln_rank = metadata.get("ss_h3_adaln_rank")
     if adaln_rank not in {None, "full"}:
@@ -169,6 +181,7 @@ def create_conditioning_encoder(
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
     text_visual_max_pixels: int = 0,
+    max_caption_tokens: int = 0,
 ):
     """Load the released understanding encoder and adapt its hidden-state output to Musubi."""
     from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder, load_text_conditioner
@@ -188,10 +201,11 @@ def create_conditioning_encoder(
         model,
         output_dtype,
         task,
-        reference_image_short_edge,
-        text_visual_max_pixels,
-        reference_image_size_mode,
-        reference_image_max_pixels,
+        reference_image_short_edge=reference_image_short_edge,
+        text_visual_max_pixels=text_visual_max_pixels,
+        reference_image_size_mode=reference_image_size_mode,
+        reference_image_max_pixels=reference_image_max_pixels,
+        max_caption_tokens=max_caption_tokens,
     )
 
 
@@ -509,6 +523,7 @@ class _NativeGenerator:
                 self.reference_image_short_edge,
                 self.reference_image_size_mode,
                 self.reference_image_max_pixels,
+                self.text_visual_max_pixels,
             )
             weights = load_file(weights_path)
             network = lora_minimax_h3.create_arch_network_from_weights(
@@ -707,6 +722,8 @@ def create_training_backend(
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    text_visual_max_pixels: int = 0,
+    max_caption_tokens: int = 0,
 ):
     """Load the selected released transformer and adapt its training forward to Musubi."""
     if dtype != "bfloat16":
@@ -736,7 +753,13 @@ def create_training_backend(
         base_lora_multipliers=base_lora_multipliers,
     )
     return _NativeTrainingBackend(
-        transformer, mode, reference_image_short_edge, reference_image_size_mode, reference_image_max_pixels
+        transformer,
+        mode,
+        reference_image_short_edge,
+        reference_image_size_mode,
+        reference_image_max_pixels,
+        text_visual_max_pixels,
+        max_caption_tokens,
     )
 
 
@@ -748,12 +771,16 @@ class _NativeTrainingBackend:
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
         reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
         reference_image_max_pixels: int = 0,
+        text_visual_max_pixels: int = 0,
+        max_caption_tokens: int = 0,
     ):
         self.transformer = transformer
         self.mode = mode
         self.reference_image_short_edge = reference_image_short_edge
+        self.max_caption_tokens = max_caption_tokens
         self.reference_image_size_mode = reference_image_size_mode
         self.reference_image_max_pixels = reference_image_max_pixels
+        self.text_visual_max_pixels = text_visual_max_pixels
 
     def get_training_transformer(self) -> torch.nn.Module:
         return self.transformer
@@ -818,7 +845,26 @@ class _NativeTrainingBackend:
         text_hidden = self._one_conditioning_item(batch, hidden_key, expected_ndim=2)
         text_tags = self._one_conditioning_item(batch, tags_key, expected_ndim=1)
         conditioning_task = self._one_conditioning_item(batch, H3_CONDITIONING_TASK_KEY, expected_ndim=0)
+        cached_caption_cap = batch.get(H3_MAX_CAPTION_TOKENS_KEY)
+        if cached_caption_cap is None:
+            if self.max_caption_tokens:
+                raise ValueError("legacy H3 text cache lacks caption-token cap identity; re-cache conditioning")
+        else:
+            cached_caption_cap = self._one_conditioning_item(batch, H3_MAX_CAPTION_TOKENS_KEY, expected_ndim=0)
+            if cached_caption_cap.dtype != torch.long or int(cached_caption_cap) != self.max_caption_tokens:
+                raise ValueError("H3 text cache uses a different h3_max_caption_tokens value; re-cache conditioning")
         if self.mode in ("ref2va", "ref2va_omni"):
+            cached_text_visual_max_pixels = batch.get(H3_TEXT_VISUAL_MAX_PIXELS_KEY)
+            if cached_text_visual_max_pixels is None:
+                if self.text_visual_max_pixels:
+                    raise ValueError("legacy H3 Ref2VA text cache lacks Qwen visual-pixel identity; re-cache conditioning")
+            else:
+                cached_text_visual_max_pixels = self._one_conditioning_item(batch, H3_TEXT_VISUAL_MAX_PIXELS_KEY, expected_ndim=0)
+                if (
+                    cached_text_visual_max_pixels.dtype != torch.long
+                    or int(cached_text_visual_max_pixels) != self.text_visual_max_pixels
+                ):
+                    raise ValueError("H3 Ref2VA text cache uses a different h3_text_visual_max_pixels value; re-cache conditioning")
             cached_reference_size = batch.get(H3_REFERENCE_IMAGE_SHORT_EDGE_KEY)
             if cached_reference_size is None:
                 if self.reference_image_short_edge != REFERENCE_IMAGE_SHORT_EDGE:

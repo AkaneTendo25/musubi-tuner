@@ -806,6 +806,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 --h3_sigma_sqrt_max_weight must be positive")
         if args.reference_image_max_pixels < 0:
             raise ValueError("MiniMax H3 --reference_image_max_pixels must be non-negative")
+        if args.h3_max_caption_tokens < 0:
+            raise ValueError("MiniMax H3 --h3_max_caption_tokens must be non-negative")
         if args.reference_image_size_mode == "short_edge" and args.reference_image_max_pixels:
             raise ValueError("--reference_image_max_pixels applies only to --reference_image_size_mode target_area")
         if args.h3_guidance_distillation_scale is not None and float(getattr(args, "network_dropout", 0.0) or 0.0) > 0:
@@ -1204,6 +1206,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if reference_image_size_mode != "short_edge" or reference_image_max_pixels:
             backend_kwargs["reference_image_size_mode"] = reference_image_size_mode
             backend_kwargs["reference_image_max_pixels"] = reference_image_max_pixels
+        text_visual_max_pixels = int(getattr(args, "h3_text_visual_max_pixels", 0) or 0)
+        if text_visual_max_pixels:
+            backend_kwargs["text_visual_max_pixels"] = text_visual_max_pixels
+        max_caption_tokens = int(getattr(args, "h3_max_caption_tokens", 0) or 0)
+        if max_caption_tokens:
+            backend_kwargs["max_caption_tokens"] = max_caption_tokens
         if base_lora_weights:
             backend_kwargs["base_lora_weights"] = base_lora_weights
             backend_kwargs["base_lora_multipliers"] = base_lora_multipliers
@@ -2061,6 +2069,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_reference_image_short_edge": str(args.reference_image_short_edge),
             "ss_h3_reference_image_size_mode": args.reference_image_size_mode,
             "ss_h3_reference_image_max_pixels": str(args.reference_image_max_pixels),
+            "ss_h3_text_visual_max_pixels": str(args.h3_text_visual_max_pixels),
+            "ss_h3_max_caption_tokens": str(args.h3_max_caption_tokens),
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
@@ -2303,6 +2313,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "released keyframe contract. per_row_sigma pins the observed rows inside the target block, costing no "
             "extra tokens but placing intra-block noise levels outside what the released weights have seen"
         ),
+    )
+    parser.add_argument(
+        "--h3_max_caption_tokens",
+        type=int,
+        default=0,
+        help="caption-token cap used to build the H3 text cache; 0 expects uncapped caches",
     )
     parser.add_argument(
         "--h3_caption_dropout_rate",

@@ -9,9 +9,11 @@ from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_MAX_CAPTION_TOKENS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
+    H3_TEXT_VISUAL_MAX_PIXELS_KEY,
 )
 from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder
 from musubi_tuner.minimax_h3.references import H3PreparedReference, H3ReferenceKind
@@ -136,6 +138,20 @@ def test_empty_conditioning_preserves_the_prompt_row_count():
     assert torch.equal(null_ids, torch.full((1, 3), _Tokenizer.pad_token_id, dtype=torch.long))
 
 
+def test_caption_token_cap_is_opt_in_and_preserves_structural_vision_rows():
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "fl2va", max_caption_tokens=1)
+    content = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+
+    result = encoder.encode_conditioning([SimpleNamespace(caption="three caption tokens", content=content)])[0]
+
+    hidden = result[f"varlen_{H3_TEXT_HIDDEN_KEY}_bfloat16"]
+    tags = result[f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64"]
+    assert hidden.shape == (11, 5120)
+    assert tags.tolist() == [1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1]
+    assert int(result[H3_MAX_CAPTION_TOKENS_KEY]) == 1
+
+
 def test_null_conditioning_keeps_the_vision_prefix_intact():
     """Only the instruction is replaced; media labels and vision rows are untouched."""
     model = _TextModel()
@@ -229,6 +245,55 @@ def test_ref2va_conditioning_matches_released_ordered_presentation():
     assert int((model.last_mm_token_type_ids == 1).sum()) == 1
     assert int((model.last_mm_token_type_ids == 2).sum()) == 2
     assert set(tags.tolist()) == {0, 1}
+
+
+def test_ref2va_text_visual_cap_changes_only_qwen_reference_pixels():
+    class RecordingImageProcessor(_ImageProcessor):
+        def __init__(self):
+            self.sizes = []
+
+        def __call__(self, images, **kwargs):
+            self.sizes.append([image.size for image in images])
+            return super().__call__(images, **kwargs)
+
+    class RecordingVideoProcessor(_VideoProcessor):
+        def __init__(self):
+            self.shapes = []
+
+        def __call__(self, videos, **kwargs):
+            self.shapes.append([video.shape for video in videos])
+            return super().__call__(videos, **kwargs)
+
+    processor = _RefProcessor()
+    processor.image_processor = RecordingImageProcessor()
+    processor.video_processor = RecordingVideoProcessor()
+    encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "ref2va", text_visual_max_pixels=65_536)
+    image = Image.new("RGB", (640, 320))
+    frames = np.zeros((25, 320, 640, 3), dtype=np.uint8)
+    references = (
+        H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=image),
+        H3PreparedReference(kind=H3ReferenceKind.VIDEO, frames=frames),
+    )
+
+    encoder._encode_prompt("prompt", references=references)
+
+    qwen_image_size = processor.image_processor.sizes[0][0]
+    qwen_video_shape = processor.video_processor.shapes[0][0]
+    assert qwen_image_size[0] * qwen_image_size[1] <= 65_536
+    assert qwen_video_shape[1] * qwen_video_shape[2] <= 65_536
+    assert references[0].image is image and references[0].image.size == (640, 320)
+    assert references[1].frames is frames and references[1].frames.shape == (25, 320, 640, 3)
+
+
+def test_ref2va_text_visual_cap_is_recorded_in_conditioning_cache(monkeypatch):
+    encoder = MiniMaxH3ConditioningEncoder(_RefProcessor(), _TextModel(), torch.bfloat16, "ref2va", text_visual_max_pixels=65_536)
+    references = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (64, 64))),)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_references", lambda *_args, **_kwargs: references)
+    item = SimpleNamespace(caption="reference", content=np.zeros((5, 4, 4, 3), dtype=np.uint8))
+
+    cached = encoder.encode_conditioning([item])[0]
+
+    assert int(cached[H3_TEXT_VISUAL_MAX_PIXELS_KEY]) == 65_536
 
 
 def test_ref2va_omni_conditioning_accepts_text_only_presentation():

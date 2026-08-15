@@ -226,6 +226,8 @@ commands and use `--task fl2va` for text caching. `h3_image_frame_count` in the 
 `multiple_target = true` instead resamples an ordered target-image sequence. The latent and text caches carry the same
 source fingerprint, so changed/reordered targets or controls are rebuilt under `--skip_existing` and mismatched cache pairs
 are rejected during training. `--h3_text_visual_max_pixels` limits only the images presented to Qwen3-VL.
+`--h3_max_caption_tokens N` optionally truncates only the caption while retaining every structural image/video token. Its
+default `0` leaves captions unchanged; pass the same nonzero value to text caching and training.
 
 ```shell
 # First-frame I2V
@@ -478,8 +480,8 @@ Block swapping streams frozen weights from host memory. It is valid only while t
 ```
 
 `--use_pinned_memory_for_block_swap` can improve transfer bandwidth when the host has enough available memory; leave it disabled
-when pinned allocations stall or fail. `--block_swap_granularity layer` streams individual `Linear` layers and supports all 50
-blocks, at the cost of more transfers; use the default `block` granularity when it fits. Add
+when pinned allocations stall or fail. `--block_swap_granularity layer` streams individual `Linear` layers through the same
+H2D-only ring and supports all 50 blocks, at the cost of more transfers; use the default `block` granularity when it fits. Add
 `--gradient_checkpointing_cpu_offload` when sequence length would otherwise exceed VRAM, and set
 `PYTORCH_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
 

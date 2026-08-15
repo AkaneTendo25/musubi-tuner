@@ -23,6 +23,8 @@ H3_AUDIO_LOSS_MASK_KEY = "audio_loss_mask"
 H3_VIDEO_GEOMETRY_KEY = "mmh3_video_geometry"
 H3_TEXT_HIDDEN_KEY = "mmh3_hidden_states"
 H3_TEXT_TOKEN_TAGS_KEY = "mmh3_token_tags"
+H3_MAX_CAPTION_TOKENS_KEY = "mmh3_max_caption_tokens"
+H3_TEXT_VISUAL_MAX_PIXELS_KEY = "mmh3_text_visual_max_pixels"
 H3_EMPTY_TEXT_HIDDEN_KEY = "mmh3_empty_hidden_states"
 H3_EMPTY_TEXT_TOKEN_TAGS_KEY = "mmh3_empty_token_tags"
 H3_CONDITIONING_TASK_KEY = "mmh3_conditioning_task"
@@ -201,6 +203,20 @@ def save_text_encoder_output_cache_minimax_h3(
     task = tensor_for(H3_CONDITIONING_TASK_KEY)
     if task.dtype != torch.long or task.ndim != 0 or int(task) not in H3_CONDITIONING_TASK_IDS.values():
         raise ValueError(f"H3 {H3_CONDITIONING_TASK_KEY} must be a scalar int64 task id")
+    caption_cap_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_MAX_CAPTION_TOKENS_KEY]
+    if caption_cap_matches:
+        if len(caption_cap_matches) != 1:
+            raise ValueError(f"H3 conditioning cache must contain at most one {H3_MAX_CAPTION_TOKENS_KEY} tensor")
+        caption_cap = caption_cap_matches[0]
+        if caption_cap.dtype != torch.long or caption_cap.ndim != 0 or int(caption_cap) <= 0:
+            raise ValueError(f"H3 {H3_MAX_CAPTION_TOKENS_KEY} must be a positive scalar int64 value")
+    visual_cap_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_TEXT_VISUAL_MAX_PIXELS_KEY]
+    if visual_cap_matches:
+        if len(visual_cap_matches) != 1:
+            raise ValueError(f"H3 conditioning cache must contain at most one {H3_TEXT_VISUAL_MAX_PIXELS_KEY} tensor")
+        visual_cap = visual_cap_matches[0]
+        if visual_cap.dtype != torch.long or visual_cap.ndim != 0 or int(visual_cap) <= 0:
+            raise ValueError(f"H3 {H3_TEXT_VISUAL_MAX_PIXELS_KEY} must be a positive scalar int64 value")
     reference_size_matches = [
         tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_IMAGE_SHORT_EDGE_KEY
     ]

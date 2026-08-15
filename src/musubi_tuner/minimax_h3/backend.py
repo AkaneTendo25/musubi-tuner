@@ -115,6 +115,7 @@ def create_conditioning_encoder(
     blocks_to_stream: int = 0,
     nvfp4_scaled_mm: bool = False,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    max_caption_tokens: int = 0,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
     text_visual_max_pixels: int = 0,
@@ -135,6 +136,7 @@ def create_conditioning_encoder(
         **({} if not nvfp4_scaled_mm else {"nvfp4_scaled_mm": True}),
         **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
         **_reference_short_edge_kwargs(reference_image_short_edge),
+        **({} if max_caption_tokens == 0 else {"max_caption_tokens": max_caption_tokens}),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
     )
 
@@ -249,8 +251,10 @@ def create_training_backend(
     base_lora_weights: list[dict[str, torch.Tensor]] | None = None,
     base_lora_multipliers: list[float] | None = None,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    max_caption_tokens: int = 0,
     reference_image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     reference_image_max_pixels: int = 0,
+    text_visual_max_pixels: int = 0,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -294,5 +298,7 @@ def create_training_backend(
             else {"base_lora_weights": base_lora_weights, "base_lora_multipliers": base_lora_multipliers}
         ),
         **_reference_short_edge_kwargs(reference_image_short_edge),
+        **({} if max_caption_tokens == 0 else {"max_caption_tokens": max_caption_tokens}),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
+        **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
     )

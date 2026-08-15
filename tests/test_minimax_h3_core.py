@@ -109,6 +109,23 @@ def test_h3_inference_validates_lora_training_metadata(tmp_path, caplog):
     assert "rank-16 frozen AdaLN approximation" in caplog.text
 
 
+def test_h3_inference_validates_ref2va_qwen_visual_cap_metadata(tmp_path):
+    path = tmp_path / "adapter.safetensors"
+    save_file(
+        {"probe": torch.zeros(1)},
+        path,
+        metadata={
+            "ss_h3_training_mode": "ref2va",
+            "ss_h3_reference_image_short_edge": "2048",
+            "ss_h3_text_visual_max_pixels": "65536",
+        },
+    )
+
+    with pytest.raises(ValueError, match="trained with h3_text_visual_max_pixels=65536"):
+        h3_integration._validate_inference_lora_metadata(path, "ref2va", 2048)
+    h3_integration._validate_inference_lora_metadata(path, "ref2va", 2048, text_visual_max_pixels=65_536)
+
+
 def test_public_request_modes_and_limits(tmp_path):
     t2v = H3GenerationRequest("prompt", tmp_path / "out.mp4")
     assert t2v.mode == "text_to_video"
