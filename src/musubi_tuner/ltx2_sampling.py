@@ -51,6 +51,28 @@ def _video_scale_factors_from_vae(vae, fallback_type):
     return fallback_type(time=temporal, height=spatial, width=spatial)
 
 
+def _vae_tiling_config(vae, tile_size: int, tile_overlap: int, temporal_size: int, temporal_overlap: int):
+    """Build the tiling API expected by the selected ConvVAE or DiffVAE."""
+    if hasattr(vae, "recommended_tiling_config"):
+        from musubi_tuner.ltx_2.tiling import DimensionSizeConfig, TileSizeConfig
+
+        return TileSizeConfig(
+            frames=DimensionSizeConfig(tile_size=temporal_size, overlap=temporal_overlap),
+            height=DimensionSizeConfig(tile_size=tile_size, overlap=tile_overlap),
+            width=DimensionSizeConfig(tile_size=tile_size, overlap=tile_overlap),
+        )
+
+    from musubi_tuner.ltx_2.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
+
+    return TilingConfig(
+        spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
+        temporal_config=TemporalTilingConfig(
+            tile_size_in_frames=temporal_size,
+            tile_overlap_in_frames=temporal_overlap,
+        ),
+    )
+
+
 # --- Latent-guide prompt-line extension (--gl / --gk) -----------------------
 # We don't add these to hv_train_network.line_to_prompt_dict to keep that file
 # model-agnostic. Instead, we re-parse the prompt lines after load_prompts.
@@ -1028,7 +1050,6 @@ class LTX2SamplingMixin:
         distributed_state = PartialState()  # for multi gpu distributed inference
 
         transformer = accelerator.unwrap_model(transformer)
-        transformer.switch_block_swap_for_inference()
         original_device = next(transformer.parameters()).device
         offload = bool(getattr(args, "sample_with_offloading", False))
         transformer_offloaded = offload and accelerator.device.type == "cuda"
@@ -1043,6 +1064,12 @@ class LTX2SamplingMixin:
                 transformer.to(accelerator.device)
             clean_memory_on_device(accelerator.device)
             original_device = accelerator.device
+
+        # Device moves replace Parameter objects.  Prepare the H2D-only block
+        # ring only after the final placement move, otherwise the move turns
+        # its GPU-bound INT8 weights back into CPU tensors.
+        if not transformer_offloaded:
+            transformer.switch_block_swap_for_inference()
 
         save_dir = os.path.join(args.output_dir, "sample")
         os.makedirs(save_dir, exist_ok=True)
@@ -1062,6 +1089,7 @@ class LTX2SamplingMixin:
                 else:
                     transformer.to(accelerator.device)
                 clean_memory_on_device(accelerator.device)
+                transformer.switch_block_swap_for_inference()
 
         def offload_transformer_if_needed() -> None:
             if transformer_offloaded:
@@ -1319,10 +1347,11 @@ class LTX2SamplingMixin:
             logger.info("Sampling offload: restored transformer to training device")
             clean_memory_on_device(accelerator.device)
 
-        transformer.switch_block_swap_for_training()
         # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep.
         if hasattr(transformer, "move_to_device_except_swap_blocks"):
             transformer.move_to_device_except_swap_blocks(accelerator.device)
+        # As above, placement must precede ring preparation.
+        transformer.switch_block_swap_for_training()
         self._cleanup_cuda(accelerator.device)
 
     @staticmethod
@@ -3869,8 +3898,6 @@ class LTX2SamplingMixin:
             with torch.no_grad():
                 use_tiled_vae = getattr(args, "sample_tiled_vae", False)
                 if use_tiled_vae:
-                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
-
                     tile_size = getattr(args, "sample_vae_tile_size", 512)
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
@@ -3880,15 +3907,12 @@ class LTX2SamplingMixin:
                     effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 8192
                     effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
 
-                    tiling_config = TilingConfig(
-                        spatial_config=SpatialTilingConfig(
-                            tile_size_in_pixels=tile_size,
-                            tile_overlap_in_pixels=tile_overlap,
-                        ),
-                        temporal_config=TemporalTilingConfig(
-                            tile_size_in_frames=effective_temporal_size,
-                            tile_overlap_in_frames=effective_temporal_overlap,
-                        ),
+                    tiling_config = _vae_tiling_config(
+                        vae,
+                        tile_size,
+                        tile_overlap,
+                        effective_temporal_size,
+                        effective_temporal_overlap,
                     )
                     if temporal_tile_size > 0:
                         logger.info(
@@ -4470,19 +4494,18 @@ class LTX2SamplingMixin:
             with torch.no_grad():
                 use_tiled_vae = getattr(args, "sample_tiled_vae", False)
                 if use_tiled_vae:
-                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
-
                     tile_size = getattr(args, "sample_vae_tile_size", 512)
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
                     temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
                     effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 8192
                     effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
-                    tiling_config = TilingConfig(
-                        spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
-                        temporal_config=TemporalTilingConfig(
-                            tile_size_in_frames=effective_temporal_size, tile_overlap_in_frames=effective_temporal_overlap
-                        ),
+                    tiling_config = _vae_tiling_config(
+                        vae,
+                        tile_size,
+                        tile_overlap,
+                        effective_temporal_size,
+                        effective_temporal_overlap,
                     )
                     video = vae.tiled_decode(latents.squeeze(0), tiling_config)
                     if video.dim() == 4:
@@ -4968,19 +4991,18 @@ class LTX2SamplingMixin:
             with torch.no_grad():
                 use_tiled_vae = getattr(args, "sample_tiled_vae", False)
                 if use_tiled_vae:
-                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
-
                     tile_size = getattr(args, "sample_vae_tile_size", 512)
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
                     temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
                     effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 8192
                     effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
-                    tiling_config = TilingConfig(
-                        spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
-                        temporal_config=TemporalTilingConfig(
-                            tile_size_in_frames=effective_temporal_size, tile_overlap_in_frames=effective_temporal_overlap
-                        ),
+                    tiling_config = _vae_tiling_config(
+                        vae,
+                        tile_size,
+                        tile_overlap,
+                        effective_temporal_size,
+                        effective_temporal_overlap,
                     )
                     video = vae.tiled_decode(latents.squeeze(0), tiling_config)
                     if video.dim() == 4:

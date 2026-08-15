@@ -793,6 +793,8 @@ class LTXModel(torch.nn.Module):
                     block.to(cpu_device)
                 else:
                     block.to(target_device)
+            if self.offloader is not None and hasattr(self.offloader, "invalidate_ring_bindings_after_device_move"):
+                self.offloader.invalidate_ring_bindings_after_device_move()
             last_block = len(self.transformer_blocks) - 1
             managed_desc = (
                 f"{swap_start}-{last_block}"

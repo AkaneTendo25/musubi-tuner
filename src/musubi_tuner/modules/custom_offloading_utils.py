@@ -971,6 +971,29 @@ class LoRAStreamOffloader:
         self.copier.sync()
         self.forward_only = forward_only
 
+    def invalidate_ring_bindings_after_device_move(self) -> None:
+        """Recreate ring views after ``Module.to`` may have mutated bound Parameters.
+
+        PyTorch moves registered Parameters in place.  If a streamed block is
+        currently bound to a ring Parameter, moving that block to CPU therefore
+        also changes the cached ring Parameter to CPU even though ``ring_flat``
+        remains on the GPU.  Recreate the views and force the next prepare to
+        refill every slot.
+        """
+        if self.ring_param is None or not self.cpu_master:
+            return
+        self.copier.sync()
+        template = self.cpu_master[self.stream_idx[0]]
+        template_weights = [p.data for p in template]
+        self.ring_param = [
+            [
+                nn.Parameter(view, requires_grad=False) if isinstance(template_ref, nn.Parameter) else view
+                for template_ref, view in zip(template, self._flat_views(flat, template_weights))
+            ]
+            for flat in self.ring_flat
+        ]
+        self.in_slot = [None] * self.B
+
     def __del__(self):
         if getattr(self, "supports_backward", False):
             for handle in getattr(self, "remove_handles", []):
