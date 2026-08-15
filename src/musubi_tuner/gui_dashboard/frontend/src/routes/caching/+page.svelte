@@ -62,6 +62,11 @@
 		updateSection('training', 'reference_image_short_edge', value);
 		updateSection('inference', 'h3_reference_image_short_edge', value);
 	}
+	function updateH3ReferenceVideoSizing(key, value) {
+		updateSection('caching', `h3_reference_video_${key}`, value);
+		updateSection('training', `reference_video_${key}`, value);
+		updateSection('inference', `h3_reference_video_${key}`, value);
+	}
 
 	let caching = $derived($projectConfig?.caching || {});
 	let latentStatus = $derived($processStatuses.cache_latents || { state: 'idle', exit_code: null });
@@ -429,6 +434,8 @@
 					<FormSelect fieldPath="caching.h3_text_encoder_dtype" value={caching.h3_text_encoder_dtype || 'bfloat16'} options={[{ value: 'bfloat16', label: 'BF16' }]} onchange={(e) => updateCaching('h3_text_encoder_dtype', e.target.value)} tooltip="MiniMax H3 Qwen3-VL conditioning and cached layer-50 outputs require BF16." />
 					<FormField type="number" fieldPath="caching.cache_batch_size" value={caching.cache_batch_size ?? ''} oninput={(e) => updateCaching('cache_batch_size', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="Automatic" tooltip="Batch size passed to both H3 cache stages" />
 					<FormField type="number" fieldPath="caching.h3_reference_image_short_edge" value={caching.h3_reference_image_short_edge ?? 2048} oninput={(e) => updateH3ReferenceShortEdge(Number(e.target.value || 2048))} min={32} step={8} tooltip="Shared reference-image size for H3 caching, training, and inference. Changing it here updates all three stages." />
+					<FormField type="number" fieldPath="caching.h3_reference_video_short_edge" value={caching.h3_reference_video_short_edge ?? 768} oninput={(e) => updateH3ReferenceVideoSizing('short_edge', Number(e.target.value || 768))} min={16} step={16} tooltip="Shared reference-video short edge. Lower values reduce Ref2VA compute and VRAM." />
+					<FormField type="number" fieldPath="caching.h3_reference_video_max_pixels" value={caching.h3_reference_video_max_pixels ?? 1032192} oninput={(e) => updateH3ReferenceVideoSizing('max_pixels', Number(e.target.value || 1032192))} min={256} step={256} tooltip="Shared maximum pixels per reference-video frame after aspect-preserving resize." />
 					<FormToggle fieldPath="caching.h3_cache_guidance_empty" checked={caching.h3_cache_guidance_empty ?? false} onchange={(e) => updateCaching('h3_cache_guidance_empty', e.target.checked)} tooltip="Also cache empty-text conditioning required by guidance training and caption dropout." />
 				</div>
 			{:else}

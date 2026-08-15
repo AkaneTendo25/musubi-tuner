@@ -25,6 +25,11 @@
 		updateSection('training', 'reference_image_short_edge', value);
 		updateSection('inference', 'h3_reference_image_short_edge', value);
 	}
+	function updateH3ReferenceVideoSizing(key, value) {
+		updateSection('caching', `h3_reference_video_${key}`, value);
+		updateSection('training', `reference_video_${key}`, value);
+		updateSection('inference', `h3_reference_video_${key}`, value);
+	}
 	const quantizedBaseModeKeys = [
 		'int8_base',
 		'int8_base_dynamic',
@@ -522,6 +527,8 @@
 										<FormField type="number" fieldPath="training.h3_extension_audio_latents" value={t.h3_extension_audio_latents ?? 0} oninput={(e) => update('h3_extension_audio_latents', Number(e.target.value || 0))} min={0} tooltip="Leading audio latents observed as extension context" />
 										<FormSelect fieldPath="training.h3_extension_route" value={t.h3_extension_route || 'condition_rows'} options={['condition_rows', 'per_row_sigma']} onchange={(e) => update('h3_extension_route', e.target.value)} tooltip="How observed extension context is represented" />
 									<FormField type="number" fieldPath="training.reference_image_short_edge" value={t.reference_image_short_edge ?? 2048} oninput={(e) => updateH3ReferenceShortEdge(Number(e.target.value || 2048))} min={64} step={8} tooltip="Shared reference-image size for caching, training, and inference. Changing it here updates all three stages." />
+									<FormField type="number" fieldPath="training.reference_video_short_edge" value={t.reference_video_short_edge ?? 768} oninput={(e) => updateH3ReferenceVideoSizing('short_edge', Number(e.target.value || 768))} min={16} step={16} tooltip="Shared reference-video short edge. Lower values reduce Ref2VA compute and VRAM." />
+									<FormField type="number" fieldPath="training.reference_video_max_pixels" value={t.reference_video_max_pixels ?? 1032192} oninput={(e) => updateH3ReferenceVideoSizing('max_pixels', Number(e.target.value || 1032192))} min={256} step={256} tooltip="Shared maximum pixels per reference-video frame." />
 									</div>
 								</div>
 								<div class="h3-control-cluster">

@@ -58,6 +58,11 @@
 		updateSection('training', 'reference_image_short_edge', value);
 		updateSection('inference', 'h3_reference_image_short_edge', value);
 	}
+	function updateH3ReferenceVideoSizing(key, value) {
+		updateSection('caching', `h3_reference_video_${key}`, value);
+		updateSection('training', `reference_video_${key}`, value);
+		updateSection('inference', `h3_reference_video_${key}`, value);
+	}
 
 	let s = $derived($projectConfig?.inference || {});
 	let inferenceStatus = $derived($processStatuses.inference || { state: 'idle', exit_code: null });
@@ -303,6 +308,10 @@
 							</div>
 							<FormField label="Interior keyframes" fieldPath="inference.h3_keyframes" value={s.h3_keyframes || ''} oninput={(e) => update('h3_keyframes', e.target.value)} placeholder="4:/path/a.png 8:/path/b.png" tooltip="Repeatable INDEX:PATH entries; quote paths containing spaces" />
 							<FormField type="number" fieldPath="inference.h3_reference_image_short_edge" value={s.h3_reference_image_short_edge ?? 2048} oninput={(e) => updateH3ReferenceShortEdge(Number(e.target.value || 2048))} min={32} step={8} tooltip="Shared reference-image size for caching, training, and inference. Changing it here updates all three stages." />
+							<div class="grid grid-cols-2 gap-2">
+								<FormField type="number" fieldPath="inference.h3_reference_video_short_edge" value={s.h3_reference_video_short_edge ?? 768} oninput={(e) => updateH3ReferenceVideoSizing('short_edge', Number(e.target.value || 768))} min={16} step={16} tooltip="Shared reference-video short edge. Match the LoRA training cache." />
+								<FormField type="number" fieldPath="inference.h3_reference_video_max_pixels" value={s.h3_reference_video_max_pixels ?? 1032192} oninput={(e) => updateH3ReferenceVideoSizing('max_pixels', Number(e.target.value || 1032192))} min={256} step={256} tooltip="Shared maximum pixels per reference-video frame." />
+							</div>
 							<div class="grid grid-cols-2 gap-x-4 gap-y-1">
 								<FormToggle label="Scaled FP8 base" fieldPath="inference.fp8_base" checked={s.fp8_base ?? false} onchange={(e) => { update('fp8_base', e.target.checked); if (e.target.checked) update('h3_int8_convrot_base', false); }} tooltip="Quantize H3 transformer blocks to scaled FP8" />
 								<FormToggle label="Pruned INT8 ConvRot" fieldPath="inference.h3_int8_convrot_base" checked={s.h3_int8_convrot_base ?? false} onchange={(e) => { update('h3_int8_convrot_base', e.target.checked); if (e.target.checked) update('fp8_base', false); }} tooltip="Load the pruned H3 ConvRot checkpoint" />
