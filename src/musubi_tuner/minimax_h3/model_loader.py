@@ -486,7 +486,7 @@ def load_transformer(
     if info.missing_keys or info.unexpected_keys:
         raise RuntimeError(f"strict H3 load failed: {info}")
     if int8_convrot:
-        enable_int8_convrot(model)
+        enable_int8_convrot(model, fwd_mode=convrot_int8_fwd, bwd_mode=convrot_int8_bwd)
     del state_dict
     logger.info(
         "Loaded MiniMax H3 %s transformer from %s on %s%s",

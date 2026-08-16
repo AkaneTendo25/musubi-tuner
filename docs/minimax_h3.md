@@ -448,7 +448,7 @@ compact factors.
 | `--h3_convrot_int8` | Quantize the released BF16 checkpoint to ConvRot INT8 at load. Rejects `--fp8_base` and `--int8_convrot_base`. |
 | `--h3_convrot_int8_fwd bf16` | Recommended. Evaluates the matmul in BF16 without changing stored weights. |
 | `--h3_convrot_int8_bwd int8` | INT8 input-gradient path for GPUs without FP8 support. |
-| `--h3_convrot_int8_lora_fused` | Fuse LoRA application into supported ConvRot INT8 linear calls. Requires an INT8 ConvRot base and `--h3_convrot_int8_fwd int8`. |
+| `--h3_convrot_int8_lora_fused` | Fuse LoRA application into supported ConvRot INT8 linear calls. Requires an INT8 ConvRot base (online or pre-quantized), `--h3_convrot_int8_fwd int8`, `--h3_convrot_int8_bwd int8`, and triton. |
 | `--fp8_base` | Scaled FP8. `--h3_fp8_quantization_mode` selects `block` (default, fastest), `channel`, or `tensor`. |
 | `--int8_convrot_base` | Load the released pre-quantized checkpoint instead of quantizing at load (see below). |
 | `--h3_adaln_rank 16` | Reduce the AdaLN projections, the largest parameter group (13.0B of 33.1B), to ~77M. |

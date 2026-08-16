@@ -2373,6 +2373,170 @@ def test_h3_convrot_bf16_forward_carries_gradients():
     assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
+def _prequantized_convrot_linear(
+    in_features=16,
+    out_features=8,
+    group_size=4,
+    bias=True,
+    seed=0,
+    **modes,
+):
+    """Build the module layout the pre-quantized Comfy checkpoint loader produces."""
+    import torch
+    from torch import nn
+
+    from musubi_tuner.minimax_h3.int8_convrot import enable_int8_convrot, rotate_activation
+
+    torch.manual_seed(seed)
+    reference = nn.Linear(in_features, out_features, bias=bias)
+    rotated = rotate_activation(reference.weight.detach().float(), group_size)
+    scale = (rotated.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-30)
+    quantized = (rotated / scale).round().clamp(-127, 127).to(torch.int8)
+
+    layer = nn.Linear(in_features, out_features, bias=bias)
+    layer.weight = nn.Parameter(quantized, requires_grad=False)
+    if bias:
+        layer.bias = nn.Parameter(reference.bias.detach().clone(), requires_grad=False)
+    layer.register_buffer("scale_weight", scale.float())
+    layer.register_buffer("int8_convrot_groupsize", torch.tensor(group_size, dtype=torch.int32))
+
+    model = nn.Module()
+    model.inner = layer
+    assert enable_int8_convrot(model, **modes) == 1
+    return reference, layer, model
+
+
+def test_h3_prequantized_convrot_honors_the_forward_mode():
+    # --int8_convrot_base used to ignore --h3_convrot_int8_fwd entirely. The stored
+    # weights are the same rotated INT8 in both paths, so the BF16 forward is the same
+    # arithmetic through a different route and must agree with the rotated one.
+    import torch
+
+    reference, int8_layer, _ = _prequantized_convrot_linear(fwd_mode="int8")
+    _, bf16_layer, _ = _prequantized_convrot_linear(fwd_mode="bf16")
+    assert int8_layer._convrot_fwd_mode == "int8"
+    assert bf16_layer._convrot_fwd_mode == "bf16"
+
+    x = torch.randn(6, 16)
+    rotated = int8_layer(x)
+    unrotated = bf16_layer(x)
+    expected = reference(x)
+
+    assert torch.allclose(rotated, unrotated, atol=2e-3, rtol=2e-3)
+    assert (unrotated - expected).norm() / expected.norm() < 0.05
+
+
+def test_h3_prequantized_convrot_bf16_forward_carries_gradients():
+    import torch
+
+    _, layer, _ = _prequantized_convrot_linear(fwd_mode="bf16")
+    x = torch.randn(6, 16, requires_grad=True)
+
+    layer(x).sum().backward()
+
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+def test_h3_prequantized_convrot_rejects_bf16_forward_with_int8_backward():
+    from torch import nn
+
+    from musubi_tuner.minimax_h3.int8_convrot import enable_int8_convrot
+
+    with pytest.raises(ValueError, match="no rotated activations"):
+        enable_int8_convrot(nn.Module(), fwd_mode="bf16", bwd_mode="int8")
+
+
+def test_h3_prequantized_convrot_stashes_the_group_size_off_device():
+    # int8_convrot_groupsize is a CUDA buffer at training time; reading it with .item()
+    # in the forward is a device sync per patched Linear per forward.
+    import torch
+
+    _, layer, _ = _prequantized_convrot_linear()
+    assert isinstance(layer._convrot_groupsize, int) and layer._convrot_groupsize == 4
+
+    del layer.int8_convrot_groupsize
+    assert torch.isfinite(layer(torch.randn(6, 16))).all()
+
+
+def test_h3_prequantized_convrot_falls_back_to_the_group_size_buffer():
+    import torch
+
+    _, layer, _ = _prequantized_convrot_linear()
+    reference_output = layer(torch.randn(6, 16))
+
+    del layer._convrot_groupsize
+    torch.manual_seed(0)
+    assert torch.isfinite(layer(torch.randn(6, 16))).all()
+    assert reference_output.shape == (6, 8)
+
+
+@pytest.mark.parametrize("bwd_mode", ["bf16", "int8"])
+def test_h3_prequantized_convrot_backward_leaves_grad_output_untouched(monkeypatch, bwd_mode):
+    # The INT8 backward folds the weight scale into the incoming gradient in place;
+    # when grad_output is already fp32 the fold used to land on the caller's tensor.
+    import torch
+
+    from musubi_tuner.minimax_h3 import int8_convrot
+
+    monkeypatch.setattr(int8_convrot, "_int8_available", lambda tensor: True)
+    monkeypatch.setattr(int8_convrot, "_int_mm", lambda left, right: left.to(torch.int32) @ right.to(torch.int32))
+
+    _, layer, _ = _prequantized_convrot_linear(bwd_mode=bwd_mode)
+    x = torch.randn(6, 16, requires_grad=True)
+    output = layer(x)
+    grad_output = torch.randn_like(output)
+    baseline = grad_output.clone()
+
+    output.backward(grad_output)
+
+    assert torch.equal(grad_output, baseline)
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+def test_h3_convrot_row_quantization_leaves_its_input_untouched():
+    import torch
+
+    from musubi_tuner.minimax_h3.int8_convrot import _quantize_rows
+
+    value = torch.randn(4, 8)
+    baseline = value.clone()
+
+    _quantize_rows(value)
+
+    assert torch.equal(value, baseline)
+
+
+def test_h3_prequantized_convrot_modules_are_visible_to_the_lora_fusion(monkeypatch):
+    # --h3_convrot_int8_lora_fused selects modules by _convrot_groupsize; the
+    # pre-quantized loader used to register only the int8_convrot_groupsize buffer,
+    # so the combination always raised "found no ConvRot INT8 Linear layers".
+    import torch
+
+    from musubi_tuner.modules import convrot_int8_utils
+
+    monkeypatch.setattr(convrot_int8_utils, "HAS_TRITON", True)
+    _, layer, model = _prequantized_convrot_linear()
+    assert layer._convrot_lora_fused is False
+
+    assert convrot_int8_utils.enable_convrot_int8_lora_fusion(model) == 1
+
+    assert layer._convrot_lora_fused is True
+    # what ConvRotInt8LoRAFn reads off the module
+    assert layer.weight.dtype is torch.int8
+    assert layer.scale_weight.shape == (8, 1) and layer.scale_weight.dtype is torch.float32
+    assert isinstance(layer._convrot_groupsize, int)
+
+
+def test_h3_convrot_lora_fusion_requires_triton(monkeypatch):
+    from musubi_tuner.modules import convrot_int8_utils
+
+    monkeypatch.setattr(convrot_int8_utils, "HAS_TRITON", False)
+    _, _, model = _prequantized_convrot_linear()
+
+    with pytest.raises(ValueError, match="requires triton"):
+        convrot_int8_utils.enable_convrot_int8_lora_fusion(model)
+
+
 # Every area-normalized grid spans an interval centered on _ROPE_SPATIAL_SCALE / 2,
 # whatever the latent shape or the density scale, so scaling the area normalization
 # contracts each coordinate toward that center by exactly the same factor.

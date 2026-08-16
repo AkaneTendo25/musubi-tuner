@@ -378,6 +378,18 @@ def apply_convrot_int8_monkey_patch(
 
 
 def enable_convrot_int8_lora_fusion(model) -> int:
+    """Mark ConvRot INT8 Linears so LoRA applies through the fused dequantization epilogue.
+
+    ``_convrot_groupsize`` is the single marker for "this Linear carries ConvRot INT8
+    weights the fused kernel understands"; both the online monkey patch and the
+    pre-quantized ``enable_int8_convrot`` set it, and both store the same rotated INT8
+    ``weight`` with an ``[N, 1]`` fp32 ``scale_weight``.
+    """
+    if not HAS_TRITON:
+        raise ValueError(
+            "the fused ConvRot INT8 LoRA epilogue requires triton. Install triton (triton-windows on Windows)"
+            " or drop --h3_convrot_int8_lora_fused."
+        )
     count = 0
     for module in model.modules():
         if isinstance(module, nn.Linear) and hasattr(module, "_convrot_groupsize"):

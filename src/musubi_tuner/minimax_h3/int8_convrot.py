@@ -65,8 +65,11 @@ def rotate_activation(value: torch.Tensor, group_size: int) -> torch.Tensor:
     return torch.matmul(grouped, matrix).reshape(value.shape)
 
 
-def _quantize_rows(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    float_value = value.float()
+def _quantize_rows(value: torch.Tensor, *, owns_buffer: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    # The rescale is done in place to avoid a second full-size temporary, so the buffer
+    # must never alias a tensor the caller still owns: ``.float()`` is an identity view
+    # when the input is already float32, which would silently corrupt it.
+    float_value = value.float() if owns_buffer else value.to(torch.float32, copy=True)
     scale = (float_value.abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
     quantized = float_value.div_(scale).round_().clamp_(-127, 127).to(torch.int8)
     return quantized, scale
@@ -84,61 +87,103 @@ def _int_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return torch._int_mm(padded.contiguous(), right)[:rows]
 
 
+def _unrotated_weight(weight: torch.Tensor, scale: torch.Tensor, group_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """Recover the ordinary weight from its stored rotated INT8 form.
+
+    The block-diagonal Hadamard is symmetric and orthogonal, so rotating the
+    dequantized rotated weight once more undoes the offline rotation. This is the same
+    identity the online ConvRot path uses for its BF16 forward.
+    """
+    dequantized = weight.to(dtype) * scale.reshape(-1, 1).to(dtype)
+    return rotate_activation(dequantized, group_size)
+
+
+def _int8_available(tensor: torch.Tensor) -> bool:
+    return bool(tensor.is_cuda) and hasattr(torch, "_int_mm")
+
+
 class _Int8ConvRotFunction(torch.autograd.Function):
+    """Pre-quantized ConvRot INT8 linear with the same forward/backward modes as the online path.
+
+    ``fwd_mode``:
+      - ``int8``: rotate the activations, quantize them row-wise and run ``torch._int_mm``
+        (transient BF16 dequantization when the INT8 matmul is unavailable, e.g. on CPU).
+      - ``bf16``: undo the rotation on the weight instead and hand ``F.linear`` an
+        ordinary matrix. Same stored weights, same arithmetic, unquantized activations.
+
+    ``bwd_mode`` (only meaningful with ``fwd_mode='int8'``):
+      - ``bf16``: transient dequantization of the rotated weight, ``grad_x = rotate(g @ W_rot)``.
+      - ``int8``: fold the per-channel weight scale into ``g``, quantize its rows and run
+        the INT8 matmul before rotating.
+    """
+
     @staticmethod
-    def forward(ctx, inputs, weight, scale, bias, group_size):
+    def forward(ctx, inputs, weight, scale, bias, group_size, fwd_mode, bwd_mode):
         group_size = int(group_size)
-        rotated = rotate_activation(inputs, group_size)
-        flat = rotated.reshape(-1, rotated.shape[-1])
-        quantized, input_scale = _quantize_rows(flat)
-        output = _int_mm(quantized, weight.t()).float()
-        output.mul_(input_scale).mul_(scale.reshape(1, -1))
-        if bias is not None:
-            output.add_(bias.float())
+        if fwd_mode == "bf16":
+            dense_weight = _unrotated_weight(weight, scale, group_size, inputs.dtype)
+            output = F.linear(inputs, dense_weight, bias.to(inputs.dtype) if bias is not None else None)
+        elif _int8_available(inputs):
+            rotated = rotate_activation(inputs, group_size)
+            flat = rotated.reshape(-1, rotated.shape[-1])
+            quantized, input_scale = _quantize_rows(flat, owns_buffer=True)
+            accumulated = _int_mm(quantized, weight.t()).float()
+            accumulated.mul_(input_scale).mul_(scale.reshape(1, -1))
+            if bias is not None:
+                accumulated.add_(bias.float())
+            output = accumulated.to(inputs.dtype).reshape(*inputs.shape[:-1], weight.shape[0])
+        else:
+            rotated = rotate_activation(inputs, group_size)
+            dense_weight = (weight.float() * scale.float()).to(inputs.dtype)
+            output = F.linear(rotated, dense_weight, bias.to(inputs.dtype) if bias is not None else None)
         ctx.save_for_backward(weight, scale)
         ctx.input_dtype = inputs.dtype
         ctx.input_shape = inputs.shape
         ctx.group_size = group_size
-        return output.to(inputs.dtype).reshape(*inputs.shape[:-1], weight.shape[0])
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        weight, scale = ctx.saved_tensors
-        folded = grad_output.reshape(-1, grad_output.shape[-1]).float()
-        folded.mul_(scale.reshape(1, -1))
-        quantized, grad_scale = _quantize_rows(folded)
-        grad_input = _int_mm(quantized, weight).float()
-        grad_input.mul_(grad_scale)
-        grad_input = rotate_activation(grad_input.to(ctx.input_dtype), ctx.group_size)
-        return grad_input.reshape(ctx.input_shape), None, None, None, None
-
-
-class _TransientInt8ConvRotFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, inputs, weight, scale, bias, group_size):
-        group_size = int(group_size)
-        rotated = rotate_activation(inputs, group_size)
-        dense_weight = (weight.float() * scale.float()).to(inputs.dtype)
-        output = F.linear(rotated, dense_weight, bias.to(inputs.dtype) if bias is not None else None)
-        ctx.save_for_backward(weight, scale)
-        ctx.input_dtype = inputs.dtype
-        ctx.input_shape = inputs.shape
-        ctx.group_size = group_size
+        ctx.fwd_mode = fwd_mode
+        ctx.bwd_mode = bwd_mode
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         weight, scale = ctx.saved_tensors
-        dense_weight = weight.float() * scale.float()
-        grad_input = grad_output.reshape(-1, grad_output.shape[-1]).float() @ dense_weight
+        folded = grad_output.reshape(-1, grad_output.shape[-1])
+        if ctx.fwd_mode == "bf16":
+            # The un-rotated weight is the ordinary W, so the gradient needs no rotation
+            # of its own: the saving applies to both directions.
+            dense_weight = _unrotated_weight(weight, scale, ctx.group_size, torch.float32)
+            grad_input = folded.float() @ dense_weight
+            return grad_input.to(ctx.input_dtype).reshape(ctx.input_shape), None, None, None, None, None, None
+        if ctx.bwd_mode == "int8" and _int8_available(folded):
+            # Copy before the in-place fold: ``folded`` is a view of the caller's gradient,
+            # and .float() on an fp32 gradient would hand back that very tensor.
+            scaled = folded.to(torch.float32, copy=True)
+            scaled.mul_(scale.reshape(1, -1))
+            quantized, grad_scale = _quantize_rows(scaled, owns_buffer=True)
+            grad_input = _int_mm(quantized, weight).float()
+            grad_input.mul_(grad_scale)
+        else:
+            dense_weight = weight.float() * scale.float()
+            grad_input = folded.float() @ dense_weight
         grad_input = rotate_activation(grad_input.to(ctx.input_dtype), ctx.group_size)
-        return grad_input.reshape(ctx.input_shape), None, None, None, None
+        return grad_input.reshape(ctx.input_shape), None, None, None, None, None, None
 
 
 def _int8_linear_forward(module: nn.Linear, inputs: torch.Tensor) -> torch.Tensor:
-    group_size = int(module.int8_convrot_groupsize.item())
-    operation = _Int8ConvRotFunction if inputs.is_cuda and hasattr(torch, "_int_mm") else _TransientInt8ConvRotFunction
-    return operation.apply(inputs, module.weight, module.scale_weight, module.bias, group_size)
+    # ``_convrot_groupsize`` is a plain Python int stashed at enable time; reading the
+    # registered buffer instead costs a device sync on every patched Linear per forward.
+    group_size = getattr(module, "_convrot_groupsize", None)
+    if group_size is None:
+        group_size = int(module.int8_convrot_groupsize.item())
+    return _Int8ConvRotFunction.apply(
+        inputs,
+        module.weight,
+        module.scale_weight,
+        module.bias,
+        group_size,
+        getattr(module, "_convrot_fwd_mode", "int8"),
+        getattr(module, "_convrot_bwd_mode", "bf16"),
+    )
 
 
 def load_comfy_int8_convrot_state_dict(
@@ -213,7 +258,13 @@ def prepare_int8_convrot_modules(model: nn.Module, state_dict: dict[str, torch.T
     return registered
 
 
-def enable_int8_convrot(model: nn.Module) -> int:
+def enable_int8_convrot(model: nn.Module, fwd_mode: str = "int8", bwd_mode: str = "bf16") -> int:
+    if fwd_mode not in ("bf16", "int8"):
+        raise ValueError(f"Unsupported ConvRot INT8 forward mode: {fwd_mode}")
+    if bwd_mode not in ("bf16", "int8"):
+        raise ValueError(f"Unsupported ConvRot INT8 backward mode: {bwd_mode}")
+    if fwd_mode == "bf16" and bwd_mode == "int8":
+        raise ValueError("ConvRot INT8 forward mode 'bf16' has no rotated activations for an INT8 backward")
     patched = 0
     for module in model.modules():
         if not isinstance(module, nn.Linear) or not hasattr(module, "scale_weight"):
@@ -223,7 +274,18 @@ def enable_int8_convrot(model: nn.Module) -> int:
         group_size = int(module.int8_convrot_groupsize.item())
         if module.weight.shape[1] % group_size:
             raise ValueError(f"INT8 ConvRot group size {group_size} does not divide {module.weight.shape[1]} input features")
+        # Same attribute names as the online monkey patch: the LoRA fusion selector, the
+        # fused LoRA epilogue and the block-swap guard then see one kind of ConvRot module.
+        module._convrot_groupsize = group_size
+        module._convrot_fwd_mode = fwd_mode
+        module._convrot_bwd_mode = bwd_mode
+        module._convrot_lora_fused = False
         module.forward = MethodType(_int8_linear_forward, module)
         patched += 1
-    logger.info("Enabled H3 INT8 ConvRot runtime on %d Linear layers", patched)
+    logger.info(
+        "Enabled H3 INT8 ConvRot runtime on %d Linear layers (forward %s, backward %s)",
+        patched,
+        fwd_mode,
+        bwd_mode,
+    )
     return patched
