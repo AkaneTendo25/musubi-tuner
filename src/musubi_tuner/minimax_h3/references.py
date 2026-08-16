@@ -15,10 +15,17 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
-from musubi_tuner.minimax_h3.architecture import AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, VIDEO_FPS
+from musubi_tuner.minimax_h3.architecture import AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, VIDEO_FPS, temporal_shape
 from musubi_tuner.minimax_h3.audio import load_audio_asset
 from musubi_tuner.minimax_h3.image_training import file_identity
-from musubi_tuner.minimax_h3.media import AudioProcessingSpec, MediaAsset, MediaModality, MissingMediaPolicy
+from musubi_tuner.minimax_h3.media import (
+    AudioProcessingSpec,
+    CropMode,
+    MediaAsset,
+    MediaModality,
+    MissingMediaPolicy,
+    PadMode,
+)
 
 REFERENCE_FINGERPRINT_KEY = "reference_fingerprint"
 
@@ -242,18 +249,26 @@ def _prepare_video(asset: MediaAsset, target_frames: int, short_edge: int, max_p
 
 
 def _prepare_audio(asset: MediaAsset, target_frames: int) -> torch.Tensor | None:
+    # The canonical grid, not frames / 24 * 32000: the latter overshoots by one audio latent row on
+    # frame counts 5, 56, 107, ... and would disagree with temporal_shape() everywhere else.
+    samples = temporal_shape(target_frames, align=True).audio_samples
     clip = load_audio_asset(
         asset,
         AudioProcessingSpec(
             sample_rate=AUDIO_SAMPLE_RATE,
             channels=2,
+            clip_duration_seconds=samples / AUDIO_SAMPLE_RATE,
+            crop_mode=CropMode.BEGINNING,
+            # A short reference track is zero-padded to the canonical span, matching the target path.
+            # Reference rows carry no valid mask in the packed layout, so the padding is invisible to
+            # the model: keep reference audio at least as long as the reference video span.
+            pad_mode=PadMode.ZERO,
             missing=MissingMediaPolicy.DROP,
         ),
     )
     if clip is None:
         return None
-    maximum_samples = round(target_frames / VIDEO_FPS * AUDIO_SAMPLE_RATE)
-    return clip.waveform[:, :maximum_samples].contiguous()
+    return clip.waveform.contiguous()
 
 
 def _reference_audio_asset(asset: MediaAsset) -> MediaAsset:
@@ -335,7 +350,8 @@ def prepare_references(
             # The H3 video VAE accepts only 17n+5 frames (or a single image).
             # Trim once at the shared preparation boundary so Qwen's visual
             # presentation, the DiT latent rows, and any paired soundtrack all
-            # describe the same temporal span.
+            # describe the same temporal span: the soundtrack is cropped or
+            # zero-padded to temporal_shape(frames).audio_samples below.
             frames = frames[: trim_reference_frames(frames.shape[0])]
             prepared.append(
                 H3PreparedReference(

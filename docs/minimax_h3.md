@@ -132,7 +132,11 @@ python minimax_h3_generate_video.py \
 
 H3 uses Musubi's [shared dataset schema](./dataset_config.md) for video, image, and control fields. A target video's embedded soundtrack is the audio target; a video with
 no audio stream trains as video-only with its audio loss masked. `control_directory` holds references whose basename matches
-each target. To combine separately stored video and audio as one synchronized AV reference, use matching directories:
+each target: controls for target `X` are `X.<ext>` or `X_<n>.<ext>`. A target whose own name ends in `_<n>` and that has no
+direct match falls back to the shared prefix, but only over controls no other target claims; contested files are an error
+rather than a silent reassignment. Relative `control_path`, `control_path_N`, `control_video_path_N`, and `control_audio_path_N`
+values in a JSONL always resolve against that JSONL's directory. To combine separately stored video and audio as one
+synchronized AV reference, use matching directories:
 
 ```toml
 [[datasets]]
@@ -161,7 +165,13 @@ control_modality_probabilities = [0.5, 0.25, 0.25]
 The text cache stores every enabled presentation and training draws one mode per item. The same draw is reused by the trainable,
 guidance, and preservation forwards. Video-only removes reference soundtracks; audio-only retains image references as visual
 anchors and uses the audio from paired AV references. Recache text outputs after changing the probabilities. Latent caches do not
-need to be rebuilt. Every enabled mode must leave at least one image or video reference, as required by the released Ref2VA model.
+need to be rebuilt. Every enabled mode must leave at least one image or video reference, as required by the released Ref2VA
+model, and this is checked when the dataset config is parsed: a nonzero `video` weight needs an image or video reference, and a
+nonzero `audio` weight needs an image reference, since video references become audio in that mode.
+
+Reference audio is cropped or zero-padded to the canonical sample count of its reference video span (`temporal_shape`), the same
+grid the target audio uses. Reference rows carry no validity mask, so padding added to a short reference track is
+indistinguishable from silence to the model; keep reference audio at least as long as its reference video.
 
 To restrict video or image loss to selected regions, set `loss_mask_directory` to a directory of masks with matching target
 basenames, or set `default_loss_mask_path` as a fallback. A JSONL item may override either with `loss_mask_path` (the alias
@@ -195,7 +205,9 @@ frame_extraction = "uniform"
 
 An audio-only dataset needs **exactly one** `target_frames` value, and it must be on the `17k+5` grid — the multi-value list in
 the example above is video-only. `audio_directory` takes same-stem `.txt` captions; `audio_jsonl_file` takes records with
-`audio_path` and `caption`.
+`audio_path` and `caption`. Audio-target caches are named `<stem>_audio<hash>_…`, where the hash covers the absolute source
+path, so an audio file never overwrites a video cache of the same stem and two same-stem audio files from different directories
+stay apart in one `cache_directory`. Audio caches written before this naming are rebuilt once.
 
 The released processor uses a 768-pixel short edge with a 1344×768 area cap. Other 32-pixel-aligned sizes work but sit outside
 the released canvas distribution.
@@ -312,8 +324,10 @@ strategies address different goals:
    `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with inverse-probability loss scaling. This
    preserves the expected loss, but rare larger updates are not optimizer-equivalent to applying the dense loss every step.
 2. If a compatible de-distillation training adapter is provided, load it through `--base_weights` while training the concept
-   LoRA, then remove it for inference. One community example is
-   [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter).
+   LoRA, then remove it for inference. Adapters are checkpoint-specific: the Ref2VA checkpoint needs its own adapter, not one
+   made for FL2VA. One community example is
+   [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter), whose
+   `minimax_h3_ref2va_training_adapter_v1.safetensors` targets the Ref2VA checkpoint.
 
 For concept LoRA training over a de-distillation adapter, sparse preservation can provide an additional anchor, but the two
 objectives are not equivalent: preservation retains the loaded base's predictions, while a de-distillation adapter deliberately

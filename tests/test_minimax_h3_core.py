@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 import struct
 import wave
 from argparse import Namespace
@@ -28,6 +29,7 @@ from musubi_tuner.minimax_h3 import integration as h3_integration
 from musubi_tuner.minimax_h3 import references as h3_references
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
+    AUDIO_HOP_LENGTH,
     AUDIO_LATENT_FPS,
     AUDIO_SAMPLE_RATE,
     CANVAS_MULTIPLE,
@@ -60,6 +62,7 @@ from musubi_tuner.minimax_h3.cache import (
     reference_key_suffix,
     save_latent_cache_minimax_h3,
 )
+from musubi_tuner.minimax_h3 import dataset as h3_dataset
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.media import (
     AudioProcessingSpec,
@@ -429,6 +432,136 @@ def test_h3_reuses_control_directory_for_mixed_reference_media(tmp_path):
     assert assets[0].start_seconds == 0.5
     assert assets[0].duration_seconds == pytest.approx(22 / 24)
     assert assets[0].metadata == {"frame_count": 22, "fps": 24.0}
+
+
+def _write_control_directory(root: Path, names) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (root / name).write_bytes(name.encode())
+    return root
+
+
+def test_h3_control_matching_never_steals_controls_from_a_sibling_target(tmp_path):
+    controls = _write_control_directory(tmp_path / "controls", ("a_0.png", "a_3.png"))
+    targets = [str(tmp_path / "videos" / "a_1.mp4"), str(tmp_path / "videos" / "a_2.mp4")]
+
+    with pytest.raises(ValueError, match="ambiguous H3 controls"):
+        h3_dataset._references_from_directory(str(controls), targets)
+
+
+def test_h3_control_matching_keeps_blessed_layouts(tmp_path):
+    videos = tmp_path / "videos"
+
+    multi = _write_control_directory(tmp_path / "multi", ("a_0.png", "a_1.png"))
+    assert h3_dataset._references_from_directory(str(multi), [str(videos / "a.mp4")]) == {
+        str(videos / "a.mp4"): (multi / "a_0.png", multi / "a_1.png")
+    }
+
+    shared = _write_control_directory(tmp_path / "shared", ("a.png", "a_0.png", "a_0_0.png"))
+    assert h3_dataset._references_from_directory(str(shared), [str(videos / "a.mp4"), str(videos / "a_0.mp4")]) == {
+        str(videos / "a.mp4"): (shared / "a.png",),
+        str(videos / "a_0.mp4"): (shared / "a_0.png", shared / "a_0_0.png"),
+    }
+
+    fallback = _write_control_directory(tmp_path / "fallback", ("b.png", "b_1.png"))
+    assert h3_dataset._references_from_directory(str(fallback), [str(videos / "b_0.png")]) == {
+        str(videos / "b_0.png"): (fallback / "b.png", fallback / "b_1.png")
+    }
+
+    with pytest.raises(ValueError, match="no matching H3 controls"):
+        h3_dataset._references_from_directory(str(fallback), [str(videos / "c.mp4")])
+
+
+def test_h3_video_jsonl_resolves_relative_control_paths_against_the_manifest(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    (data / "refs").mkdir(parents=True)
+    target = data / "target.mp4"
+    reference = data / "refs" / "reference.png"
+    for path in (target, reference):
+        path.write_bytes(b"media")
+    manifest = data / "videos.jsonl"
+    manifest.write_text(
+        json.dumps({"video_path": str(target), "control_path_0": "refs/reference.png", "caption": "prompt"}),
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_jsonl_file": str(manifest),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+                "frame_extraction": "uniform",
+            }
+        ],
+    }
+    _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512), frame_count=22)
+
+    assets = adapter.attach(item)
+
+    assert assets[1].path == reference.resolve()
+
+
+def test_h3_image_jsonl_resolves_relative_control_paths_without_conditioned_image_mode(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    (data / "refs").mkdir(parents=True)
+    target = data / "target.png"
+    reference = data / "refs" / "reference.png"
+    for path in (target, reference):
+        path.write_bytes(b"media")
+    manifest = data / "images.jsonl"
+    manifest.write_text(
+        json.dumps({"image_path": str(target), "control_path": "refs/reference.png", "caption": "prompt"}),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [{"image_jsonl_file": str(manifest), "cache_directory": str(tmp_path / "cache")}],
+    }
+    _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False, h3_image_mode="none"))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512))
+
+    assets = adapter.attach(item)
+
+    assert assets[1].path == reference.resolve()
+
+
+def test_h3_reference_modality_probabilities_reject_unsatisfiable_variants(tmp_path):
+    targets = tmp_path / "targets"
+    controls = tmp_path / "controls"
+    for directory in (targets, controls):
+        directory.mkdir()
+    (targets / "scene.mp4").write_bytes(b"target")
+    (controls / "scene.mp4").write_bytes(b"reference")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_directory": str(targets),
+                "control_directory": str(controls),
+                "control_modality_probabilities": [0.5, 0.25, 0.25],
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="audio variant probability 0.25"):
+        create_h3_dataset_group(config, Namespace(debug_dataset=False))
+
+    config["datasets"][0]["control_modality_probabilities"] = [0.5, 0.5, 0.0]
+    _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(targets / "scene.mp4"), "prompt", (512, 512), (512, 512), frame_count=22)
+    adapter.attach(item)
+
+    assert item.h3_reference_modality_probabilities == (0.5, 0.5, 0.0)
 
 
 def test_h3_image_target_keeps_basename_matched_ref2va_reference(tmp_path):
@@ -1626,8 +1759,74 @@ def test_h3_audio_dataset_builds_cache_paths_and_duration_contract(tmp_path):
     assert item.caption == "a clean tone"
     assert item.frame_count == 124
     assert item.original_size == (832, 480)
-    assert Path(item.latent_cache_path).name == "tone_00000-124_0832x0480_mmh3.safetensors"
-    assert Path(item.text_encoder_output_cache_path).name == "tone_00000-124_mmh3_te.safetensors"
+    assert re.fullmatch(r"tone_audio[0-9a-f]{8}_00000-124_0832x0480_mmh3\.safetensors", Path(item.latent_cache_path).name)
+    assert re.fullmatch(r"tone_audio[0-9a-f]{8}_00000-124_mmh3_te\.safetensors", Path(item.text_encoder_output_cache_path).name)
+
+
+def test_h3_audio_cache_names_disambiguate_sources_sharing_a_stem(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    def dataset_for(directory: str) -> H3AudioDataset:
+        root = tmp_path / directory
+        root.mkdir(exist_ok=True)
+        (root / "a.wav").write_bytes(b"fixture")
+        return H3AudioDataset(
+            {
+                "audio_directory": str(root),
+                "cache_directory": str(cache),
+                "h3_target_mode": "audio",
+                "target_frames": [124],
+                "resolution": [832, 480],
+            },
+            {},
+        )
+
+    songs, others = dataset_for("songs"), dataset_for("others")
+    (_, [song]), (_, [other]) = (
+        next(iter(songs.retrieve_latent_cache_batches(1))),
+        next(iter(others.retrieve_latent_cache_batches(1))),
+    )
+    # A same-stem video target caches as `a_0064x0064_mmh3.safetensors`; the `_audio<hash>` marker
+    # keeps audio caches out of that name space and apart from each other.
+    assert Path(song.latent_cache_path).name != Path(other.latent_cache_path).name
+    assert Path(song.text_encoder_output_cache_path).name != Path(other.text_encoder_output_cache_path).name
+    assert "_audio" in Path(song.latent_cache_path).name
+    assert not Path(song.latent_cache_path).name.startswith("a_0")
+    # Deterministic for the same source path.
+    assert dataset_for("songs").get_latent_cache_path(song) == song.latent_cache_path
+
+
+def _write_tone(path: Path, samples: int, sample_rate: int = AUDIO_SAMPLE_RATE) -> Path:
+    tone = (np.sin(np.arange(samples) * 2 * np.pi * 220 / sample_rate) * 16000 + 1).astype(np.int16)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(tone.tobytes())
+    return path
+
+
+def test_reference_audio_follows_the_canonical_sample_grid(tmp_path):
+    asset = MediaAsset(_write_tone(tmp_path / "long.wav", AUDIO_SAMPLE_RATE), MediaModality.AUDIO, "reference")
+
+    waveform = h3_references._prepare_audio(asset, 5)
+
+    shape = temporal_shape(5)
+    assert waveform.shape == (2, shape.audio_samples)
+    assert math.ceil(waveform.shape[1] / AUDIO_HOP_LENGTH) == shape.audio_latent_frames
+    legacy_samples = round(5 / VIDEO_FPS * AUDIO_SAMPLE_RATE)
+    assert math.ceil(legacy_samples / AUDIO_HOP_LENGTH) == shape.audio_latent_frames + 1
+
+
+def test_short_reference_audio_is_zero_padded_to_the_target_span(tmp_path):
+    asset = MediaAsset(_write_tone(tmp_path / "short.wav", 1600), MediaModality.AUDIO, "reference")
+
+    waveform = h3_references._prepare_audio(asset, 5)
+
+    assert waveform.shape == (2, temporal_shape(5).audio_samples)
+    assert waveform[:, :1600].abs().sum() > 0
+    assert not waveform[:, 1600:].any()
 
 
 def test_native_latent_encoder_caches_fl2va_keyframes_for_video_only_target():

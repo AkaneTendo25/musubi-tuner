@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -69,19 +70,30 @@ class H3AudioDataset(BaseDataset):
         item.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item)
         return item
 
+    @staticmethod
+    def _cache_basename(item_key: str) -> str:
+        """Name audio caches ``<stem>_audio<hash>`` so they cannot collide with same-stem video caches.
+
+        The hash is the first 8 hex digits of SHA-256 over the absolute source path, which keeps the
+        name stable across runs and machines while separating same-stem files from different folders.
+        """
+        path = Path(item_key).expanduser()
+        identity = os.path.normcase(os.path.abspath(str(path))).replace(os.sep, "/")
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+        return f"{path.stem}_audio{digest}"
+
     def get_latent_cache_path(self, item_info: ItemInfo) -> str:
-        stem = Path(item_info.item_key).stem
         width, height = self.resolution
         return os.path.join(
             self.cache_directory,
-            f"{stem}_00000-{self.target_frames:03d}_{width:04d}x{height:04d}_{self.architecture}.safetensors",
+            f"{self._cache_basename(item_info.item_key)}_00000-{self.target_frames:03d}"
+            f"_{width:04d}x{height:04d}_{self.architecture}.safetensors",
         )
 
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
-        stem = Path(item_info.item_key).stem
         return os.path.join(
             self.cache_directory,
-            f"{stem}_00000-{self.target_frames:03d}_{self.architecture}_te.safetensors",
+            f"{self._cache_basename(item_info.item_key)}_00000-{self.target_frames:03d}_{self.architecture}_te.safetensors",
         )
 
     def retrieve_latent_cache_batches(self, num_workers: int):

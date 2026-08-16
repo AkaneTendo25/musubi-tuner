@@ -140,28 +140,63 @@ def _control_sort_key(path: Path, target_stem: str) -> int:
     return int(suffix) + 1
 
 
+def _stem_matches(paths: Sequence[Path], stem: str) -> list[Path]:
+    return [path for path in paths if path.stem == stem or path.stem.startswith(stem + "_")]
+
+
+def _fallback_stem(stem: str) -> str | None:
+    prefix, separator, suffix = stem.rpartition("_")
+    return prefix if separator and suffix.isdigit() and prefix else None
+
+
 def _references_from_directory(control_directory: str, target_paths: Sequence[str]) -> dict[str, tuple[Path, ...]]:
+    """Match ``control_directory`` files to targets without letting one target steal another's controls.
+
+    Controls for target ``X`` are ``X.<ext>`` or ``X_<n>.<ext>`` (Musubi's rule). A target whose own
+    stem carries a numeric suffix (``X_0``) and that finds no direct match falls back to the ``X``
+    prefix, but only over controls no other target owns directly, and never over controls a second
+    fallback target would claim as well.
+    """
     root = Path(control_directory)
     if not root.is_dir():
         raise ValueError(f"control_directory does not exist: {root}")
     allowed = {extension.lower() for extension in (*IMAGE_EXTENSIONS, *VIDEO_EXTENSIONS, *AUDIO_EXTENSIONS)}
-    available = {path for path in root.iterdir() if path.is_file() and path.suffix.lower() in allowed}
-    result: dict[str, tuple[Path, ...]] = {}
-    for target in sorted(target_paths, key=lambda path: len(Path(path).name), reverse=True):
+    available = sorted((path for path in root.iterdir() if path.is_file() and path.suffix.lower() in allowed), key=str)
+    # Longer target names first so `scene_00.mp4` claims `scene_00_0.png` before `scene.mp4` can.
+    ordered_targets = sorted(target_paths, key=lambda path: (-len(Path(path).name), str(path)))
+
+    owned: set[Path] = set()
+    matched: dict[str, tuple[str, list[Path]]] = {}
+    for target in ordered_targets:
         stem = Path(target).stem
-        matches = [path for path in available if path.stem == stem or path.stem.startswith(stem + "_")]
+        matches = [path for path in _stem_matches(available, stem) if path not in owned]
+        if matches:
+            owned.update(matches)
+            matched[target] = (stem, matches)
+
+    claims: dict[Path, list[str]] = {}
+    for target in ordered_targets:
+        if target in matched:
+            continue
+        stem = _fallback_stem(Path(target).stem)
+        matches = [path for path in _stem_matches(available, stem) if path not in owned] if stem else []
         if not matches:
-            prefix, separator, suffix = stem.rpartition("_")
-            if separator and suffix.isdigit():
-                stem = prefix
-                matches = [path for path in available if path.stem == stem or path.stem.startswith(stem + "_")]
-        matches.sort(key=lambda path: _control_sort_key(path, stem))
+            raise ValueError(f"no matching H3 controls for {target!r} in {root}")
+        matched[target] = (stem, matches)
+        for path in matches:
+            claims.setdefault(path, []).append(target)
+    contested = {path: targets for path, targets in claims.items() if len(targets) > 1}
+    if contested:
+        details = "; ".join(f"{path.name} claimed by {sorted(targets)}" for path, targets in sorted(contested.items(), key=str))
+        raise ValueError(f"ambiguous H3 controls in {root}: {details}")
+
+    result: dict[str, tuple[Path, ...]] = {}
+    for target in target_paths:
+        stem, matches = matched[target]
+        matches = sorted(matches, key=lambda path: _control_sort_key(path, stem))
         order = [_control_sort_key(path, stem) for path in matches]
         if len(order) != len(set(order)):
             raise ValueError(f"multiple H3 controls occupy the same index for {target!r}: {matches}")
-        if not matches:
-            raise ValueError(f"no matching H3 controls for {target!r} in {root}")
-        available.difference_update(matches)
         result[target] = tuple(matches)
     return result
 
@@ -227,6 +262,36 @@ def _dataset_reference_probabilities(source: dict[str, Any], general: dict[str, 
     return probabilities
 
 
+def _validate_reference_modality_probabilities(
+    target: str,
+    references: Sequence[MediaAsset],
+    probabilities: tuple[float, float, float],
+) -> None:
+    """Reject unsatisfiable variants at configuration time.
+
+    ``reference_modality_variant`` keeps image references in every variant, keeps video references
+    (audio stripped) in the ``video`` variant, and turns video references into audio rows in the
+    ``audio`` variant. Each variant must retain one non-audio reference, so ``video`` needs an image
+    or video reference and ``audio`` needs an image reference.
+    """
+    if not references:
+        raise ValueError("control_modality_probabilities requires at least one reference")
+    has_image = any(reference.modality is MediaModality.IMAGE for reference in references)
+    has_visual = has_image or any(reference.modality is MediaModality.VIDEO for reference in references)
+    requirements = (
+        ("av", probabilities[0], has_visual, "an image or video reference"),
+        ("video", probabilities[1], has_visual, "an image or video reference"),
+        ("audio", probabilities[2], has_image, "an image reference"),
+    )
+    for name, probability, satisfied, requirement in requirements:
+        if probability > 0 and not satisfied:
+            kinds = sorted({reference.modality.name.lower() for reference in references})
+            raise ValueError(
+                f"control_modality_probabilities gives the {name} variant probability {probability} "
+                f"but {target!r} has only {', '.join(kinds)} reference(s); the {name} variant needs {requirement}"
+            )
+
+
 def _read_media_jsonl(path: str, *, resolve_paths: bool = False) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as stream:
@@ -234,25 +299,28 @@ def _read_media_jsonl(path: str, *, resolve_paths: bool = False) -> list[dict[st
             try:
                 record = json.loads(line)
                 base = Path(path).expanduser().resolve().parent
+
+                def resolve(value: Any) -> str:
+                    media_path = Path(value).expanduser()
+                    if not media_path.is_absolute():
+                        media_path = base / media_path
+                    return str(media_path.resolve())
+
+                # Every relative control path resolves against the JSONL's directory, whatever the
+                # dataset kind: control_path[_N] follows control_video_path_N/control_audio_path_N.
                 for key in tuple(record):
-                    if _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key) or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key):
-                        media_path = Path(record[key]).expanduser()
-                        if not media_path.is_absolute():
-                            media_path = base / media_path
-                        record[key] = str(media_path.resolve())
+                    if (
+                        key == "control_path"
+                        or _CONTROL_PATH_PATTERN.fullmatch(key)
+                        or _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
+                        or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
+                    ):
+                        if record[key]:
+                            record[key] = resolve(record[key])
                 if resolve_paths:
                     for key in tuple(record):
-                        if (
-                            key in {"image_path", "video_path", "control_path"}
-                            or _CONTROL_PATH_PATTERN.fullmatch(key)
-                            or _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
-                            or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
-                            or re.fullmatch(r"image_path_\d+", key)
-                        ):
-                            media_path = Path(record[key]).expanduser()
-                            if not media_path.is_absolute():
-                                media_path = base / media_path
-                            record[key] = str(media_path.resolve())
+                        if key in {"image_path", "video_path"} or re.fullmatch(r"image_path_\d+", key):
+                            record[key] = resolve(record[key])
                 records.append(record)
             except json.JSONDecodeError as error:
                 raise ValueError(f"invalid JSON on line {line_number} of {path}: {error}") from error
@@ -496,8 +564,8 @@ class H3DatasetAdapter:
                 )
                 modes = _dataset_reference_modes(source, general, len(references))
                 probabilities = _dataset_reference_probabilities(source, general)
-                if probabilities is not None and not references:
-                    raise ValueError("control_modality_probabilities requires at least one reference")
+                if probabilities is not None:
+                    _validate_reference_modality_probabilities(target, references, probabilities)
                 references = tuple(
                     _select_reference_modality(reference, mode, index=index) if mode is not None else reference
                     for index, (reference, mode) in enumerate(zip(references, modes))
