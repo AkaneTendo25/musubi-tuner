@@ -862,32 +862,21 @@ class LoRANetwork(torch.nn.Module):
     def get_trainable_params(self):
         return self.parameters()
 
+    def snapshot_weights(self, dtype):
+        """Return a CPU copy of the LoRA state dict, detached from live training tensors.
+
+        This is the only part of a save that must run on the training thread: it
+        fixes the checkpoint to the current step. Hashing and writing the snapshot
+        can then happen anywhere, see ``utils.async_save.write_state_dict_file``.
+        """
+        from musubi_tuner.utils import async_save
+
+        return async_save.snapshot_state_dict(self.state_dict(), dtype)
+
     def save_weights(self, file, dtype, metadata):
-        if metadata is not None and len(metadata) == 0:
-            metadata = None
+        from musubi_tuner.utils import async_save
 
-        state_dict = self.state_dict()
-
-        if dtype is not None:
-            for key in list(state_dict.keys()):
-                v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
-                state_dict[key] = v
-
-        if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import save_file
-            from musubi_tuner.utils import model_utils
-
-            # Precalculate model hashes to save time on indexing
-            if metadata is None:
-                metadata = {}
-            model_hash, legacy_hash = model_utils.precalculate_safetensors_hashes(state_dict, metadata)
-            metadata["sshs_model_hash"] = model_hash
-            metadata["sshs_legacy_hash"] = legacy_hash
-
-            save_file(state_dict, file, metadata)
-        else:
-            torch.save(state_dict, file)
+        async_save.write_state_dict_file(self.snapshot_weights(dtype), file, metadata)
 
     def backup_weights(self):
         # 重みのバックアップを行う

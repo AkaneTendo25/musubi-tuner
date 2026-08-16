@@ -407,6 +407,9 @@ scheduler, and step start at zero. Use `--save_state_on_train_end` if only the f
 rejected instead of silently restarting at step zero. Add `--autoresume` to select the highest-step complete state matching
 `--output_name` in `--output_dir`; an explicit `--resume` path takes priority.
 
+Add `--async_checkpoint_save` to keep periodic saves off the training thread: the loop pauses only long enough to copy the
+LoRA weights to CPU, and hashing plus the file write finish in the background, so the file appears shortly after the step.
+
 For an external save trigger, provide one or both request paths:
 
 ```shell
@@ -445,6 +448,7 @@ the model checkpoint. Requests received during gradient accumulation wait for th
 | `--h3_timestep_focus_probability` | `0` | Optional video/AV curriculum: draw this fraction of the uniform base schedule from `--h3_timestep_focus_min` through `--h3_timestep_focus_max` (defaults `0.4` and `0.8`) while retaining full-range samples. Image batches keep their resolution-aware schedule. Requires `uniform` and cannot be combined with min/max timestep clipping. |
 | `--num_timestep_buckets` | off | Stratifies base timesteps across an epoch to reduce sampling imbalance; it does not change the intended distribution or make a step faster. It is incompatible with `--timestep_sampling sigma`. |
 | `--h3_video_loss_weight` / `--h3_audio_loss_weight` | `1.0` | Modality weights. `--h3_loss_balance token` switches from equal modality means to element weighting. |
+| `--async_checkpoint_save` | off | Hash and write periodic checkpoints on a background thread. The step pauses only for the CPU snapshot, so the `.safetensors` file lands shortly after the step instead of stalling training for the write. Saves stay ordered and never overlap; the final checkpoint and `--save_state` remain synchronous. |
 
 ### Memory and speed
 
@@ -539,7 +543,9 @@ normally do not speed up an H3 run whose cached batches already keep the GPU bus
 
 ### Training modes
 
-These modes use target-derived conditioning and therefore use a `t2va` conditioning cache. For observed-modality training,
+These modes use target-derived conditioning and therefore use a `t2va` conditioning cache, except where the table below says
+otherwise: masking and `per_row_sigma` extension only pin rows inside the target block, so they also combine with
+`--h3_training_mode ref2va` / `ref2va_omni` and their reference caches. For observed-modality training,
 `h3_target_mode = "av"` is required and each target video must contain its synchronized soundtrack. An audio-only dataset has no
 video rows and cannot train video-to-audio conditioning. The observed modality remains in the packed attention sequence but its
 loss weight is forced to zero; this isolates direct supervision, not H3's shared attention parameters.
@@ -547,9 +553,9 @@ loss weight is forced to zero; this isolates direct supervision, not H3's shared
 | Option | Trains |
 | --- | --- |
 | `--h3_observed_modality {video,audio,random}` | Video-to-audio, audio-to-video, or one adapter covering both plus joint |
-| `--h3_extension_video_frames N` / `--h3_extension_audio_latents N` | Continuation from an observed prefix. Counts are in **latent** units and each must be shorter than its target; the two are independent, so setting one leaves the other generated in full |
-| `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary anchors |
-| `--h3_mask_mode {box,border,segment}` | Inpainting, outpainting, temporal infilling |
+| `--h3_extension_video_frames N` / `--h3_extension_audio_latents N` | Continuation from an observed prefix. Counts are in **latent** units and each must be shorter than its target; the two are independent, so setting one leaves the other generated in full. Under Ref2VA only the `per_row_sigma` route is supported |
+| `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary anchors. FL2VA/`t2va` caches only |
+| `--h3_mask_mode {box,border,segment}` | Inpainting, outpainting, temporal infilling. Also available under Ref2VA |
 | `--h3_frame_sigma_jitter 0.2` | Spreads target-frame noise levels across the schedule in one step. Supported by native T2VA/I2VA/FL2VA/L2VA/Ref2VA caches, including guidance-consistent loss, and skipped for images; cannot be combined with in-target observed-row options or sigma-dependent loss weighting; `0` disables it |
 | `--h3_spatial_density_jitter 0.2` | Perturbs the area normalization of the spatial RoPE grids each step, drawn log-uniformly from `[1/1.2, 1.2]`, so fixed-resolution data still trains a range of token spacings. One factor covers every grid in the packed sequence; `0` disables it |
 | `--h3_caption_dropout_rate 0.1` | Trains the unconditional branch; requires `--cache_guidance_empty` |
@@ -562,12 +568,17 @@ each step; validation still reports the joint objective so its numbers stay comp
 
 **Extension.** `--h3_extension_route` chooses the presentation: `condition_rows` (default) duplicates the context as clean rows,
 matching the released keyframe contract but costing sequence length; `per_row_sigma` pins it in place with no extra tokens, at the
-cost of intra-block noise levels the released weights have not seen. The observed span is removed from the loss.
+cost of intra-block noise levels the released weights have not seen. The observed span is removed from the loss. Under
+`--h3_training_mode ref2va` / `ref2va_omni`, `condition_rows` is rejected: duplicating the context needs packer support the
+Ref2VA layout does not have, so pass `--h3_extension_route per_row_sigma`.
 
 **Keyframes.** Entries are `first`, `last`, or a latent frame index. Anchors stay in the loss, matching the released contract.
-`last` is the final *pixel* frame, deliberately not the same anchor as the integer `frames - 1`.
+`last` is the final *pixel* frame, deliberately not the same anchor as the integer `frames - 1`. Keyframes remain FL2VA-only;
+they add condition rows that only the T2VA packer can place.
 
-**Masking.** Masks are drawn per step, so the occlusion distribution changes without re-caching. `--h3_mask_min_fraction` and
+**Masking.** Masks are drawn per step, so the occlusion distribution changes without re-caching. Masks combine with every
+training mode: under Ref2VA the observed rows are pinned inside the target block, the reference rows keep their own conditioning
+noise level, and neither is scored. `--h3_mask_min_fraction` and
 `--h3_mask_max_fraction` bound the masked fraction; `--h3_mask_audio` also hides a run of audio latents. Masks are reduced to the
 `(1, 2, 2)` patch grid and a patch counts as generated when any latent inside it is, so at small latent resolutions a wide
 fraction range can leave nothing observed.

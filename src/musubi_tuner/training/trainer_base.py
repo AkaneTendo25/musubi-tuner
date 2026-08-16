@@ -49,6 +49,8 @@ from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
 import logging
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
+from musubi_tuner.utils import async_save as async_save_module
+from musubi_tuner.utils.async_save import AsyncCheckpointSaver
 
 # Helpers that used to live alongside NetworkTrainer in hv_train_network.py.
 # Imported by name so existing method bodies keep working unchanged.
@@ -1424,6 +1426,30 @@ class NetworkTrainer:
     # endregion extension seams
 
     def train(self, args):
+        """Run training, guaranteeing the background checkpoint writer is drained.
+
+        The body lives in ``_train_impl`` so that an abort anywhere inside it still
+        joins the writer thread: a save queued moments before the failure is either
+        completed or reported instead of being lost with the process.
+        """
+        self._async_checkpoint_saver: Optional[AsyncCheckpointSaver] = None
+        try:
+            return self._train_impl(args)
+        finally:
+            saver = getattr(self, "_async_checkpoint_saver", None)
+            self._async_checkpoint_saver = None
+            if saver is not None:
+                failing = sys.exc_info()[0] is not None
+                try:
+                    saver.join()
+                except Exception as save_error:
+                    # Do not mask an in-flight training exception with the writer's.
+                    if failing:
+                        logger.error(f"background checkpoint save also failed: {save_error}")
+                    else:
+                        raise
+
+    def _train_impl(self, args):
         if not self._validate_args_and_init(args):
             return
 
@@ -2106,7 +2132,29 @@ class NetworkTrainer:
             + (f" (--save_precision {args.save_precision})" if args.save_precision is not None else " (default)")
         )
 
-        def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+        # Periodic checkpoints may be hashed/serialized/written on a background thread so the
+        # training loop only pays for the CPU snapshot. Opt-in; see --async_checkpoint_save.
+        async_save_enabled = bool(getattr(args, "async_checkpoint_save", False))
+        if async_save_enabled and type(self).on_post_save is not NetworkTrainer.on_post_save:
+            logger.warning(
+                "--async_checkpoint_save is ignored: this trainer overrides on_post_save, "
+                "whose companion files must be written on the training thread"
+            )
+            async_save_enabled = False
+
+        def get_async_saver() -> Optional[AsyncCheckpointSaver]:
+            if not async_save_enabled:
+                return None
+            if getattr(self, "_async_checkpoint_saver", None) is None:
+                self._async_checkpoint_saver = AsyncCheckpointSaver()
+            return self._async_checkpoint_saver
+
+        def flush_async_saves():
+            saver = getattr(self, "_async_checkpoint_saver", None)
+            if saver is not None:
+                saver.wait()
+
+        def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False, allow_async: bool = False):
             os.makedirs(args.output_dir, exist_ok=True)
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
@@ -2141,9 +2189,23 @@ class NetworkTrainer:
 
             metadata_to_save.update(sai_metadata)
 
-            unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
-            if args.huggingface_repo_id is not None:
-                huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
+            saver = get_async_saver() if allow_async else None
+            if saver is not None and hasattr(unwrapped_nw, "snapshot_weights"):
+                # Synchronous part: the CPU snapshot, which pins the checkpoint to this step.
+                state_dict = unwrapped_nw.snapshot_weights(save_dtype)
+                # metadata_to_save is reused (and mutated) by later saves - freeze a copy.
+                metadata_snapshot = dict(metadata_to_save) if metadata_to_save is not None else None
+
+                def write_checkpoint():
+                    async_save_module.write_state_dict_file(state_dict, ckpt_file, metadata_snapshot)
+                    if args.huggingface_repo_id is not None:
+                        huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
+
+                saver.submit(write_checkpoint)  # blocks only if the previous save is still writing
+            else:
+                unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+                if args.huggingface_repo_id is not None:
+                    huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
             self.on_post_save(args, accelerator, network, transformer, ckpt_name, save_dtype, metadata_to_save, force_sync_upload)
 
@@ -2386,9 +2448,13 @@ class NetworkTrainer:
                             accelerator.wait_for_everyone()
                             if accelerator.is_main_process:
                                 ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
-                                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch, allow_async=True)
 
                             if args.save_state:
+                                # Keep the LoRA file and the accelerate state consistent on disk:
+                                # a resume must never find a state newer than its checkpoint.
+                                if accelerator.is_main_process:
+                                    flush_async_saves()
                                 step_in_epoch = train_utils.normalize_step_in_epoch(step + 1, len(train_dataloader))
                                 train_utils.save_and_remove_state_stepwise(
                                     args,
@@ -2406,6 +2472,9 @@ class NetworkTrainer:
                                     remove_model(remove_ckpt_name)
                             accelerator.wait_for_everyone()
                             if file_save_requested and accelerator.is_main_process:
+                                # The request flag signals "checkpoint written", so wait for the
+                                # background write before clearing it.
+                                flush_async_saves()
                                 train_utils.consume_checkpoint_request_file(save_request_file)
                         optimizer_train_fn()
 
@@ -2483,7 +2552,7 @@ class NetworkTrainer:
                 if saving:
                     if is_main_process:
                         ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
-                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
+                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1, allow_async=True)
 
                         remove_epoch_no = train_utils.get_remove_epoch_no(args, epoch + 1)
                         if remove_epoch_no is not None:
@@ -2491,6 +2560,8 @@ class NetworkTrainer:
                             remove_model(remove_ckpt_name)
 
                     if args.save_state:
+                        if is_main_process:
+                            flush_async_saves()
                         train_utils.save_and_remove_state_on_epoch_end(
                             args,
                             accelerator,
@@ -2513,6 +2584,11 @@ class NetworkTrainer:
 
         accelerator.end_training()
         optimizer_eval_fn()
+
+        # End of training is synchronous: drain any pending periodic save first so its
+        # failure (if any) is reported here and the final checkpoint is written last.
+        if is_main_process:
+            flush_async_saves()
 
         if args.save_state or args.save_state_on_train_end:
             train_utils.save_state_on_train_end(

@@ -735,6 +735,14 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         help="save states until N steps elapsed (remove older states if N steps elapsed, overrides --save_last_n_steps) / 指定ステップごとにstateを保存するとき、このステップ数経過するまで保存する（このステップ数経過したら削除する。--save_last_n_stepsを上書きする）",
     )
     parser.add_argument(
+        "--async_checkpoint_save",
+        action="store_true",
+        help="write periodic checkpoints on a background thread: the training loop only pays for the CPU"
+        " snapshot, so the file lands shortly after the step instead of stalling it. The final checkpoint"
+        " and --save_state remain synchronous"
+        " / 定期保存をバックグラウンドスレッドで書き出し、学習ループの停止時間を短縮する",
+    )
+    parser.add_argument(
         "--save_state",
         action="store_true",
         help="save training state additionally (including optimizer states etc.) when saving model / optimizerなど学習状態も含めたstateをモデル保存時に追加で保存する",
