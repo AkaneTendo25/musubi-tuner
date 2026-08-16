@@ -175,8 +175,8 @@ def _parse_keyframe_anchors(spec: str) -> tuple[int | str, ...]:
 
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
     @staticmethod
-    def _base_preservation_active(accelerator: Accelerator, probability: float) -> bool:
-        """Draw one preservation decision shared by every distributed rank."""
+    def _sparse_branch_active(accelerator: Accelerator, probability: float, generator: torch.Generator | None = None) -> bool:
+        """Draw one auxiliary-branch decision shared by every distributed rank."""
         if probability >= 1.0:
             return True
         device = accelerator.device
@@ -185,10 +185,31 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # own seeded CPU stream once; rank zero's decision is then authoritative.
         # This keeps the CUDA replay untouched without restoring the Bernoulli
         # generator to the same position after every call.
-        active = (torch.rand((), device="cpu") < probability).to(device=device)
+        active = (torch.rand((), device="cpu", generator=generator) < probability).to(device=device)
         if distributed:
             torch.distributed.broadcast(active, src=0)
         return bool(active.item())
+
+    @staticmethod
+    def _base_preservation_active(accelerator: Accelerator, probability: float) -> bool:
+        """Draw one preservation decision shared by every distributed rank."""
+        return MiniMaxH3NetworkTrainer._sparse_branch_active(accelerator, probability)
+
+    def _guidance_distillation_active(self, accelerator: Accelerator, probability: float) -> bool:
+        """Draw one guidance-distillation decision shared by every distributed rank."""
+        if probability >= 1.0:
+            return True
+        generator = self._guidance_probability_generator
+        if generator is None:
+            # A dedicated stream keeps the two sparse objectives independent:
+            # enabling guidance sparsity must not shift the global CPU draws the
+            # preservation branch, caption dropout, and the jitters consume. The
+            # seed still comes from the global stream, so a seeded run remains
+            # reproducible.
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._guidance_probability_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
 
     supports_validation = True
 
@@ -196,6 +217,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         super().__init__()
         self.backend: H3TrainingBackend | None = None
         self._crepa_config: H3CREPAConfig | None = None
+        self._guidance_probability_generator: torch.Generator | None = None
         self._crepa: H3CREPA | None = None
         self._extension_video_frames = 0
         self._extension_audio_latents = 0
@@ -735,6 +757,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
         if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
+        if not math.isfinite(args.h3_guidance_distillation_probability) or not 0 < args.h3_guidance_distillation_probability <= 1:
+            raise ValueError("--h3_guidance_distillation_probability must be finite and lie in (0, 1]")
+        if args.h3_guidance_distillation_probability < 1.0 and args.h3_guidance_distillation_scale is None:
+            raise ValueError("--h3_guidance_distillation_probability requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
         if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
@@ -859,9 +885,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if not args.gradient_checkpointing:
                 raise ValueError("--h3_gradient_checkpointing_blocks requires --gradient_checkpointing")
             if checkpoint_blocks < 50 and (args.blocks_to_swap or 0) > 0:
+                # Every swap implementation streams a block's weights through a
+                # buffer that is repointed or overwritten in place once the block's
+                # forward has been consumed. Only checkpoint recomputation re-reads
+                # those weights at backward time; an eager block instead saves the
+                # streamed view directly into the autograd graph, so backward reads
+                # either a stale ring slot (h2d_only, which is why block swap
+                # requires gradient checkpointing at all) or a CPU-resident storage.
                 raise ValueError("partial H3 gradient checkpointing cannot be combined with block swap")
-            if checkpoint_blocks < 50 and args.compile:
-                raise ValueError("partial H3 gradient checkpointing cannot be combined with --compile")
         if args.h3_gradient_checkpointing_cpu_offload_pin_memory and not (
             args.gradient_checkpointing and args.gradient_checkpointing_cpu_offload
         ):
@@ -1617,6 +1648,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         preservation_active = args.h3_base_preservation_loss_weight > 0 and self._base_preservation_active(
             accelerator, args.h3_base_preservation_probability
         )
+        guidance_active = args.h3_guidance_distillation_scale is not None and self._guidance_distillation_active(
+            accelerator, args.h3_guidance_distillation_probability
+        )
         if batch_size == 1:
             return self._process_single_batch(
                 args,
@@ -1632,6 +1666,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 vae,
                 global_step,
                 preservation_active_override=preservation_active,
+                guidance_active_override=guidance_active,
             )
 
         # The released H3 transformer accepts one shared packed layout, while
@@ -1665,6 +1700,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     vae,
                     global_step,
                     preservation_active_override=preservation_active,
+                    guidance_active_override=guidance_active,
                     crepa_update_similarity_threshold=False,
                 )
                 accelerator.backward(item_loss / batch_size)
@@ -1752,6 +1788,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         global_step: int,
         *,
         preservation_active_override: bool | None = None,
+        guidance_active_override: bool | None = None,
         crepa_update_similarity_threshold: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         del network_dtype, vae
@@ -1882,6 +1919,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # A dropped step is already unconditional, so there is no guided field to
         # invert and both branches would evaluate the same empty prompt.
         use_guidance = args.h3_guidance_distillation_scale is not None and conditioning == "prompt"
+        # Sparse guidance skips the empty forward entirely on an inactive step and
+        # falls back to the ordinary velocity objective for that step.
+        if use_guidance:
+            use_guidance = (
+                self._guidance_distillation_active(accelerator, args.h3_guidance_distillation_probability)
+                if guidance_active_override is None
+                else guidance_active_override
+            )
         reference_prediction = None
         preservation_active = args.h3_base_preservation_loss_weight > 0 and (
             self._base_preservation_active(accelerator, args.h3_base_preservation_probability)
@@ -1992,24 +2037,28 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             None if self._step_mask is None else self._step_mask.audio_latent,
             axis=-1,
         )
-        result = joint_velocity_loss(
-            prediction,
-            loss_inputs,
-            # The observed context is given, not predicted, so it carries no
-            # training signal and would otherwise dominate a short continuation.
-            video_mask=effective_video_mask,
-            audio_mask=effective_audio_mask,
-            # Weighting keys on the shifted sigma the model actually saw for the
-            # modality being generated, not the shared unshifted coordinate. An
-            # observed modality sits at a pinned constant and would carry no
-            # schedule information.
-            video_sample_weight=video_sample_weight,
-            audio_sample_weight=audio_sample_weight,
-            balance=args.h3_loss_balance,
-            # The observed modality is conditioning, not a target.
-            video_weight=video_weight,
-            audio_weight=audio_weight,
-        )
+
+        def _velocity_loss(step_prediction, step_inputs):
+            return joint_velocity_loss(
+                step_prediction,
+                step_inputs,
+                # The observed context is given, not predicted, so it carries no
+                # training signal and would otherwise dominate a short continuation.
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                # Weighting keys on the shifted sigma the model actually saw for the
+                # modality being generated, not the shared unshifted coordinate. An
+                # observed modality sits at a pinned constant and would carry no
+                # schedule information.
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                # The observed modality is conditioning, not a target.
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+
+        result = _velocity_loss(prediction, loss_inputs)
         # A modality with weight 0 (the observed side of a v2a/a2v step) reports a
         # flat 0.0 rather than disappearing: the key stays in every step's metric
         # set so existing dashboards and the per-item averaging below keep a
@@ -2027,6 +2076,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # set is unchanged.
             metrics["h3/caption_dropped"] = float(conditioning == "empty")
         loss = result.loss
+        # Dense-equivalent objective, free of inverse-probability scaling and of
+        # auxiliary terms. Reported as the averaged loss whenever the optimized
+        # loss differs from it.
+        dense_loss = result.loss
+        guidance_rescaled = False
+        if use_guidance and args.h3_guidance_distillation_probability < 1.0:
+            # The guidance objective replaces the ordinary one rather than adding
+            # to it, so the unbiased sparse form keeps the ordinary loss every
+            # step and scales only the guidance correction. Both terms reuse the
+            # single trainable forward; no extra transformer pass is involved.
+            plain_result = _velocity_loss(raw_prediction, inputs)
+            loss = plain_result.loss + (result.loss - plain_result.loss) / args.h3_guidance_distillation_probability
+            rescaled_velocity_loss = loss
+            guidance_rescaled = True
+        if args.h3_guidance_distillation_probability < 1.0:
+            metrics["h3/guidance_distillation_active"] = float(use_guidance)
         base_preservation_term = None
         if reference_prediction is not None:
             preservation = joint_prediction_loss(
@@ -2056,8 +2121,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics.update(crepa_metrics)
         elif use_crepa:
             metrics.update(self._crepa.status_metrics())
-        if base_preservation_term is not None:
-            metrics[LOSS_FOR_AVERAGE_KEY] = float((loss - base_preservation_term).detach())
+        if base_preservation_term is not None or guidance_rescaled:
+            average_loss = loss
+            if base_preservation_term is not None:
+                average_loss = average_loss - base_preservation_term
+            if guidance_rescaled:
+                # Report the dense guidance objective so the running average stays
+                # comparable across a sparse and a dense run.
+                average_loss = average_loss - rescaled_velocity_loss + dense_loss
+            metrics[LOSS_FOR_AVERAGE_KEY] = float(average_loss.detach())
         # Keep capture active until backward has completed. Non-reentrant
         # gradient checkpointing recomputes hooked blocks during backward and
         # requires the hook to perform the same tensor operations as forward.
@@ -2089,6 +2161,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
+            "ss_h3_guidance_distillation_probability": str(args.h3_guidance_distillation_probability),
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_guidance_loss_schedule": args.h3_guidance_loss_schedule,
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
@@ -2219,6 +2292,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
+    )
+    parser.add_argument(
+        "--h3_guidance_distillation_probability",
+        type=float,
+        default=1.0,
+        help=(
+            "probability of evaluating the empty-conditioning guidance branch on a batch; the guidance correction "
+            "is divided by this probability to preserve the expected gradient, and the draw is synchronized across "
+            "distributed ranks"
+        ),
     )
     parser.add_argument(
         "--h3_extension_video_frames",

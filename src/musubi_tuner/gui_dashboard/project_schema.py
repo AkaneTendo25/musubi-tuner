@@ -280,6 +280,7 @@ class TrainingConfig(BaseModel):
     reference_video_short_edge: int = 768
     reference_video_max_pixels: int = 1032192
     h3_guidance_distillation_scale: Optional[float] = None
+    h3_guidance_distillation_probability: float = 1.0
     h3_guidance_loss_form: Literal["normalized", "contrastive"] = "normalized"
     h3_guidance_loss_schedule: Literal["sigma", "constant"] = "sigma"
     h3_base_preservation_loss_weight: float = 0.0

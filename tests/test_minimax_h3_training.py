@@ -3085,12 +3085,25 @@ def test_h3_partial_checkpointing_requires_gradient_checkpointing():
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
-def test_h3_partial_checkpointing_rejects_compile():
+def test_h3_partial_checkpointing_allows_compile():
+    # Each block is compiled independently and the checkpoint wrapper sits outside
+    # the compiled callable, so a partially wrapped stack only adds a second
+    # compiled variant of the shared block forward.
     args = create_parser().parse_args(
         ["--sdpa", "--gradient_checkpointing", "--h3_gradient_checkpointing_blocks", "25", "--compile"]
     )
 
-    with pytest.raises(ValueError, match="cannot be combined with --compile"):
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.h3_gradient_checkpointing_blocks == 25
+
+
+def test_h3_partial_checkpointing_rejects_block_swap():
+    args = create_parser().parse_args(
+        ["--sdpa", "--gradient_checkpointing", "--h3_gradient_checkpointing_blocks", "25", "--blocks_to_swap", "10"]
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with block swap"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
@@ -4213,3 +4226,115 @@ def test_h3_base_sigma_resolves_the_scheduler_branch_in_fp32():
     torch.testing.assert_close(base_sigma, (steps / 1000.0).to(torch.float32))
     # Every value survives exactly; the BF16 round trip collapses two of them.
     assert not torch.equal(base_sigma, base_sigma.to(torch.bfloat16).to(torch.float32))
+
+
+def _guidance_probability_batch():
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
+        H3_AUDIO_LOSS_MASK_KEY: torch.zeros(1, 3, dtype=torch.bool),
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+    return video, batch
+
+
+def _run_guidance_probability(*, guidance_scale, probability, active):
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = guidance_scale
+    args.h3_guidance_distillation_probability = probability
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = _FakeBackend()
+    trainer.backend = backend
+    trainer._guidance_distillation_active = lambda accelerator, probability: active
+    transformer = _ScaleTransformer()
+    video, batch = _guidance_probability_batch()
+
+    torch.manual_seed(0)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        None,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    return backend, float(loss.detach()), metrics
+
+
+def test_h3_sparse_guidance_distillation_skips_the_empty_forward():
+    backend, loss, metrics = _run_guidance_probability(guidance_scale=4.0, probability=0.5, active=False)
+    _, plain_loss, _ = _run_guidance_probability(guidance_scale=None, probability=1.0, active=True)
+
+    assert backend.calls == [("prompt", True)]
+    assert metrics["h3/guidance_distillation_active"] == 0.0
+    assert loss == pytest.approx(plain_loss)
+
+
+def test_h3_sparse_guidance_distillation_scales_only_the_guidance_correction():
+    _, dense_loss, _ = _run_guidance_probability(guidance_scale=4.0, probability=1.0, active=True)
+    _, plain_loss, _ = _run_guidance_probability(guidance_scale=None, probability=1.0, active=True)
+    backend, sparse_loss, metrics = _run_guidance_probability(guidance_scale=4.0, probability=0.25, active=True)
+
+    assert backend.calls == [("empty", False), ("prompt", True)]
+    assert metrics["h3/guidance_distillation_active"] == 1.0
+    assert sparse_loss == pytest.approx(plain_loss + 4 * (dense_loss - plain_loss), rel=1e-5)
+    # The running average keeps reporting the dense objective.
+    assert metrics["_loss_for_average"] == pytest.approx(dense_loss, rel=1e-5)
+
+
+@pytest.mark.parametrize("probability", [0.0, -0.1, 1.1, float("nan")])
+def test_h3_guidance_distillation_probability_is_validated(probability):
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 4.0
+    args.h3_guidance_distillation_probability = probability
+
+    with pytest.raises(ValueError, match="h3_guidance_distillation_probability"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_guidance_distillation_probability_requires_a_scale():
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_probability = 0.5
+
+    with pytest.raises(ValueError, match="requires --h3_guidance_distillation_scale"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_guidance_distillation_draw_is_independent_of_the_global_cpu_stream(monkeypatch):
+    broadcasts = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda value, src: broadcasts.append((value.clone(), src)))
+
+    torch.manual_seed(321)
+    MiniMaxH3NetworkTrainer()._guidance_distillation_active(_FakeAccelerator(), 0.5)  # seeds the generator once
+    expected_next = torch.rand(())
+
+    trainer = MiniMaxH3NetworkTrainer()
+    torch.manual_seed(321)
+    for _ in range(6):
+        trainer._guidance_distillation_active(_FakeAccelerator(), 0.5)
+    actual_next = torch.rand(())
+
+    # Only the one-time seeding touches the global stream; the per-step draws do not.
+    assert actual_next == expected_next
+    assert len(broadcasts) == 7 and all(source == 0 for _, source in broadcasts)
+
+
+def test_h3_guidance_distillation_probability_is_recorded_in_metadata():
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 4.0
+    args.h3_guidance_distillation_probability = 0.5
+
+    metadata = MiniMaxH3NetworkTrainer().extra_metadata(args)
+
+    assert metadata["ss_h3_guidance_distillation_probability"] == "0.5"

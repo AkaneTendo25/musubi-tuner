@@ -536,6 +536,7 @@ def test_h3_performance_validation_matches_trainer_constraints(tmp_path: Path) -
     training.h3_convrot_int8 = True
     training.gradient_checkpointing = True
     training.h3_gradient_checkpointing_blocks = 24
+    training.blocks_to_swap = 10
     training.compile = True
     training.h3_gradient_checkpointing_cpu_offload_pin_memory = True
 

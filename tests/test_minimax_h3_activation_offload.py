@@ -1,8 +1,11 @@
 import logging
 
+import pytest
 import torch
 
 from musubi_tuner.minimax_h3.activation_offload import _OffloadedTensor, ReusableActivationOffloader
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="reusable activation offload requires CUDA")
 
 
 class _FakeEvent:
@@ -80,3 +83,37 @@ def test_reusable_activation_reset_is_callable_without_a_pending_forward() -> No
     offloader = _offloader_without_cuda()
     offloader.reset()
     assert offloader._handles == {}
+
+
+@requires_cuda
+def test_reusable_activation_round_trips_saved_tensors_through_the_side_streams() -> None:
+    # The pack path copies D2H on a dedicated stream; the saved activation must
+    # still arrive intact for the recomputed backward.
+    offloader = ReusableActivationOffloader()
+    device = torch.device("cuda")
+    weight = torch.randn(8, 8, device=device, dtype=torch.float32, requires_grad=True)
+    inputs = torch.randn(4, 8, device=device, dtype=torch.float32, requires_grad=True)
+
+    reference = (inputs @ weight).tanh().sum()
+    reference.backward()
+    expected_input_grad = inputs.grad.clone()
+    expected_weight_grad = weight.grad.clone()
+    inputs.grad = None
+    weight.grad = None
+
+    with offloader.context(0):
+        hidden = (inputs @ weight).tanh()
+    hidden.sum().backward()
+
+    torch.testing.assert_close(inputs.grad, expected_input_grad)
+    torch.testing.assert_close(weight.grad, expected_weight_grad)
+
+
+@requires_cuda
+def test_reusable_activation_d2h_and_h2d_use_distinct_side_streams() -> None:
+    offloader = ReusableActivationOffloader()
+    compute = torch.cuda.current_stream()
+
+    assert offloader._d2h_stream != compute
+    assert offloader._stream != compute
+    assert offloader._d2h_stream != offloader._stream

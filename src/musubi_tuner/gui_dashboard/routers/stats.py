@@ -481,7 +481,8 @@ def _estimate_h3_training_step_time_sec(training: dict, dataset: dict, caching: 
     # the same execution shape as an active preservation teacher pass.
     if training.get("h3_guidance_distillation_scale") is not None:
         caption_dropout = min(max(_coerce_float(training.get("h3_caption_dropout_rate", 0), 0.0), 0.0), 1.0)
-        step_time *= 1.0 + 0.23 * (1.0 - caption_dropout)
+        guidance_probability = min(max(_coerce_float(training.get("h3_guidance_distillation_probability", 1), 1.0), 0.0), 1.0)
+        step_time *= 1.0 + 0.23 * (1.0 - caption_dropout) * guidance_probability
 
     sample_every_n_steps = _coerce_int(training.get("sample_every_n_steps", 0), 0)
     if sample_every_n_steps:

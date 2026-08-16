@@ -785,6 +785,27 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        guidance_probability = float(t.h3_guidance_distillation_probability)
+        if not math.isfinite(guidance_probability) or not 0 < guidance_probability <= 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_guidance_distillation_probability",
+                    "H3 guidance distillation probability must be finite and lie in (0, 1].",
+                    label="H3 Guidance Distillation Probability",
+                    page="training",
+                )
+            )
+        elif guidance_probability < 1 and t.h3_guidance_distillation_scale is None:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_guidance_distillation_probability",
+                    "H3 guidance distillation probability requires a guidance distillation scale.",
+                    label="H3 Guidance Distillation Probability",
+                    page="training",
+                )
+            )
         spatial_density_jitter = float(t.h3_spatial_density_jitter)
         if not math.isfinite(spatial_density_jitter) or spatial_density_jitter < 0:
             errors.append(
@@ -1195,16 +1216,6 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         "error",
                         "training.h3_gradient_checkpointing_blocks",
                         "Partial H3 gradient checkpointing cannot be combined with block swap.",
-                        label="Checkpointed H3 Blocks",
-                        page="training",
-                    )
-                )
-            if checkpoint_blocks < 50 and t.compile:
-                errors.append(
-                    _make_issue(
-                        "error",
-                        "training.h3_gradient_checkpointing_blocks",
-                        "Partial H3 gradient checkpointing cannot be combined with torch.compile.",
                         label="Checkpointed H3 Blocks",
                         page="training",
                     )

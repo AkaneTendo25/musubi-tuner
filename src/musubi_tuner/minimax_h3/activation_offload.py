@@ -37,6 +37,13 @@ class ReusableActivationOffloader:
         self._pool: dict[tuple[int, int, torch.dtype], torch.Tensor] = {}
         self._handles: dict[tuple[int, int], _OffloadedTensor] = {}
         self._stream = torch.cuda.Stream()
+        # A dedicated D2H stream keeps the save-side copy off the compute stream,
+        # so offloading a block's activations overlaps the next block's forward
+        # instead of serializing with it. It stays separate from the H2D stream:
+        # the two directions are only ever active in different phases (D2H during
+        # forward, H2D prefetch during backward), but a shared stream would still
+        # order a cold-start ``_schedule`` behind whatever D2H work was queued.
+        self._d2h_stream = torch.cuda.Stream()
 
     def begin_forward(self) -> None:
         unconsumed = sum(1 for handle in self._handles.values() if not handle.consumed)
@@ -89,9 +96,21 @@ class ReusableActivationOffloader:
                 storage = torch.empty(capacity, dtype=tensor.dtype, device="cpu", pin_memory=True)
                 self._pool[key] = storage
             cpu = storage[:required].view(tensor.shape)
-            cpu.copy_(tensor, non_blocking=True)
+            compute_stream = torch.cuda.current_stream(tensor.device)
+            # The side stream may not read the activation before compute has
+            # produced it.
+            produced = torch.cuda.Event()
+            produced.record(compute_stream)
             event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(tensor.device))
+            with torch.cuda.stream(self._d2h_stream):
+                self._d2h_stream.wait_event(produced)
+                cpu.copy_(tensor, non_blocking=True)
+                event.record(self._d2h_stream)
+            # The GPU activation is now read by a stream other than the one that
+            # allocated it; without this the caching allocator may hand its
+            # memory to a later compute-stream allocation while the copy is in
+            # flight. Same hand-off the H2D side registers in _materialize.
+            tensor.record_stream(self._d2h_stream)
             handle = _OffloadedTensor(block_index, current_ordinal, cpu, tensor.device, event)
             self._handles[(block_index, current_ordinal)] = handle
             return handle

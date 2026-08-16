@@ -442,6 +442,26 @@ def test_h3_partial_gradient_checkpointing_targets_last_blocks(monkeypatch):
     assert seen == [2, 3]
 
 
+def test_h3_partial_gradient_checkpointing_matches_dense_gradients():
+    torch.manual_seed(0)
+    reference = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    partial = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    partial.load_state_dict(reference.state_dict())
+    reference.enable_gradient_checkpointing()
+    partial.enable_gradient_checkpointing()
+    partial.set_gradient_checkpointing_blocks(2)
+
+    inputs = _tiny_inputs()
+    reference(**inputs).video.sum().backward()
+    partial(**inputs).video.sum().backward()
+
+    for (name, expected), (_, actual) in zip(reference.named_parameters(), partial.named_parameters()):
+        if expected.grad is None:
+            assert actual.grad is None, name
+            continue
+        torch.testing.assert_close(actual.grad, expected.grad, msg=name)
+
+
 def test_h3_partial_gradient_checkpointing_validates_depth():
     model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
 

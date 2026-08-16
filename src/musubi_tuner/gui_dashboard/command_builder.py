@@ -677,6 +677,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += crepa_args
     if t.h3_guidance_distillation_scale is not None:
         cmd += ["--h3_guidance_distillation_scale", str(t.h3_guidance_distillation_scale)]
+        if t.h3_guidance_distillation_probability != 1.0:
+            cmd += ["--h3_guidance_distillation_probability", str(t.h3_guidance_distillation_probability)]
         if t.h3_guidance_loss_form != "normalized":
             cmd += ["--h3_guidance_loss_form", t.h3_guidance_loss_form]
         if t.h3_guidance_loss_schedule != "sigma":
