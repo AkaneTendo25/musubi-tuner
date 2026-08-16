@@ -3934,6 +3934,274 @@ def test_h3_mask_rejects_combining_with_extension():
         trainer.handle_model_specific_args(args)
 
 
+@pytest.mark.parametrize("mode", ["ref2va", "ref2va_omni"])
+def test_h3_masked_conditioning_combines_with_ref2va_training(mode):
+    # Masking pins rows inside the target block, which the Ref2VA layout carries
+    # unchanged behind its reference prefix, so it is no longer T2VA-only.
+    args = create_parser().parse_args(["--sdpa"])
+    args.h3_training_mode = mode
+    args.h3_mask_mode = "box"
+    args.h3_mask_audio = True
+    trainer = MiniMaxH3NetworkTrainer()
+
+    trainer.handle_model_specific_args(args)
+
+    assert trainer._mask_mode == "box" and trainer._mask_audio
+
+
+@pytest.mark.parametrize("mode", ["ref2va", "ref2va_omni"])
+def test_h3_extension_under_ref2va_requires_the_per_row_sigma_route(mode):
+    args = create_parser().parse_args(["--sdpa"])
+    args.h3_training_mode = mode
+    args.h3_extension_video_frames = 2
+    trainer = MiniMaxH3NetworkTrainer()
+
+    with pytest.raises(ValueError, match="requires --h3_extension_route per_row_sigma"):
+        trainer.handle_model_specific_args(args)
+
+    args.h3_extension_route = "per_row_sigma"
+    trainer.handle_model_specific_args(args)
+
+    assert trainer._extension_video_frames == 2 and trainer._extension_route == "per_row_sigma"
+
+
+def test_h3_extension_keeps_the_condition_rows_route_under_fl2va():
+    args = create_parser().parse_args(["--sdpa"])
+    args.h3_extension_audio_latents = 1
+    trainer = MiniMaxH3NetworkTrainer()
+
+    trainer.handle_model_specific_args(args)
+
+    assert trainer._extension_route == "condition_rows"
+
+
+@pytest.mark.parametrize("mode", ["ref2va", "ref2va_omni"])
+def test_h3_keyframe_conditioning_stays_t2va_only(mode):
+    # Keyframes duplicate the observed frames as extra condition rows, which
+    # only the T2VA packer knows how to place.
+    args = create_parser().parse_args([])
+    args.h3_training_mode = mode
+    args.h3_keyframe_anchors = "first,last"
+    trainer = MiniMaxH3NetworkTrainer()
+
+    with pytest.raises(ValueError, match="requires --h3_training_mode fl2va"):
+        trainer.handle_model_specific_args(args)
+
+
+class _PackedRowRecorder:
+    """Capture the packed rows and per-row sigma a forward would have received."""
+
+    def __init__(self):
+        self.config = SimpleNamespace(in_channels=4, audio_in_channels=6, patch_size=(1, 2, 2), text_dim=8)
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(video=kwargs["video_hidden_states"], audio=kwargs["audio_hidden_states"])
+
+    @property
+    def row_sigma(self):
+        call = self.calls[-1]
+        return call["timestep"][call["timestep_indices"]]
+
+
+def _ref2va_conditioning_batch(task="ref2va", *, references=True):
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 1] if references else [1, 1, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS[task])],
+    }
+    if references:
+        # One image reference (one video row) and one audio reference (two
+        # channel-major rows), so both modalities carry a conditioning prefix.
+        batch.update(
+            {
+                H3_REFERENCE_KINDS_KEY: [torch.tensor([0, 2])],
+                H3_REFERENCE_VIDEO_SHAPES_KEY: [torch.tensor([[1, 2, 2], [0, 0, 0]])],
+                H3_REFERENCE_AUDIO_LENGTHS_KEY: [torch.tensor([0, 1])],
+                H3_REFERENCE_VIDEO_ROWS_KEY: [torch.full((1, 16), 5.0)],
+                H3_REFERENCE_AUDIO_ROWS_KEY: [torch.full((2, 6), 7.0)],
+            }
+        )
+    return batch
+
+
+def test_h3_masked_conditioning_offsets_past_the_ref2va_reference_rows():
+    # The mask is drawn at target-latent granularity, so under Ref2VA it must be
+    # applied one reference prefix into the packed rows. Getting the offset wrong
+    # would pin the references and leave the matching target rows noisy.
+    transformer = _PackedRowRecorder()
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+    video = torch.zeros(1, 4, 2, 4, 4)
+    audio = torch.zeros(1, 2, 6, 3)
+    observed_video = torch.tensor([True] * 4 + [False] * 4)
+    observed_audio = torch.tensor([True, False, False] * 2)
+
+    torch.manual_seed(0)
+    prediction = backend.predict_training(
+        transformer,
+        _ref2va_conditioning_batch(),
+        video,
+        audio,
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+        observed_video_rows=observed_video,
+        clean_video_latents=torch.ones_like(video),
+        observed_audio_rows=observed_audio,
+        clean_audio_latents=torch.ones_like(audio),
+    )
+
+    # The prediction covers the target alone: reference rows are conditioning and
+    # are dropped before the loss ever sees them.
+    assert prediction.video.shape == video.shape and prediction.audio.shape == audio.shape
+
+    call = transformer.calls[-1]
+    sigma = transformer.row_sigma
+    video_indices, audio_indices = call["video_indices"], call["audio_indices"]
+    # One reference video row, then eight target rows; two reference audio rows,
+    # then six target rows.
+    assert float(sigma[video_indices[0]]) == pytest.approx(0.999)
+    assert bool((sigma[video_indices[1:5]] == 0.999).all())
+    assert bool((sigma[video_indices[5:9]] == 0.4).all())
+    assert bool((sigma[audio_indices[:2]] == 1.0).all())
+    torch.testing.assert_close(sigma[audio_indices[2:]], torch.tensor([1.0, 0.7, 0.7, 1.0, 0.7, 0.7]))
+
+    packed_video = call["video_hidden_states"][0]
+    packed_audio = call["audio_hidden_states"][0]
+    # The reference rows keep their cached content, blended with the released
+    # conditioning noise; only the target rows are swapped for clean latents.
+    torch.testing.assert_close(packed_video[0], torch.full((16,), 0.999 * 5.0), atol=5e-3, rtol=0)
+    torch.testing.assert_close(packed_video[1:5], torch.full((4, 16), 0.999), atol=5e-3, rtol=0)
+    assert bool((packed_video[5:9] == 0.0).all())
+    assert bool((packed_audio[:2] == 7.0).all())
+    torch.testing.assert_close(packed_audio[2:, 0], torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]))
+
+
+def test_h3_masked_conditioning_under_ref2va_rejects_a_packed_length_mask():
+    transformer = _PackedRowRecorder()
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+    video = torch.zeros(1, 4, 2, 4, 4)
+
+    with pytest.raises(ValueError, match="rows for 8 target rows"):
+        backend.predict_training(
+            transformer,
+            _ref2va_conditioning_batch(),
+            video,
+            None,
+            torch.tensor([0.4]),
+            torch.tensor([0.7]),
+            observed_video_rows=torch.ones(9, dtype=torch.bool),
+            clean_video_latents=torch.ones_like(video),
+        )
+
+
+def test_h3_ref2va_omni_without_references_masks_exactly_as_t2va():
+    # A zero-reference omni sample has no conditioning prefix, so the offset is
+    # zero and the packed sequence must be identical to the T2VA one.
+    video = torch.zeros(1, 4, 2, 4, 4)
+    audio = torch.zeros(1, 2, 6, 3)
+    observed_video = torch.tensor([False, True] * 4)
+    observed_audio = torch.tensor([True, False, False] * 2)
+    packed = []
+    for mode, task in (("ref2va_omni", "ref2va_omni"), ("fl2va", "t2va")):
+        transformer = _PackedRowRecorder()
+        backend = _NativeTrainingBackend(transformer, mode=mode)
+        torch.manual_seed(0)
+        backend.predict_training(
+            transformer,
+            _ref2va_conditioning_batch(task, references=False),
+            video,
+            audio,
+            torch.tensor([0.4]),
+            torch.tensor([0.7]),
+            observed_video_rows=observed_video,
+            clean_video_latents=torch.ones_like(video),
+            observed_audio_rows=observed_audio,
+            clean_audio_latents=torch.ones_like(audio),
+        )
+        packed.append(transformer.calls[-1])
+
+    omni, t2va = packed
+    for key in ("video_hidden_states", "audio_hidden_states", "position_ids", "token_tags", "video_indices", "audio_indices"):
+        torch.testing.assert_close(omni[key], t2va[key])
+    torch.testing.assert_close(
+        omni["timestep"][omni["timestep_indices"]],
+        t2va["timestep"][t2va["timestep_indices"]],
+    )
+
+
+def test_h3_ref2va_extension_pins_the_leading_target_rows_on_the_per_row_sigma_route():
+    transformer = _PackedRowRecorder()
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+    video = torch.zeros(1, 4, 2, 4, 4)
+    audio = torch.zeros(1, 2, 6, 3)
+
+    torch.manual_seed(0)
+    backend.predict_training(
+        transformer,
+        _ref2va_conditioning_batch(),
+        video,
+        audio,
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+        extension_video_frames=1,
+        extension_video_context=torch.ones(1, 4, 1, 4, 4),
+        extension_audio_latents=1,
+        extension_audio_context=torch.ones(1, 2, 6, 1),
+        extension_route="per_row_sigma",
+    )
+
+    call = transformer.calls[-1]
+    sigma = transformer.row_sigma
+    video_indices, audio_indices = call["video_indices"], call["audio_indices"]
+    assert float(sigma[video_indices[0]]) == pytest.approx(0.999)
+    assert bool((sigma[video_indices[1:5]] == 0.999).all())
+    assert bool((sigma[video_indices[5:9]] == 0.4).all())
+    torch.testing.assert_close(sigma[audio_indices[2:]], torch.tensor([1.0, 0.7, 0.7, 1.0, 0.7, 0.7]))
+
+    packed_video = call["video_hidden_states"][0]
+    packed_audio = call["audio_hidden_states"][0]
+    torch.testing.assert_close(packed_video[0], torch.full((16,), 0.999 * 5.0), atol=5e-3, rtol=0)
+    torch.testing.assert_close(packed_video[1:5], torch.full((4, 16), 0.999), atol=5e-3, rtol=0)
+    assert bool((packed_video[5:9] == 0.0).all())
+    assert bool((packed_audio[:2] == 7.0).all())
+    torch.testing.assert_close(packed_audio[2:, 0], torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]))
+
+
+def test_h3_ref2va_extension_rejects_the_condition_rows_route():
+    transformer = _PackedRowRecorder()
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+
+    with pytest.raises(ValueError, match="only supported on the per_row_sigma route"):
+        backend.predict_training(
+            transformer,
+            _ref2va_conditioning_batch(),
+            torch.zeros(1, 4, 2, 4, 4),
+            None,
+            torch.tensor([0.4]),
+            torch.tensor([0.7]),
+            extension_video_frames=1,
+            extension_video_context=torch.ones(1, 4, 1, 4, 4),
+        )
+
+
+def test_h3_ref2va_still_rejects_custom_keyframe_anchors():
+    transformer = _PackedRowRecorder()
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+
+    with pytest.raises(ValueError, match="custom keyframe anchors require --task t2va caches"):
+        backend.predict_training(
+            transformer,
+            _ref2va_conditioning_batch(),
+            torch.zeros(1, 4, 2, 4, 4),
+            None,
+            torch.tensor([0.4]),
+            torch.tensor([0.7]),
+            condition_video_anchors=("first",),
+            extension_video_context=torch.ones(1, 4, 1, 4, 4),
+        )
+
+
 def test_h3_random_observed_modality_covers_all_three_tasks():
     # Redrawing the task per step is what keeps one adapter able to do joint
     # generation, A2V and V2A instead of specialising on whichever was fixed.

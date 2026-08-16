@@ -806,6 +806,87 @@ def create_training_backend(
     )
 
 
+def _observe_leading_video_rows(
+    video_rows: torch.Tensor,
+    context_rows: torch.Tensor,
+    *,
+    condition_rows: int,
+    base_timestep: torch.Tensor,
+    observed_timestep: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Swap the leading *target* video rows for clean context and pin their sigma.
+
+    ``condition_rows`` is the number of packed rows that precede the target
+    block -- keyframes under FL2VA, references under Ref2VA -- so the observed
+    span is addressed relative to the target, never to the packed sequence.
+    """
+    observed = int(context_rows.shape[1])
+    target_rows = int(video_rows.shape[1]) - condition_rows
+    rows = torch.cat(
+        (video_rows[:, :condition_rows], context_rows, video_rows[:, condition_rows + observed :]),
+        dim=1,
+    )
+    schedule = base_timestep.reshape(1).to(dtype=torch.float32).expand(target_rows).clone()
+    schedule[:observed] = observed_timestep.reshape(1)[0]
+    return rows, schedule
+
+
+def _observe_leading_audio_rows(
+    audio_rows: torch.Tensor,
+    context_rows: torch.Tensor,
+    *,
+    condition_rows: int,
+    num_audio_latents: int,
+    context_latents: int,
+    base_timestep: torch.Tensor,
+    observed_timestep: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Swap each channel's leading target audio latents for clean context.
+
+    Packed audio is channel-major, so the observed prefix appears once per
+    channel and cannot be expressed as one contiguous slice.
+    """
+    kept = [audio_rows[:, :condition_rows]]
+    for channel in range(AUDIO_CHANNELS):
+        start = condition_rows + channel * num_audio_latents
+        kept.append(context_rows[:, channel * context_latents : (channel + 1) * context_latents])
+        kept.append(audio_rows[:, start + context_latents : start + num_audio_latents])
+    rows = torch.cat(kept, dim=1)
+    schedule = base_timestep.reshape(1).to(dtype=torch.float32).expand(AUDIO_CHANNELS * num_audio_latents).clone()
+    for channel in range(AUDIO_CHANNELS):
+        start = channel * num_audio_latents
+        schedule[start : start + context_latents] = observed_timestep.reshape(1)[0]
+    return rows, schedule
+
+
+def _pin_observed_rows(
+    rows: torch.Tensor,
+    clean_rows: torch.Tensor,
+    observed: torch.Tensor,
+    *,
+    condition_rows: int,
+    base_timestep: torch.Tensor,
+    observed_timestep: torch.Tensor,
+    modality: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Present an arbitrary subset of the target rows as clean, pinned context.
+
+    The mask is drawn at target-latent granularity, so it indexes the target
+    block alone. Conditioning rows -- keyframes or references -- keep their own
+    timestep and are never scored, which is why the mask must be offset past
+    them rather than compared against the whole packed sequence.
+    """
+    target = rows[:, condition_rows:]
+    observed = observed.to(rows.device)
+    if observed.shape != (target.shape[1],):
+        raise ValueError(f"H3 observed {modality} mask has {tuple(observed.shape)} rows for {target.shape[1]} target rows")
+    target = torch.where(observed[None, :, None], clean_rows, target)
+    rows = torch.cat((rows[:, :condition_rows], target), dim=1)
+    schedule = base_timestep.reshape(1).to(dtype=torch.float32).expand(target.shape[1]).clone()
+    schedule[observed] = observed_timestep.reshape(1)[0]
+    return rows, schedule
+
+
 class _NativeTrainingBackend:
     def __init__(
         self,
@@ -975,20 +1056,31 @@ class _NativeTrainingBackend:
             raise ValueError(f"MiniMax H3 {self.mode} training requires {expected} conditioning; re-cache text outputs")
         if condition_video_anchors and task != "t2va":
             raise ValueError("H3 custom keyframe anchors require --task t2va caches")
-        t2va_only_conditioning = {
-            "observed video rows": observed_video_rows,
-            "observed audio rows": observed_audio_rows,
-            "clean video latents": clean_video_latents,
-            "clean audio latents": clean_audio_latents,
-            "video extension context": extension_video_context,
-            "audio extension context": extension_audio_context,
-        }
-        requested_t2va_only = [name for name, value in t2va_only_conditioning.items() if value is not None]
-        if task != "t2va" and requested_t2va_only:
-            raise ValueError(
-                f"H3 {task.upper()} caches cannot represent {', '.join(requested_t2va_only)}; "
-                "disable that conditioning option, or use FL2VA training with --task t2va caches"
-            )
+        if task in ("ref2va", "ref2va_omni"):
+            # Masked and per-row-sigma conditioning only pin rows inside the
+            # target block, which the Ref2VA layout carries unchanged behind its
+            # reference prefix. Duplicating the observed span as extra clean rows
+            # would instead need reference-aware packer support.
+            if (extension_video_frames or extension_audio_latents) and extension_route != "per_row_sigma":
+                raise ValueError(
+                    "H3 Ref2VA extension is only supported on the per_row_sigma route; "
+                    "pass --h3_extension_route per_row_sigma, or use FL2VA training with --task t2va caches"
+                )
+        else:
+            t2va_only_conditioning = {
+                "observed video rows": observed_video_rows,
+                "observed audio rows": observed_audio_rows,
+                "clean video latents": clean_video_latents,
+                "clean audio latents": clean_audio_latents,
+                "video extension context": extension_video_context,
+                "audio extension context": extension_audio_context,
+            }
+            requested_t2va_only = [name for name, value in t2va_only_conditioning.items() if value is not None]
+            if task != "t2va" and requested_t2va_only:
+                raise ValueError(
+                    f"H3 {task.upper()} caches cannot represent {', '.join(requested_t2va_only)}; "
+                    "disable that conditioning option, or use FL2VA training with --task t2va caches"
+                )
         has_vision = bool((text_tags == int(MiniMaxH3TokenTag.VIDEO)).any())
         if task == "t2va" and has_vision:
             raise ValueError("MiniMax H3 T2VA training requires text-only conditioning; re-cache with --task t2va")
@@ -1045,21 +1137,101 @@ class _NativeTrainingBackend:
                 video_rows = torch.cat((reference_video[None], video_rows), dim=1)
             if reference_audio.numel():
                 audio_rows = torch.cat((reference_audio[None], audio_rows), dim=1)
+            # Every offset below is read from this step's layout: a per-step
+            # reference-modality redraw changes how many conditioning rows the
+            # sequence carries, and a zero-reference omni sample carries none at
+            # all, in which case the target block starts at row zero exactly as
+            # it does under T2VA.
+            condition_video_rows = layout.num_condition_video_rows
+            condition_audio_rows = layout.num_condition_audio_rows
+            observed_video_timestep = condition_video_timestep
+            observed_audio_timestep = torch.ones(1, device=model_device)
             row_video_timestep = video_timestep
-            if video_row_schedule is not None:
-                if video_row_schedule.numel() != video_rows.shape[1] - layout.num_condition_video_rows:
+            row_audio_timestep = audio_timestep
+            per_row = False
+
+            if extension_video_frames:
+                if extension_video_frames >= latent_frames:
                     raise ValueError(
-                        f"H3 per-row video timesteps have {video_row_schedule.numel()} entries for "
-                        f"{video_rows.shape[1] - layout.num_condition_video_rows} target rows"
+                        f"H3 video extension needs a shorter context than the target: "
+                        f"{extension_video_frames} of {latent_frames} latent frames"
+                    )
+                if extension_video_context is None:
+                    raise ValueError("H3 conditioning anchors require the clean context latents")
+                context_video_rows = patchify_video_latents(extension_video_context, patch_size)
+                context_video_rows = 0.999 * context_video_rows + 0.001 * torch.randn_like(context_video_rows)
+                video_rows, row_video_timestep = _observe_leading_video_rows(
+                    video_rows,
+                    context_video_rows,
+                    condition_rows=condition_video_rows,
+                    base_timestep=video_timestep,
+                    observed_timestep=observed_video_timestep,
+                )
+                per_row = True
+            if extension_audio_latents:
+                if extension_audio_latents >= num_audio_latents:
+                    raise ValueError(
+                        f"H3 audio extension needs a shorter context than the target: "
+                        f"{extension_audio_latents} of {num_audio_latents} audio latents"
+                    )
+                if extension_audio_context is None:
+                    raise ValueError("H3 audio extension requires the clean context latents")
+                audio_rows, row_audio_timestep = _observe_leading_audio_rows(
+                    audio_rows,
+                    pack_audio_latents(extension_audio_context),
+                    condition_rows=condition_audio_rows,
+                    num_audio_latents=num_audio_latents,
+                    context_latents=extension_audio_latents,
+                    base_timestep=audio_timestep,
+                    observed_timestep=observed_audio_timestep,
+                )
+                per_row = True
+
+            if video_row_schedule is not None:
+                target_rows = video_rows.shape[1] - condition_video_rows
+                if video_row_schedule.numel() != target_rows:
+                    raise ValueError(
+                        f"H3 per-row video timesteps have {video_row_schedule.numel()} entries for {target_rows} target rows"
                     )
                 row_video_timestep = video_row_schedule.to(device=model_device, dtype=torch.float32)
+                per_row = True
+
+            if observed_video_rows is not None:
+                if clean_video_latents is None:
+                    raise ValueError("H3 masked conditioning requires the clean video latents")
+                clean_rows = patchify_video_latents(clean_video_latents, patch_size)
+                clean_rows = 0.999 * clean_rows + 0.001 * torch.randn_like(clean_rows)
+                video_rows, row_video_timestep = _pin_observed_rows(
+                    video_rows,
+                    clean_rows,
+                    observed_video_rows,
+                    condition_rows=condition_video_rows,
+                    base_timestep=video_timestep,
+                    observed_timestep=observed_video_timestep,
+                    modality="video",
+                )
+                per_row = True
+            if observed_audio_rows is not None:
+                if clean_audio_latents is None:
+                    raise ValueError("H3 masked conditioning requires the clean audio latents")
+                audio_rows, row_audio_timestep = _pin_observed_rows(
+                    audio_rows,
+                    pack_audio_latents(clean_audio_latents),
+                    observed_audio_rows,
+                    condition_rows=condition_audio_rows,
+                    base_timestep=audio_timestep,
+                    observed_timestep=observed_audio_timestep,
+                    modality="audio",
+                )
+                per_row = True
+
             timestep, timestep_indices = build_row_timesteps(
                 layout,
                 row_video_timestep,
-                audio_timestep,
+                row_audio_timestep,
                 condition_video_timestep,
                 torch.ones(1, device=model_device),
-                per_row_timesteps=video_row_schedule is not None,
+                per_row_timesteps=per_row,
             )
         elif task in ("i2va", "fl2va", "l2va"):
             anchors = {"i2va": ("first",), "fl2va": ("first", "last"), "l2va": ("last",)}[task]
@@ -1176,40 +1348,36 @@ class _NativeTrainingBackend:
                     audio_rows = torch.cat((context_audio_rows, audio_rows), dim=1)
                     condition_audio_timestep = observed_audio_timestep
             else:
-                rows_per_frame = (latent_height // patch_size[1]) * (latent_width // patch_size[2])
                 if context_video_rows is not None:
-                    observed = len(anchors) * rows_per_frame
-                    video_rows = torch.cat((context_video_rows, video_rows[:, observed:]), dim=1)
-                    row_video_timestep = video_timestep.reshape(1).expand(latent_frames * rows_per_frame).clone()
-                    row_video_timestep[:observed] = observed_video_timestep[0]
+                    video_rows, row_video_timestep = _observe_leading_video_rows(
+                        video_rows,
+                        context_video_rows,
+                        condition_rows=layout.num_condition_video_rows,
+                        base_timestep=video_timestep,
+                        observed_timestep=observed_video_timestep,
+                    )
                     per_row = True
                 if context_audio_rows is not None:
-                    per_channel = num_audio_latents
-                    kept = [
-                        torch.cat(
-                            (
-                                context_audio_rows[:, channel * extension_audio_latents : (channel + 1) * extension_audio_latents],
-                                audio_rows[:, channel * per_channel + extension_audio_latents : (channel + 1) * per_channel],
-                            ),
-                            dim=1,
-                        )
-                        for channel in range(AUDIO_CHANNELS)
-                    ]
-                    audio_rows = torch.cat(kept, dim=1)
-                    row_audio_timestep = audio_timestep.reshape(1).expand(AUDIO_CHANNELS * per_channel).clone()
-                    for channel in range(AUDIO_CHANNELS):
-                        start = channel * per_channel
-                        row_audio_timestep[start : start + extension_audio_latents] = observed_audio_timestep[0]
+                    audio_rows, row_audio_timestep = _observe_leading_audio_rows(
+                        audio_rows,
+                        context_audio_rows,
+                        condition_rows=layout.num_condition_audio_rows,
+                        num_audio_latents=num_audio_latents,
+                        context_latents=extension_audio_latents,
+                        base_timestep=audio_timestep,
+                        observed_timestep=observed_audio_timestep,
+                    )
                     per_row = True
 
             # A caller-supplied schedule gives every target video row its own
             # noise level, which the transformer already supports because it
-            # selects modulation through timestep_indices.
+            # selects modulation through timestep_indices. It covers the target
+            # block alone, matching what build_row_timesteps assigns.
             if video_row_schedule is not None:
-                if video_row_schedule.numel() != video_rows.shape[1]:
+                target_rows = video_rows.shape[1] - layout.num_condition_video_rows
+                if video_row_schedule.numel() != target_rows:
                     raise ValueError(
-                        f"H3 per-row video timesteps have {video_row_schedule.numel()} entries "
-                        f"for {video_rows.shape[1]} packed rows"
+                        f"H3 per-row video timesteps have {video_row_schedule.numel()} entries for {target_rows} target rows"
                     )
                 row_video_timestep = video_row_schedule.to(device=model_device, dtype=torch.float32)
                 per_row = True
@@ -1221,27 +1389,28 @@ class _NativeTrainingBackend:
                     raise ValueError("H3 masked conditioning requires the clean video latents")
                 clean_rows = patchify_video_latents(clean_video_latents, patch_size)
                 clean_rows = 0.999 * clean_rows + 0.001 * torch.randn_like(clean_rows)
-                selected = observed_video_rows.to(video_rows.device)
-                if selected.shape != (video_rows.shape[1],):
-                    raise ValueError(
-                        f"H3 observed video mask has {tuple(selected.shape)} rows for {video_rows.shape[1]} packed rows"
-                    )
-                video_rows = torch.where(selected[None, :, None], clean_rows, video_rows)
-                row_video_timestep = video_timestep.reshape(1).expand(video_rows.shape[1]).clone()
-                row_video_timestep[selected] = observed_video_timestep[0]
+                video_rows, row_video_timestep = _pin_observed_rows(
+                    video_rows,
+                    clean_rows,
+                    observed_video_rows,
+                    condition_rows=layout.num_condition_video_rows,
+                    base_timestep=video_timestep,
+                    observed_timestep=observed_video_timestep,
+                    modality="video",
+                )
                 per_row = True
             if observed_audio_rows is not None:
                 if clean_audio_latents is None:
                     raise ValueError("H3 masked conditioning requires the clean audio latents")
-                clean_audio = pack_audio_latents(clean_audio_latents)
-                selected = observed_audio_rows.to(audio_rows.device)
-                if selected.shape != (audio_rows.shape[1],):
-                    raise ValueError(
-                        f"H3 observed audio mask has {tuple(selected.shape)} rows for {audio_rows.shape[1]} packed rows"
-                    )
-                audio_rows = torch.where(selected[None, :, None], clean_audio, audio_rows)
-                row_audio_timestep = audio_timestep.reshape(1).expand(audio_rows.shape[1]).clone()
-                row_audio_timestep[selected] = observed_audio_timestep[0]
+                audio_rows, row_audio_timestep = _pin_observed_rows(
+                    audio_rows,
+                    pack_audio_latents(clean_audio_latents),
+                    observed_audio_rows,
+                    condition_rows=layout.num_condition_audio_rows,
+                    base_timestep=audio_timestep,
+                    observed_timestep=observed_audio_timestep,
+                    modality="audio",
+                )
                 per_row = True
 
             timestep, timestep_indices = build_row_timesteps(

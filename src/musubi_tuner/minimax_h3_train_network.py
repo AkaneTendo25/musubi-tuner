@@ -821,10 +821,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         masking = args.h3_mask_mode != "off" or args.h3_mask_audio
         if masking and (args.h3_extension_video_frames or args.h3_extension_audio_latents):
             raise ValueError("H3 masked conditioning and extension both claim the observed rows; enable only one")
-        if masking and args.h3_training_mode != "fl2va":
-            raise ValueError("H3 masked conditioning requires --h3_training_mode fl2va with --task t2va caches")
-        if (args.h3_extension_video_frames or args.h3_extension_audio_latents) and args.h3_training_mode != "fl2va":
-            raise ValueError("H3 extension training requires --h3_training_mode fl2va with --task t2va caches")
+        # Masking and per-row-sigma extension only pin rows inside the target
+        # block, which every layout carries, so both combine with Ref2VA.
+        # condition_rows extension instead duplicates the observed span as extra
+        # clean rows, which only the T2VA packer knows how to place.
+        if (
+            (args.h3_extension_video_frames or args.h3_extension_audio_latents)
+            and args.h3_training_mode != "fl2va"
+            and args.h3_extension_route != "per_row_sigma"
+        ):
+            raise ValueError(
+                f"H3 extension under --h3_training_mode {args.h3_training_mode} requires "
+                "--h3_extension_route per_row_sigma; --h3_extension_route condition_rows needs "
+                "--h3_training_mode fl2va with --task t2va caches"
+            )
         # Jitter re-noises the whole video at per-frame levels, which silently
         # overwrites any row a conditioning mode pinned as observed and leaves
         # the row timesteps disagreeing with the noise actually applied.
