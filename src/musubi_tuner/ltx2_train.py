@@ -3821,9 +3821,20 @@ def main() -> None:
     # int8 model to the GPU. This lets int8-weight FFT fit without --blocks_to_swap (which is slow).
     # The resulting Int8QTWeight is identical to converting on the GPU (from_float is deterministic).
     int8_weights_cpu_load = bool(getattr(args, "int8_weights", False))
+    # --ltx2_gpu_load loads the transformer directly onto the GPU even when block swap is enabled:
+    # on high-VRAM cards the CPU-staging round trip costs more wall-clock time than the peak-VRAM
+    # it saves. The remaining conditions are explicit opt-ins or memory-bounded features that
+    # require CPU loading regardless.
+    gpu_load = bool(getattr(args, "ltx2_gpu_load", False))
+    if gpu_load and blocks_to_swap > 0:
+        logger.info("--ltx2_gpu_load: loading transformer directly onto %s despite --blocks_to_swap", accelerator.device)
     loading_device = (
         "cpu"
-        if blocks_to_swap > 0 or ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load or int8_weights_cpu_load
+        if (blocks_to_swap > 0 and not gpu_load)
+        or ltx2_model_parallel
+        or remote_prune_local_blocks
+        or qgalore_cpu_load
+        or int8_weights_cpu_load
         else accelerator.device
     )
     if qgalore_cpu_load:
