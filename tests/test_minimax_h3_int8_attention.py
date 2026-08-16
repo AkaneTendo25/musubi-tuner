@@ -28,7 +28,8 @@ def _tiny_config() -> MiniMaxH3TransformerConfig:
     )
 
 
-def test_int8_attention_is_disabled_by_default_and_context_restores_state():
+def test_int8_attention_is_disabled_by_default_and_context_restores_state(monkeypatch):
+    monkeypatch.setattr("musubi_tuner.minimax_h3.model.HAS_TRITON", True)
     model = MiniMaxH3Transformer(_tiny_config())
     modules = [module for module in model.modules() if isinstance(module, MiniMaxH3Attention)]
     assert modules and not any(module.int8_attention for module in modules)

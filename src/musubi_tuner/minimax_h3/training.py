@@ -45,6 +45,9 @@ class H3JointLoss:
     loss: torch.Tensor
     video_loss: torch.Tensor
     audio_loss: torch.Tensor
+    # Counts of valid elements, for reporting and for telling an inactive
+    # modality from an active one. They are not the denominator of the means
+    # above whenever sample weighting is active.
     video_elements: int
     audio_elements: int
 
@@ -269,30 +272,68 @@ def _broadcast_mask(mask: torch.Tensor | None, target: torch.Tensor) -> torch.Te
     return mask.view(shape).expand_as(target)
 
 
+def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor | float) -> torch.Tensor:
+    """Divide by a mean denominator that may be a vanishing weight sum.
+
+    A plain element count is always positive here, so the float path is the
+    unchanged division. A weight sum can legitimately reach zero (every item in
+    the batch weighted 0), in which case the numerator is zero as well; clamping
+    keeps that case at 0 instead of NaN.
+    """
+    if isinstance(denominator, torch.Tensor):
+        return numerator / denominator.clamp_min(torch.finfo(torch.float32).tiny)
+    return numerator / denominator
+
+
 def _modality_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor | None,
     sample_weight: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | float]:
+    """Return ``(mean, weighted sum, valid element count, mean denominator)``.
+
+    The element count stays a plain count for reporting and for deciding which
+    modalities are active. The denominator is what the mean actually divides by:
+    the element count when unweighted, and the sum of the per-element sample
+    weights over the valid elements when weighting is active. Dividing a
+    weighted numerator by an unweighted count would rescale the loss by the mean
+    sample weight instead of reweighting it, and would disagree with validation's
+    :func:`~musubi_tuner.minimax_h3.validation.masked_squared_error_sum`.
+    """
     if prediction.shape != target.shape:
         raise ValueError(f"H3 prediction shape {tuple(prediction.shape)} does not match target {tuple(target.shape)}")
     valid = None if mask is None else _broadcast_mask(mask, target)
-    elements = target.numel() if valid is None else int(valid.sum().item())
+    if valid is None:
+        per_item_valid = None
+        elements = target.numel()
+    else:
+        # One reduction serves both the count and the per-item weight sum, so
+        # masked steps keep the single host round-trip they already paid.
+        per_item_valid = valid.sum(dim=tuple(range(1, valid.ndim)))
+        elements = int(per_item_valid.sum().item())
     if elements == 0:
         zero = prediction.sum() * 0.0
-        return zero, zero, 0
+        return zero, zero, 0, 0.0
 
     squared = (prediction - target).float().square()
+    denominator: torch.Tensor | float = float(elements)
     if sample_weight is not None:
         if sample_weight.shape != (target.shape[0],):
             raise ValueError("H3 sample weighting must contain one value per batch item")
-        squared = squared * _expand_batch_values(sample_weight.float(), squared)
+        weights = sample_weight.to(device=squared.device, dtype=torch.float32)
+        squared = squared * _expand_batch_values(weights, squared)
+        # Kept as a device tensor: every consumer is tensor arithmetic, so no
+        # extra synchronization is introduced by the weighted denominator.
+        if per_item_valid is None:
+            denominator = weights.sum() * float(target.numel() // target.shape[0])
+        else:
+            denominator = (per_item_valid.to(dtype=torch.float32) * weights).sum()
     # Avoid ``masked_select`` here: its data-dependent output allocates a second
     # dense loss buffer and introduces an additional synchronization point.
     # Multiplication preserves the exact masked sum while keeping a static shape.
     total = squared.sum() if valid is None else (squared * valid).sum()
-    return total / elements, total, elements
+    return _safe_divide(total, denominator), total, elements, denominator
 
 
 def _joint_loss(
@@ -328,15 +369,19 @@ def _joint_loss(
     if prediction.video is None or target.video is None or video_weight == 0:
         if (prediction.video is None) != (target.video is None):
             raise ValueError("H3 video prediction and target presence differ")
-        video_mean, video_total, video_elements = zero, zero, 0
+        video_mean, video_total, video_elements, video_denominator = zero, zero, 0, 0.0
     else:
-        video_mean, video_total, video_elements = _modality_loss(prediction.video, target.video, video_mask, video_sample_weight)
+        video_mean, video_total, video_elements, video_denominator = _modality_loss(
+            prediction.video, target.video, video_mask, video_sample_weight
+        )
     if prediction.audio is None or target.audio is None or audio_weight == 0:
         if (prediction.audio is None) != (target.audio is None):
             raise ValueError("H3 audio prediction and target presence differ")
-        audio_mean, audio_total, audio_elements = zero, zero, 0
+        audio_mean, audio_total, audio_elements, audio_denominator = zero, zero, 0, 0.0
     else:
-        audio_mean, audio_total, audio_elements = _modality_loss(prediction.audio, target.audio, audio_mask, audio_sample_weight)
+        audio_mean, audio_total, audio_elements, audio_denominator = _modality_loss(
+            prediction.audio, target.audio, audio_mask, audio_sample_weight
+        )
 
     active_video_weight = video_weight if video_elements else 0.0
     active_audio_weight = audio_weight if audio_elements else 0.0
@@ -346,8 +391,11 @@ def _joint_loss(
     if balance == "modality":
         loss = (active_video_weight * video_mean + active_audio_weight * audio_mean) / (active_video_weight + active_audio_weight)
     else:
-        weighted_elements = active_video_weight * video_elements + active_audio_weight * audio_elements
-        loss = (active_video_weight * video_total + active_audio_weight * audio_total) / weighted_elements
+        # Token balancing pools the two numerators, so it pools the two mean
+        # denominators as well; with sample weighting those are weight sums, in
+        # the same convention as the validation accumulator.
+        weighted_denominator = active_video_weight * video_denominator + active_audio_weight * audio_denominator
+        loss = _safe_divide(active_video_weight * video_total + active_audio_weight * audio_total, weighted_denominator)
 
     return H3JointLoss(loss, video_mean, audio_mean, video_elements, audio_elements)
 

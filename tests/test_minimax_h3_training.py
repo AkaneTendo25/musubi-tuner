@@ -69,6 +69,7 @@ from musubi_tuner.minimax_h3.training import (
     shift_sigma,
     unshift_sigma,
 )
+from musubi_tuner.minimax_h3.validation import masked_squared_error_sum
 from musubi_tuner.minimax_h3_cache_dino_features import (
     _dino_cache_is_current,
     _latent_cache_identity,
@@ -1674,9 +1675,116 @@ def test_joint_loss_applies_modality_specific_sample_weights():
         balance="modality",
     )
 
-    torch.testing.assert_close(result.video_loss, torch.tensor(2.0))
-    torch.testing.assert_close(result.audio_loss, torch.tensor(3.0))
-    torch.testing.assert_close(result.loss, torch.tensor(2.5))
+    # Every squared error is 1 and every item holds one element, so a true
+    # weighted mean is sum(w * 1) / sum(w) = 1 for either modality, not the
+    # weighted sum over a plain element count.
+    torch.testing.assert_close(result.video_loss, torch.tensor(1.0))
+    torch.testing.assert_close(result.audio_loss, torch.tensor(1.0))
+    torch.testing.assert_close(result.loss, torch.tensor(1.0))
+
+
+def _weighted_reference(prediction, target, weights, mask=None):
+    squared = (prediction - target).float().square()
+    numerator = 0.0
+    denominator = 0.0
+    for index, weight in enumerate(weights.tolist()):
+        valid = torch.ones_like(squared[index], dtype=torch.bool) if mask is None else mask[index].expand_as(squared[index])
+        numerator += float((squared[index] * valid).sum()) * weight
+        denominator += float(valid.sum()) * weight
+    return numerator, denominator
+
+
+def test_joint_loss_sample_weights_form_a_true_weighted_mean():
+    torch.manual_seed(0)
+    video = torch.randn(3, 1, 1, 2, 2)
+    audio = torch.randn(3, 1, 1, 4)
+    inputs = prepare_joint_noisy_inputs(video, audio, torch.randn_like(video), torch.randn_like(audio), torch.full((3,), 0.4))
+    prediction = H3ModelPrediction(torch.randn_like(video), torch.randn_like(audio))
+    video_weights = torch.tensor([0.25, 1.5, 4.0])
+    audio_weights = torch.tensor([2.0, 0.5, 1.0])
+    audio_mask = torch.tensor([[True, True, False, False], [True, False, False, False], [True, True, True, True]])
+
+    video_numerator, video_denominator = _weighted_reference(prediction.video, inputs.video_target, video_weights)
+    audio_numerator, audio_denominator = _weighted_reference(
+        prediction.audio, inputs.audio_target, audio_weights, mask=audio_mask.view(3, 1, 1, 4)
+    )
+
+    for balance, expected_total in (
+        ("modality", 0.5 * (video_numerator / video_denominator + audio_numerator / audio_denominator)),
+        ("token", (video_numerator + audio_numerator) / (video_denominator + audio_denominator)),
+    ):
+        result = joint_velocity_loss(
+            prediction,
+            inputs,
+            audio_mask=audio_mask,
+            video_sample_weight=video_weights,
+            audio_sample_weight=audio_weights,
+            balance=balance,
+        )
+        torch.testing.assert_close(result.video_loss, torch.tensor(video_numerator / video_denominator))
+        torch.testing.assert_close(result.audio_loss, torch.tensor(audio_numerator / audio_denominator))
+        torch.testing.assert_close(result.loss, torch.tensor(expected_total))
+        # Counts stay counts: the weighted denominator never leaks into them.
+        assert result.video_elements == 12
+        assert result.audio_elements == 7
+
+
+def test_joint_loss_matches_validation_weighted_normalization():
+    torch.manual_seed(1)
+    prediction = torch.randn(2, 1, 1, 3)
+    target = torch.randn(2, 1, 1, 3)
+    weights = torch.tensor([0.5, 3.0])
+    mask = torch.tensor([[True, True, False], [True, False, True]])
+
+    result = joint_prediction_loss(
+        H3ModelPrediction(video=None, audio=prediction),
+        H3ModelPrediction(video=None, audio=target),
+        audio_mask=mask,
+        audio_sample_weight=weights,
+    )
+    error_sum, denominator = masked_squared_error_sum(prediction, target, mask.view(2, 1, 1, 3), sample_weight=weights)
+
+    torch.testing.assert_close(result.audio_loss, error_sum / denominator)
+    torch.testing.assert_close(result.loss, error_sum / denominator)
+
+
+def test_joint_loss_unweighted_normalization_is_unchanged_by_weighting_support():
+    torch.manual_seed(2)
+    video = torch.randn(2, 1, 1, 2, 2)
+    audio = torch.randn(2, 1, 1, 3)
+    inputs = prepare_joint_noisy_inputs(video, audio, torch.randn_like(video), torch.randn_like(audio), torch.full((2,), 0.5))
+    prediction = H3ModelPrediction(torch.randn_like(video), torch.randn_like(audio))
+    audio_mask = torch.tensor([[True, True, False], [True, False, False]])
+
+    video_error = (prediction.video - inputs.video_target).float().square()
+    audio_error = ((prediction.audio - inputs.audio_target).float().square() * audio_mask.view(2, 1, 1, 3)).sum()
+
+    result = joint_velocity_loss(prediction, inputs, audio_mask=audio_mask, balance="token")
+
+    torch.testing.assert_close(result.video_loss, video_error.sum() / 8)
+    torch.testing.assert_close(result.audio_loss, audio_error / 3)
+    torch.testing.assert_close(result.loss, (video_error.sum() + audio_error) / 11)
+    # A unit sample weight must reproduce the unweighted path exactly.
+    unit = joint_velocity_loss(
+        prediction,
+        inputs,
+        audio_mask=audio_mask,
+        video_sample_weight=torch.ones(2),
+        audio_sample_weight=torch.ones(2),
+        balance="token",
+    )
+    torch.testing.assert_close(unit.loss, result.loss)
+
+
+def test_joint_loss_zero_sample_weights_do_not_produce_nan():
+    video = torch.ones(2, 1, 1, 1, 1)
+    inputs = prepare_joint_noisy_inputs(video, None, torch.zeros_like(video), None, torch.full((2,), 0.5))
+    prediction = H3ModelPrediction(torch.zeros_like(video), None)
+
+    result = joint_velocity_loss(prediction, inputs, video_sample_weight=torch.zeros(2))
+
+    assert torch.isfinite(result.loss)
+    torch.testing.assert_close(result.loss, torch.tensor(0.0))
 
 
 def test_h3_text_cache_contract_and_optional_empty_pair(tmp_path):
