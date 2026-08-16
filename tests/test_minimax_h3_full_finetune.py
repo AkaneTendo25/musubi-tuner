@@ -46,6 +46,12 @@ def test_h3_full_finetune_rejects_frozen_weight_and_lora_paths():
     with pytest.raises(ValueError, match="LoRA initialization"):
         trainer._validate_full_finetune_args(args)
 
+    # Without this rejection the flag reaches handle_model_specific_args and
+    # crashes on ``network_module=None``.endswith().
+    args = create_parser().parse_args(["--sdpa", "--h3_lora_token_refiner"])
+    with pytest.raises(ValueError, match="LoRA-only option"):
+        trainer._validate_full_finetune_args(args)
+
 
 def test_h3_trainable_ring_contract_is_checked_before_cuda_setup():
     args = create_parser().parse_args(
@@ -96,6 +102,22 @@ def test_h3_full_module_streams_native_transformer_checkpoint(tmp_path):
 
     assert set(saved) == set(transformer.state_dict())
     assert all(tensor.dtype == torch.bfloat16 for tensor in saved.values() if tensor.is_floating_point())
+
+
+def test_h3_mem_eff_save_can_be_turned_off_and_writes_the_same_checkpoint(tmp_path):
+    assert create_parser().parse_args(["--sdpa"]).mem_eff_save is True
+    assert create_parser().parse_args(["--sdpa", "--no_mem_eff_save"]).mem_eff_save is False
+
+    transformer = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.LayerNorm(4)).to(torch.bfloat16)
+    streamed = tmp_path / "streamed.safetensors"
+    ordinary = tmp_path / "ordinary.safetensors"
+
+    MiniMaxH3FullFinetuneModule(transformer, mem_eff_save=True).save_weights(str(streamed), torch.bfloat16, None)
+    MiniMaxH3FullFinetuneModule(transformer, mem_eff_save=False).save_weights(str(ordinary), torch.bfloat16, None)
+
+    left, right = load_file(streamed), load_file(ordinary)
+    assert set(left) == set(right)
+    assert all(torch.equal(left[key], right[key]) for key in left)
 
 
 def test_h3_full_module_can_skip_large_weight_write_for_diagnostics(tmp_path):

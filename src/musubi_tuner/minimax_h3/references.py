@@ -110,11 +110,37 @@ def reference_fingerprint(assets: Sequence[MediaAsset]) -> str | None:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _multiple_size(width: float, height: float) -> tuple[int, int]:
-    return (
-        max(CANVAS_MULTIPLE, round(height / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
-        max(CANVAS_MULTIPLE, round(width / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
-    )
+def _round_to_multiple(value: float) -> int:
+    # Explicit half-up: ``round`` is banker's, so a dimension landing exactly on
+    # a half-multiple would alternate between the two neighbours by parity.
+    return max(CANVAS_MULTIPLE, math.floor(value / CANVAS_MULTIPLE + 0.5) * CANVAS_MULTIPLE)
+
+
+def _multiple_size(width: float, height: float, max_pixels: int | None = None) -> tuple[int, int]:
+    """Return ``(height, width)`` snapped to the canvas multiple.
+
+    Rounding happens first so the result is always canvas-aligned. When
+    ``max_pixels`` is given the aligned dimensions are then stepped down, one
+    canvas multiple at a time off the longer edge, until the area fits: clamping
+    before rounding lets the rounding push the area back over the cap, which for
+    extreme aspect ratios overshot it severalfold.
+
+    Both edges are floored at ``CANVAS_MULTIPLE``. A cap below
+    ``CANVAS_MULTIPLE**2`` (rejected by the validators) therefore cannot be
+    satisfied and the single degenerate ``CANVAS_MULTIPLE x CANVAS_MULTIPLE``
+    result is returned instead.
+    """
+    resolved_height = _round_to_multiple(height)
+    resolved_width = _round_to_multiple(width)
+    if max_pixels is not None:
+        while resolved_height * resolved_width > max_pixels and (
+            resolved_height > CANVAS_MULTIPLE or resolved_width > CANVAS_MULTIPLE
+        ):
+            if resolved_height >= resolved_width and resolved_height > CANVAS_MULTIPLE:
+                resolved_height -= CANVAS_MULTIPLE
+            else:
+                resolved_width -= CANVAS_MULTIPLE
+    return resolved_height, resolved_width
 
 
 def validate_reference_image_short_edge(short_edge: int) -> int:
@@ -177,7 +203,7 @@ def resolve_reference_video_size(
         scale = math.sqrt(max_pixels / area)
         resolved_width *= scale
         resolved_height *= scale
-    return _multiple_size(resolved_width, resolved_height)
+    return _multiple_size(resolved_width, resolved_height, max_pixels)
 
 
 def _source_frame_limit(target_frames: int, source_fps: float) -> int:

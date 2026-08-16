@@ -63,6 +63,7 @@ from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SIZE_MODES,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
+    validate_reference_video_sizing,
 )
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
@@ -595,14 +596,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if missing_empty:
                 raise KeyError("guidance-consistent H3 validation is missing " + ", ".join(missing_empty))
             fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
-            with torch.random.fork_rng(devices=fork_devices):
+            # Mirror the training empty branch: it is an auxiliary forward, so it
+            # must use the same INT8-attention calibration or validation measures
+            # a different model than training optimizes.
+            int8_context = getattr(transformer, "int8_attention_context", None)
+            with (
+                torch.random.fork_rng(devices=fork_devices),
+                int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+            ):
                 empty_prediction = self._predict(
                     accelerator,
                     transformer,
                     batch,
                     inputs,
                     conditioning="empty",
-                    gradient_checkpointing=False,
                 )
         prediction = self._predict(
             accelerator,
@@ -610,7 +617,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             batch,
             inputs,
             conditioning="prompt",
-            gradient_checkpointing=False,
         )
         if args.h3_guidance_distillation_scale is not None:
             prediction, loss_inputs = self._guidance_loss_inputs(args, prediction, empty_prediction, inputs)
@@ -816,10 +822,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 --h3_sigma_sqrt_max_weight must be positive")
         if args.reference_image_max_pixels < 0:
             raise ValueError("MiniMax H3 --reference_image_max_pixels must be non-negative")
-        if args.reference_video_short_edge < 16:
-            raise ValueError("MiniMax H3 --reference_video_short_edge must be at least 16")
-        if args.reference_video_max_pixels < 256:
-            raise ValueError("MiniMax H3 --reference_video_max_pixels must be at least 256")
+        # Defer to the canonical validator so a value accepted here cannot fail
+        # later inside reference_key_suffix() with a different lower bound.
+        validate_reference_video_sizing(args.reference_video_short_edge, args.reference_video_max_pixels)
         if args.h3_max_caption_tokens < 0:
             raise ValueError("MiniMax H3 --h3_max_caption_tokens must be non-negative")
         if args.reference_image_size_mode == "short_edge" and args.reference_image_max_pixels:
@@ -1269,7 +1274,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         noise_scheduler,
         timesteps: torch.Tensor,
         device: torch.device,
-        dtype: torch.dtype,
     ) -> torch.Tensor:
         """Recover the *unshifted* schedule coordinate for this step.
 
@@ -1279,10 +1283,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         ``FlowMatchDiscreteScheduler(shift=discrete_flow_shift)``. The chosen
         ``--timestep_sampling`` therefore only picks the *shape* of the base
         distribution; H3's own shifts are applied downstream.
+
+        Both branches resolve in fp32. Reading the schedule in the DiT dtype
+        would quantize the base coordinate to the ~256 distinct BF16 values in
+        [0, 1] before H3's 12/3 shifts are applied downstream.
         """
         if args.timestep_sampling in _DIRECT_SIGMA_SAMPLING:
             return ((timesteps.to(device=device, dtype=torch.float32) - 1.0) / 1000.0).clamp(0.0, 1.0)
-        return get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=dtype).to(torch.float32)
+        return get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=torch.float32)
 
     def _apply_frame_sigma_jitter(self, args, inputs, video_latents, video_noise, base_sigma, is_image):
         """Give each latent frame its own noise level around the shared schedule.
@@ -1521,8 +1529,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         inputs,
         *,
         conditioning: str,
-        gradient_checkpointing: bool,
     ) -> H3ModelPrediction:
+        # Checkpointing is not a per-call argument here: the model reads its own
+        # ``gradient_checkpointing`` flag (set once from ``--gradient_checkpointing``)
+        # and both ``MiniMaxH3Transformer.forward`` and ``MiniMaxH3TokenRefiner.forward``
+        # additionally gate the wrapper on ``torch.is_grad_enabled()``. The teacher
+        # forwards therefore already run unwrapped under ``torch.no_grad()``.
         if self.backend is None:
             raise RuntimeError("H3 training backend is not loaded")
         video = inputs.video.to(device=accelerator.device, dtype=self.dit_dtype) if inputs.video is not None else None
@@ -1824,7 +1836,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             dit_dtype,
             return_noisy=False,
         )
-        base_sigma = self._base_sigma(scheduler_args, noise_scheduler, scheduler_timesteps, accelerator.device, dit_dtype)
+        base_sigma = self._base_sigma(scheduler_args, noise_scheduler, scheduler_timesteps, accelerator.device)
         if not is_image:
             base_sigma = _apply_timestep_focus(
                 base_sigma,
@@ -1912,7 +1924,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         batch,
                         inputs,
                         conditioning="empty",
-                        gradient_checkpointing=False,
                     )
             if preservation_active:
                 if network is None:
@@ -1938,7 +1949,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                                 # would pull the unconditional branch toward the
                                 # frozen base's conditional prediction.
                                 conditioning=conditioning,
-                                gradient_checkpointing=False,
                             )
                     finally:
                         set_enabled(True)
@@ -1956,7 +1966,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 batch,
                 inputs,
                 conditioning=conditioning,
-                gradient_checkpointing=args.gradient_checkpointing,
             )
         except Exception:
             if self._crepa is not None:
@@ -2001,6 +2010,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             video_weight=video_weight,
             audio_weight=audio_weight,
         )
+        # A modality with weight 0 (the observed side of a v2a/a2v step) reports a
+        # flat 0.0 rather than disappearing: the key stays in every step's metric
+        # set so existing dashboards and the per-item averaging below keep a
+        # constant schema.
         metrics = {
             "loss/video": float(result.video_loss.detach()),
             "loss/audio": float(result.audio_loss.detach()),

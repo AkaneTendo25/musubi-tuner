@@ -6,6 +6,7 @@ import time
 from collections.abc import Sequence
 
 import torch
+from safetensors.torch import save_file
 
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer
@@ -18,10 +19,11 @@ logger = logging.getLogger(__name__)
 class MiniMaxH3FullFinetuneModule(torch.nn.Module):
     """Adapter between the shared trainer lifecycle and dense H3 parameters."""
 
-    def __init__(self, transformer: torch.nn.Module, *, save_weights: bool = True) -> None:
+    def __init__(self, transformer: torch.nn.Module, *, save_weights: bool = True, mem_eff_save: bool = True) -> None:
         super().__init__()
         self.transformer = transformer
         self._save_weights = save_weights
+        self._mem_eff_save = mem_eff_save
 
     def forward(self, *args, **kwargs):
         return self.transformer(*args, **kwargs)
@@ -60,7 +62,13 @@ class MiniMaxH3FullFinetuneModule(torch.nn.Module):
             state_dict = {key.replace("_orig_mod.", ""): value for key, value in state_dict.items()}
         if dtype not in (None, torch.bfloat16):
             raise ValueError("MiniMax H3 dense checkpoints can only be saved in native BF16 precision")
-        mem_eff_save_file(state_dict, file, metadata)
+        if self._mem_eff_save:
+            mem_eff_save_file(state_dict, file, metadata)
+        else:
+            # ``save_file`` needs the whole checkpoint contiguous in host memory,
+            # but it is the reference writer: keep it available for users who hit
+            # a problem with the streaming path.
+            save_file(state_dict, file, metadata)
 
 
 class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
@@ -81,6 +89,8 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
             )
         if args.h3_convrot_int8_lora_fused:
             raise ValueError("--h3_convrot_int8_lora_fused is a LoRA-only option")
+        if args.h3_lora_token_refiner:
+            raise ValueError("--h3_lora_token_refiner is a LoRA-only option")
         if args.block_swap_h2d_only:
             raise ValueError("MiniMax H3 full fine-tuning cannot use frozen-weight --block_swap_h2d_only")
         if args.block_swap_granularity != "block":
@@ -136,7 +146,11 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
         transformer.train()
         if args.gradient_checkpointing:
             transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
-        return MiniMaxH3FullFinetuneModule(transformer, save_weights=not args.debug_no_save_weights)
+        return MiniMaxH3FullFinetuneModule(
+            transformer,
+            save_weights=not args.debug_no_save_weights,
+            mem_eff_save=bool(args.mem_eff_save),
+        )
 
     def on_train_start(self, args, accelerator, network, transformer, optimizer) -> None:
         del args, network, transformer, optimizer
@@ -283,7 +297,13 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--mem_eff_save",
         action="store_true",
-        help="stream the full checkpoint tensor-by-tensor instead of cloning the model in host memory",
+        help="stream the full checkpoint tensor-by-tensor instead of cloning the model in host memory (default)",
+    )
+    parser.add_argument(
+        "--no_mem_eff_save",
+        dest="mem_eff_save",
+        action="store_false",
+        help="write the checkpoint with the ordinary safetensors writer instead of the streaming writer",
     )
     parser.add_argument("--debug_no_save_weights", action="store_true", help=argparse.SUPPRESS)
     parser.set_defaults(

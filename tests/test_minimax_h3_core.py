@@ -1203,6 +1203,54 @@ def test_reference_video_sizing_is_configurable_and_names_the_cache():
     )
 
 
+def test_reference_video_sizing_keeps_released_defaults_and_never_overshoots_the_cap():
+    # Released defaults must resolve exactly as before the cap was moved after
+    # rounding: these are the sizes every existing cache was written with.
+    assert resolve_reference_video_size(1344, 768) == (768, 1344)
+    assert resolve_reference_video_size(1920, 1080) == (768, 1344)
+    assert resolve_reference_video_size(1080, 1920) == (1344, 768)
+    assert resolve_reference_video_size(512, 512) == (768, 768)
+    assert resolve_reference_video_size(1024, 512, 384, 384 * 672) == (352, 704)
+
+    # A 4:1 source with a small cap used to round back up to 64x32 = 2048 px,
+    # twice the requested 1024-pixel budget.
+    assert resolve_reference_video_size(4096, 1024, 768, 1024) == (CANVAS_MULTIPLE, CANVAS_MULTIPLE)
+
+    for width, height in [(4096, 1024), (1024, 4096), (1920, 1080), (1080, 1920), (640, 640), (1200, 500)]:
+        for short_edge in (CANVAS_MULTIPLE, 96, 384, 768):
+            for max_pixels in (CANVAS_MULTIPLE**2, 1024, 65536, 384 * 672, REFERENCE_VIDEO_MAX_PIXELS):
+                resolved_height, resolved_width = resolve_reference_video_size(width, height, short_edge, max_pixels)
+                assert resolved_height % CANVAS_MULTIPLE == 0 and resolved_width % CANVAS_MULTIPLE == 0
+                assert resolved_height >= CANVAS_MULTIPLE and resolved_width >= CANVAS_MULTIPLE
+                # The 32x32 floor is the only licensed way to exceed the cap.
+                assert resolved_height * resolved_width <= max_pixels or (
+                    resolved_height == CANVAS_MULTIPLE and resolved_width == CANVAS_MULTIPLE
+                )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        # Both used to pass the trainer's own looser bounds (>= 16 / >= 256) and
+        # only fail later inside reference_key_suffix().
+        ("reference_video_short_edge", CANVAS_MULTIPLE - 1),
+        ("reference_video_max_pixels", CANVAS_MULTIPLE**2 - 1),
+    ],
+)
+def test_h3_reference_video_sizing_argparse_bounds_match_the_canonical_validator(key, value):
+    from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
+
+    args = create_parser().parse_args(["--sdpa"])
+    setattr(args, key, value)
+
+    with pytest.raises(ValueError, match="H3 reference video"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    args = create_parser().parse_args(["--sdpa"])
+    setattr(args, key, CANVAS_MULTIPLE if key == "reference_video_short_edge" else CANVAS_MULTIPLE**2)
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
 def test_reference_image_target_area_preserves_aspect_and_names_cache_variant():
     assert resolve_reference_image_area_size(512, 512, 512 * 512) == (512, 512)
     assert resolve_reference_image_area_size(1024, 512, 512 * 512) == (352, 736)

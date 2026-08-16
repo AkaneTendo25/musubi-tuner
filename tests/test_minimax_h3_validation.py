@@ -118,11 +118,35 @@ def test_masked_squared_error_sum_matches_training_broadcast_and_handles_fully_m
     prediction = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
     target = torch.zeros_like(prediction)
     total, count = masked_squared_error_sum(prediction, target, torch.tensor([[True, False]]), sample_weight=torch.tensor([2.0]))
-    assert count == 2
+    # Weighting scales the numerator, so it must scale the denominator too: the
+    # accumulator's ratio has to stay the plain mean squared error (1 and 9).
+    assert count == pytest.approx(4.0)
     assert float(total) == pytest.approx(20.0)
+    assert float(total) / count == pytest.approx(5.0)
+    unweighted_total, unweighted_count = masked_squared_error_sum(prediction, target, torch.tensor([[True, False]]))
+    assert unweighted_count == pytest.approx(2.0)
+    assert float(unweighted_total) / unweighted_count == pytest.approx(5.0)
     empty_total, empty_count = masked_squared_error_sum(prediction, target, torch.zeros(1, 2, dtype=torch.bool))
     assert empty_count == 0
     assert float(empty_total) == 0.0
+
+
+def test_validation_accumulator_mean_is_a_weighted_mean_across_differently_weighted_items():
+    # Two batch items with the same per-element error but different sample
+    # weights must average to that error, not to a weight-scaled value.
+    prediction = torch.tensor([[2.0, 2.0], [2.0, 2.0]])
+    target = torch.zeros_like(prediction)
+    accumulator = H3ValidationAccumulator(1)
+
+    for weight in (0.25, 4.0):
+        total, count = masked_squared_error_sum(prediction[:1], target[:1], None, sample_weight=torch.tensor([weight]))
+        accumulator.add(0, "video", total, count)
+
+    assert accumulator.metrics()["loss/video"] == pytest.approx(4.0)
+    # Fractional denominators must survive the distributed round trip.
+    combined = H3ValidationAccumulator(1)
+    combined.load_reduced_tensor(accumulator.reduction_tensor())
+    assert combined.metrics() == accumulator.metrics()
 
 
 def test_preserve_rng_state_restores_python_numpy_and_torch_streams():

@@ -321,14 +321,18 @@ def _joint_loss(
         raise ValueError("pass either shared or per-modality H3 sample weights, not both")
     video_sample_weight = sample_weight if video_sample_weight is None else video_sample_weight
     audio_sample_weight = sample_weight if audio_sample_weight is None else audio_sample_weight
-    if prediction.video is None or target.video is None:
-        if prediction.video is not None or target.video is not None:
+    # A zero modality weight contributes nothing to the total, so its squared
+    # error is never computed: it is the largest allocation in an observed-modality
+    # (v2a/a2v) step, and materializing it only to multiply by zero also reported a
+    # meaningless ``loss/video``/``loss/audio`` value for the conditioning modality.
+    if prediction.video is None or target.video is None or video_weight == 0:
+        if (prediction.video is None) != (target.video is None):
             raise ValueError("H3 video prediction and target presence differ")
         video_mean, video_total, video_elements = zero, zero, 0
     else:
         video_mean, video_total, video_elements = _modality_loss(prediction.video, target.video, video_mask, video_sample_weight)
-    if prediction.audio is None or target.audio is None:
-        if prediction.audio is not None or target.audio is not None:
+    if prediction.audio is None or target.audio is None or audio_weight == 0:
+        if (prediction.audio is None) != (target.audio is None):
             raise ValueError("H3 audio prediction and target presence differ")
         audio_mean, audio_total, audio_elements = zero, zero, 0
     else:

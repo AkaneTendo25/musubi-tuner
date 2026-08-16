@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,8 +39,25 @@ class ReusableActivationOffloader:
         self._stream = torch.cuda.Stream()
 
     def begin_forward(self) -> None:
-        if any(not handle.consumed for handle in self._handles.values()):
-            raise RuntimeError("reusable H3 activation buffers cannot start another grad-enabled forward before backward")
+        unconsumed = sum(1 for handle in self._handles.values() if not handle.consumed)
+        if unconsumed:
+            # Raising here used to wedge training permanently: any forward whose
+            # backward never ran (a skipped non-finite step, a caught OOM, a
+            # partial ``autograd.grad``) left the handles behind and every later
+            # step failed with the same misleading message. Recover instead, but
+            # warn loudly -- a genuine double forward before backward shows up
+            # here too, and the discarded activations would be its symptom.
+            logger.warning(
+                "reusable H3 activation offload is discarding %d saved activation handle(s) from a previous "
+                "grad-enabled forward whose backward never ran (skipped step, caught OOM, or partial autograd.grad); "
+                "if you did not expect an aborted backward, a second forward was started before the first was "
+                "backpropagated and its recomputation will fail",
+                unconsumed,
+            )
+        self.reset()
+
+    def reset(self) -> None:
+        """Retire every outstanding handle so the next forward starts clean."""
         # A saved tensor can be unpacked more than once, and autograd is not
         # required to consume equal ordinals in strict block-reverse order.
         # Retire any speculative copy left behind before its pinned source is

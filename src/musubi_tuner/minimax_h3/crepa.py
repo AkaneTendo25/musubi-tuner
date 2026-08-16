@@ -263,7 +263,9 @@ class H3CREPA(torch.nn.Module):
             if teacher.shape[0] != student.shape[0] or teacher.shape[-1] != student.shape[-1]:
                 raise ValueError("cached DINO features do not match the CREPA batch or selected DINO model")
             if teacher.shape[1] != student.shape[1]:
-                frame_indices = torch.linspace(0, teacher.shape[1] - 1, student.shape[1], device=teacher.device).long()
+                # Round rather than truncate: ``.long()`` on a linspace floors every
+                # index and biases the teacher alignment toward earlier frames.
+                frame_indices = torch.linspace(0, teacher.shape[1] - 1, student.shape[1], device=teacher.device).round().long()
                 teacher = teacher.index_select(1, frame_indices)
             if teacher.shape[2] != student.shape[2]:
                 batch, frames, rows, channels = student.shape
@@ -282,7 +284,10 @@ class H3CREPA(torch.nn.Module):
         alignment_sum = student.new_zeros(batch_size, frame_count)
         alignment_weight = student.new_zeros(batch_size, frame_count)
         self_sum = student.new_zeros(batch_size)
-        comparison_count = 0
+        # The numerator accumulates temporally weighted pairs, so the denominator
+        # is the sum of those same weights. Counting pairs instead made the
+        # effective CREPA loss magnitude scale with --crepa tau/neighbors.
+        comparison_weight = 0.0
         max_neighbor = min(self.config.neighbors, frame_count - 1)
 
         def pair_similarity(left_frame: int, right_frame: int) -> torch.Tensor:
@@ -295,7 +300,7 @@ class H3CREPA(torch.nn.Module):
             self_sum += same
             alignment_sum[:, frame] += same
             alignment_weight[:, frame] += 1.0
-            comparison_count += 1
+            comparison_weight += 1.0
             for distance in range(1, max_neighbor + 1):
                 temporal_weight = math.exp(-distance / self.config.tau)
                 for neighbor in (frame - distance, frame + distance):
@@ -304,8 +309,8 @@ class H3CREPA(torch.nn.Module):
                         loss_by_batch -= temporal_weight * nearby
                         alignment_sum[:, frame] += temporal_weight * nearby
                         alignment_weight[:, frame] += temporal_weight
-                        comparison_count += 1
-        unweighted_loss = loss_by_batch.mean() / max(comparison_count, 1)
+                        comparison_weight += temporal_weight
+        unweighted_loss = loss_by_batch.mean() / max(comparison_weight, 1e-12)
         similarity = (alignment_sum / alignment_weight.clamp_min(torch.finfo(student.dtype).eps)).mean()
         self_similarity = (self_sum / frame_count).mean()
         score = float(similarity.detach())

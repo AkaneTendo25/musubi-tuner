@@ -847,8 +847,6 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--h3_text_visual_max_pixels", str(c.h3_text_visual_max_pixels)]
     if t.sample_at_first:
         cmd.append("--sample_at_first")
-    if t.offload_optimizer_during_validation:
-        cmd.append("--offload_optimizer_during_validation")
     validation_requested = bool(t.validate_at_start or t.validate_every_n_steps or t.validate_every_n_epochs)
     validation_config = t.validation_dataset_config
     if not validation_config and validation_requested and config.dataset.validation_datasets:
@@ -2230,8 +2228,6 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--validate_every_n_steps", str(t.validate_every_n_steps)]
     if t.validate_every_n_epochs is not None:
         cmd += ["--validate_every_n_epochs", str(t.validate_every_n_epochs)]
-    if t.offload_optimizer_during_validation:
-        cmd.append("--offload_optimizer_during_validation")
 
     # Output
     cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
@@ -3187,8 +3183,6 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--num_validation_batches", str(t.num_validation_batches)]
     if t.validation_timesteps:
         cmd += ["--validation_timesteps", t.validation_timesteps]
-    if t.offload_optimizer_during_validation:
-        cmd.append("--offload_optimizer_during_validation")
 
     # Output
     cmd += ["--output_dir", _effective_output_dir(t.output_dir)]

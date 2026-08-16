@@ -678,7 +678,6 @@ class TrainingConfig(BaseModel):
     validation_min_timestep: int = 0
     validation_max_timestep: int = 1000
     max_validation_items: Optional[int] = None
-    offload_optimizer_during_validation: bool = False
 
     # Output
     output_dir: str = ""

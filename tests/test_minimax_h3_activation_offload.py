@@ -1,3 +1,5 @@
+import logging
+
 import torch
 
 from musubi_tuner.minimax_h3.activation_offload import _OffloadedTensor, ReusableActivationOffloader
@@ -51,4 +53,30 @@ def test_reusable_activation_begin_forward_retires_stale_prefetch() -> None:
     offloader.begin_forward()
 
     assert event.synchronize_calls == 1
+    assert offloader._handles == {}
+
+
+def test_reusable_activation_begin_forward_recovers_from_an_aborted_backward(caplog) -> None:
+    # A forward whose backward never ran (skipped non-finite step, caught OOM,
+    # partial autograd.grad) used to raise here forever after.
+    offloader = _offloader_without_cuda()
+    event = _FakeEvent()
+    offloader._handles[(1, 0)] = _handle(1, consumed=False, gpu=torch.zeros(1), h2d_event=event)
+
+    with caplog.at_level(logging.WARNING, logger="musubi_tuner.minimax_h3.activation_offload"):
+        offloader.begin_forward()
+
+    assert offloader._handles == {}
+    assert event.synchronize_calls == 1
+    assert "backward never ran" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="musubi_tuner.minimax_h3.activation_offload"):
+        offloader.begin_forward()
+    assert caplog.text == ""
+
+
+def test_reusable_activation_reset_is_callable_without_a_pending_forward() -> None:
+    offloader = _offloader_without_cuda()
+    offloader.reset()
     assert offloader._handles == {}

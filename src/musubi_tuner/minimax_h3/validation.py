@@ -52,8 +52,14 @@ def masked_squared_error_sum(
     mask: torch.Tensor | None,
     *,
     sample_weight: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, int]:
-    """Return the exact weighted squared-error numerator and valid count."""
+) -> tuple[torch.Tensor, float]:
+    """Return the exact weighted squared-error numerator and its denominator.
+
+    Without ``sample_weight`` the denominator is the number of valid elements.
+    With it, both numerator and denominator are weighted, so the accumulator's
+    ratio stays a true weighted mean instead of a weighted sum over a plain
+    element count.
+    """
     if prediction.shape != target.shape:
         raise ValueError("H3 validation prediction and target shapes differ")
     if mask is None:
@@ -69,14 +75,17 @@ def masked_squared_error_sum(
             valid = mask.view(shape).expand_as(target)
     count = int(valid.sum().item())
     if count == 0:
-        return prediction.new_zeros((), dtype=torch.float32), 0
+        return prediction.new_zeros((), dtype=torch.float32), 0.0
     squared = (prediction - target).float().square()
+    denominator = float(count)
     if sample_weight is not None:
         if sample_weight.shape != (target.shape[0],):
             raise ValueError("H3 validation sample weighting must contain one value per batch item")
         weight_shape = (target.shape[0], *([1] * (target.ndim - 1)))
-        squared = squared * sample_weight.to(device=squared.device, dtype=torch.float32).view(weight_shape)
-    return squared.masked_select(valid).sum(), count
+        weights = sample_weight.to(device=squared.device, dtype=torch.float32).view(weight_shape)
+        squared = squared * weights
+        denominator = float((valid * weights).sum().item())
+    return squared.masked_select(valid).sum(), denominator
 
 
 @dataclass(frozen=True)
@@ -110,8 +119,7 @@ def validation_sigma_bins(
     video = shift_sigma(base, video_shift)
     audio = shift_sigma(base, audio_shift)
     return tuple(
-        H3ValidationSigmaBin(index, float(base[index]), float(video[index]), float(audio[index]))
-        for index in range(count)
+        H3ValidationSigmaBin(index, float(base[index]), float(video[index]), float(audio[index])) for index in range(count)
     )
 
 
@@ -164,13 +172,22 @@ class H3ValidationAccumulator:
     def bin_count(self) -> int:
         return self._state.shape[0]
 
-    def add(self, bin_index: int, modality: ValidationModality, error_sum: torch.Tensor | float, element_count: int) -> None:
+    def add(
+        self, bin_index: int, modality: ValidationModality, error_sum: torch.Tensor | float, element_count: int | float
+    ) -> None:
+        """Accumulate one modality update.
+
+        ``element_count`` is the denominator of the mean, not a sample count: it
+        is the element count for unweighted updates and the sum of the per-item
+        sample weights when :func:`masked_squared_error_sum` applied weighting.
+        """
         if not 0 <= bin_index < self.bin_count:
             raise IndexError(f"H3 validation bin index {bin_index} is out of range")
         if modality not in {"video", "audio"}:
             raise ValueError(f"unsupported H3 validation modality: {modality}")
-        if element_count < 0:
-            raise ValueError("H3 validation element count must be non-negative")
+        element_count = float(element_count)
+        if not math.isfinite(element_count) or element_count < 0:
+            raise ValueError("H3 validation element count must be finite and non-negative")
         value = float(error_sum.detach().double().cpu()) if isinstance(error_sum, torch.Tensor) else float(error_sum)
         if element_count == 0:
             if value != 0.0:
@@ -195,9 +212,8 @@ class H3ValidationAccumulator:
         reduced = reduced.detach().to(device="cpu", dtype=torch.float64)
         if not bool(torch.isfinite(reduced).all()) or bool((reduced < 0).any()):
             raise ValueError("H3 validation reduction tensor must contain finite non-negative values")
-        counts = reduced[:, :, _COUNT]
-        if not bool(torch.equal(counts, counts.round())):
-            raise ValueError("H3 validation reduction counts must be integers")
+        # Denominators are weight sums, not element counts, whenever sample
+        # weighting is active, so they are not required to be integral.
         self._state.copy_(reduced)
 
     def _loss(self, state: torch.Tensor) -> float | None:

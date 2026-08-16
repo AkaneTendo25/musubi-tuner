@@ -54,6 +54,7 @@ from musubi_tuner.minimax_h3.packing import (
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
+from musubi_tuner.minimax_h3 import training as h3_training
 from musubi_tuner.minimax_h3.training import (
     OBSERVED_AUDIO_SIGMA,
     OBSERVED_VIDEO_SIGMA,
@@ -355,7 +356,10 @@ def test_h3_crepa_neighbor_objective_matches_valid_comparison_normalization():
     crepa._teacher = torch.tensor([[[3.0], [4.0]]])
     crepa._effective_weight = config.weight
     loss, metrics = crepa.loss()
-    expected = -config.weight * (11.0 + 10.0 / torch.e) / 4.0
+    # The numerator is temporally weighted, so the denominator is the sum of the
+    # same weights (2 self pairs at 1.0 plus 2 neighbour pairs at exp(-1/tau)),
+    # not the plain comparison count.
+    expected = -config.weight * (11.0 + 10.0 / torch.e) / (2.0 + 2.0 / torch.e)
     torch.testing.assert_close(loss, loss.new_tensor(expected))
     expected_alignment = ((3.0 + 4.0 / torch.e) + (8.0 + 6.0 / torch.e)) / (2.0 * (1.0 + 1.0 / torch.e))
     assert metrics["crepa/alignment"] == pytest.approx(float(expected_alignment))
@@ -485,6 +489,53 @@ def test_h3_joint_loss_ignores_the_observed_modality():
     result = joint_velocity_loss(prediction, inputs, video_weight=0.0, audio_weight=1.0)
 
     torch.testing.assert_close(result.loss, result.audio_loss)
+    # The zero-weight modality's squared error is never materialized: it is the
+    # largest allocation in a v2a/a2v step and multiplying it by zero afterwards
+    # also reported a meaningless loss/video on the divergence panel.
+    assert result.video_elements == 0
+    assert float(result.video_loss) == 0.0
+
+
+def test_h3_joint_loss_skips_the_zero_weight_modality_without_changing_the_total():
+    torch.manual_seed(0)
+    prediction = H3ModelPrediction(video=torch.randn(2, 5), audio=torch.randn(2, 3))
+    inputs = SimpleNamespace(video_target=torch.randn(2, 5), audio_target=torch.randn(2, 3))
+    weights = torch.tensor([0.25, 1.5])
+
+    calls: list[str] = []
+    original = h3_training._modality_loss
+
+    def counting(prediction_tensor, target_tensor, mask, sample_weight):
+        calls.append(tuple(prediction_tensor.shape))
+        return original(prediction_tensor, target_tensor, mask, sample_weight)
+
+    for balance in ("token", "modality"):
+        for video_weight, audio_weight in ((0.0, 1.0), (1.0, 0.0)):
+            expected = joint_velocity_loss(
+                prediction,
+                inputs,
+                balance=balance,
+                video_sample_weight=weights,
+                audio_sample_weight=weights,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+            calls.clear()
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(h3_training, "_modality_loss", counting)
+                actual = joint_velocity_loss(
+                    prediction,
+                    inputs,
+                    balance=balance,
+                    video_sample_weight=weights,
+                    audio_sample_weight=weights,
+                    video_weight=video_weight,
+                    audio_weight=audio_weight,
+                )
+            # Only the nonzero-weight modality is evaluated, and the total the
+            # optimizer sees is unchanged.
+            assert calls == [(2, 3) if video_weight == 0.0 else (2, 5)]
+            torch.testing.assert_close(actual.loss, expected.loss)
 
 
 def test_h3_prediction_preservation_detaches_reference_and_ignores_observed_modality():
@@ -4145,3 +4196,20 @@ def test_native_h3_backend_accepts_named_and_indexed_condition_anchors(anchors):
             torch.tensor([0.7]),
             observed_video_rows=torch.zeros(3, dtype=torch.bool),
         )
+
+
+def test_h3_base_sigma_resolves_the_scheduler_branch_in_fp32():
+    # The scheduler branch used to read the schedule in the DiT dtype and only
+    # widen afterwards, quantizing the base coordinate to BF16's ~256 distinct
+    # values in [0, 1] before H3's 12/3 shifts are applied downstream.
+    trainer = MiniMaxH3NetworkTrainer()
+    args = create_parser().parse_args(["--sdpa", "--timestep_sampling", "sigma"])
+    steps = torch.tensor([999.0, 501.0, 3.0])
+    scheduler = SimpleNamespace(sigmas=steps / 1000.0, timesteps=steps)
+
+    base_sigma = trainer._base_sigma(args, scheduler, steps, torch.device("cpu"))
+
+    assert base_sigma.dtype is torch.float32
+    torch.testing.assert_close(base_sigma, (steps / 1000.0).to(torch.float32))
+    # Every value survives exactly; the BF16 round trip collapses two of them.
+    assert not torch.equal(base_sigma, base_sigma.to(torch.bfloat16).to(torch.float32))
