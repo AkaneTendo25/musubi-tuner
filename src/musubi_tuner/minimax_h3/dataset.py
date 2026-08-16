@@ -20,6 +20,7 @@ from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
 from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
 from musubi_tuner.minimax_h3.image_training import condition_paths, resample_image_targets, sample_fingerprint, validate_image_mode
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media_asset
+from musubi_tuner.minimax_h3.references import REFERENCE_FINGERPRINT_KEY, reference_fingerprint
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
 _CONTROL_PATH_PATTERN = re.compile(r"^control_path_(\d+)$")
@@ -637,6 +638,9 @@ class H3DatasetAdapter:
             assets = (target, *resolved.references)
         validate_h3_media_assets(item.item_key, assets)
         item.h3_media_assets = assets
+        fingerprint = reference_fingerprint(assets)
+        if fingerprint is not None:
+            item.h3_cache_metadata = {REFERENCE_FINGERPRINT_KEY: fingerprint}
         if normal in self._target_reference_probabilities:
             item.h3_reference_modality_probabilities = self._target_reference_probabilities[normal]
         item.h3_target_mode = "video" if image_frame_count is not None else self._target_modes[normal]

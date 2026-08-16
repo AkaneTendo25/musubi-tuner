@@ -149,6 +149,9 @@ The three directories must contain basename-matched files. Set `control_modality
 ordered `control_modalities = ["video", "audio", "av"]` list. The choice is part of latent and text caching; recache both after
 changing it. Ref2VA requires at least one visual reference, so an audio-only entry must accompany an image or video reference.
 
+Both caches record which reference files produced them, so swapping, reordering, or editing a reference rebuilds that item under
+`--skip_existing`. Reference caches written before this identity was recorded are rebuilt once.
+
 For modality dropout, replace the static modality setting with probabilities in `[av, video, audio]` order:
 
 ```toml

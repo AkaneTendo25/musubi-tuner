@@ -1454,6 +1454,38 @@ def test_native_h3_ref2va_rejects_mismatched_qwen_visual_cap():
         )
 
 
+def test_native_h3_conditioned_image_training_checks_qwen_visual_cap():
+    transformer = SimpleNamespace(config=SimpleNamespace(in_channels=4, audio_in_channels=6, text_dim=8))
+    backend = _NativeTrainingBackend(transformer, mode="fl2va", text_visual_max_pixels=65_536)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(2, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(2, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["fl2va"])],
+        H3_TEXT_VISUAL_MAX_PIXELS_KEY: [torch.tensor(131_072)],
+    }
+
+    with pytest.raises(ValueError, match="different h3_text_visual_max_pixels"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 1, 2, 2),
+            None,
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+        )
+
+    batch[H3_TEXT_VISUAL_MAX_PIXELS_KEY] = [torch.tensor(65_536)]
+    with pytest.raises(ValueError, match="keyframe vision rows"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 1, 2, 2),
+            None,
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+        )
+
+
 def test_native_h3_rejects_mismatched_caption_token_cap():
     transformer = SimpleNamespace(config=SimpleNamespace(in_channels=4, audio_in_channels=6, text_dim=8))
     backend = _NativeTrainingBackend(transformer, mode="fl2va", max_caption_tokens=512)

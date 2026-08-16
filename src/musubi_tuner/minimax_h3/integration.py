@@ -900,18 +900,18 @@ class _NativeTrainingBackend:
             cached_caption_cap = self._one_conditioning_item(batch, H3_MAX_CAPTION_TOKENS_KEY, expected_ndim=0)
             if cached_caption_cap.dtype != torch.long or int(cached_caption_cap) != self.max_caption_tokens:
                 raise ValueError("H3 text cache uses a different h3_max_caption_tokens value; re-cache conditioning")
+        cached_text_visual_max_pixels = batch.get(H3_TEXT_VISUAL_MAX_PIXELS_KEY)
+        if cached_text_visual_max_pixels is None:
+            if self.text_visual_max_pixels:
+                raise ValueError("legacy H3 text cache lacks Qwen visual-pixel identity; re-cache conditioning")
+        else:
+            cached_text_visual_max_pixels = self._one_conditioning_item(batch, H3_TEXT_VISUAL_MAX_PIXELS_KEY, expected_ndim=0)
+            if (
+                cached_text_visual_max_pixels.dtype != torch.long
+                or int(cached_text_visual_max_pixels) != self.text_visual_max_pixels
+            ):
+                raise ValueError("H3 text cache uses a different h3_text_visual_max_pixels value; re-cache conditioning")
         if self.mode in ("ref2va", "ref2va_omni"):
-            cached_text_visual_max_pixels = batch.get(H3_TEXT_VISUAL_MAX_PIXELS_KEY)
-            if cached_text_visual_max_pixels is None:
-                if self.text_visual_max_pixels:
-                    raise ValueError("legacy H3 Ref2VA text cache lacks Qwen visual-pixel identity; re-cache conditioning")
-            else:
-                cached_text_visual_max_pixels = self._one_conditioning_item(batch, H3_TEXT_VISUAL_MAX_PIXELS_KEY, expected_ndim=0)
-                if (
-                    cached_text_visual_max_pixels.dtype != torch.long
-                    or int(cached_text_visual_max_pixels) != self.text_visual_max_pixels
-                ):
-                    raise ValueError("H3 Ref2VA text cache uses a different h3_text_visual_max_pixels value; re-cache conditioning")
             cached_reference_size = batch.get(H3_REFERENCE_IMAGE_SHORT_EDGE_KEY)
             if cached_reference_size is None:
                 if self.reference_image_short_edge != REFERENCE_IMAGE_SHORT_EDGE:

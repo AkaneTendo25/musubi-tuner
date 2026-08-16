@@ -92,7 +92,7 @@ def read_text_visual(path: Path, max_pixels: int = H3_TEXT_VISUAL_MAX_PIXELS) ->
     return image
 
 
-def _file_identity(path: Path) -> dict[str, Any]:
+def file_identity(path: Path) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     stat = resolved.stat()
     return {"path": str(resolved), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -113,16 +113,16 @@ def sample_fingerprint(
         "frame_count": int(frame_count),
         "original_size": [int(value) for value in original_size],
         "bucket_size": [int(value) for value in bucket_size[:2]],
-        "targets": [_file_identity(path) for path in targets],
-        "controls": [_file_identity(path) for path in controls],
+        "targets": [file_identity(path) for path in targets],
+        "controls": [file_identity(path) for path in controls],
     }
     encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
-def cache_matches_fingerprint(path: str | Path, fingerprint: str) -> bool:
+def cache_matches_fingerprint(path: str | Path, fingerprint: str, key: str = "sample_fingerprint") -> bool:
     try:
         with safe_open(path, framework="pt", device="cpu") as handle:
-            return (handle.metadata() or {}).get("sample_fingerprint") == fingerprint
+            return (handle.metadata() or {}).get(key) == fingerprint
     except (OSError, RuntimeError, ValueError):
         return False

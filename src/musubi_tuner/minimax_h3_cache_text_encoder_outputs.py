@@ -14,19 +14,30 @@ from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_conditioning_encoder
 from musubi_tuner.minimax_h3.cache import (
+    H3_CONDITIONING_TASK_IDS,
+    H3_CONDITIONING_TASK_KEY,
+    H3_EMPTY_TEXT_HIDDEN_KEY,
+    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
+    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
+    H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
+    H3_TEXT_VISUAL_MAX_PIXELS_KEY,
+    logical_cache_key,
     normalize_batch_tensors,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
 from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
 from musubi_tuner.minimax_h3.references import (
+    REFERENCE_FINGERPRINT_KEY,
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
+    reference_assets,
 )
 
 logger = logging.getLogger(__name__)
@@ -172,9 +183,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         attach_h3_media((item,), dataset_adapter)
         if args.h3_image_mode != "none" and not cache_matches_fingerprint(path, item.h3_cache_metadata["sample_fingerprint"]):
             return False
+        if reference_assets(item) and not cache_matches_fingerprint(
+            path, item.h3_cache_metadata[REFERENCE_FINGERPRINT_KEY], REFERENCE_FINGERPRINT_KEY
+        ):
+            return False
         try:
             with safe_open(path, framework="pt", device="cpu") as handle:
                 keys = set(handle.keys())
+                logical_keys = {logical_cache_key(key) for key in keys}
+                if H3_CONDITIONING_TASK_KEY not in keys:
+                    return False
+                if int(handle.get_tensor(H3_CONDITIONING_TASK_KEY)) != H3_CONDITIONING_TASK_IDS[args.task]:
+                    return False
                 if args.task in {"ref2va", "ref2va_omni"}:
                     if H3_REFERENCE_VIDEO_SHORT_EDGE_KEY not in keys or H3_REFERENCE_VIDEO_MAX_PIXELS_KEY not in keys:
                         return False
@@ -182,6 +202,26 @@ def main(argv: Sequence[str] | None = None) -> None:
                         return False
                     if int(handle.get_tensor(H3_REFERENCE_VIDEO_MAX_PIXELS_KEY)) != args.reference_video_max_pixels:
                         return False
+                    if (
+                        H3_REFERENCE_IMAGE_SHORT_EDGE_KEY not in keys
+                        or H3_REFERENCE_IMAGE_SIZE_MODE_KEY not in keys
+                        or H3_REFERENCE_IMAGE_MAX_PIXELS_KEY not in keys
+                    ):
+                        return False
+                    if int(handle.get_tensor(H3_REFERENCE_IMAGE_SHORT_EDGE_KEY)) != args.reference_image_short_edge:
+                        return False
+                    expected_size_mode = 0 if args.reference_image_size_mode == "short_edge" else 1
+                    if int(handle.get_tensor(H3_REFERENCE_IMAGE_SIZE_MODE_KEY)) != expected_size_mode:
+                        return False
+                    if int(handle.get_tensor(H3_REFERENCE_IMAGE_MAX_PIXELS_KEY)) != args.reference_image_max_pixels:
+                        return False
+                if args.cache_guidance_empty and not {H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY} <= logical_keys:
+                    return False
+                if H3_TEXT_VISUAL_MAX_PIXELS_KEY not in keys:
+                    if args.h3_text_visual_max_pixels != 0:
+                        return False
+                elif int(handle.get_tensor(H3_TEXT_VISUAL_MAX_PIXELS_KEY)) != args.h3_text_visual_max_pixels:
+                    return False
                 if H3_MAX_CAPTION_TOKENS_KEY not in keys:
                     return args.h3_max_caption_tokens == 0
                 return int(handle.get_tensor(H3_MAX_CAPTION_TOKENS_KEY)) == args.h3_max_caption_tokens

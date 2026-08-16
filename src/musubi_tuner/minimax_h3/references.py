@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -14,7 +17,10 @@ from PIL import Image, ImageOps
 
 from musubi_tuner.minimax_h3.architecture import AUDIO_SAMPLE_RATE, CANVAS_MULTIPLE, VIDEO_FPS
 from musubi_tuner.minimax_h3.audio import load_audio_asset
+from musubi_tuner.minimax_h3.image_training import file_identity
 from musubi_tuner.minimax_h3.media import AudioProcessingSpec, MediaAsset, MediaModality, MissingMediaPolicy
+
+REFERENCE_FINGERPRINT_KEY = "reference_fingerprint"
 
 REFERENCE_IMAGE_SHORT_EDGE = 2048
 REFERENCE_IMAGE_SIZE_MODE = "short_edge"
@@ -79,6 +85,22 @@ def reference_assets(item: Any) -> tuple[MediaAsset, ...]:
     if assets and all(asset.modality is MediaModality.AUDIO for asset in assets):
         raise ValueError("MiniMax H3 audio references require at least one image or video reference")
     return assets
+
+
+def reference_fingerprint(assets: Sequence[MediaAsset]) -> str | None:
+    references = [asset for asset in assets if asset.role == "reference"]
+    if not references:
+        return None
+    entries: list[dict[str, Any]] = []
+    for order, asset in enumerate(references):
+        entry = {"order": order, "kind": int(_kind(asset)), **file_identity(asset.path)}
+        audio_path = asset.metadata.get("audio_path")
+        if audio_path:
+            entry["audio"] = file_identity(Path(audio_path))
+        entries.append(entry)
+    descriptor = {"format": 1, "references": entries}
+    encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _multiple_size(width: float, height: float) -> tuple[int, int]:

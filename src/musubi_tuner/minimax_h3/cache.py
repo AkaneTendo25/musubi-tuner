@@ -114,7 +114,7 @@ def _validated_cache_tensors(
     return {key: value.detach().cpu().contiguous() for key, value in tensors.items()}
 
 
-def _logical_key(key: str) -> str:
+def logical_cache_key(key: str) -> str:
     if key.startswith("varlen_"):
         key = key.removeprefix("varlen_")
     return remove_dtype_suffix(key)
@@ -172,7 +172,7 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
     elif H3_AUDIO_LOSS_MASK_KEY in cache_tensors:
         raise ValueError(f"H3 {H3_AUDIO_LOSS_MASK_KEY} requires cached audio latents")
 
-    geometry_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_VIDEO_GEOMETRY_KEY]
+    geometry_matches = [tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_VIDEO_GEOMETRY_KEY]
     geometry = geometry_matches[0] if len(geometry_matches) == 1 else None
     if target_mode == "audio" and (geometry is None or geometry.dtype is not torch.long or geometry.shape != (2,)):
         raise ValueError(f"H3 audio-only cache requires int64 {H3_VIDEO_GEOMETRY_KEY} with shape [2]")
@@ -187,7 +187,7 @@ def save_text_encoder_output_cache_minimax_h3(
     tensors: dict[str, torch.Tensor],
 ) -> None:
     cache_tensors = _validated_cache_tensors(item_info, tensors, operation="conditioning encoder")
-    logical_keys = {_logical_key(key) for key in cache_tensors}
+    logical_keys = {logical_cache_key(key) for key in cache_tensors}
     required = {H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY, H3_CONDITIONING_TASK_KEY}
     missing = sorted(required - logical_keys)
     if missing:
@@ -197,7 +197,7 @@ def save_text_encoder_output_cache_minimax_h3(
         raise ValueError("H3 empty conditioning cache must contain both hidden states and token tags")
 
     def tensor_for(logical_key: str) -> torch.Tensor:
-        matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == logical_key]
+        matches = [tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == logical_key]
         if len(matches) != 1:
             raise ValueError(f"H3 conditioning cache must contain exactly one {logical_key} tensor")
         return matches[0]
@@ -218,14 +218,16 @@ def save_text_encoder_output_cache_minimax_h3(
     task = tensor_for(H3_CONDITIONING_TASK_KEY)
     if task.dtype != torch.long or task.ndim != 0 or int(task) not in H3_CONDITIONING_TASK_IDS.values():
         raise ValueError(f"H3 {H3_CONDITIONING_TASK_KEY} must be a scalar int64 task id")
-    caption_cap_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_MAX_CAPTION_TOKENS_KEY]
+    caption_cap_matches = [tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_MAX_CAPTION_TOKENS_KEY]
     if caption_cap_matches:
         if len(caption_cap_matches) != 1:
             raise ValueError(f"H3 conditioning cache must contain at most one {H3_MAX_CAPTION_TOKENS_KEY} tensor")
         caption_cap = caption_cap_matches[0]
         if caption_cap.dtype != torch.long or caption_cap.ndim != 0 or int(caption_cap) <= 0:
             raise ValueError(f"H3 {H3_MAX_CAPTION_TOKENS_KEY} must be a positive scalar int64 value")
-    visual_cap_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_TEXT_VISUAL_MAX_PIXELS_KEY]
+    visual_cap_matches = [
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_TEXT_VISUAL_MAX_PIXELS_KEY
+    ]
     if visual_cap_matches:
         if len(visual_cap_matches) != 1:
             raise ValueError(f"H3 conditioning cache must contain at most one {H3_TEXT_VISUAL_MAX_PIXELS_KEY} tensor")
@@ -233,7 +235,7 @@ def save_text_encoder_output_cache_minimax_h3(
         if visual_cap.dtype != torch.long or visual_cap.ndim != 0 or int(visual_cap) <= 0:
             raise ValueError(f"H3 {H3_TEXT_VISUAL_MAX_PIXELS_KEY} must be a positive scalar int64 value")
     reference_size_matches = [
-        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_IMAGE_SHORT_EDGE_KEY
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_IMAGE_SHORT_EDGE_KEY
     ]
     if reference_size_matches:
         if len(reference_size_matches) != 1:
@@ -242,8 +244,12 @@ def save_text_encoder_output_cache_minimax_h3(
         if reference_size.dtype != torch.long or reference_size.ndim != 0:
             raise ValueError(f"H3 {H3_REFERENCE_IMAGE_SHORT_EDGE_KEY} must be a scalar int64 value")
         validate_reference_image_short_edge(int(reference_size))
-    size_mode_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_IMAGE_SIZE_MODE_KEY]
-    max_pixels_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_IMAGE_MAX_PIXELS_KEY]
+    size_mode_matches = [
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_IMAGE_SIZE_MODE_KEY
+    ]
+    max_pixels_matches = [
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_IMAGE_MAX_PIXELS_KEY
+    ]
     if bool(size_mode_matches) != bool(max_pixels_matches):
         raise ValueError("H3 reference sizing cache identity must contain both mode and max-pixel tensors")
     if size_mode_matches:
@@ -256,10 +262,10 @@ def save_text_encoder_output_cache_minimax_h3(
             raise ValueError(f"H3 {H3_REFERENCE_IMAGE_MAX_PIXELS_KEY} must be a non-negative scalar int64")
         validate_reference_image_sizing("short_edge" if int(size_mode) == 0 else "target_area", int(max_pixels))
     video_short_edge_matches = [
-        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_VIDEO_SHORT_EDGE_KEY
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_VIDEO_SHORT_EDGE_KEY
     ]
     video_max_pixels_matches = [
-        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_VIDEO_MAX_PIXELS_KEY
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_VIDEO_MAX_PIXELS_KEY
     ]
     if bool(video_short_edge_matches) != bool(video_max_pixels_matches):
         raise ValueError("H3 reference-video sizing cache identity must contain both short-edge and max-pixel tensors")
@@ -273,7 +279,7 @@ def save_text_encoder_output_cache_minimax_h3(
             raise ValueError(f"H3 {H3_REFERENCE_VIDEO_MAX_PIXELS_KEY} must be a scalar int64 value")
         validate_reference_video_sizing(int(video_short_edge), int(video_max_pixels))
     reference_contract_matches = [
-        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_TEMPORAL_CONTRACT_KEY
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_TEMPORAL_CONTRACT_KEY
     ]
     if reference_contract_matches:
         if len(reference_contract_matches) != 1:
@@ -290,7 +296,7 @@ def save_text_encoder_output_cache_minimax_h3(
     if empty_keys <= logical_keys:
         validate_pair(H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
     probability_matches = [
-        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_MODALITY_PROBABILITIES_KEY
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_MODALITY_PROBABILITIES_KEY
     ]
     if probability_matches:
         if len(probability_matches) != 1:

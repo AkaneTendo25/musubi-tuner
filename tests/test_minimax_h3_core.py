@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import struct
 import wave
 from argparse import Namespace
@@ -13,6 +14,8 @@ from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from musubi_tuner import minimax_h3_cache_latents as h3_cache_latents
+from musubi_tuner import minimax_h3_cache_text_encoder_outputs as h3_cache_text
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
 from musubi_tuner.dataset.config_utils import (
     BlueprintGenerator,
@@ -42,9 +45,18 @@ from musubi_tuner.minimax_h3.audio import (
 from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
+    H3_CONDITIONING_TASK_IDS,
+    H3_CONDITIONING_TASK_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
+    H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
+    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
+    H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
+    H3_REFERENCE_KINDS_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
+    H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
+    H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
+    H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     reference_key_suffix,
     save_latent_cache_minimax_h3,
 )
@@ -1063,6 +1075,295 @@ def test_reference_image_target_area_preserves_aspect_and_names_cache_variant():
     assert resolve_reference_image_area_size(1024, 512, 512 * 512) == (352, 736)
     assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, "target_area", 0) == "_ta"
     assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, "target_area", 262144) == "_ta262144"
+
+
+def _reference_latent_cache(path: Path, suffix: str, fingerprint="fingerprint") -> str:
+    metadata = {h3_references.REFERENCE_FINGERPRINT_KEY: fingerprint} if fingerprint is not None else None
+    save_file(
+        {f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64": torch.tensor([0, 2], dtype=torch.long)},
+        str(path),
+        metadata=metadata,
+    )
+    return str(path)
+
+
+def _latent_cache_predicate(monkeypatch, argv):
+    captured = {}
+
+    def encode_datasets(datasets, encode, args, existing_cache_valid=None):
+        captured["predicate"] = existing_cache_valid
+
+    adapter = SimpleNamespace(requires_video=False, requires_audio=False)
+    monkeypatch.setattr(h3_cache_latents.config_utils, "load_user_config", lambda path: {})
+    monkeypatch.setattr(h3_cache_latents, "create_h3_dataset_group", lambda config, args: (SimpleNamespace(datasets=[]), adapter))
+    monkeypatch.setattr(h3_cache_latents, "create_latent_encoder", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(h3_cache_latents, "attach_h3_media", lambda batch, dataset_adapter: None)
+    monkeypatch.setattr(h3_cache_latents.cache_latents, "encode_datasets", encode_datasets)
+    h3_cache_latents.main(["--dataset_config", "dataset.toml", *argv])
+    return captured["predicate"]
+
+
+def test_skip_existing_rejects_reference_caches_written_with_other_sizing(monkeypatch, tmp_path):
+    monkeypatch.setattr(h3_cache_latents, "reference_assets", lambda item: item.has_references)
+    item = SimpleNamespace(has_references=True, h3_cache_metadata={h3_references.REFERENCE_FINGERPRINT_KEY: "fingerprint"})
+    default_cache = _reference_latent_cache(tmp_path / "default.safetensors", "")
+    short_edge_cache = _reference_latent_cache(tmp_path / "short_edge.safetensors", "_se512")
+    video_cache = _reference_latent_cache(tmp_path / "video.safetensors", "_vse256")
+    target_area_cache = _reference_latent_cache(tmp_path / "target_area.safetensors", "_ta")
+    capped_area_cache = _reference_latent_cache(tmp_path / "capped_area.safetensors", "_ta262144")
+
+    default_valid = _latent_cache_predicate(monkeypatch, [])
+    assert default_valid(item, default_cache) is True
+    assert default_valid(item, short_edge_cache) is False
+    assert default_valid(item, video_cache) is False
+    assert default_valid(item, target_area_cache) is False
+    assert default_valid(item, capped_area_cache) is False
+
+    target_area_valid = _latent_cache_predicate(monkeypatch, ["--reference_image_size_mode", "target_area"])
+    assert target_area_valid(item, target_area_cache) is True
+    assert target_area_valid(item, capped_area_cache) is False
+    assert target_area_valid(item, default_cache) is False
+
+    capped_area_valid = _latent_cache_predicate(
+        monkeypatch, ["--reference_image_size_mode", "target_area", "--reference_image_max_pixels", "262144"]
+    )
+    assert capped_area_valid(item, capped_area_cache) is True
+    assert capped_area_valid(item, target_area_cache) is False
+
+    assert default_valid(SimpleNamespace(has_references=False), short_edge_cache) is True
+
+
+def _text_cache_predicate(monkeypatch, argv):
+    captured = {}
+
+    def process_text_encoder_batches(*args, existing_cache_valid=None, **kwargs):
+        captured["predicate"] = existing_cache_valid
+
+    adapter = SimpleNamespace(requires_video=False, requires_audio=False)
+    monkeypatch.setattr(h3_cache_text.config_utils, "load_user_config", lambda path: {})
+    monkeypatch.setattr(h3_cache_text, "create_h3_dataset_group", lambda config, args: (SimpleNamespace(datasets=[]), adapter))
+    monkeypatch.setattr(
+        h3_cache_text,
+        "create_conditioning_encoder",
+        lambda **kwargs: SimpleNamespace(conditioning_requires_content=False, close=lambda: None),
+    )
+    monkeypatch.setattr(h3_cache_text, "attach_h3_media", lambda batch, dataset_adapter: None)
+    monkeypatch.setattr(h3_cache_text.cache_text_encoder_outputs, "prepare_cache_files_and_paths", lambda datasets: ({}, {}))
+    monkeypatch.setattr(h3_cache_text.cache_text_encoder_outputs, "process_text_encoder_batches", process_text_encoder_batches)
+    monkeypatch.setattr(h3_cache_text.cache_text_encoder_outputs, "post_process_cache_files", lambda *args, **kwargs: None)
+    h3_cache_text.main(["--dataset_config", "dataset.toml", "--text_encoder", "encoder", *argv])
+    return captured["predicate"]
+
+
+def _reference_text_cache(path: Path, fingerprint="fingerprint") -> str:
+    metadata = {h3_references.REFERENCE_FINGERPRINT_KEY: fingerprint} if fingerprint is not None else None
+    save_file(
+        {
+            "mmh3_hidden_states_bfloat16": torch.zeros(1),
+            H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["ref2va"]),
+            H3_REFERENCE_IMAGE_SHORT_EDGE_KEY: torch.tensor(REFERENCE_IMAGE_SHORT_EDGE),
+            H3_REFERENCE_IMAGE_SIZE_MODE_KEY: torch.tensor(0),
+            H3_REFERENCE_IMAGE_MAX_PIXELS_KEY: torch.tensor(0),
+            H3_REFERENCE_VIDEO_SHORT_EDGE_KEY: torch.tensor(REFERENCE_VIDEO_SHORT_EDGE),
+            H3_REFERENCE_VIDEO_MAX_PIXELS_KEY: torch.tensor(REFERENCE_VIDEO_MAX_PIXELS),
+        },
+        str(path),
+        metadata=metadata,
+    )
+    return str(path)
+
+
+def _identity_text_cache(path: Path, task: str = "fl2va", tensors: dict | None = None) -> str:
+    save_file(
+        {
+            "varlen_mmh3_hidden_states_bfloat16": torch.zeros(1, dtype=torch.bfloat16),
+            H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[task]),
+            **(tensors or {}),
+        },
+        str(path),
+    )
+    return str(path)
+
+
+def _fingerprint_item(fingerprint: str, *, has_references: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(has_references=has_references, h3_cache_metadata={h3_references.REFERENCE_FINGERPRINT_KEY: fingerprint})
+
+
+def _reference_item(paths, kinds=None, audio_paths=None) -> SimpleNamespace:
+    kinds = kinds or [MediaModality.IMAGE] * len(paths)
+    audio_paths = audio_paths or [None] * len(paths)
+    return SimpleNamespace(
+        h3_media_assets=tuple(
+            MediaAsset(path, kind, "reference", metadata={"audio_path": str(audio)} if audio else {})
+            for path, kind, audio in zip(paths, kinds, audio_paths)
+        )
+    )
+
+
+def test_reference_fingerprint_tracks_file_identity_kind_and_order(tmp_path):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    assets = _reference_item([first, second]).h3_media_assets
+
+    baseline = h3_references.reference_fingerprint(assets)
+    assert len(baseline) == 64
+    assert h3_references.reference_fingerprint(_reference_item([first, second]).h3_media_assets) == baseline
+    assert h3_references.reference_fingerprint(_reference_item([second, first]).h3_media_assets) != baseline
+    assert (
+        h3_references.reference_fingerprint(
+            _reference_item([first, second], [MediaModality.IMAGE, MediaModality.VIDEO]).h3_media_assets
+        )
+        != baseline
+    )
+
+    first.write_bytes(b"replaced with other content")
+    replaced = h3_references.reference_fingerprint(assets)
+    assert replaced != baseline
+
+    os.utime(first, (0, 0))
+    assert h3_references.reference_fingerprint(assets) != replaced
+
+    assert h3_references.reference_fingerprint(()) is None
+    target = MediaAsset(first, MediaModality.IMAGE, "target")
+    assert h3_references.reference_fingerprint((target,)) is None
+    assert h3_references.reference_fingerprint((target, *assets)) == h3_references.reference_fingerprint(assets)
+
+
+def test_reference_fingerprint_tracks_paired_reference_soundtracks(tmp_path):
+    video = tmp_path / "clip.mp4"
+    audio = tmp_path / "clip.wav"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    assets = _reference_item([video], [MediaModality.VIDEO], [audio]).h3_media_assets
+
+    baseline = h3_references.reference_fingerprint(assets)
+    assert baseline != h3_references.reference_fingerprint(_reference_item([video], [MediaModality.VIDEO]).h3_media_assets)
+    audio.write_bytes(b"other soundtrack")
+    assert h3_references.reference_fingerprint(assets) != baseline
+
+
+def test_h3_dataset_records_reference_fingerprint_in_cache_metadata(tmp_path):
+    images = tmp_path / "images"
+    controls = tmp_path / "controls"
+    images.mkdir()
+    controls.mkdir()
+    target = images / "monster.png"
+    reference = controls / "monster.png"
+    Image.new("RGB", (64, 64)).save(target)
+    Image.new("RGB", (64, 64), color=(1, 2, 3)).save(reference)
+    config = {
+        "general": {"resolution": [64, 64], "batch_size": 1},
+        "datasets": [
+            {
+                "image_directory": str(images),
+                "control_directory": str(controls),
+                "cache_directory": str(tmp_path / "cache"),
+            }
+        ],
+    }
+    _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "monster", (64, 64), (64, 64))
+
+    assets = adapter.attach(item)
+
+    fingerprint = item.h3_cache_metadata[h3_references.REFERENCE_FINGERPRINT_KEY]
+    assert fingerprint == h3_references.reference_fingerprint(assets)
+
+    item.latent_cache_path = str(tmp_path / "cache" / "monster_mmh3.safetensors")
+    save_latent_cache_minimax_h3(
+        item,
+        {
+            "latents_1x8x8_float32": torch.zeros(24, 1, 8, 8),
+            f"varlen_{H3_REFERENCE_KINDS_KEY}_int64": torch.tensor([0], dtype=torch.long),
+        },
+    )
+    with safe_open(item.latent_cache_path, framework="pt", device="cpu") as handle:
+        assert handle.metadata()[h3_references.REFERENCE_FINGERPRINT_KEY] == fingerprint
+
+
+def test_skip_existing_rejects_reference_caches_encoded_from_other_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(h3_cache_latents, "reference_assets", lambda item: item.has_references)
+    monkeypatch.setattr(h3_cache_text, "reference_assets", lambda item: item.has_references)
+    latent_cache = _reference_latent_cache(tmp_path / "latent.safetensors", "")
+    legacy_latent_cache = _reference_latent_cache(tmp_path / "legacy_latent.safetensors", "", fingerprint=None)
+    text_cache = _reference_text_cache(tmp_path / "text.safetensors")
+    legacy_text_cache = _reference_text_cache(tmp_path / "legacy_text.safetensors", fingerprint=None)
+
+    latent_valid = _latent_cache_predicate(monkeypatch, [])
+    text_valid = _text_cache_predicate(monkeypatch, ["--task", "ref2va"])
+
+    assert latent_valid(_fingerprint_item("fingerprint"), latent_cache) is True
+    assert latent_valid(_fingerprint_item("other"), latent_cache) is False
+    assert latent_valid(_fingerprint_item("fingerprint"), legacy_latent_cache) is False
+    assert latent_valid(SimpleNamespace(has_references=False), legacy_latent_cache) is True
+
+    assert text_valid(_fingerprint_item("fingerprint"), text_cache) is True
+    assert text_valid(_fingerprint_item("other"), text_cache) is False
+    assert text_valid(_fingerprint_item("fingerprint"), legacy_text_cache) is False
+    assert text_valid(SimpleNamespace(has_references=False), legacy_text_cache) is True
+
+
+def test_skip_existing_rejects_text_caches_encoded_for_another_task(monkeypatch, tmp_path):
+    cache = _identity_text_cache(tmp_path / "text.safetensors")
+    legacy = str(tmp_path / "legacy.safetensors")
+    save_file({"varlen_mmh3_hidden_states_bfloat16": torch.zeros(1, dtype=torch.bfloat16)}, legacy)
+    item = SimpleNamespace()
+
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va"])(item, cache) is True
+    assert _text_cache_predicate(monkeypatch, ["--task", "i2va"])(item, cache) is False
+    assert _text_cache_predicate(monkeypatch, ["--task", "t2va"])(item, cache) is False
+    assert _text_cache_predicate(monkeypatch, ["--task", "t2va"])(item, legacy) is False
+
+
+def test_skip_existing_rejects_text_caches_with_another_qwen_visual_cap(monkeypatch, tmp_path):
+    capped = _identity_text_cache(tmp_path / "capped.safetensors", tensors={H3_TEXT_VISUAL_MAX_PIXELS_KEY: torch.tensor(65_536)})
+    uncapped = _identity_text_cache(tmp_path / "uncapped.safetensors")
+    item = SimpleNamespace()
+
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va", "--h3_text_visual_max_pixels", "65536"])(item, capped) is True
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va", "--h3_text_visual_max_pixels", "131072"])(item, capped) is False
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va"])(item, capped) is False
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va"])(item, uncapped) is True
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va", "--h3_text_visual_max_pixels", "65536"])(item, uncapped) is False
+
+
+def test_skip_existing_rejects_reference_caches_sized_with_another_image_strategy(monkeypatch, tmp_path):
+    cache = _reference_text_cache(tmp_path / "text.safetensors")
+    legacy = _identity_text_cache(
+        tmp_path / "legacy.safetensors",
+        task="ref2va",
+        tensors={
+            H3_REFERENCE_VIDEO_SHORT_EDGE_KEY: torch.tensor(REFERENCE_VIDEO_SHORT_EDGE),
+            H3_REFERENCE_VIDEO_MAX_PIXELS_KEY: torch.tensor(REFERENCE_VIDEO_MAX_PIXELS),
+        },
+    )
+    item = _fingerprint_item("fingerprint")
+
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va"])(item, cache) is True
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va", "--reference_image_short_edge", "1024"])(item, cache) is False
+    assert (
+        _text_cache_predicate(monkeypatch, ["--task", "ref2va", "--reference_image_size_mode", "target_area"])(item, cache) is False
+    )
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va", "--reference_image_max_pixels", "262144"])(item, cache) is False
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va"])(item, legacy) is False
+
+
+def test_skip_existing_rejects_text_caches_without_the_requested_empty_pair(monkeypatch, tmp_path):
+    prompt_only = _identity_text_cache(tmp_path / "prompt.safetensors")
+    with_empty = _identity_text_cache(
+        tmp_path / "empty.safetensors",
+        tensors={
+            "varlen_mmh3_empty_hidden_states_bfloat16": torch.zeros(1, dtype=torch.bfloat16),
+            "varlen_mmh3_empty_token_tags_int64": torch.zeros(1, dtype=torch.long),
+        },
+    )
+    item = SimpleNamespace()
+
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va"])(item, prompt_only) is True
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va", "--cache_guidance_empty"])(item, prompt_only) is False
+    assert _text_cache_predicate(monkeypatch, ["--task", "fl2va", "--cache_guidance_empty"])(item, with_empty) is True
 
 
 def test_prepare_reference_target_area_uses_bucket_area_and_optional_cap(tmp_path):

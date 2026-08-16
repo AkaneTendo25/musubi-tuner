@@ -21,6 +21,7 @@ from musubi_tuner.minimax_h3.cache import (
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
 from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
 from musubi_tuner.minimax_h3.references import (
+    REFERENCE_FINGERPRINT_KEY,
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
     REFERENCE_VIDEO_MAX_PIXELS,
@@ -129,6 +130,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             return False
         if not reference_assets(item):
             return True
+        if not cache_matches_fingerprint(path, item.h3_cache_metadata[REFERENCE_FINGERPRINT_KEY], REFERENCE_FINGERPRINT_KEY):
+            return False
         suffix = reference_key_suffix(
             args.reference_image_short_edge,
             args.reference_image_size_mode,
@@ -136,9 +139,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.reference_video_short_edge,
             args.reference_video_max_pixels,
         )
+        kinds_key = f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64"
         try:
             with safe_open(path, framework="pt", device="cpu") as handle:
-                return any(H3_REFERENCE_KINDS_KEY + suffix in key for key in handle.keys())
+                return kinds_key in set(handle.keys())
         except (OSError, RuntimeError, ValueError):
             return False
 
