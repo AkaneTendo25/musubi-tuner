@@ -3124,6 +3124,27 @@ def test_h3_trainer_maps_common_fp8_switch_to_scaled_loading_and_accepts_swap():
     assert args.h3_attn_auto_dispatch is False
 
 
+@pytest.mark.parametrize("convrot_flag", ["--h3_convrot_int8", "--int8_convrot_base"])
+def test_h3_trainer_rejects_layer_granular_swap_with_convrot_int8(convrot_flag):
+    layer_args = [
+        "--sdpa",
+        convrot_flag,
+        "--blocks_to_swap",
+        "2",
+        "--block_swap_h2d_only",
+        "--block_swap_granularity",
+        "layer",
+    ]
+
+    with pytest.raises(ValueError, match="bypasses the ConvRot INT8 forward"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(create_parser().parse_args(layer_args))
+
+    block_args = create_parser().parse_args(layer_args[:-1] + ["block"])
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(block_args)
+
+    assert block_args.block_swap_granularity == "block"
+
+
 def test_h3_attention_auto_dispatch_requires_sdpa():
     args = create_parser().parse_args(["--flash_attn", "--h3_attn_auto_dispatch"])
 

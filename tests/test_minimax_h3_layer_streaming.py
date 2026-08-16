@@ -5,7 +5,7 @@ import pytest
 from torch import nn
 
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
-from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, _reject_convrot_int8_linear
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires split CPU/CUDA placement")
@@ -45,3 +45,20 @@ def test_layer_streaming_keeps_non_linear_block_parameters_on_compute_device(mon
         assert block.attn.q_norm.weight.device.type == "cuda"
         assert block.attn.k_norm.weight.device.type == "cuda"
         assert all(module.weight.device.type == "cpu" for module in block.modules() if isinstance(module, nn.Linear))
+
+
+@pytest.mark.parametrize("marker", ["_convrot_groupsize", "int8_convrot_groupsize"])
+def test_layer_streaming_rejects_convrot_int8_linear(marker):
+    linear = nn.Linear(8, 8, bias=False)
+    linear.weight.requires_grad_(False)
+    if marker == "int8_convrot_groupsize":
+        linear.register_buffer(marker, torch.tensor(64, dtype=torch.int32))
+    else:
+        setattr(linear, marker, 64)
+
+    with pytest.raises(ValueError, match="ConvRot INT8"):
+        _reject_convrot_int8_linear(linear, "block 0.linear")
+
+
+def test_layer_streaming_accepts_plain_linear():
+    _reject_convrot_int8_linear(nn.Linear(8, 8), "block 0.linear")

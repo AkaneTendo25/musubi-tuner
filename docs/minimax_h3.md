@@ -481,7 +481,8 @@ Block swapping streams frozen weights from host memory. It is valid only while t
 
 `--use_pinned_memory_for_block_swap` can improve transfer bandwidth when the host has enough available memory; leave it disabled
 when pinned allocations stall or fail. `--block_swap_granularity layer` streams individual `Linear` layers through the same
-H2D-only ring and supports all 50 blocks, at the cost of more transfers; use the default `block` granularity when it fits. Add
+H2D-only ring and supports all 50 blocks, at the cost of more transfers; use the default `block` granularity when it fits. It
+cannot be combined with `--h3_convrot_int8` or `--int8_convrot_base`. Add
 `--gradient_checkpointing_cpu_offload` when sequence length would otherwise exceed VRAM, and set
 `PYTORCH_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
 
@@ -503,9 +504,9 @@ PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch minimax_h3_train_n
   --output_dir output --output_name h3_style
 ```
 
-If this configuration exceeds available VRAM, add
-`--block_swap_granularity layer`, raise `--blocks_to_swap` to `50`, and use `--block_swap_ring_size 1`; those settings trade
-throughput for lower device residency. Block-swap loading materializes CPU-master copies only for swapped blocks, so
+If this configuration exceeds available VRAM, raise `--blocks_to_swap` to `50` and use `--block_swap_ring_size 1`; those
+settings trade throughput for lower device residency. `--block_swap_granularity layer` is rejected here because it bypasses the
+ConvRot INT8 forward. Block-swap loading materializes CPU-master copies only for swapped blocks, so
 `--blocks_to_swap` affects both host and device residency. Total training memory also depends on packed sequence length,
 attention workspaces, adapter rank, gradients, and optimizer state.
 

@@ -749,6 +749,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "--h3_convrot_int8_lora_fused requires online or pre-quantized ConvRot INT8 weights with "
                 "--h3_convrot_int8_fwd int8 and --h3_convrot_int8_bwd int8"
             )
+        if convrot_int8_active and args.block_swap_granularity == "layer":
+            raise ValueError(
+                "--block_swap_granularity layer bypasses the ConvRot INT8 forward and corrupts the base output; "
+                "use --block_swap_granularity block or drop --h3_convrot_int8/--int8_convrot_base"
+            )
         if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:
             raise ValueError("--h3_caption_dropout_rate must lie in [0, 1]")
         if args.h3_extension_video_frames < 0 or args.h3_extension_audio_latents < 0:

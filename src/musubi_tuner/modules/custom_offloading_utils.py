@@ -1314,6 +1314,17 @@ class ForwardOnlyBlockStreamer:
         self.handles.clear()
 
 
+_CONVROT_INT8_MARKERS = ("_convrot_groupsize", "int8_convrot_groupsize")
+
+
+def _reject_convrot_int8_linear(module: nn.Module, layer_name: str) -> None:
+    if any(hasattr(module, marker) for marker in _CONVROT_INT8_MARKERS):
+        raise ValueError(
+            "layer-granular H2D streaming replaces the ConvRot INT8 forward and corrupts the base output; "
+            f"found ConvRot INT8 weights in {layer_name}. Use block-granular swap or disable ConvRot INT8."
+        )
+
+
 class LoRALinearStreamOffloader:
     """H2D-only streaming of individual frozen Linear layers through a GPU ring.
 
@@ -1363,6 +1374,7 @@ class LoRALinearStreamOffloader:
                         "layer-granular H2D streaming requires frozen base Linear parameters; "
                         f"found a trainable parameter in block {block_index}.{name}"
                     )
+                _reject_convrot_int8_linear(module, f"block {block_index}.{name}")
                 self.layers.append(module)
                 self.layer_names.append(f"{block_index}.{name}")
 
