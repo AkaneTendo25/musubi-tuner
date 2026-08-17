@@ -174,8 +174,8 @@ guidance, and preservation forwards. Video-only removes reference soundtracks; a
 anchors and uses the audio from paired AV references. Recache text outputs after changing the probabilities. Latent caches do not
 need to be rebuilt. Every enabled mode must leave at least one reference of some kind, checked when the dataset config is parsed:
 a nonzero `video` weight needs an image or video reference, and a nonzero `audio` weight needs an image or audio reference, since
-a video reference contributes only its soundtrack in that mode and may not have one. Audio-only survivors are permitted, with the
-off-distribution caveat above. On a reference set that is already audio-only the `audio` mode is the identity — it selects exactly
+a video reference contributes only its soundtrack in that mode and may not have one. Audio-only survivors are permitted; the
+off-distribution limitation above applies to them. On a reference set that is already audio-only the `audio` mode is the identity — it selects exactly
 the same references as `av` — so dropout between those two weights has no effect there.
 
 Reference audio is cropped or zero-padded to a canonical sample count (`temporal_shape`): audio paired with a video reference is
@@ -214,8 +214,8 @@ files (`qwen_control_fingerprint`): any change rebuilds it under `--skip_existin
 
 For CFG-style control dropout, cache with `--h3_qwen_control_dropout` — every item that carries controls also stores a
 control-free presentation — and train with `--h3_qwen_control_dropout_rate P`, one synchronized draw per step that feeds the
-same presentation to the guidance and base-preservation branches. Caveat: the twin doubles the text-encoding work and the
-cached presentations for those items, and a rate above 0 refuses a cache written without the flag.
+same presentation to the guidance and base-preservation branches. The twin doubles the text-encoding work and the cached
+presentations for those items; a rate above 0 refuses a cache written without the flag.
 
 Experimental: the released H3 never saw control imagery in this channel, so verify control adherence against a prompt-only
 baseline before relying on the recipe.
@@ -632,7 +632,12 @@ cost of intra-block noise levels the released weights have not seen. The observe
 Ref2VA layout does not have, so pass `--h3_extension_route per_row_sigma`.
 
 **Keyframes.** Entries are `first`, `last`, or a latent frame index. Anchors stay in the loss, matching the released contract.
-`last` is the final *pixel* frame, not the same anchor as the integer `frames - 1`.
+`last` is the final *pixel* frame, not the same anchor as the integer `frames - 1`. A `t2va` cache is text-only, so the
+conditioner never sees the frames those anchors pin; cache with `--h3_keyframe_visuals first,11,last` (EXPERIMENTAL, `--task
+t2va` only, entries are decoded *target-video* frames) to present them to Qwen3-VL as picture spans ahead of any Qwen control
+spans, restoring the visibility the released `i2va`/`fl2va`/`l2va` presentations have. The list is part of the text-cache
+identity, so changing it rebuilds the cache under `--skip_existing`; latent caches and DiT rows are untouched, and a run whose
+anchors name other frames than the cache presents is only warned about, once.
 
 **Masking.** Masks are drawn per step, so the occlusion distribution changes without re-caching. Masks combine with `t2va` and
 `ref2va`/`ref2va_omni` caches; `i2va`/`fl2va`/`l2va` caches reject observed rows. Under Ref2VA the observed rows are pinned

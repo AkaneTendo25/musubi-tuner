@@ -153,6 +153,7 @@ def create_conditioning_encoder(
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     reference_video_fps: float = REFERENCE_VIDEO_FPS,
     text_visual_max_pixels: int = 0,
+    keyframe_visuals: tuple[int, ...] = (),
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
     _validate_dtype(dtype)
@@ -174,6 +175,7 @@ def create_conditioning_encoder(
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
         **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
         **_reference_video_fps_kwargs(reference_video_fps),
+        **({} if not keyframe_visuals else {"keyframe_visuals": tuple(keyframe_visuals)}),
     )
 
 

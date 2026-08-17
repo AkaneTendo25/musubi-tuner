@@ -40,12 +40,15 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
+    H3_KEYFRAME_VISUALS_KEY,
+    H3_KEYFRAME_VISUAL_LAST,
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     H3_VIDEO_GEOMETRY_KEY,
+    format_keyframe_visuals,
     qwen_control_dropout_key,
     reference_key_suffix,
     reference_variant_key,
@@ -212,6 +215,7 @@ def create_conditioning_encoder(
     reference_video_fps: float = REFERENCE_VIDEO_FPS,
     text_visual_max_pixels: int = 0,
     max_caption_tokens: int = 0,
+    keyframe_visuals: tuple[int, ...] = (),
 ):
     """Load the released understanding encoder and adapt its hidden-state output to Musubi."""
     from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder, load_text_conditioner
@@ -239,6 +243,7 @@ def create_conditioning_encoder(
         reference_video_max_pixels=reference_video_max_pixels,
         reference_video_fps=reference_video_fps,
         max_caption_tokens=max_caption_tokens,
+        keyframe_visuals=keyframe_visuals,
     )
 
 
@@ -921,6 +926,9 @@ class _NativeTrainingBackend:
         self.reference_video_max_pixels = reference_video_max_pixels
         self.reference_video_fps = reference_video_fps
         self.text_visual_max_pixels = text_visual_max_pixels
+        # One warning per run: keyframe anchors and cached keyframe visuals are
+        # independent, so a divergence is reported once and never repeated.
+        self._keyframe_visual_mismatch_warned = False
 
     def get_training_transformer(self) -> torch.nn.Module:
         return self.transformer
@@ -1126,8 +1134,34 @@ class _NativeTrainingBackend:
         has_qwen_controls = H3_QWEN_CONTROL_VISUALS_KEY in batch and int(
             self._one_conditioning_item(batch, H3_QWEN_CONTROL_VISUALS_KEY, expected_ndim=0)
         )
-        if task == "t2va" and has_vision and not has_qwen_controls:
+        # EXPERIMENTAL keyframe visuals are the second marked population: target
+        # frames shown to Qwen so custom anchors are visible to the conditioner.
+        # They too produce VIDEO-tagged text rows and no DiT rows, so the T2VA
+        # acceptance check ORs the two markers.
+        cached_keyframe_visuals = ()
+        if H3_KEYFRAME_VISUALS_KEY in batch:
+            cached_keyframe_visuals = tuple(
+                int(value) for value in self._one_conditioning_item(batch, H3_KEYFRAME_VISUALS_KEY, expected_ndim=1)
+            )
+        if task == "t2va" and has_vision and not (has_qwen_controls or cached_keyframe_visuals):
             raise ValueError("MiniMax H3 T2VA training requires text-only conditioning; re-cache with --task t2va")
+        if condition_video_anchors and cached_keyframe_visuals and not self._keyframe_visual_mismatch_warned:
+            # The pinned rows and the presented frames are independently valid --
+            # one lives in latent space, the other in decoded pixel frames -- so a
+            # divergence is worth naming once and never worth failing on.
+            pinned = tuple(
+                0 if anchor == "first" else H3_KEYFRAME_VISUAL_LAST if anchor == "last" else int(anchor)
+                for anchor in condition_video_anchors
+            )
+            if set(pinned) != set(cached_keyframe_visuals):
+                self._keyframe_visual_mismatch_warned = True
+                logger.warning(
+                    "H3 keyframe anchors pin %s while the text cache presents %s to the conditioner; "
+                    "re-cache with --h3_keyframe_visuals %s to show the anchored frames",
+                    format_keyframe_visuals(pinned),
+                    format_keyframe_visuals(cached_keyframe_visuals),
+                    format_keyframe_visuals(pinned),
+                )
         if task in ("i2va", "fl2va", "l2va") and not has_vision:
             raise ValueError(f"MiniMax H3 {task.upper()} training requires keyframe vision rows; re-cache with --task {task}")
         if task == "ref2va" and not has_vision:

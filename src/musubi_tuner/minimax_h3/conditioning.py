@@ -27,6 +27,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
+    H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_HIDDEN_KEY,
@@ -35,6 +36,7 @@ from musubi_tuner.minimax_h3.cache import (
     qwen_control_assets,
     qwen_control_dropout_key,
     reference_variant_key,
+    resolve_keyframe_visuals,
 )
 from musubi_tuner.minimax_h3.comfy_quant import (
     has_comfy_quantized_layers,
@@ -328,6 +330,7 @@ class MiniMaxH3ConditioningEncoder:
         reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
         reference_video_fps: float = REFERENCE_VIDEO_FPS,
         max_caption_tokens: int = 0,
+        keyframe_visuals: tuple[int, ...] = (),
     ) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -342,6 +345,11 @@ class MiniMaxH3ConditioningEncoder:
         self.reference_video_short_edge = reference_video_short_edge
         self.reference_video_max_pixels = reference_video_max_pixels
         self.reference_video_fps = reference_video_fps
+        # EXPERIMENTAL: target frames shown to Qwen on the T2VA route, so the
+        # conditioner sees what the trainer's custom keyframe anchors will pin.
+        if keyframe_visuals and task != "t2va":
+            raise ValueError("MiniMax H3 keyframe visuals require --task t2va")
+        self.keyframe_visuals = tuple(keyframe_visuals)
         # Even T2VA enumerates decoded video crops so its cache filename shares
         # the same crop identity as FL2VA and the corresponding latent cache.
         self.conditioning_requires_content = True
@@ -553,8 +561,18 @@ class MiniMaxH3ConditioningEncoder:
                 return int(candidate)
         raise ValueError("H3 null conditioning needs a pad or eos token; this tokenizer defines neither")
 
+    def _keyframe_visual_images(self, item: Any) -> list[Image.Image]:
+        """Decode the listed target frames exactly as the FL2VA endpoints are decoded."""
+        content = item.content
+        if not isinstance(content, np.ndarray) or content.ndim != 4 or content.shape[0] < 1:
+            raise ValueError("MiniMax H3 keyframe visuals require a decoded target video with at least 1 frame")
+        frames = resolve_keyframe_visuals(self.keyframe_visuals, int(content.shape[0]))
+        return [Image.fromarray(content[frame].astype(np.uint8)) for frame in frames]
+
     def _images_for_item(self, item: Any) -> list[Image.Image] | None:
-        if self.task in ("t2va", "ref2va", "ref2va_omni"):
+        if self.task == "t2va":
+            return self._keyframe_visual_images(item) if self.keyframe_visuals else None
+        if self.task in ("ref2va", "ref2va_omni"):
             return None
         if getattr(item, "h3_image_mode", "none") != "none":
             if self.task != "fl2va":
@@ -643,6 +661,10 @@ class MiniMaxH3ConditioningEncoder:
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
                 H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
+            if self.keyframe_visuals:
+                # The marker doubles as the cache identity: the tags alone cannot
+                # tell a keyframe span apart from a control span or a stale cache.
+                tensors[f"{H3_KEYFRAME_VISUALS_KEY}_int64"] = torch.tensor(self.keyframe_visuals, dtype=torch.long)
             if self.max_caption_tokens:
                 tensors[H3_MAX_CAPTION_TOKENS_KEY] = torch.tensor(self.max_caption_tokens, dtype=torch.long)
             if self.text_visual_max_pixels:

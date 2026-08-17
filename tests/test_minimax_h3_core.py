@@ -50,6 +50,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_IDS,
     H3_CONDITIONING_TASK_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
+    H3_KEYFRAME_VISUALS_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
@@ -65,9 +66,12 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     QWEN_CONTROL_FINGERPRINT_KEY,
     QWEN_CONTROL_ROLE,
+    format_keyframe_visuals,
+    parse_keyframe_visuals,
     qwen_control_dropout_key,
     qwen_control_fingerprint,
     reference_key_suffix,
+    resolve_keyframe_visuals,
     save_latent_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3 import dataset as h3_dataset
@@ -3746,3 +3750,56 @@ def test_skip_existing_requires_the_control_free_twin_only_when_dropout_is_reque
     # The reverse is harmless: the extra keys are simply never read.
     assert plain(item, controls_only) is True
     assert plain(item, dual) is True
+
+
+def test_keyframe_visual_specs_parse_and_resolve_against_the_decoded_frames():
+    """EXPERIMENTAL: the list names decoded target frames, not packer anchors."""
+    assert parse_keyframe_visuals("") == ()
+    # 'first' collapses to 0 because both name the same decoded image, while
+    # 'last' keeps a sentinel until the item's frame count is known.
+    assert parse_keyframe_visuals("first,11,last") == (0, 11, -1)
+    assert parse_keyframe_visuals(" 3 , 0 ") == (3, 0)
+    assert format_keyframe_visuals((0, 11, -1)) == "0,11,last"
+
+    with pytest.raises(ValueError, match="listed twice"):
+        parse_keyframe_visuals("first,0")
+    with pytest.raises(ValueError, match="'first', 'last', or a non-negative frame index"):
+        parse_keyframe_visuals("middle")
+    with pytest.raises(ValueError, match="'first', 'last', or a non-negative frame index"):
+        parse_keyframe_visuals("-2")
+
+    assert resolve_keyframe_visuals((0, 11, -1), 33) == (0, 11, 32)
+    with pytest.raises(ValueError, match="outside the 8 target frames"):
+        resolve_keyframe_visuals((11,), 8)
+    # 'last' and an explicit final index name one frame, so the pair is refused.
+    with pytest.raises(ValueError, match="duplicate target frame"):
+        resolve_keyframe_visuals((7, -1), 8)
+
+
+def test_keyframe_visuals_are_rejected_outside_t2va_caching(monkeypatch):
+    with pytest.raises(SystemExit):
+        _text_cache_predicate(monkeypatch, ["--task", "fl2va", "--h3_keyframe_visuals", "first,last"])
+    with pytest.raises(SystemExit):
+        _text_cache_predicate(monkeypatch, ["--task", "t2va", "--h3_keyframe_visuals", "middle"])
+
+
+def test_skip_existing_rejects_text_caches_presenting_other_keyframe_visuals(monkeypatch, tmp_path):
+    text_only = _identity_text_cache(tmp_path / "text_only.safetensors", task="t2va")
+    presented = _identity_text_cache(
+        tmp_path / "presented.safetensors",
+        task="t2va",
+        tensors={f"{H3_KEYFRAME_VISUALS_KEY}_int64": torch.tensor([0, 11, -1], dtype=torch.long)},
+    )
+    item = SimpleNamespace()
+
+    plain = _text_cache_predicate(monkeypatch, ["--task", "t2va"])
+    same = _text_cache_predicate(monkeypatch, ["--task", "t2va", "--h3_keyframe_visuals", "first,11,last"])
+    other = _text_cache_predicate(monkeypatch, ["--task", "t2va", "--h3_keyframe_visuals", "first,12,last"])
+
+    assert same(item, presented) is True
+    # The presented list is cache identity in both directions: changing it, or
+    # asking for none, re-encodes the item.
+    assert other(item, presented) is False
+    assert plain(item, presented) is False
+    assert same(item, text_only) is False
+    assert plain(item, text_only) is True

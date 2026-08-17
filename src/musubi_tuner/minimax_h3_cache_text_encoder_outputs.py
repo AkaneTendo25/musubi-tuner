@@ -18,6 +18,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
@@ -30,8 +31,10 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     QWEN_CONTROL_FINGERPRINT_KEY,
+    format_keyframe_visuals,
     logical_cache_key,
     normalize_batch_tensors,
+    parse_keyframe_visuals,
     qwen_control_assets,
     qwen_control_dropout_key,
     save_text_encoder_output_cache_minimax_h3,
@@ -140,6 +143,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h3_keyframe_visuals",
+        type=str,
+        default="",
+        help=(
+            "EXPERIMENTAL: comma-separated target-video frames -- 'first', 'last', or a frame index -- presented to "
+            "the Qwen3-VL conditioner as picture spans, so a --task t2va cache shows the conditioner the frames "
+            "--h3_keyframe_anchors will pin at training time. --task t2va only"
+        ),
+    )
+    parser.add_argument(
         "--h3_qwen_control_dropout",
         action="store_true",
         help=(
@@ -169,6 +182,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--h3_text_visual_max_pixels must be non-negative")
     if args.h3_max_caption_tokens < 0:
         parser.error("--h3_max_caption_tokens must be non-negative")
+    try:
+        keyframe_visuals = parse_keyframe_visuals(args.h3_keyframe_visuals)
+    except ValueError as error:
+        parser.error(str(error))
+    if keyframe_visuals and args.task != "t2va":
+        parser.error("--h3_keyframe_visuals requires --task t2va")
+    if keyframe_visuals:
+        logger.info("Presenting target frames %s to the conditioner as keyframe visuals", format_keyframe_visuals(keyframe_visuals))
     device_name = args.device if args.device is not None else "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
 
@@ -195,6 +216,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         reference_video_max_pixels=args.reference_video_max_pixels,
         reference_video_fps=args.reference_video_fps,
         text_visual_max_pixels=args.h3_text_visual_max_pixels,
+        keyframe_visuals=keyframe_visuals,
     )
 
     def encode(batch: list[ItemInfo]) -> None:
@@ -279,6 +301,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                         }
                     if not required <= logical_keys:
                         return False
+                # The presented frame list is cache identity: changing it changes
+                # what the conditioner saw, and its absence means the cache was
+                # written text-only.
+                cached_visuals = [handle.get_tensor(key) for key in keys if logical_cache_key(key) == H3_KEYFRAME_VISUALS_KEY]
+                if len(cached_visuals) > 1:
+                    return False
+                if bool(keyframe_visuals) != bool(cached_visuals):
+                    return False
+                if cached_visuals and tuple(int(value) for value in cached_visuals[0]) != keyframe_visuals:
+                    return False
                 if H3_TEXT_VISUAL_MAX_PIXELS_KEY not in keys:
                     if args.h3_text_visual_max_pixels != 0:
                         return False

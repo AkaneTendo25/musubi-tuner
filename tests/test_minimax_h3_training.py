@@ -1,3 +1,4 @@
+import logging
 import shutil
 from contextlib import nullcontext
 from dataclasses import replace
@@ -31,6 +32,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_KEYFRAME_VISUALS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
@@ -5469,3 +5471,134 @@ def test_h3_text_cache_validates_the_control_free_twin(tmp_path):
     orphaned.pop(H3_QWEN_CONTROL_VISUALS_KEY)
     with pytest.raises(ValueError, match="requires cached mmh3_qwen_control_visuals"):
         save_text_encoder_output_cache_minimax_h3(item, orphaned)
+
+
+def _keyframe_visual_transformer():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    return MiniMaxH3Transformer(config)
+
+
+def test_native_h3_t2va_backend_accepts_marked_keyframe_visual_rows():
+    """EXPERIMENTAL: target frames shown to Qwen are marked exactly like controls."""
+    transformer = _keyframe_visual_transformer()
+    backend = _NativeTrainingBackend(transformer)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 0, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+        H3_KEYFRAME_VISUALS_KEY: [torch.tensor([0, -1])],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        torch.randn(1, 4, 2, 2, 2),
+        torch.randn(1, 2, 6, 1),
+        torch.tensor([0.5]),
+        torch.tensor([0.5]),
+    )
+
+    assert prediction.video.shape == (1, 4, 2, 2, 2)
+
+    # Without the marker the same vision rows are a stale keyframe cache again.
+    del batch[H3_KEYFRAME_VISUALS_KEY]
+    with pytest.raises(ValueError, match="--task t2va"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 2, 2, 2),
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+        )
+
+
+def test_keyframe_anchor_and_keyframe_visual_divergence_warns_once(caplog):
+    transformer = _keyframe_visual_transformer()
+    backend = _NativeTrainingBackend(transformer)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 0, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+        H3_KEYFRAME_VISUALS_KEY: [torch.tensor([0, 5])],
+    }
+
+    def run(anchors):
+        return backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 2, 2, 2),
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+            condition_video_anchors=anchors,
+            extension_video_context=torch.randn(1, 4, len(anchors), 2, 2),
+        )
+
+    with caplog.at_level(logging.WARNING, logger="musubi_tuner.minimax_h3.integration"):
+        run(("first", "last"))
+        run(("first", "last"))
+
+    warnings = [record for record in caplog.records if "keyframe anchors pin" in record.getMessage()]
+    # Both lists stay valid -- one is latent, the other decoded frames -- so the
+    # divergence is named once and never fails the step.
+    assert len(warnings) == 1
+    assert "0,last" in warnings[0].getMessage() and "0,5" in warnings[0].getMessage()
+
+    caplog.clear()
+    matching = _NativeTrainingBackend(transformer)
+    aligned = dict(batch, **{H3_KEYFRAME_VISUALS_KEY: [torch.tensor([0, 1])]})
+    with caplog.at_level(logging.WARNING, logger="musubi_tuner.minimax_h3.integration"):
+        matching.predict_training(
+            transformer,
+            aligned,
+            torch.randn(1, 4, 2, 2, 2),
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+            condition_video_anchors=("first", 1),
+            extension_video_context=torch.randn(1, 4, 2, 2, 2),
+        )
+    assert not [record for record in caplog.records if "keyframe anchors pin" in record.getMessage()]
+
+
+def test_h3_text_cache_validates_the_keyframe_visual_identity(tmp_path):
+    path = tmp_path / "sample_mmh3_te.safetensors"
+    item = ItemInfo("sample", "caption", (0, 0), (0, 0))
+    item.text_encoder_output_cache_path = str(path)
+    tensors = {
+        f"varlen_{H3_TEXT_HIDDEN_KEY}_float32": torch.zeros(3, 5120),
+        f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": torch.tensor([1, 0, 1]),
+        H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"]),
+        f"{H3_KEYFRAME_VISUALS_KEY}_int64": torch.tensor([0, -1]),
+    }
+
+    save_text_encoder_output_cache_minimax_h3(item, tensors)
+
+    with safe_open(path, framework="pt") as handle:
+        assert handle.get_tensor(f"{H3_KEYFRAME_VISUALS_KEY}_int64").tolist() == [0, -1]
+
+    empty = dict(tensors, **{f"{H3_KEYFRAME_VISUALS_KEY}_int64": torch.zeros(0, dtype=torch.long)})
+    with pytest.raises(ValueError, match="non-empty int64 vector"):
+        save_text_encoder_output_cache_minimax_h3(item, empty)
+
+    # The presentation only exists on the T2VA route; the released keyframe
+    # tasks show their endpoints without any marker.
+    elsewhere = dict(tensors, **{H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["fl2va"])})
+    with pytest.raises(ValueError, match="only valid for T2VA"):
+        save_text_encoder_output_cache_minimax_h3(item, elsewhere)

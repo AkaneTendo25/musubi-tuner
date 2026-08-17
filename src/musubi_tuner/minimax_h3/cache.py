@@ -55,6 +55,15 @@ H3_REFERENCE_TEMPORAL_CONTRACT_KEY = "mmh3_reference_temporal_contract"
 H3_REFERENCE_TEMPORAL_CONTRACT_VERSION = 1
 H3_QWEN_CONTROL_VISUALS_KEY = "mmh3_qwen_control_visuals"
 
+# EXPERIMENTAL. Target-video frames presented to the Qwen3-VL conditioner on the
+# T2VA route, so custom keyframe anchors regain the conditioner visibility the
+# released i2va/fl2va/l2va presentations already have. Nothing here reaches a
+# VAE or adds a DiT row: the anchors themselves are still pinned by the trainer.
+H3_KEYFRAME_VISUALS_KEY = "mmh3_keyframe_visuals"
+# ``last`` cannot be resolved until the item's frame count is known, so it keeps
+# its own sentinel inside the cached identity vector.
+H3_KEYFRAME_VISUAL_LAST = -1
+
 # EXPERIMENTAL. Control imagery shown only to the Qwen3-VL conditioner. These
 # assets never reach a VAE, so they change the text cache and nothing else: the
 # role is deliberately distinct from "reference" so the Ref2VA reference channel
@@ -91,6 +100,52 @@ def qwen_control_fingerprint(assets: Sequence[MediaAsset]) -> str | None:
     ]
     encoded = json.dumps({"format": 1, "qwen_controls": entries}, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def parse_keyframe_visuals(spec: str) -> tuple[int, ...]:
+    """Parse ``--h3_keyframe_visuals`` into canonical target-frame indices.
+
+    ``first`` collapses to ``0``: unlike a packer anchor, this list names decoded
+    *pixel* frames, where the two are literally the same image. ``last`` keeps
+    the ``H3_KEYFRAME_VISUAL_LAST`` sentinel because the frame count is only
+    known once the item is decoded, and the cached identity must be comparable
+    without decoding anything.
+    """
+    if not spec:
+        return ()
+    indices: list[int] = []
+    for piece in spec.split(","):
+        token = piece.strip()
+        if token == "first":
+            index = 0
+        elif token == "last":
+            index = H3_KEYFRAME_VISUAL_LAST
+        elif token.isdigit():
+            index = int(token)
+        else:
+            raise ValueError(f"H3 keyframe visual {token!r} must be 'first', 'last', or a non-negative frame index")
+        if index in indices:
+            raise ValueError(f"H3 keyframe visual {token!r} is listed twice")
+        indices.append(index)
+    return tuple(indices)
+
+
+def resolve_keyframe_visuals(indices: Sequence[int], frame_count: int) -> tuple[int, ...]:
+    """Resolve a parsed keyframe-visual list against one item's decoded frames."""
+    resolved: list[int] = []
+    for index in indices:
+        frame = frame_count - 1 if int(index) == H3_KEYFRAME_VISUAL_LAST else int(index)
+        if not 0 <= frame < frame_count:
+            raise ValueError(f"H3 keyframe visual {format_keyframe_visuals((index,))} is outside the {frame_count} target frames")
+        if frame in resolved:
+            raise ValueError(f"H3 keyframe visuals resolved to duplicate target frame {frame}")
+        resolved.append(frame)
+    return tuple(resolved)
+
+
+def format_keyframe_visuals(indices: Sequence[int]) -> str:
+    """Spell a parsed keyframe-visual list the way the user wrote it."""
+    return ",".join("last" if int(index) == H3_KEYFRAME_VISUAL_LAST else str(int(index)) for index in indices)
 
 
 def qwen_control_dropout_key(key: str) -> str:
@@ -361,6 +416,17 @@ def save_text_encoder_output_cache_minimax_h3(
         qwen_controls = qwen_control_matches[0]
         if qwen_controls.dtype is not torch.long or qwen_controls.ndim != 0 or int(qwen_controls) <= 0:
             raise ValueError(f"H3 {H3_QWEN_CONTROL_VISUALS_KEY} must be a positive scalar int64 count")
+    keyframe_visual_matches = [tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_KEYFRAME_VISUALS_KEY]
+    if keyframe_visual_matches:
+        if len(keyframe_visual_matches) != 1:
+            raise ValueError(f"H3 conditioning cache must contain at most one {H3_KEYFRAME_VISUALS_KEY} tensor")
+        keyframe_visuals = keyframe_visual_matches[0]
+        if keyframe_visuals.dtype is not torch.long or keyframe_visuals.ndim != 1 or keyframe_visuals.numel() == 0:
+            raise ValueError(f"H3 {H3_KEYFRAME_VISUALS_KEY} must be a non-empty int64 vector of frame indices")
+        if int(keyframe_visuals.min()) < H3_KEYFRAME_VISUAL_LAST:
+            raise ValueError(f"H3 {H3_KEYFRAME_VISUALS_KEY} entries must be frame indices or the 'last' sentinel")
+        if int(task) != H3_CONDITIONING_TASK_IDS["t2va"]:
+            raise ValueError(f"H3 {H3_KEYFRAME_VISUALS_KEY} is only valid for T2VA conditioning")
     reference_contract_matches = [
         tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_TEMPORAL_CONTRACT_KEY
     ]

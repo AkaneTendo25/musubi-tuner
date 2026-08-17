@@ -11,6 +11,7 @@ from musubi_tuner.minimax_h3 import conditioning as h3_conditioning
 from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
@@ -553,3 +554,52 @@ def test_qwen_control_dropout_covers_every_reference_modality_variant(monkeypatc
         assert f"varlen_{qwen_control_dropout_key(variant)}_bfloat16" in cached
     assert f"varlen_{qwen_control_dropout_key(reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, 'video'))}_int64" in cached
     assert f"varlen_{qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, 'video'))}_int64" in cached
+
+
+def test_t2va_keyframe_visuals_present_target_frames_and_mark_the_cache(monkeypatch):
+    """EXPERIMENTAL: custom anchors regain the visibility fl2va keyframes have."""
+    processor = _RefProcessor()
+    encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "t2va", keyframe_visuals=(0, 5, -1))
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: ())
+    content = np.zeros((9, 4, 4, 3), dtype=np.uint8)
+    item = SimpleNamespace(caption="two tokens", content=content)
+
+    cached = encoder.encode_conditioning([item])[0]
+
+    # Three picture spans in the listed order, then the instruction -- the same
+    # placement the released FL2VA endpoint keyframes use.
+    assert processor.tokenizer.calls == ["<Picture 1>: ", "<Picture 2>: ", "<Picture 3>: ", "two tokens"]
+    tags = cached[f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64"]
+    assert tags.tolist() == [1, 1, 0, 0, 0] * 3 + [1, 1]
+    assert cached[f"{H3_KEYFRAME_VISUALS_KEY}_int64"].tolist() == [0, 5, -1]
+
+
+def test_keyframe_visuals_compose_with_qwen_controls_and_lead_the_numbering(monkeypatch):
+    processor = _RefProcessor()
+    encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "t2va", keyframe_visuals=(0, -1))
+    controls = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: controls)
+    item = SimpleNamespace(caption="prompt", content=np.zeros((4, 4, 4, 3), dtype=np.uint8))
+
+    cached = encoder.encode_conditioning([item])[0]
+
+    # Keyframes are target-derived and lead, exactly as they do on the FL2VA
+    # route; the controls continue the <Picture N> counter and close the prefix.
+    assert processor.tokenizer.calls == ["<Picture 1>: ", "<Picture 2>: ", "<Picture 3>: ", "prompt"]
+    assert cached[f"{H3_KEYFRAME_VISUALS_KEY}_int64"].tolist() == [0, -1]
+    assert int(cached[H3_QWEN_CONTROL_VISUALS_KEY]) == 1
+
+
+def test_keyframe_visuals_validate_the_task_and_the_decoded_frame_count(monkeypatch):
+    with pytest.raises(ValueError, match="--task t2va"):
+        MiniMaxH3ConditioningEncoder(_RefProcessor(), _TextModel(), torch.bfloat16, "fl2va", keyframe_visuals=(0,))
+
+    encoder = MiniMaxH3ConditioningEncoder(_RefProcessor(), _TextModel(), torch.bfloat16, "t2va", keyframe_visuals=(11,))
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: ())
+    item = SimpleNamespace(caption="prompt", content=np.zeros((4, 4, 4, 3), dtype=np.uint8))
+
+    with pytest.raises(ValueError, match="outside the 4 target frames"):
+        encoder.encode_conditioning([item])
+
+    with pytest.raises(ValueError, match="decoded target video"):
+        encoder.encode_conditioning([SimpleNamespace(caption="prompt", content=None)])
