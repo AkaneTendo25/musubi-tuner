@@ -534,9 +534,17 @@ def train(self, args):
     if args.gradient_checkpointing:
         blocks_to_ckpt = getattr(args, "blocks_to_checkpoint", -1)
         if getattr(args, "blockwise_checkpointing", False):
-            transformer.enable_gradient_checkpointing(
-                args.gradient_checkpointing_cpu_offload, weight_cpu_offloading=True, blocks_to_checkpoint=blocks_to_ckpt
-            )
+            try:
+                transformer.enable_gradient_checkpointing(
+                    args.gradient_checkpointing_cpu_offload, weight_cpu_offloading=True, blocks_to_checkpoint=blocks_to_ckpt
+                )
+            except TypeError:
+                logger.warning(
+                    "Transformer %s does not support blocks_to_checkpoint / weight_cpu_offloading; "
+                    "falling back to basic gradient checkpointing.",
+                    type(transformer).__name__,
+                )
+                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
             if hasattr(transformer, "transformer_blocks"):
                 total_blocks = len(transformer.transformer_blocks)
                 if blocks_to_ckpt is None or int(blocks_to_ckpt) == -1:
@@ -556,7 +564,14 @@ def train(self, args):
                     if hasattr(block, "use_pinned_memory"):
                         block.use_pinned_memory = True
         else:
-            transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload, blocks_to_checkpoint=blocks_to_ckpt)
+            try:
+                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload, blocks_to_checkpoint=blocks_to_ckpt)
+            except TypeError:
+                logger.warning(
+                    "Transformer %s does not support blocks_to_checkpoint; falling back to basic gradient checkpointing.",
+                    type(transformer).__name__,
+                )
+                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
         try:
             network.enable_gradient_checkpointing(
                 args.gradient_checkpointing_cpu_offload,

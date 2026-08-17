@@ -96,6 +96,11 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
             "--ltx2_block_swap_trainable_ring",
             "Coalesce trainable FFT block transfers through a preallocated pinned/GPU ring.",
         ),
+        (
+            "--ltx2_gpu_load",
+            "Load the transformer directly onto the GPU even when --blocks_to_swap is set. "
+            "Skips the CPU-staging round trip for faster startup on high-VRAM cards.",
+        ),
     )
     for option, help_text in flags:
         group.add_argument(option, action="store_true", default=None, help=help_text)
