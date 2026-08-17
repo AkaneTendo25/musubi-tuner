@@ -131,6 +131,40 @@ class LoRAModule(torch.nn.Module):
             return value.to(org_forwarded.dtype)
         return value
 
+    def _fuse_delta(self, org_forwarded, delta, scale):
+        """``org_forwarded + delta * self.multiplier * scale`` without the redundant copies.
+
+        The naive expression materializes three full-size tensors on top of ``delta``
+        (``delta*multiplier``, ``*scale``, and the sum) before the block's activation is
+        finally produced. At the H3 LoRA sites the full size is ``[S, 2*ffn_dim] = [S, 28672]``
+        for ``mlp.fc1`` and ``[S, 3*heads*head_dim] = [S, 21504]`` for ``attn.qkv_proj``, i.e.
+        hundreds of MiB per copy for a long packed sequence, so the redundancy dominates the
+        allocator traffic of a non-checkpointed block.
+
+        Here the scalar factors are applied one out-of-place multiply (which yields a tensor
+        this module exclusively owns) followed by in-place ones, and the base output is then
+        accumulated in place. Every element goes through exactly the same elementwise kernels
+        in the same order as before, so the result is bit-identical; only the destination
+        buffer changes.
+
+        The in-place accumulate is skipped in two cases: when it would have to downcast
+        (bf16 delta on an fp32 base output, where ``add_`` is illegal), and when no scalar
+        factor produced an owned tensor -- ``lora_up``'s output on a 3-D input is an autograd
+        *view* of the underlying matmul result, and writing into a view rebases the graph onto
+        ``CopySlices``, which costs a full-size temporary in backward instead of forward.
+        """
+        owned = False
+        for factor in (self.multiplier, scale):
+            if factor == 1.0:
+                continue  # x * 1.0 is bit-identical to x
+            delta = delta.mul_(factor) if owned else delta * factor
+            owned = True
+        # promote_types (not result_type) keeps this a dtype-only check, which torch.compile
+        # can fold as a constant instead of graph-breaking on a torch.* op returning a dtype.
+        if owned and delta.is_floating_point() and torch.promote_types(delta.dtype, org_forwarded.dtype) == delta.dtype:
+            return delta.add_(org_forwarded)
+        return org_forwarded + delta
+
     def apply_to(self):
         self.org_forward = self.org_module.forward
         self.org_module.forward = self.forward
@@ -192,7 +226,7 @@ class LoRAModule(torch.nn.Module):
             lx = self.lora_up(lx)
 
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
-            return self._match_org_dtype(org_forwarded + lx * self.multiplier * scale, org_forwarded)
+            return self._match_org_dtype(self._fuse_delta(org_forwarded, lx, scale), org_forwarded)
         else:
             lxs = [lora_down(lora_input) for lora_down in self.lora_down]
 
@@ -218,7 +252,7 @@ class LoRAModule(torch.nn.Module):
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
 
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
-            return self._match_org_dtype(org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale, org_forwarded)
+            return self._match_org_dtype(self._fuse_delta(org_forwarded, torch.cat(lxs, dim=-1), scale), org_forwarded)
 
 
 class LoRAInfModule(LoRAModule):
@@ -369,13 +403,13 @@ class LoRAInfModule(LoRAModule):
             lx = self.lora_up(lx)
             org_forwarded = self.org_forward(x)
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
-            return self._match_org_dtype(org_forwarded + lx * self.multiplier * self.scale, org_forwarded)
+            return self._match_org_dtype(self._fuse_delta(org_forwarded, lx, self.scale), org_forwarded)
         else:
             lxs = [lora_down(lora_input) for lora_down in self.lora_down]
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
             org_forwarded = self.org_forward(x)
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
-            return self._match_org_dtype(org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * self.scale, org_forwarded)
+            return self._match_org_dtype(self._fuse_delta(org_forwarded, torch.cat(lxs, dim=-1), self.scale), org_forwarded)
 
     def forward(self, x):
         if not self.enabled:

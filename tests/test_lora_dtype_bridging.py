@@ -234,3 +234,138 @@ def test_other_arch_no_regime_all_fp32_helpers_are_noop_and_removal_is_safe():
             y = downstream(h)
         assert h.dtype == torch.float32
         assert y.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# Delta accumulation: LoRAModule._fuse_delta must stay bit-identical to the
+# naive `org_forwarded + delta * multiplier * scale` it replaced, while issuing
+# fewer full-size elementwise allocations.
+# ---------------------------------------------------------------------------
+
+
+def _naive_fuse_delta(self, org_forwarded, delta, scale):
+    """The pre-optimization expression, for bit-identity comparisons."""
+    return org_forwarded + delta * self.multiplier * scale
+
+
+def _build_module(in_dim, out_dim, base_dtype, lora_dtype, multiplier, alpha, lora_dim, split_dims=None, seed=0):
+    torch.manual_seed(seed)
+    base = nn.Linear(in_dim, out_dim, bias=True).to(base_dtype)
+    lora = LoRAModule("blk", base, multiplier=multiplier, lora_dim=lora_dim, alpha=alpha, split_dims=split_dims)
+    lora.lora_down.to(lora_dtype)
+    lora.lora_up.to(lora_dtype)
+    ups = lora.lora_up if split_dims else [lora.lora_up]
+    for up in ups:
+        nn.init.normal_(up.weight, std=1e-2)
+    lora.apply_to()
+    return base, lora
+
+
+def _run(lora, base, x):
+    for p in lora.parameters():
+        p.grad = None
+    xg = x.detach().clone().requires_grad_(True)
+    out = base(xg)
+    out.float().pow(2).sum().backward()
+    grads = [p.grad.detach().clone() for p in lora.parameters() if p.grad is not None]
+    return out.detach().clone(), xg.grad.detach().clone(), grads
+
+
+@pytest.mark.parametrize("shape", [(3, 8), (2, 5, 8)])
+@pytest.mark.parametrize("multiplier", [1.0, 0.75])
+@pytest.mark.parametrize("alpha,lora_dim", [(4, 4), (2, 4)])  # scale == 1.0 and scale != 1.0
+@pytest.mark.parametrize(
+    "base_dtype,lora_dtype",
+    [
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),  # mixed regime: _match_org_dtype fires
+        (torch.float32, torch.bfloat16),  # in-place accumulate must bail out (would downcast)
+    ],
+)
+@pytest.mark.parametrize("split", [False, True])
+def test_fuse_delta_is_bit_identical_to_naive_expression(shape, multiplier, alpha, lora_dim, base_dtype, lora_dtype, split):
+    in_dim, out_dim = shape[-1], 12
+    split_dims = [4, 8] if split else None
+    kwargs = dict(
+        in_dim=in_dim,
+        out_dim=out_dim,
+        base_dtype=base_dtype,
+        lora_dtype=lora_dtype,
+        multiplier=multiplier,
+        alpha=alpha,
+        lora_dim=lora_dim,
+        split_dims=split_dims,
+    )
+    x = torch.randn(*shape).to(base_dtype)
+
+    base_a, lora_a = _build_module(**kwargs)
+    out_a, xgrad_a, grads_a = _run(lora_a, base_a, x)
+
+    base_b, lora_b = _build_module(**kwargs)
+    lora_b._fuse_delta = _naive_fuse_delta.__get__(lora_b, LoRAModule)
+    out_b, xgrad_b, grads_b = _run(lora_b, base_b, x)
+
+    assert out_a.dtype == out_b.dtype
+    assert torch.equal(out_a, out_b), "forward is not bit-identical to the naive expression"
+    assert torch.equal(xgrad_a, xgrad_b), "input gradient is not bit-identical"
+    assert len(grads_a) == len(grads_b) and grads_a
+    for ga, gb in zip(grads_a, grads_b):
+        assert torch.equal(ga, gb), "LoRA weight gradient is not bit-identical"
+
+
+class _CountFullSizeOps(torch.utils._python_dispatch.TorchDispatchMode):
+    """Count elementwise mul/add kernels that produce a full-size [*, out_dim] tensor."""
+
+    def __init__(self, out_dim):
+        self.out_dim = out_dim
+        self.count = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        name = func.overloadpacket.__name__
+        if name in {"mul", "add", "mul_", "add_"} and isinstance(out, torch.Tensor):
+            if out.dim() and out.shape[-1] == self.out_dim:
+                self.count += 1
+        return out
+
+
+def test_fuse_delta_issues_fewer_full_size_elementwise_kernels():
+    """Locks in the allocation reduction: 3 full-size mul/add kernels become 2 (or 1)."""
+    in_dim, out_dim = 8, 12
+    x = torch.randn(2, 5, in_dim)
+
+    def count(mult, alpha, naive):
+        base, lora = _build_module(in_dim, out_dim, torch.float32, torch.float32, mult, alpha, 4)
+        if naive:
+            lora._fuse_delta = _naive_fuse_delta.__get__(lora, LoRAModule)
+        mode = _CountFullSizeOps(out_dim)
+        with mode:
+            base(x)
+        return mode.count
+
+    # multiplier != 1 and scale != 1: two muls + one add -> one mul, one in-place mul, one in-place add
+    # (same kernel count but two fewer allocations); multiplier == 1 additionally drops a kernel.
+    assert count(1.0, 4, naive=True) == 3  # naive always runs mul, mul, add
+    assert count(1.0, 4, naive=False) == 1  # both factors are 1.0 -> plain add only
+    assert count(1.0, 2, naive=False) == 2  # scale != 1.0 -> mul + in-place add
+    assert count(0.75, 2, naive=False) == 3
+
+
+def test_fuse_delta_does_not_break_the_dynamo_graph():
+    """LoRA modules live inside the compiled ("blocks", ...) scope, so the delta path must
+    trace in one graph. A `torch.result_type` call here graph-breaks; `promote_types` does not."""
+    in_dim, out_dim = 8, 12
+    base, lora = _build_module(in_dim, out_dim, torch.float32, torch.float32, 0.75, 2, 4)
+    x = torch.randn(2, 5, in_dim, requires_grad=True)
+    eager = base(x)
+    eager.sum().backward()
+    eager_grad = x.grad.detach().clone()
+
+    compiled = torch.compile(base, backend="aot_eager", fullgraph=True)
+    x2 = x.detach().clone().requires_grad_(True)
+    out = compiled(x2)
+    out.sum().backward()
+
+    assert torch.equal(eager.detach(), out.detach())
+    assert torch.equal(eager_grad, x2.grad)
