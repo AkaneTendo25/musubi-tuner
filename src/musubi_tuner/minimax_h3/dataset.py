@@ -23,6 +23,8 @@ from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media
 from musubi_tuner.minimax_h3.references import REFERENCE_FINGERPRINT_KEY, reference_fingerprint
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
+CONDITIONING_MASK_KEY = "conditioning_mask_path"
+CONDITIONING_MASK_DIRECTORY_KEY = "conditioning_mask_directory"
 _CONTROL_PATH_PATTERN = re.compile(r"^control_path_(\d+)$")
 _CONTROL_VIDEO_PATH_PATTERN = re.compile(r"^control_video_path_(\d+)$")
 _CONTROL_AUDIO_PATH_PATTERN = re.compile(r"^control_audio_path_(\d+)$")
@@ -201,6 +203,40 @@ def _references_from_directory(control_directory: str, target_paths: Sequence[st
     return result
 
 
+def _masks_from_directory(mask_directory: str, target_paths: Sequence[str]) -> dict[str, Path]:
+    """Match ``conditioning_mask_directory`` files to targets by basename.
+
+    One mask per target, matched on the exact stem: unlike controls, a target
+    never owns several masks, so the numbered-suffix convention does not apply.
+    A target without a mask is simply absent here; whether that is an error
+    depends on the configured mask mode, which the adapter checks.
+    """
+    root = Path(mask_directory)
+    if not root.is_dir():
+        raise ValueError(f"conditioning_mask_directory does not exist: {root}")
+    allowed = {extension.lower() for extension in IMAGE_EXTENSIONS}
+    available: dict[str, Path] = {}
+    for path in sorted(root.iterdir(), key=str):
+        if not path.is_file() or path.suffix.lower() not in allowed:
+            continue
+        if path.stem in available:
+            raise ValueError(f"ambiguous H3 conditioning masks for {path.stem!r} in {root}")
+        available[path.stem] = path
+    return {target: available[Path(target).stem] for target in target_paths if Path(target).stem in available}
+
+
+def _record_masks(records: Sequence[dict[str, Any]], target_keys: Sequence[str]) -> dict[str, Path]:
+    masks: dict[str, Path] = {}
+    for record, target_key in zip(records, target_keys):
+        value = record.get(CONDITIONING_MASK_KEY)
+        if not value:
+            continue
+        if not target_key:
+            raise ValueError("H3 media JSONL records must contain a target path")
+        masks[target_key] = Path(value)
+    return masks
+
+
 def _paired_references_from_directories(
     video_directory: str,
     audio_directory: str,
@@ -311,6 +347,7 @@ def _read_media_jsonl(path: str, *, resolve_paths: bool = False) -> list[dict[st
                 for key in tuple(record):
                     if (
                         key == "control_path"
+                        or key == CONDITIONING_MASK_KEY
                         or _CONTROL_PATH_PATTERN.fullmatch(key)
                         or _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
                         or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
@@ -418,6 +455,10 @@ class H3DatasetAdapter:
         self._target_source_paths: dict[str, tuple[Path, ...]] = {}
         self._target_reference_probabilities: dict[str, tuple[float, float, float]] = {}
         self._image_frame_counts: dict[str, int] = {}
+        # Authored conditioning masks: the observed region for --h3_mask_mode
+        # dataset. They are applied to the packed rows at train time, so they
+        # never enter the latent cache and never change its identity.
+        self.conditioning_masks: dict[str, Path] = {}
         self.image_mode = str(getattr(args, "h3_image_mode", "none"))
         self.image_frame_count = getattr(args, "h3_image_frame_count", None)
         if self.image_mode not in {"none", "first", "first_last"}:
@@ -435,7 +476,13 @@ class H3DatasetAdapter:
             "control_modality_probabilities",
         ):
             clean_general.pop(key, None)
-        for key in ("h3_target_mode", "h3_image_frame_count", "audio_directory", "audio_jsonl_file"):
+        for key in (
+            "h3_target_mode",
+            "h3_image_frame_count",
+            "audio_directory",
+            "audio_jsonl_file",
+            CONDITIONING_MASK_DIRECTORY_KEY,
+        ):
             clean_general.pop(key, None)
 
         source_datasets = user_config.get("datasets", [])
@@ -451,9 +498,15 @@ class H3DatasetAdapter:
             audio_jsonl_file = _effective(source, general, "audio_jsonl_file")
             clean.pop("audio_directory", None)
             clean.pop("audio_jsonl_file", None)
+            mask_directory = _effective(source, general, CONDITIONING_MASK_DIRECTORY_KEY)
+            clean.pop(CONDITIONING_MASK_DIRECTORY_KEY, None)
             if audio_directory or audio_jsonl_file:
                 if target_mode != "audio":
                     raise ValueError("audio_directory/audio_jsonl_file require h3_target_mode = 'audio'")
+                if mask_directory:
+                    raise ValueError(
+                        f"{CONDITIONING_MASK_DIRECTORY_KEY} masks video latents, so it cannot be used on an audio dataset"
+                    )
                 audio_dataset = H3AudioDataset(source, general)
                 self.audio_datasets.append(audio_dataset)
                 self.dataset_kinds.append("audio")
@@ -621,6 +674,19 @@ class H3DatasetAdapter:
             else:
                 reference_paths = {}
 
+            record_masks = _record_masks(records, target_paths) if records is not None else {}
+            if mask_directory and record_masks:
+                raise ValueError(f"specify H3 conditioning masks in {CONDITIONING_MASK_DIRECTORY_KEY} or the JSONL, not both")
+            mask_paths = _masks_from_directory(mask_directory, target_paths) if mask_directory else record_masks
+            for target, mask_path in mask_paths.items():
+                if not Path(mask_path).is_file():
+                    raise FileNotFoundError(f"H3 conditioning mask not found for {target!r}: {mask_path}")
+                normal_target = _normal_path(target)
+                existing_mask = self.conditioning_masks.get(normal_target)
+                if existing_mask is not None and _normal_path(existing_mask) != _normal_path(mask_path):
+                    raise ValueError(f"conflicting H3 conditioning mask for target path across datasets: {target}")
+                self.conditioning_masks[normal_target] = Path(mask_path)
+
             for target in target_paths:
                 modality = _modality_for_path(Path(target))
                 if (video_directory or video_jsonl_file) and modality is not MediaModality.VIDEO:
@@ -667,6 +733,45 @@ class H3DatasetAdapter:
             for resolved in self._targets.values()
             for reference in resolved.references
         )
+        self._validate_conditioning_masks(getattr(args, "h3_mask_mode", None) if args is not None else None)
+
+    def _validate_conditioning_masks(self, mask_mode: str | None) -> None:
+        """Refuse a configuration whose masks and mask mode disagree.
+
+        ``mask_mode`` is ``None`` for the caching scripts, which never read a
+        conditioning mask: masks are applied to the packed rows at train time,
+        so a cache is identical with and without them.
+        """
+        if mask_mode is None:
+            return
+        if mask_mode == "dataset":
+            missing = sorted(
+                str(resolved.path)
+                for normal, resolved in self._targets.items()
+                if normal not in self.conditioning_masks and self._target_modes[normal] != "audio"
+            )
+            if missing:
+                raise ValueError(
+                    "--h3_mask_mode dataset needs a conditioning mask for every item; "
+                    f"{CONDITIONING_MASK_DIRECTORY_KEY}/{CONDITIONING_MASK_KEY} covers none for: {', '.join(missing[:5])}"
+                )
+            return
+        if self.conditioning_masks:
+            raise ValueError(
+                f"the dataset declares conditioning masks ({CONDITIONING_MASK_DIRECTORY_KEY}/{CONDITIONING_MASK_KEY}) "
+                f"but --h3_mask_mode {mask_mode} draws its own; pass --h3_mask_mode dataset to use them"
+            )
+
+    def conditioning_mask_paths_by_item_key(self) -> dict[str, str]:
+        """Map the cached item key -- the target's basename -- to its mask file.
+
+        Training rebuilds items from cache filenames, which keep only the stem,
+        so that is the only handle the collator has on the source media.
+        """
+        masks: dict[str, str] = {}
+        for normal, mask_path in self.conditioning_masks.items():
+            masks[Path(self._targets[normal].path).stem] = str(mask_path)
+        return masks
 
     def adapt_dataset_group(self, dataset_group: DatasetGroup) -> None:
         if len(dataset_group.datasets) != len(self._target_groups):
@@ -680,6 +785,7 @@ class H3DatasetAdapter:
                     for key in tuple(record):
                         if (
                             key == "control_path"
+                            or key == CONDITIONING_MASK_KEY
                             or _CONTROL_PATH_PATTERN.fullmatch(key)
                             or _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
                             or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
@@ -810,11 +916,15 @@ def create_h3_dataset_group(
             dataset.prepare_for_training(num_timestep_buckets=num_timestep_buckets)
     if training:
         load_dino_features = bool(getattr(args, "h3_load_dino_features", False))
+        # Authored masks are read per batch rather than cached: they are applied
+        # to the packed rows, so the latents they mask are the same either way.
+        conditioning_masks = adapter.conditioning_mask_paths_by_item_key() if adapter.conditioning_masks else {}
         for dataset in ordered_datasets:
             batch_manager = getattr(dataset, "batch_manager", None)
             if batch_manager is not None:
                 batch_manager.load_h3_dino_features = load_dino_features and isinstance(dataset, VideoDataset)
                 batch_manager.h3_dino_model = getattr(args, "h3_dino_model", None) if load_dino_features else None
+                batch_manager.h3_conditioning_mask_paths = conditioning_masks
     dataset_group = DatasetGroup(ordered_datasets)
     adapter.adapt_dataset_group(dataset_group)
     return dataset_group, adapter

@@ -51,6 +51,7 @@ from musubi_tuner.minimax_h3.inference import (
     save_av_mp4,
 )
 from musubi_tuner.minimax_h3.masking import (
+    CONDITIONING_MASK_BATCH_KEY as H3_CONDITIONING_MASK_KEY,
     audio_mask_to_rows,
     rows_to_latent_video_mask,
     sample_audio_mask,
@@ -668,7 +669,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # comparable; a run that mixes masking and extension per step reports the
         # masked one, since the two cannot share a step.
         self._step_recipe = "mask" if all(self._configured_recipes()) else None
-        self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
+        self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE), batch)
         effective_video_mask = self._mask_to_loss(
             self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3),
             inputs.video_target,
@@ -1536,11 +1537,44 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         shape[0] = sigma.shape[0]
         return noisy + sigma.to(device=noisy.device, dtype=noisy.dtype).view(shape) * target
 
-    def _draw_step_mask(self, inputs, patch_size):
+    @staticmethod
+    def _dataset_observed_mask(batch, inputs):
+        """Read the item's authored observed mask out of the batch.
+
+        Dataset masks are static per item, so they are decoded and reduced to the
+        latent grid by the collator; here they only have to be checked against the
+        latents they claim to mask.
+        """
+        mask = None if batch is None else batch.get(H3_CONDITIONING_MASK_KEY)
+        if mask is None:
+            raise ValueError(
+                "--h3_mask_mode dataset reads the observed region from the dataset, so every dataset needs "
+                "conditioning_mask_directory or a per-record conditioning_mask_path"
+            )
+        mask = mask.to(device="cpu", dtype=torch.bool)
+        if mask.ndim == 4:
+            # Observed rows are one flag per packed row, shared by the whole
+            # batch, so a batch may only carry one authored region.
+            if mask.shape[0] > 1 and not bool((mask == mask[:1]).all()):
+                raise ValueError(
+                    "--h3_mask_mode dataset pins one observed region per step; a batch whose items carry "
+                    "different masks needs batch_size = 1"
+                )
+            mask = mask[0]
+        if mask.ndim != 3:
+            raise ValueError(f"H3 conditioning mask must be [frames, height, width], got {tuple(mask.shape)}")
+        expected = tuple(int(value) for value in inputs.video.shape[-3:])
+        if tuple(mask.shape) != expected:
+            raise ValueError(f"H3 conditioning mask has shape {tuple(mask.shape)} for {expected} video latents")
+        return mask
+
+    def _draw_step_mask(self, inputs, patch_size, batch=None):
         """Draw one conditioning mask per step, shared by every forward it needs.
 
         The teacher, empty and trainable branches must all see the same observed
         region; drawing per forward would let them disagree about what is given.
+        ``dataset`` mode reads the region the dataset authored instead of drawing
+        one, which is the only difference: everything downstream is identical.
         """
         if self._mask_mode == "off" and not self._mask_audio:
             return None
@@ -1553,15 +1587,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         video_rows = audio_rows = video_latent = audio_latent = None
         if self._mask_mode != "off" and inputs.video is not None:
             frames, height, width = inputs.video.shape[-3:]
-            latent = sample_video_mask(
-                mode=self._mask_mode,
-                latent_frames=frames,
-                latent_height=height,
-                latent_width=width,
-                generator=generator,
-                minimum=self._mask_bounds[0],
-                maximum=self._mask_bounds[1],
-            )
+            if self._mask_mode == "dataset":
+                # The authored mask marks observed context; the samplers return
+                # True where the model generates, so it enters inverted.
+                latent = ~self._dataset_observed_mask(batch, inputs)
+            else:
+                latent = sample_video_mask(
+                    mode=self._mask_mode,
+                    latent_frames=frames,
+                    latent_height=height,
+                    latent_width=width,
+                    generator=generator,
+                    minimum=self._mask_bounds[0],
+                    maximum=self._mask_bounds[1],
+                )
             rows = video_mask_to_rows(latent, patch_size)
             # A patch counts as generated when any latent inside it is, so the
             # loss must score the whole patch rather than the drawn region.
@@ -2038,7 +2077,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # means no mixing is configured, so the mask draw and the extension
         # context below behave exactly as they did before recipe mixing existed.
         self._step_recipe = recipe_override if recipe_override is not None else self._draw_step_recipe(accelerator, args)
-        self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
+        self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE), batch)
         # Drawn once per step for the same reason the mask is: the guidance and
         # base-preservation branches must condition on the same anchors as the
         # trainable branch, or the guidance correction inverts a different field.
@@ -2574,11 +2613,13 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--h3_mask_mode",
-        choices=("off", "box", "border", "segment"),
+        choices=("off", "box", "border", "segment", "dataset"),
         default="off",
         help=(
-            "procedural video conditioning mask drawn per step: box trains inpainting, border trains outpainting, "
-            "segment hides a run of frames. The observed region is presented as clean context and excluded from the loss"
+            "video conditioning mask: box trains inpainting, border trains outpainting, segment hides a run of "
+            "frames, all drawn procedurally per step; dataset instead reads the region the dataset authored via "
+            "conditioning_mask_directory/conditioning_mask_path. The observed region is presented as clean context "
+            "and excluded from the loss"
         ),
     )
     parser.add_argument(

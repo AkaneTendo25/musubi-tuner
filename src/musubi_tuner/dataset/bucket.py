@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import re
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import numpy as np
@@ -182,6 +183,12 @@ class BucketBatchManager:
         self.timestep_pool = None
         self.load_h3_dino_features = False
         self.h3_dino_model: str | None = None
+        # item_key -> authored conditioning mask file, for --h3_mask_mode dataset.
+        # Read here rather than cached: the mask is applied to the packed rows, so
+        # the latents are identical with and without it and a re-cache is pointless.
+        self.h3_conditioning_mask_paths: dict[str, str] = {}
+        self._h3_conditioning_mask_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
+        self._h3_degenerate_masks_warned: set[str] = set()
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -243,6 +250,46 @@ class BucketBatchManager:
     def __len__(self):
         return len(self.bucket_batch_indices)
 
+    def _h3_conditioning_mask(self, item_info: "ItemInfo", sd: dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Reduce this item's authored mask to the latent grid its cache carries.
+
+        Returns ``None`` for an item the dataset gave no mask -- an audio-only
+        target has no video latents to observe. The mask itself is static, so the
+        reduction is memoised per (file, latent geometry).
+        """
+        mask_path = self.h3_conditioning_mask_paths.get(item_info.item_key)
+        if mask_path is None:
+            return None
+        latents = next(
+            (tensor for key, tensor in sd.items() if re.fullmatch(r"latents_\d+x\d+x\d+_.+", key)),
+            None,
+        )
+        if latents is None:
+            return None
+        frames, height, width = (int(value) for value in latents.shape[-3:])
+        bucket_size = (int(item_info.bucket_size[0]), int(item_info.bucket_size[1]))
+        cache_key = (mask_path, (frames, height, width, *bucket_size))
+        mask = self._h3_conditioning_mask_cache.get(cache_key)
+        if mask is None:
+            from musubi_tuner.minimax_h3.masking import conditioning_mask_to_latent, load_conditioning_mask
+
+            mask = conditioning_mask_to_latent(
+                load_conditioning_mask(mask_path),
+                bucket_size=bucket_size,
+                latent_frames=frames,
+                latent_height=height,
+                latent_width=width,
+            )
+            self._h3_conditioning_mask_cache[cache_key] = mask
+            if item_info.item_key not in self._h3_degenerate_masks_warned and (bool(mask.all()) or not bool(mask.any())):
+                self._h3_degenerate_masks_warned.add(item_info.item_key)
+                observed = "every" if bool(mask.all()) else "no"
+                logger.warning(
+                    f"MiniMax H3 conditioning mask {mask_path} leaves {observed} latent cell observed for "
+                    f"{item_info.item_key}; the step trains no inpainting on this item"
+                )
+        return mask
+
     def __getitem__(self, idx):
         bucket_reso, batch_idx = self.bucket_batch_indices[idx]
         bucket = self.buckets[bucket_reso]
@@ -285,6 +332,13 @@ class BucketBatchManager:
                 if expected_shape and (len(expected_shape) != 3 or tuple(features.shape) != expected_shape):
                     raise ValueError(f"MiniMax H3 DINO cache metadata does not match its tensor shape: {dino_path}")
                 sd["h3_dino_features_float16"] = features
+
+            if self.h3_conditioning_mask_paths:
+                from musubi_tuner.minimax_h3.masking import CONDITIONING_MASK_BATCH_KEY
+
+                mask = self._h3_conditioning_mask(item_info, sd)
+                if mask is not None:
+                    sd[CONDITIONING_MASK_BATCH_KEY] = mask
 
             # TODO refactor this
             for key in sd.keys():

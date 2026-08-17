@@ -3080,3 +3080,201 @@ def test_h3_spatial_density_jitter_draws_log_uniformly_inside_its_bounds():
 
     assert all(abs(math.log(draw)) <= math.log(1.5) + 1e-12 for draw in draws)
     assert len(set(draws)) > 1
+
+
+def _write_mask(path, *, size=(64, 64), observed_box=None):
+    """Write a mask image: white (observed) inside ``observed_box``, black elsewhere."""
+    image = Image.new("L", size, 0)
+    if observed_box is not None:
+        image.paste(255, observed_box)
+    image.save(path)
+    return path
+
+
+def test_h3_conditioning_mask_directory_matches_targets_by_basename(tmp_path):
+    videos = tmp_path / "videos"
+    masks = tmp_path / "masks"
+    videos.mkdir()
+    masks.mkdir()
+    (videos / "clip.mp4").write_bytes(b"video")
+    _write_mask(masks / "clip.png", observed_box=(0, 0, 32, 64))
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_directory": str(videos),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+                "conditioning_mask_directory": str(masks),
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(h3_mask_mode="dataset"))
+
+    assert adapter.conditioning_masks[h3_dataset._normal_path(videos / "clip.mp4")] == masks / "clip.png"
+    assert adapter.conditioning_mask_paths_by_item_key() == {"clip": str(masks / "clip.png")}
+    # The key must not reach Musubi's dataset schema, which would reject it.
+    assert "conditioning_mask_directory" not in adapter.musubi_config["datasets"][0]
+
+
+def test_h3_conditioning_mask_jsonl_path_resolves_against_the_manifest(tmp_path):
+    manifest = tmp_path / "videos.jsonl"
+    manifest.write_text(
+        json.dumps({"video_path": "target.mp4", "caption": "prompt", "conditioning_mask_path": "masks/target.png"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "masks").mkdir()
+    _write_mask(tmp_path / "masks" / "target.png", observed_box=(0, 0, 64, 32))
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_jsonl_file": str(manifest),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(h3_mask_mode="dataset"))
+
+    assert list(adapter.conditioning_masks.values()) == [tmp_path / "masks" / "target.png"]
+
+
+def test_h3_dataset_mask_mode_requires_a_mask_for_every_item(tmp_path):
+    manifest = tmp_path / "videos.jsonl"
+    manifest.write_text(json.dumps({"video_path": "target.mp4", "caption": "prompt"}), encoding="utf-8")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_jsonl_file": str(manifest),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="conditioning mask for every item"):
+        h3_dataset.H3DatasetAdapter(config, Namespace(h3_mask_mode="dataset"))
+
+
+def test_h3_conditioning_masks_are_rejected_under_a_procedural_mask_mode(tmp_path):
+    # Declaring masks and then drawing procedural ones would leave the authored
+    # regions silently unused, which is never what the config meant.
+    manifest = tmp_path / "videos.jsonl"
+    manifest.write_text(
+        json.dumps({"video_path": "target.mp4", "caption": "prompt", "conditioning_mask_path": "mask.png"}),
+        encoding="utf-8",
+    )
+    _write_mask(tmp_path / "mask.png", observed_box=(0, 0, 32, 64))
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_jsonl_file": str(manifest),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="--h3_mask_mode box"):
+        h3_dataset.H3DatasetAdapter(config, Namespace(h3_mask_mode="box"))
+    # The caching scripts never read a conditioning mask, so they must not care.
+    assert h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False)).conditioning_masks
+
+
+def test_h3_conditioning_mask_directory_is_rejected_on_an_audio_dataset(tmp_path):
+    audio = tmp_path / "audio"
+    masks = tmp_path / "masks"
+    audio.mkdir()
+    masks.mkdir()
+    (audio / "tone.wav").write_bytes(b"target")
+    _write_mask(masks / "tone.png", observed_box=(0, 0, 32, 64))
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "audio_directory": str(audio),
+                "h3_target_mode": "audio",
+                "cache_directory": str(tmp_path / "cache"),
+                "conditioning_mask_directory": str(masks),
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="cannot be used on an audio dataset"):
+        h3_dataset.H3DatasetAdapter(config, Namespace(h3_mask_mode="dataset"))
+
+
+def test_h3_conditioning_mask_loads_with_white_as_observed(tmp_path):
+    from musubi_tuner.minimax_h3.masking import load_conditioning_mask
+
+    _write_mask(tmp_path / "mask.png", size=(4, 2), observed_box=(0, 0, 2, 2))
+
+    observed = load_conditioning_mask(tmp_path / "mask.png")
+
+    assert observed.shape == (2, 4) and observed.dtype is torch.bool
+    assert bool(observed[:, :2].all()) and not bool(observed[:, 2:].any())
+
+
+def test_h3_conditioning_mask_reduces_to_latent_cells_conservatively():
+    from musubi_tuner.minimax_h3.masking import conditioning_mask_to_latent
+
+    # An 8x8 bucket over a 4x4 latent grid: two pixels per cell each way. The
+    # left half is observed, plus one stray observed pixel in the third column,
+    # which must not make that cell observed.
+    observed = torch.zeros(8, 8, dtype=torch.bool)
+    observed[:, :4] = True
+    observed[0, 4] = True
+
+    latent = conditioning_mask_to_latent(observed, bucket_size=(8, 8), latent_frames=3, latent_height=4, latent_width=4)
+
+    assert latent.shape == (3, 4, 4)
+    # Static mask: every latent frame carries the same plane.
+    assert bool((latent[0] == latent[2]).all())
+    assert bool(latent[0, :, :2].all()) and not bool(latent[0, :, 2:].any())
+
+
+def test_h3_conditioning_mask_resizes_to_the_bucket_without_preserving_aspect():
+    from musubi_tuner.minimax_h3.masking import conditioning_mask_to_latent
+
+    # A 2x4 mask authored for a 4x8 bucket: nearest-neighbour, no antialiasing,
+    # so the reduced mask stays strictly binary.
+    observed = torch.tensor([[True, True, False, False], [True, True, False, False]])
+
+    latent = conditioning_mask_to_latent(observed, bucket_size=(8, 4), latent_frames=1, latent_height=2, latent_width=4)
+
+    assert latent.dtype is torch.bool
+    assert latent[0].tolist() == [[True, True, False, False], [True, True, False, False]]
+
+
+def test_h3_conditioning_mask_collator_reduces_and_warns_once_on_a_degenerate_mask(tmp_path, caplog):
+    from musubi_tuner.dataset.bucket import BucketBatchManager
+    from musubi_tuner.minimax_h3.masking import CONDITIONING_MASK_BATCH_KEY
+
+    _write_mask(tmp_path / "clip.png", size=(16, 16), observed_box=(0, 0, 16, 16))
+    manager = BucketBatchManager({}, 1)
+    manager.h3_conditioning_mask_paths = {"clip": str(tmp_path / "clip.png")}
+    item = ItemInfo("clip", "", (16, 16), (16, 16, 5), frame_count=5)
+    sd = {"latents_2x2x2_float32": torch.zeros(24, 2, 2, 2), "latents_audio_2x32x4_float32": torch.zeros(2, 32, 4)}
+
+    with caplog.at_level("WARNING"):
+        mask = manager._h3_conditioning_mask(item, sd)
+        manager._h3_conditioning_mask(item, sd)
+
+    assert CONDITIONING_MASK_BATCH_KEY.endswith("_mask")  # the batch assembler keeps such keys verbatim
+    assert mask.shape == (2, 2, 2) and bool(mask.all())
+    assert sum("every latent cell observed" in record.message for record in caplog.records) == 1
+
+
+def test_h3_conditioning_mask_collator_skips_an_item_without_a_mask():
+    from musubi_tuner.dataset.bucket import BucketBatchManager
+
+    manager = BucketBatchManager({}, 1)
+    manager.h3_conditioning_mask_paths = {"other": "unused.png"}
+    item = ItemInfo("clip", "", (16, 16), (16, 16, 5), frame_count=5)
+
+    assert manager._h3_conditioning_mask(item, {"latents_2x2x2_float32": torch.zeros(24, 2, 2, 2)}) is None

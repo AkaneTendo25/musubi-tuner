@@ -39,6 +39,7 @@ from musubi_tuner.minimax_h3.cache import (
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
 from musubi_tuner.minimax_h3.masking import (
+    CONDITIONING_MASK_BATCH_KEY as H3_CONDITIONING_MASK_KEY,
     audio_mask_to_rows,
     sample_video_mask,
     video_mask_to_rows,
@@ -2749,7 +2750,7 @@ def test_h3_base_preservation_uses_the_primary_generated_region_mask(monkeypatch
     trainer._mask_mode = "box"
     generated = torch.zeros(2, 2, 2, dtype=torch.bool)
     generated[1] = True
-    trainer._draw_step_mask = lambda inputs, patch_size: SimpleNamespace(
+    trainer._draw_step_mask = lambda inputs, patch_size, batch=None: SimpleNamespace(
         video_rows=torch.zeros(2, dtype=torch.bool),
         audio_rows=None,
         video_latent=generated,
@@ -3836,7 +3837,7 @@ class _MaskRecordingBackend(_FakeBackend):
         )
 
 
-def _run_masked(mode, *, mask_audio=False, guidance_scale=None):
+def _run_masked(mode, *, mask_audio=False, guidance_scale=None, dataset_mask=None, forced_recipe=None):
     args = create_parser().parse_args([])
     args.h3_mask_mode = mode
     args.h3_mask_audio = mask_audio
@@ -3847,6 +3848,8 @@ def _run_masked(mode, *, mask_audio=False, guidance_scale=None):
     trainer.backend = backend
     trainer._mask_mode = mode
     trainer._mask_audio = mask_audio
+    if forced_recipe is not None:
+        trainer._draw_step_recipe = lambda accelerator, arguments: forced_recipe
     # A realistic patch grid: at 2x2 patches a box spanning up to 75% of each
     # axis touches every patch, so the any() reduction would mark all rows
     # generated and the mask would carry no information.
@@ -3859,6 +3862,8 @@ def _run_masked(mode, *, mask_audio=False, guidance_scale=None):
     if guidance_scale is not None:
         batch[H3_EMPTY_TEXT_HIDDEN_KEY] = [torch.zeros(1, 5120)]
         batch[H3_EMPTY_TEXT_TOKEN_TAGS_KEY] = [torch.ones(1, dtype=torch.long)]
+    if dataset_mask is not None:
+        batch[H3_CONDITIONING_MASK_KEY] = dataset_mask
     torch.manual_seed(0)
     loss, metrics = trainer.process_batch(
         args,
@@ -5000,3 +5005,120 @@ def test_h3_mixed_recipes_under_ref2va_still_require_the_per_row_sigma_route():
     args.h3_extension_route = "per_row_sigma"
 
     assert _recipe_trainer(args)._configured_recipes() == (True, True)
+
+
+def _dataset_observed_left_half(frames=4, height=16, width=16):
+    """An authored mask observing the left half of every frame, at latent resolution."""
+    observed = torch.zeros(1, frames, height, width, dtype=torch.bool)
+    observed[..., : width // 2] = True
+    return observed
+
+
+def test_h3_dataset_mask_observes_exactly_the_authored_region():
+    mask = _dataset_observed_left_half()
+    trainer, backend, loss = _run_masked("dataset", dataset_mask=mask)
+
+    observed_video, _, clean = backend.observed[0]
+    assert clean is not None
+    # 4 latent frames x 8x8 patches: the left half of each frame is observed.
+    rows = observed_video.reshape(4, 8, 8)
+    assert bool(rows[..., :4].all()) and not bool(rows[..., 4:].any())
+    assert torch.isfinite(loss)
+
+
+def test_h3_dataset_mask_excludes_the_observed_region_from_the_loss():
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._mask_mode = "dataset"
+    inputs = SimpleNamespace(video=torch.zeros(1, 24, 4, 16, 16), audio=None)
+
+    step = trainer._draw_step_mask(inputs, (1, 2, 2), {H3_CONDITIONING_MASK_KEY: _dataset_observed_left_half()})
+
+    generated = step.video_latent
+    assert generated.shape == (4, 16, 16)
+    assert not bool(generated[..., :8].any()) and bool(generated[..., 8:].all())
+
+
+def test_h3_dataset_mask_keeps_a_patch_generated_when_any_latent_inside_it_is():
+    # One generated latent inside an otherwise observed patch pulls the whole
+    # patch to the generated side, as for procedural masks.
+    mask = torch.ones(1, 4, 16, 16, dtype=torch.bool)
+    mask[:, :, 0, 0] = False
+
+    trainer, backend, _ = _run_masked("dataset", dataset_mask=mask)
+
+    rows = backend.observed[0][0].reshape(4, 8, 8)
+    assert not bool(rows[:, 0, 0].any()) and bool(rows[:, 0, 1:].all())
+
+
+def test_h3_dataset_mask_mode_without_a_mask_in_the_batch_is_an_error():
+    with pytest.raises(ValueError, match="conditioning_mask_directory"):
+        _run_masked("dataset")
+
+
+def test_h3_dataset_mask_rejects_a_batch_whose_items_disagree():
+    # Observed rows are one flag per packed row, shared by the whole batch, so a
+    # batch cannot carry two different authored regions.
+    mask = torch.zeros(2, 4, 16, 16, dtype=torch.bool)
+    mask[0, ..., :8] = True
+    inputs = SimpleNamespace(video=torch.zeros(1, 24, 4, 16, 16))
+
+    with pytest.raises(ValueError, match="batch_size = 1"):
+        MiniMaxH3NetworkTrainer._dataset_observed_mask({H3_CONDITIONING_MASK_KEY: mask}, inputs)
+
+    shared = mask[:1].expand(2, 4, 16, 16).contiguous()
+    assert MiniMaxH3NetworkTrainer._dataset_observed_mask({H3_CONDITIONING_MASK_KEY: shared}, inputs).shape == (4, 16, 16)
+
+
+def test_h3_dataset_mask_rejects_a_mask_that_does_not_match_the_latents():
+    inputs = SimpleNamespace(video=torch.zeros(1, 24, 4, 16, 16))
+
+    with pytest.raises(ValueError, match="for \\(4, 16, 16\\) video latents"):
+        MiniMaxH3NetworkTrainer._dataset_observed_mask(
+            {H3_CONDITIONING_MASK_KEY: torch.zeros(1, 4, 8, 8, dtype=torch.bool)}, inputs
+        )
+
+
+def test_h3_dataset_mask_composes_with_recipe_mixing():
+    # An inactive masked step trains the plain objective: the authored mask is
+    # ignored and no row is presented as observed.
+    trainer, backend, _ = _run_masked("dataset", dataset_mask=_dataset_observed_left_half(), forced_recipe="plain")
+
+    assert trainer._step_mask is None
+    assert backend.observed[0] == (None, None, None)
+
+
+@pytest.mark.parametrize("mode,task", [("fl2va", "t2va"), ("ref2va", "ref2va")])
+def test_h3_dataset_mask_pins_clean_rows_under_every_training_mode(mode, task):
+    # The authored mask reaches the packer as ordinary observed rows, so the
+    # released pinning path consumes it unchanged in both layouts.
+    from musubi_tuner.minimax_h3.masking import conditioning_mask_to_latent
+
+    transformer = _PackedRowRecorder()
+    backend = _NativeTrainingBackend(transformer, mode=mode)
+    video = torch.zeros(1, 4, 2, 4, 4)
+    authored = torch.zeros(8, 8, dtype=torch.bool)
+    authored[:, :4] = True  # left half observed, at twice the latent resolution
+    latent = conditioning_mask_to_latent(authored, bucket_size=(8, 8), latent_frames=2, latent_height=4, latent_width=4)
+    observed_video = ~video_mask_to_rows(~latent, (1, 2, 2))
+
+    torch.manual_seed(0)
+    backend.predict_training(
+        transformer,
+        _ref2va_conditioning_batch(task=task, references=mode == "ref2va"),
+        video,
+        None,
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+        observed_video_rows=observed_video,
+        clean_video_latents=torch.ones_like(video),
+    )
+
+    call = transformer.calls[-1]
+    rows = call["video_hidden_states"][0]
+    condition_rows = rows.shape[0] - observed_video.shape[0]
+    target_rows = rows[condition_rows:]
+    sigma = transformer.row_sigma[call["video_indices"]][condition_rows:]
+    # Observed rows carry the clean content at the pinned conditioning level.
+    assert bool((target_rows[observed_video].abs() > 0.5).all())
+    assert len(set(sigma[observed_video].tolist())) == 1
+    assert sigma[observed_video][0] != sigma[~observed_video][0]

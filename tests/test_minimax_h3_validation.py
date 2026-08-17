@@ -385,7 +385,7 @@ def test_h3_validation_recreates_task_conditioning_and_scores_only_generated_reg
     generated[1] = True
     step_mask = SimpleNamespace(video_rows=None, audio_rows=None, video_latent=generated, audio_latent=None)
     trainer._resolve_keyframe_anchors = lambda _video: (("first",), (0,))
-    trainer._draw_step_mask = lambda _inputs, _patch: step_mask
+    trainer._draw_step_mask = lambda _inputs, _patch, _batch=None: step_mask
     observed_state = []
     original_predict = trainer._predict
 

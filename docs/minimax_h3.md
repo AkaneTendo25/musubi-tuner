@@ -570,7 +570,7 @@ loss weight is forced to zero; this isolates direct supervision, not H3's shared
 | `--h3_extension_video_frames N` / `--h3_extension_audio_latents N` | Continuation from an observed prefix. Counts are in **latent** units and each must be shorter than its target; the two are independent, so setting one leaves the other generated in full. Under Ref2VA only the `per_row_sigma` route is supported |
 | `--h3_extension_probability P` | Train the extension recipe on a synchronized random fraction of steps; the rest train the plain objective. Requires the extension flags. `1` (default) applies it every step |
 | `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary anchors. FL2VA/`t2va` caches only |
-| `--h3_mask_mode {box,border,segment}` | Inpainting, outpainting, temporal infilling. Also available under Ref2VA |
+| `--h3_mask_mode {box,border,segment,dataset}` | Inpainting, outpainting, temporal infilling from a procedural mask, or the region the dataset authored. Also available under Ref2VA |
 | `--h3_mask_probability P` | Train the masked recipe on a synchronized random fraction of steps; the rest train the plain objective. Requires `--h3_mask_mode` or `--h3_mask_audio`. `1` (default) applies it every step |
 | `--h3_frame_sigma_jitter 0.2` | Spreads target-frame noise levels across the schedule in one step. Supported by native T2VA/I2VA/FL2VA/L2VA/Ref2VA caches, including guidance-consistent loss, and skipped for images; cannot be combined with in-target observed-row options or sigma-dependent loss weighting; `0` disables it |
 | `--h3_spatial_density_jitter 0.2` | Perturbs the area normalization of the spatial RoPE grids each step, drawn log-uniformly from `[1/1.2, 1.2]`, so fixed-resolution data still trains a range of token spacings. One factor covers every grid in the packed sequence; `0` disables it |
@@ -609,6 +609,39 @@ noise level, and neither is scored. `--h3_mask_min_fraction` and
 `--h3_mask_max_fraction` bound the masked fraction; `--h3_mask_audio` also hides a run of audio latents. Masks are reduced to the
 `(1, 2, 2)` patch grid and a patch counts as generated when any latent inside it is, so at small latent resolutions a wide
 fraction range can leave nothing observed.
+
+A conditioning mask is not a loss mask: it says which pixels the model *observes* as clean context, while `loss_mask_directory`
+and friends say which pixels are *scored*. Both may be set; the effective loss is their intersection.
+
+**Dataset masks.** `--h3_mask_mode dataset` reads the observed region from the dataset instead of drawing one, for segmentation
+maps, mattes, or hand-drawn regions.
+
+| Field | Behavior |
+| --- | --- |
+| `conditioning_mask_directory` | Directory of mask images matched to targets by basename, exactly one per target |
+| `conditioning_mask_path` | Per-record override in an image or video JSONL, resolved against the JSONL's directory |
+
+Masks are still images (`png`, `jpg`, …), read as luma: pixels above `127` are **observed context**, everything else is the
+region to generate. The same plane applies to every frame — video masks are not supported this round. The mask is resized to the
+item's bucket resolution with nearest-neighbour sampling and no antialiasing (aspect ratio is not preserved, since a mask is
+authored against its target), then reduced to latent cells: a cell is observed only when every pixel inside it is, which keeps
+the region boundary on the generated side just as the patch reduction does. Masks are applied to the packed rows at train time,
+so they never enter the latent cache and never invalidate it — adding, editing, or removing one needs no re-cache.
+
+Downstream the behavior is identical to a procedural mask: observed rows are pinned clean at the conditioning noise level and
+excluded from the loss, under `t2va`, `ref2va` and `ref2va_omni` alike, and `--h3_mask_probability` mixes it with the plain
+objective per step as usual. `--h3_mask_min_fraction` / `--h3_mask_max_fraction` do not apply — the region is authored, not
+drawn — but a mask that reduces to all-observed or all-generated is warned about once, naming the item. `--h3_mask_audio` stays
+procedural: dataset masks are video-only, and declaring one on an audio dataset is an error. Because the observed rows are shared
+by the whole batch, a batch whose items carry different masks is rejected; use `batch_size = 1` for such datasets. A config that
+declares masks under a procedural mode, or selects `dataset` without them, is rejected when the dataset config is parsed.
+
+```toml
+[[datasets]]
+video_directory = "/data/clips"
+conditioning_mask_directory = "/data/masks"   # clip_01.mp4 -> clip_01.png, white = observed
+batch_size = 1
+```
 
 ### Auxiliary objectives
 
