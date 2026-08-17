@@ -59,7 +59,11 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
+    QWEN_CONTROL_FINGERPRINT_KEY,
+    QWEN_CONTROL_ROLE,
+    qwen_control_fingerprint,
     reference_key_suffix,
     save_latent_cache_minimax_h3,
 )
@@ -3463,3 +3467,140 @@ def test_h3_conditioning_mask_collator_skips_an_item_without_a_mask():
     item = ItemInfo("clip", "", (16, 16), (16, 16, 5), frame_count=5)
 
     assert manager._h3_conditioning_mask(item, {"latents_2x2x2_float32": torch.zeros(24, 2, 2, 2)}) is None
+
+
+def test_h3_qwen_control_directory_attaches_visual_only_controls(tmp_path):
+    """EXPERIMENTAL Qwen control visuals are a third population beside references."""
+    videos = tmp_path / "videos"
+    references = tmp_path / "references"
+    controls = tmp_path / "qwen_controls"
+    videos.mkdir()
+    references.mkdir()
+    controls.mkdir()
+    (videos / "target.mp4").write_bytes(b"target")
+    (references / "target.png").write_bytes(b"reference")
+    (controls / "target.png").write_bytes(b"pose")
+    (controls / "target_0.mp4").write_bytes(b"depth")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_directory": str(videos),
+                "control_directory": str(references),
+                "qwen_control_directory": str(controls),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(videos / "target.mp4"), "prompt", (512, 512), (512, 512, 22), frame_count=22)
+    assets = adapter.attach(item)
+
+    assert [asset.role for asset in assets] == ["target", "reference", QWEN_CONTROL_ROLE, QWEN_CONTROL_ROLE]
+    assert [asset.modality for asset in assets[2:]] == [MediaModality.IMAGE, MediaModality.VIDEO]
+    # The key must not reach Musubi's dataset schema, which would reject it.
+    assert "qwen_control_directory" not in adapter.musubi_config["datasets"][0]
+    # The two fingerprints are independent: controls compose with real references.
+    assert item.h3_cache_metadata[h3_references.REFERENCE_FINGERPRINT_KEY]
+    assert item.h3_cache_metadata[QWEN_CONTROL_FINGERPRINT_KEY] == qwen_control_fingerprint(assets)
+
+
+def test_h3_qwen_control_jsonl_paths_resolve_against_the_manifest(tmp_path):
+    manifest = tmp_path / "videos.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "video_path": str(tmp_path / "target.mp4"),
+                "caption": "prompt",
+                "qwen_control_path_0": "pose/target.png",
+                "qwen_control_path_1": "pose/target.mp4",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "target.mp4").write_bytes(b"target")
+    (tmp_path / "pose").mkdir()
+    (tmp_path / "pose" / "target.png").write_bytes(b"pose")
+    (tmp_path / "pose" / "target.mp4").write_bytes(b"pose video")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_jsonl_file": str(manifest),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(tmp_path / "target.mp4"), "prompt", (512, 512), (512, 512, 22), frame_count=22)
+    assets = adapter.attach(item)
+
+    assert [asset.path for asset in assets[1:]] == [tmp_path / "pose" / "target.png", tmp_path / "pose" / "target.mp4"]
+    assert all(asset.role == QWEN_CONTROL_ROLE for asset in assets[1:])
+
+
+def test_h3_qwen_controls_reject_two_sources_audio_files_and_gapped_indices(tmp_path):
+    manifest = tmp_path / "videos.jsonl"
+    manifest.write_text(
+        json.dumps({"video_path": "target.mp4", "caption": "prompt", "qwen_control_path": "pose/target.png"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "target.mp4").write_bytes(b"target")
+    (tmp_path / "pose").mkdir()
+    (tmp_path / "pose" / "target.png").write_bytes(b"pose")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_jsonl_file": str(manifest),
+                "qwen_control_directory": str(tmp_path / "pose"),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="qwen_control_directory or the JSONL"):
+        h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
+
+    with pytest.raises(ValueError, match="images or videos"):
+        h3_dataset._qwen_control_assets([tmp_path / "voice.wav"])
+    with pytest.raises(ValueError, match="contiguous from zero"):
+        h3_dataset._ordered_qwen_control_paths({"qwen_control_path_1": "a.png"})
+    with pytest.raises(ValueError, match="not both"):
+        h3_dataset._ordered_qwen_control_paths({"qwen_control_path": "a.png", "qwen_control_path_0": "b.png"})
+
+
+def _qwen_control_item(fingerprint: str, *, has_controls: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(has_controls=has_controls, h3_cache_metadata={QWEN_CONTROL_FINGERPRINT_KEY: fingerprint})
+
+
+def test_skip_existing_rebuilds_text_cache_when_a_qwen_control_file_changes(monkeypatch, tmp_path):
+    monkeypatch.setattr(h3_cache_text, "reference_assets", lambda item: ())
+    monkeypatch.setattr(h3_cache_text, "qwen_control_assets", lambda item: item.has_controls)
+    path = tmp_path / "text.safetensors"
+    save_file(
+        {
+            "varlen_mmh3_hidden_states_bfloat16": torch.zeros(1, dtype=torch.bfloat16),
+            H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"]),
+            H3_QWEN_CONTROL_VISUALS_KEY: torch.tensor(2),
+        },
+        str(path),
+        metadata={QWEN_CONTROL_FINGERPRINT_KEY: "fingerprint"},
+    )
+    control_free = _identity_text_cache(tmp_path / "plain.safetensors", task="t2va")
+
+    valid = _text_cache_predicate(monkeypatch, ["--task", "t2va"])
+
+    assert valid(_qwen_control_item("fingerprint"), str(path)) is True
+    # Editing or swapping a control file changes the fingerprint and rebuilds the item.
+    assert valid(_qwen_control_item("other"), str(path)) is False
+    # A cache written without controls cannot serve a dataset that now declares them.
+    assert valid(_qwen_control_item("fingerprint"), control_free) is False
+    # ...and the reverse, so removing the controls also rebuilds.
+    assert valid(_qwen_control_item("", has_controls=False), str(path)) is False
+    assert valid(_qwen_control_item("", has_controls=False), control_free) is True

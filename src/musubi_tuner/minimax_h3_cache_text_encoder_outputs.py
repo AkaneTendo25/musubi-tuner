@@ -19,6 +19,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
@@ -26,8 +27,10 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
+    QWEN_CONTROL_FINGERPRINT_KEY,
     logical_cache_key,
     normalize_batch_tensors,
+    qwen_control_assets,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
@@ -199,10 +202,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             path, item.h3_cache_metadata[REFERENCE_FINGERPRINT_KEY], REFERENCE_FINGERPRINT_KEY
         ):
             return False
+        # Qwen control visuals live only in the text presentation, so their file
+        # identity is a parallel fingerprint: editing or swapping a control file
+        # rebuilds this cache and leaves the latent cache untouched.
+        qwen_controls = qwen_control_assets(item)
+        if qwen_controls and not cache_matches_fingerprint(
+            path, item.h3_cache_metadata[QWEN_CONTROL_FINGERPRINT_KEY], QWEN_CONTROL_FINGERPRINT_KEY
+        ):
+            return False
         try:
             with safe_open(path, framework="pt", device="cpu") as handle:
                 keys = set(handle.keys())
                 logical_keys = {logical_cache_key(key) for key in keys}
+                if bool(qwen_controls) != (H3_QWEN_CONTROL_VISUALS_KEY in keys):
+                    return False
                 if H3_CONDITIONING_TASK_KEY not in keys:
                     return False
                 if int(handle.get_tensor(H3_CONDITIONING_TASK_KEY)) != H3_CONDITIONING_TASK_IDS[args.task]:

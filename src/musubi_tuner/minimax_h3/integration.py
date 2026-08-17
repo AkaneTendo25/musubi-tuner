@@ -41,6 +41,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -1103,7 +1104,15 @@ class _NativeTrainingBackend:
                     "disable that conditioning option, or use FL2VA training with --task t2va caches"
                 )
         has_vision = bool((text_tags == int(MiniMaxH3TokenTag.VIDEO)).any())
-        if task == "t2va" and has_vision:
+        # EXPERIMENTAL Qwen control visuals produce ordinary VIDEO-tagged text
+        # rows, indistinguishable from keyframe or reference spans by tag alone.
+        # The cache therefore carries an explicit marker, and it is the only thing
+        # that tells a T2VA presentation with control spans apart from a stale
+        # keyframe cache. No DiT rows are involved either way.
+        has_qwen_controls = H3_QWEN_CONTROL_VISUALS_KEY in batch and int(
+            self._one_conditioning_item(batch, H3_QWEN_CONTROL_VISUALS_KEY, expected_ndim=0)
+        )
+        if task == "t2va" and has_vision and not has_qwen_controls:
             raise ValueError("MiniMax H3 T2VA training requires text-only conditioning; re-cache with --task t2va")
         if task in ("i2va", "fl2va", "l2va") and not has_vision:
             raise ValueError(f"MiniMax H3 {task.upper()} training requires keyframe vision rows; re-cache with --task {task}")

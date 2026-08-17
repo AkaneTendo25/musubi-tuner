@@ -31,6 +31,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -1201,6 +1202,62 @@ def test_native_h3_t2va_backend_rejects_visual_conditioning_without_keyframe_lat
             transformer,
             batch,
             torch.randn(1, 4, 1, 2, 2),
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+        )
+
+
+def test_native_h3_t2va_backend_accepts_qwen_control_vision_rows():
+    """EXPERIMENTAL: control spans are ordinary VIDEO-tagged text rows.
+
+    They are indistinguishable from keyframe spans by tag alone, so the cache
+    marker is what separates a deliberate control presentation from a stale
+    keyframe cache. No DiT rows and no latent cache are involved either way.
+    """
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 0, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+        H3_QWEN_CONTROL_VISUALS_KEY: [torch.tensor(1)],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        torch.randn(1, 4, 2, 2, 2),
+        torch.randn(1, 2, 6, 1),
+        torch.tensor([0.5]),
+        torch.tensor([0.5]),
+    )
+
+    assert prediction.video.shape == (1, 4, 2, 2, 2)
+
+    # A zero count is not a control presentation and must still be refused.
+    batch[H3_QWEN_CONTROL_VISUALS_KEY] = [torch.tensor(0)]
+    with pytest.raises(ValueError, match="--task t2va"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 2, 2, 2),
             torch.randn(1, 2, 6, 1),
             torch.tensor([0.5]),
             torch.tensor([0.5]),

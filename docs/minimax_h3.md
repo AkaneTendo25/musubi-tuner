@@ -18,6 +18,7 @@ Two released transformers, with different conditioning contracts:
 - [Task contracts](#task-contracts)
 - [Model download](#model-download)
 - [Dataset](#dataset)
+  - [Qwen control visuals (experimental)](#qwen-control-visuals-experimental)
 - [Pre-caching](#pre-caching)
 - [Training](#training)
   - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
@@ -172,6 +173,40 @@ nonzero `audio` weight needs an image reference, since video references become a
 Reference audio is cropped or zero-padded to the canonical sample count of its reference video span (`temporal_shape`), the same
 grid the target audio uses. Reference rows carry no validity mask, so padding added to a short reference track is
 indistinguishable from silence to the model; keep reference audio at least as long as its reference video.
+
+### Qwen control visuals (experimental)
+
+`qwen_control_directory`, `qwen_control_path`, and `qwen_control_path_N` attach control imagery — pose, depth, edges, sketch —
+shown to the Qwen3-VL conditioner as visual context. Matching follows the `control_directory` rule (`X.<ext>` or `X_<n>.<ext>`);
+relative JSONL paths resolve against the JSONL's directory. Images and videos only; at most 9 images and 3 videos per item.
+
+```toml
+[[datasets]]
+video_directory = "/data/targets"
+qwen_control_directory = "/data/pose"
+cache_directory = "/data/cache"
+target_frames = [33]
+```
+
+```json
+{"video_path": "clip.mp4", "caption": "a dancer", "qwen_control_path_0": "pose/clip.mp4", "qwen_control_path_1": "depth/clip.png"}
+```
+
+| Field | Who sees it | Cost |
+| --- | --- | --- |
+| `control_path`, `control_directory`, … | pixel-space Ref2VA references: encoded by the VAE and packed as extra **reference rows in the DiT** | latent cache + longer packed sequence |
+| `qwen_control_path`, `qwen_control_directory`, … | **only the text conditioner**; carried inside the Qwen presentation as vision-span tokens | text cache only; DiT input layout untouched |
+
+Control spans close the visual prefix — after any keyframes or references, before the caption — continuing the existing
+`<Picture N>` / `<Video N>` numbering. `--h3_text_visual_max_pixels` caps their size; control videos sample at
+`--reference_video_fps` when set, otherwise at 2 fps, with no VAE preparation or soundtrack, within the 32768-token budget.
+Every task accepts them and they compose with real Ref2VA references; under `t2va` the cache records an
+`mmh3_qwen_control_visuals` marker so the text-only check passes. The text cache fingerprints the control files
+(`qwen_control_fingerprint`): any change rebuilds it under `--skip_existing`; latent caches are unaffected. Per-sample control
+dropout is not implemented — to compare against a control-free baseline, cache a second dataset copy without `qwen_control_*`.
+
+Experimental: the released H3 never saw control imagery in this channel, so verify control adherence against a prompt-only
+baseline before relying on the recipe.
 
 To restrict video or image loss to selected regions, set `loss_mask_directory` to a directory of masks with matching target
 basenames, or set `default_loss_mask_path` as a fallback. A JSONL item may override either with `loss_mask_path` (the alias

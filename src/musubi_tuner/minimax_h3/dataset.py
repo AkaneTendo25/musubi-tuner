@@ -18,6 +18,7 @@ from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo, Vid
 from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
 from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
+from musubi_tuner.minimax_h3.cache import QWEN_CONTROL_FINGERPRINT_KEY, QWEN_CONTROL_ROLE, qwen_control_fingerprint
 from musubi_tuner.minimax_h3.image_training import condition_paths, resample_image_targets, sample_fingerprint, validate_image_mode
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media_asset
 from musubi_tuner.minimax_h3.references import REFERENCE_FINGERPRINT_KEY, reference_fingerprint
@@ -25,7 +26,10 @@ from musubi_tuner.minimax_h3.references import REFERENCE_FINGERPRINT_KEY, refere
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
 CONDITIONING_MASK_KEY = "conditioning_mask_path"
 CONDITIONING_MASK_DIRECTORY_KEY = "conditioning_mask_directory"
+QWEN_CONTROL_DIRECTORY_KEY = "qwen_control_directory"
+QWEN_CONTROL_KEY = "qwen_control_path"
 _CONTROL_PATH_PATTERN = re.compile(r"^control_path_(\d+)$")
+_QWEN_CONTROL_PATH_PATTERN = re.compile(r"^qwen_control_path_(\d+)$")
 _CONTROL_VIDEO_PATH_PATTERN = re.compile(r"^control_video_path_(\d+)$")
 _CONTROL_AUDIO_PATH_PATTERN = re.compile(r"^control_audio_path_(\d+)$")
 _CONTROL_MODALITY_PATTERN = re.compile(r"^control_modality_(\d+)$")
@@ -62,6 +66,34 @@ def _ordered_control_paths(record: dict[str, Any]) -> tuple[Path, ...]:
     if indices != list(range(len(indices))):
         raise ValueError(f"control_path_N indices must be contiguous from zero, got {indices}")
     return tuple(path for _, path in numbered)
+
+
+def _ordered_qwen_control_paths(record: dict[str, Any]) -> tuple[Path, ...]:
+    """Parse the EXPERIMENTAL per-record ``qwen_control_path[_N]`` fields."""
+    numbered: list[tuple[int, Path]] = []
+    for key, value in record.items():
+        match = _QWEN_CONTROL_PATH_PATTERN.fullmatch(key)
+        if match and value:
+            numbered.append((int(match.group(1)), Path(value)))
+    if record.get(QWEN_CONTROL_KEY):
+        if numbered:
+            raise ValueError(f"use {QWEN_CONTROL_KEY} or {QWEN_CONTROL_KEY}_N, not both")
+        return (Path(record[QWEN_CONTROL_KEY]),)
+    numbered.sort(key=lambda value: value[0])
+    indices = [index for index, _ in numbered]
+    if indices != list(range(len(indices))):
+        raise ValueError(f"{QWEN_CONTROL_KEY}_N indices must be contiguous from zero, got {indices}")
+    return tuple(path for _, path in numbered)
+
+
+def _qwen_control_assets(paths: Sequence[Path]) -> tuple[MediaAsset, ...]:
+    assets = []
+    for path in paths:
+        modality = _modality_for_path(Path(path))
+        if modality is MediaModality.AUDIO:
+            raise ValueError(f"H3 Qwen control visuals must be images or videos, got audio: {path}")
+        assets.append(MediaAsset(Path(path), modality, QWEN_CONTROL_ROLE))
+    return tuple(assets)
 
 
 def _paired_control_assets(record: dict[str, Any]) -> tuple[MediaAsset, ...]:
@@ -348,9 +380,11 @@ def _read_media_jsonl(path: str, *, resolve_paths: bool = False) -> list[dict[st
                     if (
                         key == "control_path"
                         or key == CONDITIONING_MASK_KEY
+                        or key == QWEN_CONTROL_KEY
                         or _CONTROL_PATH_PATTERN.fullmatch(key)
                         or _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
                         or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
+                        or _QWEN_CONTROL_PATH_PATTERN.fullmatch(key)
                     ):
                         if record[key]:
                             record[key] = resolve(record[key])
@@ -378,6 +412,28 @@ def _directory_references(
         else {}
     )
     return {target: (*ordinary_reference_paths.get(target, ()), *paired_reference_paths.get(target, ())) for target in target_paths}
+
+
+def _resolve_qwen_controls(
+    qwen_control_directory: str | None,
+    records: Sequence[dict[str, Any]] | None,
+    target_paths: Sequence[str],
+) -> dict[str, tuple[MediaAsset, ...]]:
+    """Resolve the EXPERIMENTAL Qwen-only control visuals from a directory or the JSONL."""
+    record_paths: dict[str, tuple[Path, ...]] = {}
+    if records is not None:
+        for record, target in zip(records, target_paths):
+            paths = _ordered_qwen_control_paths(record)
+            if not paths:
+                continue
+            if not target:
+                raise ValueError("H3 media JSONL records must contain a target path")
+            record_paths[target] = paths
+    if qwen_control_directory and record_paths:
+        raise ValueError(f"specify H3 Qwen control visuals in {QWEN_CONTROL_DIRECTORY_KEY} or the JSONL, not both")
+    if qwen_control_directory:
+        record_paths = _references_from_directory(qwen_control_directory, target_paths)
+    return {target: _qwen_control_assets(paths) for target, paths in record_paths.items()}
 
 
 def _record_references(records: Sequence[dict[str, Any]], target_keys: Sequence[str]) -> dict[str, tuple[MediaAsset, ...]]:
@@ -434,6 +490,7 @@ def _effective(dataset: dict[str, Any], general: dict[str, Any], key: str) -> An
 class _ResolvedTarget:
     path: Path
     references: tuple[MediaAsset, ...]
+    qwen_controls: tuple[MediaAsset, ...] = ()
 
 
 class H3DatasetAdapter:
@@ -482,6 +539,7 @@ class H3DatasetAdapter:
             "audio_directory",
             "audio_jsonl_file",
             CONDITIONING_MASK_DIRECTORY_KEY,
+            QWEN_CONTROL_DIRECTORY_KEY,
         ):
             clean_general.pop(key, None)
 
@@ -500,6 +558,8 @@ class H3DatasetAdapter:
             clean.pop("audio_jsonl_file", None)
             mask_directory = _effective(source, general, CONDITIONING_MASK_DIRECTORY_KEY)
             clean.pop(CONDITIONING_MASK_DIRECTORY_KEY, None)
+            qwen_control_directory = _effective(source, general, QWEN_CONTROL_DIRECTORY_KEY)
+            clean.pop(QWEN_CONTROL_DIRECTORY_KEY, None)
             if audio_directory or audio_jsonl_file:
                 if target_mode != "audio":
                     raise ValueError("audio_directory/audio_jsonl_file require h3_target_mode = 'audio'")
@@ -539,6 +599,7 @@ class H3DatasetAdapter:
                     audio_reference_paths = _record_references(audio_records, paths)
                 else:
                     audio_reference_paths = {}
+                audio_qwen_controls = _resolve_qwen_controls(qwen_control_directory, audio_records, paths)
                 for target in paths:
                     normal = _normal_path(target)
                     references, probabilities = _dataset_references(
@@ -547,7 +608,7 @@ class H3DatasetAdapter:
                         target,
                         audio_reference_paths.get(target, ()),
                     )
-                    self._targets[normal] = _ResolvedTarget(Path(target), references)
+                    self._targets[normal] = _ResolvedTarget(Path(target), references, audio_qwen_controls.get(target, ()))
                     self._target_modalities[normal] = MediaModality.AUDIO
                     self._target_modes[normal] = "audio"
                     if probabilities is not None:
@@ -674,6 +735,8 @@ class H3DatasetAdapter:
             else:
                 reference_paths = {}
 
+            qwen_control_paths = _resolve_qwen_controls(qwen_control_directory, records, target_paths)
+
             record_masks = _record_masks(records, target_paths) if records is not None else {}
             if mask_directory and record_masks:
                 raise ValueError(f"specify H3 conditioning masks in {CONDITIONING_MASK_DIRECTORY_KEY} or the JSONL, not both")
@@ -694,7 +757,7 @@ class H3DatasetAdapter:
                 if (image_directory or image_jsonl_file) and modality is not MediaModality.IMAGE:
                     raise ValueError(f"MiniMax H3 image datasets must resolve image targets, got {target}")
                 references, probabilities = _dataset_references(source, general, target, reference_paths.get(target, ()))
-                resolved = _ResolvedTarget(Path(target), references)
+                resolved = _ResolvedTarget(Path(target), references, qwen_control_paths.get(target, ()))
                 normal = _normal_path(target)
                 existing = self._targets.get(normal)
                 if existing is not None:
@@ -786,6 +849,8 @@ class H3DatasetAdapter:
                         if (
                             key == "control_path"
                             or key == CONDITIONING_MASK_KEY
+                            or key == QWEN_CONTROL_KEY
+                            or _QWEN_CONTROL_PATH_PATTERN.fullmatch(key)
                             or _CONTROL_PATH_PATTERN.fullmatch(key)
                             or _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
                             or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
@@ -865,14 +930,22 @@ class H3DatasetAdapter:
                 ),
                 "h3_image_mode": self.image_mode,
             }
-            assets = (target,)
+            assets = (target, *resolved.qwen_controls)
         else:
-            assets = (target, *resolved.references)
+            assets = (target, *resolved.references, *resolved.qwen_controls)
         validate_h3_media_assets(item.item_key, assets)
         item.h3_media_assets = assets
+        # Both fingerprints are optional and independent, so they are merged into
+        # whatever the image-mode branch already recorded rather than replacing it.
+        metadata = dict(getattr(item, "h3_cache_metadata", {}))
         fingerprint = reference_fingerprint(assets)
         if fingerprint is not None:
-            item.h3_cache_metadata = {REFERENCE_FINGERPRINT_KEY: fingerprint}
+            metadata[REFERENCE_FINGERPRINT_KEY] = fingerprint
+        control_fingerprint = qwen_control_fingerprint(assets)
+        if control_fingerprint is not None:
+            metadata[QWEN_CONTROL_FINGERPRINT_KEY] = control_fingerprint
+        if metadata:
+            item.h3_cache_metadata = metadata
         if normal in self._target_reference_probabilities:
             item.h3_reference_modality_probabilities = self._target_reference_probabilities[normal]
         item.h3_target_mode = "video" if image_frame_count is not None else self._target_modes[normal]
@@ -942,7 +1015,7 @@ def validate_h3_media_assets(key: str, assets: tuple[MediaAsset, ...], *, check_
     targets = tuple(asset for asset in assets if asset.role == "target")
     if len(targets) != 1 or targets[0].modality not in {MediaModality.IMAGE, MediaModality.VIDEO, MediaModality.AUDIO}:
         raise ValueError(f"H3 item {key!r} must contain exactly one target image, video, or audio clip")
-    unsupported_roles = sorted({asset.role for asset in assets if asset.role not in {"target", "reference"}})
+    unsupported_roles = sorted({asset.role for asset in assets if asset.role not in {"target", "reference", QWEN_CONTROL_ROLE}})
     if unsupported_roles:
         raise ValueError(f"H3 item {key!r} contains unsupported roles: {unsupported_roles}")
     if check_files:

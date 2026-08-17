@@ -1,21 +1,26 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
 from musubi_tuner.cache_text_encoder_outputs import process_text_encoder_batches
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.minimax_h3 import conditioning as h3_conditioning
 from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
+    QWEN_CONTROL_ROLE,
 )
 from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder
+from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.references import H3PreparedReference, H3ReferenceKind
 
 
@@ -361,3 +366,105 @@ def test_content_conditioning_populates_video_text_cache_path(tmp_path):
 
     assert encoded == [item]
     assert item.text_encoder_output_cache_path == str(tmp_path / "sample_mmh3_te.safetensors")
+
+
+def _qwen_control_item(caption, controls, **extra):
+    return SimpleNamespace(caption=caption, h3_media_assets=(), _qwen_controls=controls, **extra)
+
+
+def test_t2va_qwen_controls_add_vision_spans_and_a_cache_marker(monkeypatch):
+    """EXPERIMENTAL: control visuals ride the text channel, so T2VA gains vision rows."""
+    processor = _RefProcessor()
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(processor, model, torch.bfloat16, "t2va")
+    controls = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: controls)
+
+    cached = encoder.encode_conditioning([SimpleNamespace(caption="two tokens")])[0]
+
+    tags = cached[f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64"]
+    # <Picture 1>: label, vision span, then the caption -- the controls close the
+    # visual prefix and the instruction stays last.
+    assert tags.tolist() == [1, 1, 0, 0, 0, 1, 1]
+    assert processor.tokenizer.calls == ["<Picture 1>: ", "two tokens"]
+    assert int(cached[H3_QWEN_CONTROL_VISUALS_KEY]) == 1
+
+
+def test_qwen_controls_compose_with_ref2va_references_and_continue_the_numbering(monkeypatch):
+    processor = _RefProcessor()
+    encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "ref2va")
+    references = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+    controls = (
+        H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),
+        H3PreparedReference(kind=H3ReferenceKind.VIDEO, frames=np.zeros((4, 4, 4, 3), dtype=np.uint8), sample_fps=2.0),
+    )
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_references", lambda *_a, **_k: references)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: controls)
+    item = SimpleNamespace(caption="prompt", content=np.zeros((5, 4, 4, 3), dtype=np.uint8))
+
+    cached = encoder.encode_conditioning([item])[0]
+
+    # The XOR guard governs keyframes vs references only; controls compose with both.
+    assert processor.tokenizer.calls == [
+        "<Picture 1>: ",
+        "<Picture 2>: ",
+        "<Video 1>: ",
+        "<0.2 seconds>",
+        "<1.2 seconds>",
+        "prompt",
+    ]
+    assert int(cached[H3_QWEN_CONTROL_VISUALS_KEY]) == 2
+
+
+def test_qwen_controls_honour_the_text_visual_pixel_cap_without_mutating_the_source():
+    class RecordingImageProcessor(_ImageProcessor):
+        def __init__(self):
+            self.sizes = []
+
+        def __call__(self, images, **kwargs):
+            self.sizes.append([image.size for image in images])
+            return super().__call__(images, **kwargs)
+
+    processor = _RefProcessor()
+    processor.image_processor = RecordingImageProcessor()
+    encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "t2va", text_visual_max_pixels=65_536)
+    image = Image.new("RGB", (640, 320))
+    controls = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=image),)
+
+    encoder._encode_prompt("prompt", qwen_controls=controls)
+
+    presented = processor.image_processor.sizes[0][0]
+    assert presented[0] * presented[1] <= 65_536
+    assert controls[0].image is image and image.size == (640, 320)
+
+
+def test_keyframe_reference_xor_still_fires_and_ignores_qwen_controls():
+    encoder = MiniMaxH3ConditioningEncoder(_RefProcessor(), _TextModel(), torch.bfloat16, "fl2va")
+    references = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+    controls = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+
+    with pytest.raises(ValueError, match="keyframes or Ref2VA references"):
+        encoder._encode_prompt("prompt", [Image.new("RGB", (8, 8))], references)
+
+    # The same call with controls in place of references is accepted.
+    hidden, tags = encoder._encode_prompt("prompt", [Image.new("RGB", (8, 8))], qwen_controls=controls)
+    assert hidden.shape[0] == tags.shape[0] == 11
+
+
+def test_prepare_qwen_controls_presents_video_frames_without_vae_preparation(monkeypatch, tmp_path):
+    control = tmp_path / "pose.mp4"
+    control.write_bytes(b"video")
+    monkeypatch.setattr(
+        "musubi_tuner.minimax_h3.conditioning._decode_video",
+        lambda path, target_frames=None: (np.zeros((24, 4, 4, 3), dtype=np.uint8), 24.0),
+    )
+    item = SimpleNamespace(
+        h3_media_assets=(MediaAsset(control, MediaModality.VIDEO, QWEN_CONTROL_ROLE),),
+    )
+
+    prepared = h3_conditioning.prepare_qwen_controls(item)
+
+    # No 17n+5 landing, no soundtrack: 24 source frames at Qwen's 2 fps presentation rate.
+    assert prepared[0].frames.shape == (2, 4, 4, 3)
+    assert prepared[0].sample_fps == 2.0
+    assert prepared[0].waveform is None

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -9,7 +12,8 @@ from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.dataset.cache_io import save_latent_cache_common, save_text_encoder_output_cache_common
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.architecture import AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS, TEXT_DIM, VIDEO_LATENT_CHANNELS
-from musubi_tuner.minimax_h3.media import MediaModality
+from musubi_tuner.minimax_h3.image_training import file_identity
+from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
@@ -49,6 +53,44 @@ H3_REFERENCE_AUDIO_ROWS_KEY = "mmh3_reference_audio_rows"
 H3_REFERENCE_MODALITY_PROBABILITIES_KEY = "mmh3_reference_modality_probabilities"
 H3_REFERENCE_TEMPORAL_CONTRACT_KEY = "mmh3_reference_temporal_contract"
 H3_REFERENCE_TEMPORAL_CONTRACT_VERSION = 1
+H3_QWEN_CONTROL_VISUALS_KEY = "mmh3_qwen_control_visuals"
+
+# EXPERIMENTAL. Control imagery shown only to the Qwen3-VL conditioner. These
+# assets never reach a VAE, so they change the text cache and nothing else: the
+# role is deliberately distinct from "reference" so the Ref2VA reference channel
+# and its DiT rows stay exactly as the released model defines them.
+QWEN_CONTROL_ROLE = "qwen_control"
+QWEN_CONTROL_FINGERPRINT_KEY = "qwen_control_fingerprint"
+MAX_QWEN_CONTROL_IMAGES = 9
+MAX_QWEN_CONTROL_VIDEOS = 3
+
+
+def qwen_control_assets(item: Any) -> tuple[MediaAsset, ...]:
+    """The ordered Qwen-only control visuals attached to one dataset item."""
+    assets = tuple(asset for asset in getattr(item, "h3_media_assets", ()) if asset.role == QWEN_CONTROL_ROLE)
+    limits = ((MediaModality.IMAGE, MAX_QWEN_CONTROL_IMAGES), (MediaModality.VIDEO, MAX_QWEN_CONTROL_VIDEOS))
+    for modality, limit in limits:
+        count = sum(asset.modality is modality for asset in assets)
+        if count > limit:
+            raise ValueError(f"MiniMax H3 accepts at most {limit} Qwen control {modality.value}s, got {count}")
+    unsupported = sorted(
+        {asset.modality.value for asset in assets if asset.modality not in {MediaModality.IMAGE, MediaModality.VIDEO}}
+    )
+    if unsupported:
+        raise ValueError(f"MiniMax H3 Qwen control visuals must be images or videos, got: {', '.join(unsupported)}")
+    return assets
+
+
+def qwen_control_fingerprint(assets: Sequence[MediaAsset]) -> str | None:
+    """Identify the Qwen control files so editing or swapping one rebuilds the text cache."""
+    controls = [asset for asset in assets if asset.role == QWEN_CONTROL_ROLE]
+    if not controls:
+        return None
+    entries = [
+        {"order": order, "modality": asset.modality.value, **file_identity(asset.path)} for order, asset in enumerate(controls)
+    ]
+    encoded = json.dumps({"format": 1, "qwen_controls": entries}, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def reference_variant_key(key: str, modality: str) -> str:
@@ -300,6 +342,15 @@ def save_text_encoder_output_cache_minimax_h3(
         if video_fps.dtype is not torch.float64 or video_fps.ndim != 0:
             raise ValueError(f"H3 {H3_REFERENCE_VIDEO_FPS_KEY} must be a scalar float64 value")
         validate_reference_video_fps(float(video_fps))
+    qwen_control_matches = [
+        tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_QWEN_CONTROL_VISUALS_KEY
+    ]
+    if qwen_control_matches:
+        if len(qwen_control_matches) != 1:
+            raise ValueError(f"H3 conditioning cache must contain at most one {H3_QWEN_CONTROL_VISUALS_KEY} tensor")
+        qwen_controls = qwen_control_matches[0]
+        if qwen_controls.dtype is not torch.long or qwen_controls.ndim != 0 or int(qwen_controls) <= 0:
+            raise ValueError(f"H3 {H3_QWEN_CONTROL_VISUALS_KEY} must be a positive scalar int64 count")
     reference_contract_matches = [
         tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_TEMPORAL_CONTRACT_KEY
     ]

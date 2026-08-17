@@ -8,7 +8,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from accelerate import init_empty_weights
-from PIL import Image
+from PIL import Image, ImageOps
 from safetensors import safe_open
 from torch import nn
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLConfig, Qwen3VLModel
@@ -28,9 +28,11 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
+    qwen_control_assets,
     reference_variant_key,
 )
 from musubi_tuner.minimax_h3.comfy_quant import (
@@ -39,18 +41,22 @@ from musubi_tuner.minimax_h3.comfy_quant import (
     nvfp4_scaled_mm_available,
 )
 from musubi_tuner.minimax_h3.component_loader import resolve_nvfp4_awq_text_encoder_checkpoint, text_encoder_metadata
+from musubi_tuner.minimax_h3.media import MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
     REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SAMPLE_FPS,
     REFERENCE_VIDEO_SHORT_EDGE,
     H3PreparedReference,
     H3ReferenceKind,
+    _decode_video,
     prepare_references,
     reference_modality_variant,
     sample_reference_video_frames,
+    subsample_reference_frames,
 )
 from musubi_tuner.utils.model_utils import dtype_to_str
 
@@ -88,6 +94,36 @@ def _cap_reference_visuals(references: tuple[H3PreparedReference, ...], max_pixe
         else:
             capped.append(reference)
     return tuple(capped)
+
+
+def prepare_qwen_controls(item: Any, video_sample_fps: float = REFERENCE_VIDEO_FPS) -> tuple[H3PreparedReference, ...]:
+    """Decode the EXPERIMENTAL Qwen-only control visuals attached to one item.
+
+    Nothing here touches the VAE: the frames and images exist solely to be handed
+    to the Qwen3-VL processor, so no reference short-edge sizing, no 17n+5 frame
+    landing and no soundtrack preparation apply. A control video is subsampled
+    straight onto the presentation grid -- ``reference_video_fps`` when the run
+    opted into temporal subsampling, otherwise Qwen's own 2 fps presentation rate
+    -- because the released 24 fps resample only exists to feed the video VAE.
+    The Qwen visual pixel cap is applied later, with the other visuals.
+    """
+    prepared: list[H3PreparedReference] = []
+    for asset in qwen_control_assets(item):
+        if asset.modality is MediaModality.IMAGE:
+            with Image.open(asset.path) as source:
+                image = ImageOps.exif_transpose(source).convert("RGB").copy()
+            prepared.append(H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=image))
+        else:
+            frames, source_fps = _decode_video(asset.path)
+            sample_fps = float(video_sample_fps) or float(REFERENCE_VIDEO_SAMPLE_FPS)
+            prepared.append(
+                H3PreparedReference(
+                    kind=H3ReferenceKind.VIDEO,
+                    frames=subsample_reference_frames(frames, source_fps, sample_fps),
+                    sample_fps=sample_fps,
+                )
+            )
+    return tuple(prepared)
 
 
 def _text_encoder_key(source_prefix: str) -> str:
@@ -321,11 +357,15 @@ class MiniMaxH3ConditioningEncoder:
         images: list[Image.Image] | None = None,
         references: tuple[H3PreparedReference, ...] | None = None,
         null_instruction: bool = False,
+        qwen_controls: tuple[H3PreparedReference, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if images and references:
             raise ValueError("H3 conditioning accepts keyframes or Ref2VA references, not both")
         if references:
             references = _cap_reference_visuals(references, self.text_visual_max_pixels)
+        # Qwen control visuals are a third population: they compose with either of
+        # the two above and are never subject to the keyframe/reference XOR.
+        qwen_controls = _cap_reference_visuals(qwen_controls, self.text_visual_max_pixels) if qwen_controls else ()
         token_ids: list[int] = []
         token_tags: list[int] = []
         pixel_values = None
@@ -346,33 +386,50 @@ class MiniMaxH3ConditioningEncoder:
                     if reference.image is None:
                         raise ValueError("H3 prepared image reference has no image")
                     prepared_images.append(reference.image)
+        control_images = []
+        for control in qwen_controls:
+            if control.kind is H3ReferenceKind.IMAGE:
+                if control.image is None:
+                    raise ValueError("H3 prepared Qwen control image has no image")
+                control_images.append(control.image)
         image_token_counts: list[int] = []
-        if prepared_images:
-            vision = self.processor.image_processor(images=prepared_images, return_tensors="pt")
+        control_image_token_counts: list[int] = []
+        if prepared_images or control_images:
+            # One processor call keeps the flattened patch tensor in the same
+            # order the vision spans are emitted in: primaries first, controls
+            # after them.
+            vision = self.processor.image_processor(images=[*prepared_images, *control_images], return_tensors="pt")
             pixel_values = vision["pixel_values"]
             image_grid_thw = vision["image_grid_thw"]
-            image_token_counts = [int(grid.prod()) // merge_size for grid in image_grid_thw]
+            counts = [int(grid.prod()) // merge_size for grid in image_grid_thw]
+            image_token_counts = counts[: len(prepared_images)]
+            control_image_token_counts = counts[len(prepared_images) :]
 
         video_token_counts: list[int] = []
-        if references:
-            videos = [reference for reference in references if reference.kind is H3ReferenceKind.VIDEO]
-            if videos:
-                if any(reference.frames is None for reference in videos):
-                    raise ValueError("H3 prepared video reference has no frames")
-                sampled = [sample_reference_video_frames(reference.frames, reference.sample_fps) for reference in videos]
-                for reference, (_, timestamps) in zip(videos, sampled):
-                    reference.block_timestamps = timestamps
-                vision = self.processor.video_processor(
-                    videos=[np.stack(frames) for frames, _ in sampled],
-                    do_sample_frames=False,
-                    return_tensors="pt",
-                )
-                pixel_values_videos = vision["pixel_values_videos"]
-                video_grid_thw = vision["video_grid_thw"]
-                video_token_counts = [int(grid[1]) * int(grid[2]) // merge_size for grid in video_grid_thw]
-                for reference, grid in zip(videos, video_grid_thw):
-                    if int(grid[0]) != len(reference.block_timestamps):
-                        raise ValueError("H3 reference video timestamps do not match Qwen3-VL vision blocks")
+        control_video_token_counts: list[int] = []
+        videos = [reference for reference in references or () if reference.kind is H3ReferenceKind.VIDEO]
+        control_videos = [control for control in qwen_controls if control.kind is H3ReferenceKind.VIDEO]
+        if videos or control_videos:
+            if any(reference.frames is None for reference in (*videos, *control_videos)):
+                raise ValueError("H3 prepared video reference has no frames")
+            sampled = [
+                sample_reference_video_frames(reference.frames, reference.sample_fps) for reference in (*videos, *control_videos)
+            ]
+            for reference, (_, timestamps) in zip((*videos, *control_videos), sampled):
+                reference.block_timestamps = timestamps
+            vision = self.processor.video_processor(
+                videos=[np.stack(frames) for frames, _ in sampled],
+                do_sample_frames=False,
+                return_tensors="pt",
+            )
+            pixel_values_videos = vision["pixel_values_videos"]
+            video_grid_thw = vision["video_grid_thw"]
+            counts = [int(grid[1]) * int(grid[2]) // merge_size for grid in video_grid_thw]
+            video_token_counts = counts[: len(videos)]
+            control_video_token_counts = counts[len(videos) :]
+            for reference, grid in zip((*videos, *control_videos), video_grid_thw):
+                if int(grid[0]) != len(reference.block_timestamps):
+                    raise ValueError("H3 reference video timestamps do not match Qwen3-VL vision blocks")
 
         def emit_text(value: str) -> None:
             ids = self.tokenizer(value, add_special_tokens=False)["input_ids"]
@@ -384,6 +441,8 @@ class MiniMaxH3ConditioningEncoder:
             token_ids.extend(ids)
             token_tags.extend([int(MiniMaxH3TokenTag.VIDEO)] * len(ids))
 
+        picture_index = 0
+        video_index = 0
         if references:
             counts = {H3ReferenceKind.IMAGE: 0, H3ReferenceKind.VIDEO: 0, H3ReferenceKind.AUDIO: 0}
             for reference in references:
@@ -402,6 +461,8 @@ class MiniMaxH3ConditioningEncoder:
                     for timestamp in reference.block_timestamps:
                         emit_text(f"<{timestamp:.1f} seconds>")
                         emit_vision(video_pad, video_token_counts[index])
+            picture_index = counts[H3ReferenceKind.IMAGE]
+            video_index = counts[H3ReferenceKind.VIDEO]
         elif images:
             for index, image_tokens in enumerate(image_token_counts):
                 label_ids = self.tokenizer(f"<Picture {index + 1}>: ", add_special_tokens=False)["input_ids"]
@@ -410,6 +471,28 @@ class MiniMaxH3ConditioningEncoder:
                 token_ids.extend(vision_ids)
                 token_tags.extend([int(MiniMaxH3TokenTag.TEXT)] * len(label_ids))
                 token_tags.extend([int(MiniMaxH3TokenTag.VIDEO)] * len(vision_ids))
+            picture_index = len(image_token_counts)
+        if qwen_controls:
+            # Placement contract: the released presentation puts every vision span
+            # before the instruction, so the controls close the visual prefix --
+            # after any keyframes or Ref2VA references, immediately before the
+            # caption. Existing spans keep both their position and their
+            # <Picture N>/<Video N> numbers; the controls continue those counters.
+            control_image_index = 0
+            control_video_index = 0
+            for control in qwen_controls:
+                if control.kind is H3ReferenceKind.IMAGE:
+                    picture_index += 1
+                    emit_text(f"<Picture {picture_index}>: ")
+                    emit_vision(image_pad, control_image_token_counts[control_image_index])
+                    control_image_index += 1
+                else:
+                    video_index += 1
+                    emit_text(f"<Video {video_index}>: ")
+                    for timestamp in control.block_timestamps:
+                        emit_text(f"<{timestamp:.1f} seconds>")
+                        emit_vision(video_pad, control_video_token_counts[control_video_index])
+                    control_video_index += 1
         prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
         if self.max_caption_tokens > 0:
             prompt_ids = prompt_ids[: self.max_caption_tokens]
@@ -540,7 +623,8 @@ class MiniMaxH3ConditioningEncoder:
             )
             if self.task == "ref2va" and not references:
                 raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
-            hidden, tags = self._encode_prompt(item.caption, self._images_for_item(item), references)
+            qwen_controls = prepare_qwen_controls(item, self.reference_video_fps)
+            hidden, tags = self._encode_prompt(item.caption, self._images_for_item(item), references, qwen_controls=qwen_controls)
             tensors = {
                 f"varlen_{H3_TEXT_HIDDEN_KEY}_{dtype_name}": hidden,
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
@@ -550,6 +634,11 @@ class MiniMaxH3ConditioningEncoder:
                 tensors[H3_MAX_CAPTION_TOKENS_KEY] = torch.tensor(self.max_caption_tokens, dtype=torch.long)
             if self.text_visual_max_pixels:
                 tensors[H3_TEXT_VISUAL_MAX_PIXELS_KEY] = torch.tensor(self.text_visual_max_pixels, dtype=torch.long)
+            if qwen_controls:
+                # The marker is what lets T2VA training accept a presentation that
+                # carries vision rows: the tags themselves cannot tell a control
+                # span apart from a keyframe or reference span.
+                tensors[H3_QWEN_CONTROL_VISUALS_KEY] = torch.tensor(len(qwen_controls), dtype=torch.long)
             probabilities = getattr(item, "h3_reference_modality_probabilities", None)
             if probabilities is not None:
                 if references is None:
@@ -559,11 +648,15 @@ class MiniMaxH3ConditioningEncoder:
                     if modality == "av" or probability <= 0:
                         continue
                     variant = reference_modality_variant(references, modality)
-                    variant_hidden, variant_tags = self._encode_prompt(item.caption, references=variant)
+                    variant_hidden, variant_tags = self._encode_prompt(
+                        item.caption, references=variant, qwen_controls=qwen_controls
+                    )
                     tensors[f"varlen_{reference_variant_key(H3_TEXT_HIDDEN_KEY, modality)}_{dtype_name}"] = variant_hidden
                     tensors[f"varlen_{reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = variant_tags
                     if include_empty:
-                        empty_hidden, empty_tags = self._encode_prompt(item.caption, references=variant, null_instruction=True)
+                        empty_hidden, empty_tags = self._encode_prompt(
+                            item.caption, references=variant, null_instruction=True, qwen_controls=qwen_controls
+                        )
                         tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality)}_{dtype_name}"] = empty_hidden
                         tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = empty_tags
             if self.task in ("ref2va", "ref2va_omni"):
@@ -581,7 +674,7 @@ class MiniMaxH3ConditioningEncoder:
                     )
             if include_empty:
                 empty_hidden, empty_tags = self._encode_prompt(
-                    item.caption, self._images_for_item(item), references, null_instruction=True
+                    item.caption, self._images_for_item(item), references, null_instruction=True, qwen_controls=qwen_controls
                 )
                 tensors[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_{dtype_name}"] = empty_hidden
                 tensors[f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64"] = empty_tags
