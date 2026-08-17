@@ -36,6 +36,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     H3_VIDEO_GEOMETRY_KEY,
+    qwen_control_dropout_key,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
@@ -5273,3 +5274,198 @@ def test_h3_dataset_mask_pins_clean_rows_under_every_training_mode(mode, task):
     assert bool((target_rows[observed_video].abs() > 0.5).all())
     assert len(set(sigma[observed_video].tolist())) == 1
     assert sigma[observed_video][0] != sigma[~observed_video][0]
+
+
+class _ControlDropoutBackend:
+    """Record the presentation each branch was handed for this step."""
+
+    def __init__(self):
+        self.calls = []
+
+    def predict_training(
+        self,
+        transformer,
+        batch,
+        video_hidden_states,
+        audio_hidden_states,
+        video_timestep,
+        audio_timestep,
+        *,
+        conditioning="prompt",
+        qwen_control_dropout=False,
+        **kwargs,
+    ):
+        del batch, video_timestep, audio_timestep, kwargs
+        self.calls.append((conditioning, qwen_control_dropout))
+        scale = transformer.scale if getattr(transformer, "adapter_enabled", True) else transformer.scale.detach() * 0 + 1.0
+        return H3ModelPrediction(
+            video_hidden_states * scale if video_hidden_states is not None else None,
+            audio_hidden_states * scale if audio_hidden_states is not None else None,
+        )
+
+
+def _run_qwen_control_dropout(rate):
+    args = create_parser().parse_args([])
+    args.h3_qwen_control_dropout_rate = rate
+    args.h3_guidance_distillation_scale = 3.0
+    args.h3_base_preservation_loss_weight = 0.1
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ControlDropoutBackend()
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    torch.manual_seed(0)
+    _, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    return trainer, metrics
+
+
+@pytest.mark.parametrize("rate", [0.0, 1.0])
+def test_h3_qwen_control_dropout_shares_one_presentation_across_every_branch(rate):
+    # One draw per step: the guidance empty branch and the base-preservation
+    # teacher must condition on the same presentation as the trainable branch.
+    trainer, metrics = _run_qwen_control_dropout(rate)
+
+    dropped = rate == 1.0
+    assert trainer.backend.calls == [("empty", dropped), ("prompt", dropped), ("prompt", dropped)]
+    if dropped:
+        assert metrics["h3/qwen_control_dropout_active"] == 1.0
+    else:
+        # Rate 0 is bit-for-bit the previous behaviour: no metric, no draw and
+        # no dedicated stream is ever built.
+        assert "h3/qwen_control_dropout_active" not in metrics
+        assert trainer._qwen_control_dropout_generator is None
+
+
+@pytest.mark.parametrize("rate", [-0.1, 1.5, float("nan")])
+def test_h3_qwen_control_dropout_rate_is_validated(rate):
+    args = create_parser().parse_args([])
+    args.h3_qwen_control_dropout_rate = rate
+
+    with pytest.raises(ValueError, match=r"h3_qwen_control_dropout_rate"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_qwen_control_dropout_draw_is_independent_of_the_global_cpu_stream(monkeypatch):
+    broadcasts = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda value, src: broadcasts.append((value.clone(), src)))
+
+    torch.manual_seed(321)
+    MiniMaxH3NetworkTrainer()._qwen_control_dropout_active(_FakeAccelerator(), 0.5)  # seeds the generator once
+    expected_next = torch.rand(())
+
+    trainer = MiniMaxH3NetworkTrainer()
+    torch.manual_seed(321)
+    for _ in range(6):
+        trainer._qwen_control_dropout_active(_FakeAccelerator(), 0.5)
+    actual_next = torch.rand(())
+
+    # A fourth dedicated stream: only its one-time seeding touches the global
+    # stream, so control dropout shifts neither caption dropout nor the recipe,
+    # guidance and preservation draws.
+    assert actual_next == expected_next
+    assert len(broadcasts) == 7 and all(source == 0 for _, source in broadcasts)
+
+
+def test_h3_qwen_control_dropout_requires_the_control_free_cache():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 0, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+        H3_QWEN_CONTROL_VISUALS_KEY: [torch.tensor(1)],
+    }
+
+    with pytest.raises(KeyError, match="--h3_qwen_control_dropout"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 2, 2, 2),
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+            qwen_control_dropout=True,
+        )
+
+    # With the twin cached, the control-free presentation is what reaches the model.
+    batch[qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY)] = [torch.randn(2, 8)]
+    batch[qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)] = [torch.tensor([1, 1])]
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        torch.randn(1, 4, 2, 2, 2),
+        torch.randn(1, 2, 6, 1),
+        torch.tensor([0.5]),
+        torch.tensor([0.5]),
+        qwen_control_dropout=True,
+    )
+
+    assert prediction.video.shape == (1, 4, 2, 2, 2)
+
+
+def test_h3_text_cache_validates_the_control_free_twin(tmp_path):
+    path = tmp_path / "sample_mmh3_te.safetensors"
+    item = ItemInfo("sample", "caption", (0, 0), (0, 0))
+    item.text_encoder_output_cache_path = str(path)
+    tensors = {
+        f"varlen_{H3_TEXT_HIDDEN_KEY}_float32": torch.zeros(3, 5120),
+        f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": torch.tensor([1, 0, 1]),
+        H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"]),
+        H3_QWEN_CONTROL_VISUALS_KEY: torch.tensor(1),
+        f"varlen_{qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY)}_float32": torch.zeros(1, 5120),
+        f"varlen_{qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)}_int64": torch.tensor([1]),
+    }
+
+    save_text_encoder_output_cache_minimax_h3(item, tensors)
+
+    with safe_open(path, framework="pt") as handle:
+        assert set(handle.keys()) == set(tensors)
+
+    half = dict(tensors)
+    half.pop(f"varlen_{qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)}_int64")
+    with pytest.raises(ValueError, match="both hidden states and token tags"):
+        save_text_encoder_output_cache_minimax_h3(item, half)
+
+    # A control-free twin without controls to drop is a malformed cache.
+    orphaned = dict(tensors)
+    orphaned.pop(H3_QWEN_CONTROL_VISUALS_KEY)
+    with pytest.raises(ValueError, match="requires cached mmh3_qwen_control_visuals"):
+        save_text_encoder_output_cache_minimax_h3(item, orphaned)

@@ -210,8 +210,12 @@ Control spans close the visual prefix — after any keyframes or references, bef
 `<Picture N>` / `<Video N>` numbering. `--h3_text_visual_max_pixels` caps their size; control videos sample at
 `--reference_video_fps` when set, otherwise at 2 fps, with no VAE preparation or soundtrack, within the 32768-token budget.
 Every task accepts them, `t2va` included, and they compose with real Ref2VA references. The text cache fingerprints the control
-files (`qwen_control_fingerprint`): any change rebuilds it under `--skip_existing`; latent caches are unaffected. Per-sample control
-dropout is not implemented — to compare against a control-free baseline, cache a second dataset copy without `qwen_control_*`.
+files (`qwen_control_fingerprint`): any change rebuilds it under `--skip_existing`; latent caches are unaffected.
+
+For CFG-style control dropout, cache with `--h3_qwen_control_dropout` — every item that carries controls also stores a
+control-free presentation — and train with `--h3_qwen_control_dropout_rate P`, one synchronized draw per step that feeds the
+same presentation to the guidance and base-preservation branches. Caveat: the twin doubles the text-encoding work and the
+cached presentations for those items, and a rate above 0 refuses a cache written without the flag.
 
 Experimental: the released H3 never saw control imagery in this channel, so verify control adherence against a prompt-only
 baseline before relying on the recipe.

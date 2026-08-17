@@ -26,11 +26,14 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
+    H3_TEXT_HIDDEN_KEY,
+    H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     QWEN_CONTROL_FINGERPRINT_KEY,
     logical_cache_key,
     normalize_batch_tensors,
     qwen_control_assets,
+    qwen_control_dropout_key,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
@@ -137,6 +140,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h3_qwen_control_dropout",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL: also cache the control-free presentation of every item that carries qwen_control_* assets, "
+            "so training can drop the controls per step with --h3_qwen_control_dropout_rate"
+        ),
+    )
+    parser.add_argument(
         "--cache_guidance_empty",
         action="store_true",
         help="also cache H3's empty-text conditioning for the optional guidance-consistent training objective",
@@ -189,7 +200,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     def encode(batch: list[ItemInfo]) -> None:
         attach_h3_media(batch, dataset_adapter)
         results = normalize_batch_tensors(
-            encoder.encode_conditioning(batch, include_empty=args.cache_guidance_empty), len(batch), "conditioning encoder"
+            encoder.encode_conditioning(
+                batch,
+                include_empty=args.cache_guidance_empty,
+                include_qwen_control_dropout=args.h3_qwen_control_dropout,
+            ),
+            len(batch),
+            "conditioning encoder",
         )
         for item, tensors in zip(batch, results):
             save_text_encoder_output_cache_minimax_h3(item, tensors)
@@ -249,6 +266,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                         return False
                 if args.cache_guidance_empty and not {H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY} <= logical_keys:
                     return False
+                # The control-free twin is part of the cache identity in one
+                # direction only: a run that asks for dropout needs it, while a
+                # cache that carries it serves a run that does not, because the
+                # extra keys are simply never read.
+                if args.h3_qwen_control_dropout and qwen_controls:
+                    required = {qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY), qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)}
+                    if args.cache_guidance_empty:
+                        required |= {
+                            qwen_control_dropout_key(H3_EMPTY_TEXT_HIDDEN_KEY),
+                            qwen_control_dropout_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY),
+                        }
+                    if not required <= logical_keys:
+                        return False
                 if H3_TEXT_VISUAL_MAX_PIXELS_KEY not in keys:
                     if args.h3_text_visual_max_pixels != 0:
                         return False

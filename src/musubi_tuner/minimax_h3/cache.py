@@ -93,6 +93,16 @@ def qwen_control_fingerprint(assets: Sequence[MediaAsset]) -> str | None:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def qwen_control_dropout_key(key: str) -> str:
+    """Name the control-free twin of a cached presentation key.
+
+    EXPERIMENTAL per-step control dropout needs both presentations side by side
+    in one cache, exactly as the reference-modality variants do: the trainer
+    draws between them per step and never re-encodes anything.
+    """
+    return f"{key}_no_qwen_control"
+
+
 def reference_variant_key(key: str, modality: str) -> str:
     if modality not in {"video", "audio"}:
         raise ValueError(f"unsupported H3 reference modality variant: {modality}")
@@ -391,6 +401,31 @@ def save_text_encoder_output_cache_minimax_h3(
                     reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality),
                     reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality),
                 )
+    dropout_keys = {qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY), qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)}
+    if logical_keys & dropout_keys:
+        if not dropout_keys <= logical_keys:
+            raise ValueError("H3 control-free conditioning cache must contain both hidden states and token tags")
+        if not qwen_control_matches:
+            raise ValueError(f"H3 control-free conditioning requires cached {H3_QWEN_CONTROL_VISUALS_KEY} visuals")
+        validate_pair(qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY), qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY))
+        if empty_keys <= logical_keys:
+            validate_pair(
+                qwen_control_dropout_key(H3_EMPTY_TEXT_HIDDEN_KEY),
+                qwen_control_dropout_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY),
+            )
+        if probability_matches:
+            for index, modality in enumerate(("av", "video", "audio")):
+                if modality == "av" or float(probabilities[index]) == 0:
+                    continue
+                validate_pair(
+                    qwen_control_dropout_key(reference_variant_key(H3_TEXT_HIDDEN_KEY, modality)),
+                    qwen_control_dropout_key(reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality)),
+                )
+                if empty_keys <= logical_keys:
+                    validate_pair(
+                        qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality)),
+                        qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality)),
+                    )
     save_text_encoder_output_cache_common(
         item_info,
         cache_tensors,

@@ -60,9 +60,12 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
+    H3_TEXT_HIDDEN_KEY,
+    H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     QWEN_CONTROL_FINGERPRINT_KEY,
     QWEN_CONTROL_ROLE,
+    qwen_control_dropout_key,
     qwen_control_fingerprint,
     reference_key_suffix,
     save_latent_cache_minimax_h3,
@@ -3710,3 +3713,36 @@ def test_skip_existing_rebuilds_text_cache_when_a_qwen_control_file_changes(monk
     # ...and the reverse, so removing the controls also rebuilds.
     assert valid(_qwen_control_item("", has_controls=False), str(path)) is False
     assert valid(_qwen_control_item("", has_controls=False), control_free) is True
+
+
+def test_skip_existing_requires_the_control_free_twin_only_when_dropout_is_requested(monkeypatch, tmp_path):
+    monkeypatch.setattr(h3_cache_text, "reference_assets", lambda item: ())
+    monkeypatch.setattr(h3_cache_text, "qwen_control_assets", lambda item: item.has_controls)
+    base = {
+        "varlen_mmh3_hidden_states_bfloat16": torch.zeros(1, dtype=torch.bfloat16),
+        H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"]),
+        H3_QWEN_CONTROL_VISUALS_KEY: torch.tensor(1),
+    }
+    controls_only = str(tmp_path / "controls.safetensors")
+    save_file(base, controls_only, metadata={QWEN_CONTROL_FINGERPRINT_KEY: "fingerprint"})
+    dual = str(tmp_path / "dual.safetensors")
+    save_file(
+        {
+            **base,
+            f"varlen_{qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY)}_bfloat16": torch.zeros(1, dtype=torch.bfloat16),
+            f"varlen_{qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)}_int64": torch.zeros(1, dtype=torch.long),
+        },
+        dual,
+        metadata={QWEN_CONTROL_FINGERPRINT_KEY: "fingerprint"},
+    )
+    item = _qwen_control_item("fingerprint")
+
+    plain = _text_cache_predicate(monkeypatch, ["--task", "t2va"])
+    dropout = _text_cache_predicate(monkeypatch, ["--task", "t2va", "--h3_qwen_control_dropout"])
+
+    # Requesting dropout against a cache without the twin re-encodes the item.
+    assert dropout(item, controls_only) is False
+    assert dropout(item, dual) is True
+    # The reverse is harmless: the extra keys are simply never read.
+    assert plain(item, controls_only) is True
+    assert plain(item, dual) is True

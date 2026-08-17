@@ -33,6 +33,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     qwen_control_assets,
+    qwen_control_dropout_key,
     reference_variant_key,
 )
 from musubi_tuner.minimax_h3.comfy_quant import (
@@ -604,7 +605,13 @@ class MiniMaxH3ConditioningEncoder:
         hidden, tags = self._encode_prompt(prompt, references=references)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
 
-    def encode_conditioning(self, batch: list[Any], *, include_empty: bool = False) -> tuple[dict[str, torch.Tensor], ...]:
+    def encode_conditioning(
+        self,
+        batch: list[Any],
+        *,
+        include_empty: bool = False,
+        include_qwen_control_dropout: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], ...]:
         dtype_name = dtype_to_str(self.output_dtype)
         results = []
         for item in batch:
@@ -624,7 +631,13 @@ class MiniMaxH3ConditioningEncoder:
             if self.task == "ref2va" and not references:
                 raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
             qwen_controls = prepare_qwen_controls(item, self.reference_video_fps)
-            hidden, tags = self._encode_prompt(item.caption, self._images_for_item(item), references, qwen_controls=qwen_controls)
+            # EXPERIMENTAL per-step control dropout is a cache-side dual
+            # presentation, mirroring the reference-modality variants: every
+            # presentation this item caches gains a control-free twin, and the
+            # trainer draws between the two per step without re-encoding.
+            control_dropout = bool(include_qwen_control_dropout and qwen_controls)
+            images = self._images_for_item(item)
+            hidden, tags = self._encode_prompt(item.caption, images, references, qwen_controls=qwen_controls)
             tensors = {
                 f"varlen_{H3_TEXT_HIDDEN_KEY}_{dtype_name}": hidden,
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
@@ -639,6 +652,10 @@ class MiniMaxH3ConditioningEncoder:
                 # carries vision rows: the tags themselves cannot tell a control
                 # span apart from a keyframe or reference span.
                 tensors[H3_QWEN_CONTROL_VISUALS_KEY] = torch.tensor(len(qwen_controls), dtype=torch.long)
+            if control_dropout:
+                dropped_hidden, dropped_tags = self._encode_prompt(item.caption, images, references)
+                tensors[f"varlen_{qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY)}_{dtype_name}"] = dropped_hidden
+                tensors[f"varlen_{qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)}_int64"] = dropped_tags
             probabilities = getattr(item, "h3_reference_modality_probabilities", None)
             if probabilities is not None:
                 if references is None:
@@ -653,12 +670,26 @@ class MiniMaxH3ConditioningEncoder:
                     )
                     tensors[f"varlen_{reference_variant_key(H3_TEXT_HIDDEN_KEY, modality)}_{dtype_name}"] = variant_hidden
                     tensors[f"varlen_{reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = variant_tags
+                    if control_dropout:
+                        dropped_variant_hidden, dropped_variant_tags = self._encode_prompt(item.caption, references=variant)
+                        hidden_key = qwen_control_dropout_key(reference_variant_key(H3_TEXT_HIDDEN_KEY, modality))
+                        tags_key = qwen_control_dropout_key(reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality))
+                        tensors[f"varlen_{hidden_key}_{dtype_name}"] = dropped_variant_hidden
+                        tensors[f"varlen_{tags_key}_int64"] = dropped_variant_tags
                     if include_empty:
                         empty_hidden, empty_tags = self._encode_prompt(
                             item.caption, references=variant, null_instruction=True, qwen_controls=qwen_controls
                         )
                         tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality)}_{dtype_name}"] = empty_hidden
                         tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = empty_tags
+                        if control_dropout:
+                            dropped_empty_hidden, dropped_empty_tags = self._encode_prompt(
+                                item.caption, references=variant, null_instruction=True
+                            )
+                            hidden_key = qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality))
+                            tags_key = qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality))
+                            tensors[f"varlen_{hidden_key}_{dtype_name}"] = dropped_empty_hidden
+                            tensors[f"varlen_{tags_key}_int64"] = dropped_empty_tags
             if self.task in ("ref2va", "ref2va_omni"):
                 tensors[H3_REFERENCE_IMAGE_SHORT_EDGE_KEY] = torch.tensor(self.reference_image_short_edge, dtype=torch.long)
                 tensors[H3_REFERENCE_IMAGE_SIZE_MODE_KEY] = torch.tensor(
@@ -674,9 +705,15 @@ class MiniMaxH3ConditioningEncoder:
                     )
             if include_empty:
                 empty_hidden, empty_tags = self._encode_prompt(
-                    item.caption, self._images_for_item(item), references, null_instruction=True, qwen_controls=qwen_controls
+                    item.caption, images, references, null_instruction=True, qwen_controls=qwen_controls
                 )
                 tensors[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_{dtype_name}"] = empty_hidden
                 tensors[f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64"] = empty_tags
+                if control_dropout:
+                    dropped_empty_hidden, dropped_empty_tags = self._encode_prompt(
+                        item.caption, images, references, null_instruction=True
+                    )
+                    tensors[f"varlen_{qwen_control_dropout_key(H3_EMPTY_TEXT_HIDDEN_KEY)}_{dtype_name}"] = dropped_empty_hidden
+                    tensors[f"varlen_{qwen_control_dropout_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY)}_int64"] = dropped_empty_tags
             results.append(tensors)
         return tuple(results)

@@ -29,7 +29,13 @@ class H3LatentEncoder(Protocol):
 class H3ConditioningEncoder(Protocol):
     conditioning_requires_content: bool
 
-    def encode_conditioning(self, batch: list[Any], *, include_empty: bool = False) -> Any: ...
+    def encode_conditioning(
+        self,
+        batch: list[Any],
+        *,
+        include_empty: bool = False,
+        include_qwen_control_dropout: bool = False,
+    ) -> Any: ...
 
 
 class H3Generator(Protocol):

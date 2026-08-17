@@ -237,6 +237,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._guidance_probability_generator = generator
         return self._sparse_branch_active(accelerator, probability, generator)
 
+    def _qwen_control_dropout_active(self, accelerator: Accelerator, probability: float) -> bool:
+        """Draw one EXPERIMENTAL Qwen-control dropout decision, shared by every rank.
+
+        A fourth dedicated stream, independent of the guidance, recipe and
+        preservation ones and of the global CPU stream that caption dropout, the
+        observed-modality draw and the jitters consume: enabling control dropout
+        must not shift any of them. Only the one-time seed comes from the global
+        stream, so a seeded run stays reproducible, and a rate of 0 never reaches
+        this method, so it builds no generator and draws nothing.
+        """
+        if probability >= 1.0:
+            return True
+        generator = self._qwen_control_dropout_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._qwen_control_dropout_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
+
     def _draw_step_recipe(self, accelerator: Accelerator, args: argparse.Namespace) -> str | None:
         """Draw which conditioning recipe this step trains, shared by every rank.
 
@@ -290,7 +309,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._crepa_config: H3CREPAConfig | None = None
         self._guidance_probability_generator: torch.Generator | None = None
         self._recipe_probability_generator: torch.Generator | None = None
+        self._qwen_control_dropout_generator: torch.Generator | None = None
         self._step_recipe: str | None = None
+        self._step_qwen_control_dropout = False
         self._crepa: H3CREPA | None = None
         self._extension_video_frames = 0
         self._extension_audio_latents = 0
@@ -413,6 +434,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_spatial_density_scale = None
         self._step_keyframes = None
         self._step_reference_modality = "av"
+        self._step_qwen_control_dropout = False
         self._step_recipe = None
         if self._validation_dataloader is None:
             self._validation_dataloader = self._build_validation_dataloader(args, accelerator)
@@ -483,6 +505,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._step_mask = None
             self._step_keyframes = None
             self._step_reference_modality = "av"
+            self._step_qwen_control_dropout = False
             self._step_recipe = None
             if block_swap_active:
                 transformer.switch_block_swap_for_training()
@@ -870,6 +893,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:
             raise ValueError("--h3_caption_dropout_rate must lie in [0, 1]")
+        if not math.isfinite(args.h3_qwen_control_dropout_rate) or not 0.0 <= args.h3_qwen_control_dropout_rate <= 1.0:
+            raise ValueError("--h3_qwen_control_dropout_rate must be finite and lie in [0, 1]")
         if args.h3_extension_video_frames < 0 or args.h3_extension_audio_latents < 0:
             raise ValueError("H3 extension context lengths must be non-negative")
         self._extension_video_frames = args.h3_extension_video_frames
@@ -1775,6 +1800,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if self._step_reference_modality != "av":
             extension_kwargs["reference_modality"] = self._step_reference_modality
+        # Read here, so the guidance empty branch and the base-preservation
+        # teacher condition on the same presentation as the trainable branch --
+        # the same sharing the mask, the keyframes and the modality variant use.
+        if self._step_qwen_control_dropout:
+            extension_kwargs["qwen_control_dropout"] = True
         with accelerator.autocast():
             prediction = self.backend.predict_training(
                 transformer,
@@ -1829,6 +1859,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # above are shared. Its stream is independent of theirs, so the draw order
         # here does not couple the three.
         recipe = self._draw_step_recipe(accelerator, args)
+        # One control-dropout decision per step, on its own stream, for the same
+        # reason: every item of a batch trains the same presentation.
+        qwen_control_dropout = args.h3_qwen_control_dropout_rate > 0 and self._qwen_control_dropout_active(
+            accelerator, args.h3_qwen_control_dropout_rate
+        )
         if batch_size == 1:
             return self._process_single_batch(
                 args,
@@ -1846,6 +1881,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 preservation_active_override=preservation_active,
                 guidance_active_override=guidance_active,
                 recipe_override=recipe,
+                qwen_control_dropout_override=qwen_control_dropout,
             )
 
         # The released H3 transformer accepts one shared packed layout, while
@@ -1881,6 +1917,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     preservation_active_override=preservation_active,
                     guidance_active_override=guidance_active,
                     recipe_override=recipe,
+                    qwen_control_dropout_override=qwen_control_dropout,
                     crepa_update_similarity_threshold=False,
                 )
                 accelerator.backward(item_loss / batch_size)
@@ -1970,9 +2007,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         preservation_active_override: bool | None = None,
         guidance_active_override: bool | None = None,
         recipe_override: str | None = None,
+        qwen_control_dropout_override: bool | None = None,
         crepa_update_similarity_threshold: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         del network_dtype, vae
+        # EXPERIMENTAL: one presentation per step. A dropped step feeds the
+        # control-free twin cached beside the control presentation to every
+        # branch; no loss is rescaled, exactly as caption dropout does not.
+        if qwen_control_dropout_override is None:
+            self._step_qwen_control_dropout = args.h3_qwen_control_dropout_rate > 0 and self._qwen_control_dropout_active(
+                accelerator, args.h3_qwen_control_dropout_rate
+            )
+        else:
+            self._step_qwen_control_dropout = qwen_control_dropout_override
         self._step_reference_modality = "av"
         probabilities = batch.get(H3_REFERENCE_MODALITY_PROBABILITIES_KEY)
         if probabilities is not None:
@@ -2262,6 +2309,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Only reported when the feature is on, so an existing run's metric
             # set is unchanged.
             metrics["h3/caption_dropped"] = float(conditioning == "empty")
+        if args.h3_qwen_control_dropout_rate > 0:
+            # Only reported when the feature is on, so an existing run's metric
+            # set is unchanged.
+            metrics["h3/qwen_control_dropout_active"] = float(self._step_qwen_control_dropout)
         if self._step_recipe is not None:
             # Only reported once a probability below 1 turns mixing on, so a
             # single-recipe run's metric set is unchanged. Recipe mixing trains a
@@ -2337,6 +2388,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_spatial_density_scale = None
         self._step_keyframes = None
         self._step_reference_modality = "av"
+        self._step_qwen_control_dropout = False
         self._step_recipe = None
         return loss, metrics
 
@@ -2363,6 +2415,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_guidance_loss_schedule": args.h3_guidance_loss_schedule,
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
+            "ss_h3_qwen_control_dropout_rate": str(args.h3_qwen_control_dropout_rate),
             "ss_h3_fp8_quantization_mode": args.h3_fp8_quantization_mode,
             "ss_h3_convrot_int8": str(args.h3_convrot_int8),
             "ss_h3_convrot_int8_bwd": args.h3_convrot_int8_bwd,
@@ -2689,6 +2742,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "probability of replacing the prompt with the cached empty conditioning for a step, training the "
             "unconditional branch; requires --cache_guidance_empty. Steps that drop the caption skip the "
             "guidance-consistent correction, which has nothing to invert without a prompt"
+        ),
+    )
+    parser.add_argument(
+        "--h3_qwen_control_dropout_rate",
+        type=float,
+        default=0.0,
+        help=(
+            "EXPERIMENTAL probability of presenting a step without its qwen_control_* visuals, CFG style; requires a "
+            "text cache written with --h3_qwen_control_dropout. 0 (default) always shows the controls"
         ),
     )
     parser.add_argument(

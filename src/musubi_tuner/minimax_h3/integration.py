@@ -46,6 +46,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     H3_VIDEO_GEOMETRY_KEY,
+    qwen_control_dropout_key,
     reference_key_suffix,
     reference_variant_key,
 )
@@ -935,6 +936,7 @@ class _NativeTrainingBackend:
         *,
         conditioning: Literal["prompt", "empty"] = "prompt",
         reference_modality: Literal["av", "video", "audio"] = "av",
+        qwen_control_dropout: bool = False,
         extension_video_frames: int = 0,
         extension_audio_latents: int = 0,
         condition_video_anchors: tuple[int, ...] = (),
@@ -981,6 +983,18 @@ class _NativeTrainingBackend:
                 raise ValueError("reference modality selection is only valid for Ref2VA training")
             hidden_key = reference_variant_key(hidden_key, reference_modality)
             tags_key = reference_variant_key(tags_key, reference_modality)
+        if qwen_control_dropout:
+            # The control-free twin of whichever presentation the branches above
+            # selected: dropout composes with the empty branch and with every
+            # reference-modality variant rather than replacing them.
+            hidden_key = qwen_control_dropout_key(hidden_key)
+            tags_key = qwen_control_dropout_key(tags_key)
+            missing = [key for key in (hidden_key, tags_key) if key not in batch]
+            if missing:
+                raise KeyError(
+                    "--h3_qwen_control_dropout_rate requires a text cache written with --h3_qwen_control_dropout; missing "
+                    + ", ".join(missing)
+                )
         text_hidden = self._one_conditioning_item(batch, hidden_key, expected_ndim=2)
         text_tags = self._one_conditioning_item(batch, tags_key, expected_ndim=1)
         conditioning_task = self._one_conditioning_item(batch, H3_CONDITIONING_TASK_KEY, expected_ndim=0)

@@ -18,6 +18,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
     QWEN_CONTROL_ROLE,
+    qwen_control_dropout_key,
+    reference_variant_key,
 )
 from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
@@ -485,3 +487,69 @@ def test_prepare_qwen_controls_presents_video_frames_without_vae_preparation(mon
     assert prepared[0].frames.shape == (2, 4, 4, 3)
     assert prepared[0].sample_fps == 2.0
     assert prepared[0].waveform is None
+
+
+def test_qwen_control_dropout_caches_the_control_free_twin(monkeypatch):
+    """EXPERIMENTAL: both presentations live in one cache, as the modality variants do."""
+    processor = _RefProcessor()
+    encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "t2va")
+    controls = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: controls)
+
+    cached = encoder.encode_conditioning(
+        [SimpleNamespace(caption="two tokens")],
+        include_empty=True,
+        include_qwen_control_dropout=True,
+    )[0]
+
+    # The control presentation keeps its vision spans; the twin is the caption alone.
+    assert cached[f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64"].tolist() == [1, 1, 0, 0, 0, 1, 1]
+    dropped_tags = cached[f"varlen_{qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)}_int64"]
+    assert dropped_tags.tolist() == [1, 1]
+    assert cached[f"varlen_{qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY)}_bfloat16"].shape == (2, 5120)
+    # The empty branch gets a twin too, so a dropped step stays consistent across branches.
+    assert cached[f"varlen_{qwen_control_dropout_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY)}_int64"].tolist() == [1, 1]
+    assert int(cached[H3_QWEN_CONTROL_VISUALS_KEY]) == 1
+
+
+def test_qwen_control_dropout_is_absent_without_the_flag_or_without_controls(monkeypatch):
+    processor = _RefProcessor()
+    encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "t2va")
+    controls = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: controls)
+
+    without_flag = encoder.encode_conditioning([SimpleNamespace(caption="two tokens")])[0]
+
+    assert not any(qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY) in key for key in without_flag)
+
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: ())
+    without_controls = encoder.encode_conditioning([SimpleNamespace(caption="two tokens")], include_qwen_control_dropout=True)[0]
+
+    # Nothing to drop, so the item's cache is unchanged.
+    assert not any(qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY) in key for key in without_controls)
+    assert H3_QWEN_CONTROL_VISUALS_KEY not in without_controls
+
+
+def test_qwen_control_dropout_covers_every_reference_modality_variant(monkeypatch):
+    encoder = MiniMaxH3ConditioningEncoder(_RefProcessor(), _TextModel(), torch.bfloat16, "ref2va")
+    references = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+    controls = (H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8))),)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_references", lambda *_a, **_k: references)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_qwen_controls", lambda *_a, **_k: controls)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.reference_modality_variant", lambda refs, modality: refs)
+    item = SimpleNamespace(
+        caption="prompt",
+        content=np.zeros((5, 4, 4, 3), dtype=np.uint8),
+        h3_reference_modality_probabilities=(0.5, 0.5, 0.0),
+    )
+
+    cached = encoder.encode_conditioning([item], include_empty=True, include_qwen_control_dropout=True)[0]
+
+    # Dropout composes with the variants rather than replacing them: every
+    # cached presentation has a control-free twin.
+    for base in (H3_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_HIDDEN_KEY):
+        variant = reference_variant_key(base, "video")
+        assert f"varlen_{variant}_bfloat16" in cached
+        assert f"varlen_{qwen_control_dropout_key(variant)}_bfloat16" in cached
+    assert f"varlen_{qwen_control_dropout_key(reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, 'video'))}_int64" in cached
+    assert f"varlen_{qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, 'video'))}_int64" in cached
