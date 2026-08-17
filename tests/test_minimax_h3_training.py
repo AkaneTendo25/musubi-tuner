@@ -64,7 +64,9 @@ from musubi_tuner.minimax_h3 import training as h3_training
 from musubi_tuner.minimax_h3.training import (
     OBSERVED_AUDIO_SIGMA,
     OBSERVED_VIDEO_SIGMA,
+    H3JointNoisyInputs,
     H3ModelPrediction,
+    cfg_zero_rescaled_empty,
     contrastive_guidance_target,
     guidance_consistent_prediction,
     guidance_scale_for_sigma,
@@ -3114,6 +3116,283 @@ def test_h3_contrastive_guidance_form_is_scale_squared_larger(schedule):
     assert contrastive_metrics["loss/video"] == pytest.approx(normalized_metrics["loss/video"] * effective_scale**2)
 
 
+def _guidance_form_inputs(*, frame_sigma=False):
+    torch.manual_seed(11)
+    video_target = torch.randn(2, 3, 2, 2, 2)
+    audio_target = torch.randn(2, 2, 8, 3)
+    video_sigma = torch.tensor([0.25, 0.75])
+    audio_sigma = torch.tensor([0.4, 0.6])
+    return H3JointNoisyInputs(
+        video=torch.zeros_like(video_target),
+        audio=torch.zeros_like(audio_target),
+        video_target=video_target,
+        audio_target=audio_target,
+        video_sigma=video_sigma,
+        audio_sigma=audio_sigma,
+        video_timestep=1.0 - video_sigma,
+        audio_timestep=1.0 - audio_sigma,
+        video_frame_sigma=torch.tensor([0.2, 0.5]) if frame_sigma else None,
+    )
+
+
+def _guidance_form_args(form, schedule, *, cfg_zero=False, scale=3.0):
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = scale
+    args.h3_guidance_loss_form = form
+    args.h3_guidance_loss_schedule = schedule
+    args.h3_guidance_cfg_zero = cfg_zero
+    return args
+
+
+def _expected_guidance_scales(args, inputs):
+    video_sigma = inputs.video_frame_sigma if inputs.video_frame_sigma is not None else inputs.video_sigma
+    video_scale = guidance_scale_for_sigma(args.h3_guidance_distillation_scale, video_sigma, args.h3_guidance_loss_schedule)
+    if inputs.video_frame_sigma is not None:
+        video_scale = video_scale.reshape(1, 1, -1, 1, 1)
+    else:
+        video_scale = video_scale.reshape(-1, 1, 1, 1, 1)
+    audio_scale = guidance_scale_for_sigma(
+        args.h3_guidance_distillation_scale, inputs.audio_sigma, args.h3_guidance_loss_schedule
+    ).reshape(-1, 1, 1, 1)
+    return video_scale, audio_scale
+
+
+def _alpha(reference, empty):
+    batch = empty.shape[0]
+    reference_flat = reference.detach().float().reshape(batch, -1)
+    empty_flat = empty.detach().float().reshape(batch, -1)
+    alpha = (reference_flat * empty_flat).sum(dim=1) / (empty_flat.square().sum(dim=1) + 1e-8)
+    return alpha.reshape(batch, *([1] * (empty.ndim - 1)))
+
+
+@pytest.mark.parametrize("form", ["normalized", "contrastive"])
+@pytest.mark.parametrize("schedule", ["sigma", "constant"])
+def test_h3_guidance_forms_are_unchanged_while_the_null_flags_stay_at_their_defaults(form, schedule):
+    # Regression guard: with neither new flag set the two guidance forms must
+    # still be exactly the published closed forms.
+    args = _guidance_form_args(form, schedule)
+    assert args.h3_guidance_null_source == "live" and args.h3_guidance_cfg_zero is False
+    inputs = _guidance_form_inputs()
+    prediction = H3ModelPrediction(torch.randn_like(inputs.video_target), torch.randn_like(inputs.audio_target))
+    empty = H3ModelPrediction(torch.randn_like(inputs.video_target), torch.randn_like(inputs.audio_target))
+    video_scale, audio_scale = _expected_guidance_scales(args, inputs)
+
+    result, loss_inputs = MiniMaxH3NetworkTrainer()._guidance_loss_inputs(args, prediction, empty, inputs)
+
+    if form == "contrastive":
+        torch.testing.assert_close(result.video, prediction.video)
+        torch.testing.assert_close(loss_inputs.video_target, empty.video + video_scale * (inputs.video_target - empty.video))
+        torch.testing.assert_close(loss_inputs.audio_target, empty.audio + audio_scale * (inputs.audio_target - empty.audio))
+    else:
+        torch.testing.assert_close(loss_inputs.video_target, inputs.video_target)
+        torch.testing.assert_close(result.video, (prediction.video + (video_scale - 1.0) * empty.video) / video_scale)
+        torch.testing.assert_close(result.audio, (prediction.audio + (audio_scale - 1.0) * empty.audio) / audio_scale)
+
+
+def test_h3_cfg_zero_projects_the_null_field_onto_the_reference_field():
+    # A null branch that only differs from the conditional field in magnitude
+    # rescales to it exactly; one that is orthogonal to it collapses to zero.
+    reference_video = torch.randn(2, 3, 2, 2, 2)
+    parallel = torch.stack((reference_video[0] * 4.0, reference_video[1] * -0.5))
+    reference_audio = torch.zeros(2, 2, 2, 2)
+    reference_audio[:, 0] = 1.0
+    orthogonal_audio = torch.zeros(2, 2, 2, 2)
+    orthogonal_audio[:, 1] = 3.0
+
+    rescaled = cfg_zero_rescaled_empty(
+        H3ModelPrediction(parallel, orthogonal_audio),
+        H3ModelPrediction(reference_video, reference_audio),
+    )
+
+    torch.testing.assert_close(rescaled.video, reference_video)
+    torch.testing.assert_close(rescaled.audio, torch.zeros_like(orthogonal_audio))
+
+
+def test_h3_cfg_zero_rescales_each_sample_and_modality_independently():
+    empty = H3ModelPrediction(torch.randn(3, 3, 2, 2, 2), torch.randn(3, 2, 8, 3))
+    reference = H3ModelPrediction(torch.randn(3, 3, 2, 2, 2), torch.randn(3, 2, 8, 3))
+
+    rescaled = cfg_zero_rescaled_empty(empty, reference)
+
+    torch.testing.assert_close(rescaled.video, empty.video * _alpha(reference.video, empty.video))
+    torch.testing.assert_close(rescaled.audio, empty.audio * _alpha(reference.audio, empty.audio))
+    for index in range(3):
+        single = cfg_zero_rescaled_empty(
+            H3ModelPrediction(empty.video[index : index + 1], empty.audio[index : index + 1]),
+            H3ModelPrediction(reference.video[index : index + 1], reference.audio[index : index + 1]),
+        )
+        torch.testing.assert_close(single.video, rescaled.video[index : index + 1])
+        torch.testing.assert_close(single.audio, rescaled.audio[index : index + 1])
+
+
+@pytest.mark.parametrize("form", ["normalized", "contrastive"])
+@pytest.mark.parametrize("schedule", ["sigma", "constant"])
+@pytest.mark.parametrize("frame_sigma", [False, True])
+def test_h3_cfg_zero_applies_the_analytic_alpha_before_the_guidance_form(form, schedule, frame_sigma):
+    args = _guidance_form_args(form, schedule, cfg_zero=True)
+    inputs = _guidance_form_inputs(frame_sigma=frame_sigma)
+    prediction = H3ModelPrediction(torch.randn_like(inputs.video_target), torch.randn_like(inputs.audio_target))
+    empty = H3ModelPrediction(torch.randn_like(inputs.video_target), torch.randn_like(inputs.audio_target))
+    video_scale, audio_scale = _expected_guidance_scales(args, inputs)
+    # Contrastive pairs the null field with the true flow target; normalized
+    # pairs it with the guided prediction it is about to de-guide.
+    video_reference = inputs.video_target if form == "contrastive" else prediction.video
+    audio_reference = inputs.audio_target if form == "contrastive" else prediction.audio
+    scaled_video = empty.video * _alpha(video_reference, empty.video)
+    scaled_audio = empty.audio * _alpha(audio_reference, empty.audio)
+
+    result, loss_inputs = MiniMaxH3NetworkTrainer()._guidance_loss_inputs(args, prediction, empty, inputs)
+
+    if form == "contrastive":
+        torch.testing.assert_close(loss_inputs.video_target, scaled_video + video_scale * (inputs.video_target - scaled_video))
+        torch.testing.assert_close(loss_inputs.audio_target, scaled_audio + audio_scale * (inputs.audio_target - scaled_audio))
+    else:
+        torch.testing.assert_close(result.video, (prediction.video + (video_scale - 1.0) * scaled_video) / video_scale)
+        torch.testing.assert_close(result.audio, (prediction.audio + (audio_scale - 1.0) * scaled_audio) / audio_scale)
+
+
+@pytest.mark.parametrize("form", ["normalized", "contrastive"])
+@pytest.mark.parametrize("schedule", ["sigma", "constant"])
+def test_h3_cfg_zero_changes_the_guidance_result(form, schedule):
+    inputs = _guidance_form_inputs()
+    prediction = H3ModelPrediction(torch.randn_like(inputs.video_target), torch.randn_like(inputs.audio_target))
+    empty = H3ModelPrediction(torch.randn_like(inputs.video_target), torch.randn_like(inputs.audio_target))
+
+    plain, plain_inputs = MiniMaxH3NetworkTrainer()._guidance_loss_inputs(
+        _guidance_form_args(form, schedule), prediction, empty, inputs
+    )
+    rescaled, rescaled_inputs = MiniMaxH3NetworkTrainer()._guidance_loss_inputs(
+        _guidance_form_args(form, schedule, cfg_zero=True), prediction, empty, inputs
+    )
+
+    if form == "contrastive":
+        assert not torch.allclose(plain_inputs.video_target, rescaled_inputs.video_target)
+        assert not torch.allclose(plain_inputs.audio_target, rescaled_inputs.audio_target)
+    else:
+        assert not torch.allclose(plain.video, rescaled.video)
+        assert not torch.allclose(plain.audio, rescaled.audio)
+
+
+class _NullSourceBackend(_StochasticPreservationBackend):
+    def __init__(self):
+        super().__init__()
+        self.predictions = {}
+        self.hidden = {}
+
+    def predict_training(self, transformer, batch, video_hidden_states, audio_hidden_states, *args, **kwargs):
+        conditioning = kwargs.get("conditioning", "prompt")
+        prediction = super().predict_training(transformer, batch, video_hidden_states, audio_hidden_states, *args, **kwargs)
+        self.predictions[conditioning] = prediction
+        self.hidden[conditioning] = video_hidden_states
+        return prediction
+
+
+def _run_null_source(source):
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 3.0
+    args.h3_guidance_null_source = source
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = _NullSourceBackend()
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    torch.manual_seed(0)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    return backend, network, transformer, loss, metrics
+
+
+def test_h3_frozen_null_source_evaluates_the_null_branch_without_the_adapter():
+    # The frozen null branch must be the base model's own prediction, so the
+    # guidance correction inverts a field that does not drift with the adapter.
+    frozen_backend, network, transformer, frozen_loss, _ = _run_null_source("frozen")
+    live_backend, _, _, live_loss, _ = _run_null_source("live")
+
+    assert frozen_backend.calls == live_backend.calls == [("empty", False), ("prompt", True)]
+    assert network.events == [False, True]
+    assert transformer.adapter_enabled is True
+    draw = frozen_backend.random_draws[0]
+    hidden = frozen_backend.hidden["empty"]
+    torch.testing.assert_close(frozen_backend.predictions["empty"].video, hidden * 1.0 + draw)
+    torch.testing.assert_close(live_backend.predictions["empty"].video, live_backend.hidden["empty"] * 0.5 + draw)
+    assert not torch.allclose(frozen_loss, live_loss)
+    frozen_loss.backward()
+    assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
+
+
+def test_h3_frozen_null_source_replays_the_rng_of_the_trainable_pass():
+    backend, _, _, _, _ = _run_null_source("frozen")
+
+    assert backend.random_draws[0] == backend.random_draws[1]
+
+
+def test_h3_frozen_null_source_requires_a_trainable_network():
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 3.0
+    args.h3_guidance_null_source = "frozen"
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _NullSourceBackend()
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    def run(network):
+        trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            _ScaleTransformer(),
+            network,
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+
+    with pytest.raises(ValueError, match="requires a trainable network"):
+        run(None)
+    with pytest.raises(TypeError, match="set_enabled"):
+        run(object())
+
+
+@pytest.mark.parametrize(
+    "option",
+    [["--h3_guidance_null_source", "frozen"], ["--h3_guidance_cfg_zero"]],
+)
+def test_h3_null_field_options_require_a_guidance_scale(option):
+    args = create_parser().parse_args(option)
+
+    with pytest.raises(ValueError, match="h3_guidance_distillation_scale"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
 def test_h3_trainer_image_process_batch_uses_resolution_schedule_without_audio():
     args = create_parser().parse_args([])
     trainer = MiniMaxH3NetworkTrainer()
@@ -3714,6 +3993,8 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.h3_guidance_distillation_scale is None
     assert args.h3_guidance_loss_form == "normalized"
     assert args.h3_guidance_loss_schedule == "sigma"
+    assert args.h3_guidance_null_source == "live"
+    assert args.h3_guidance_cfg_zero is False
     assert args.h3_base_preservation_loss_weight == 0.0
     assert args.fp8_scaled is False
     assert args.int8_convrot_base is False
@@ -4687,7 +4968,7 @@ def test_h3_frame_sigma_jitter_supports_sigma_scheduled_guidance_per_frame():
     guided = H3ModelPrediction(torch.ones_like(inputs.video), None)
     empty = H3ModelPrediction(torch.zeros_like(inputs.video), None)
 
-    corrected, _ = MiniMaxH3NetworkTrainer._guidance_loss_inputs(args, guided, empty, inputs)
+    corrected, _ = MiniMaxH3NetworkTrainer()._guidance_loss_inputs(args, guided, empty, inputs)
 
     expected = 1.0 / (1.0 + 2.0 * inputs.video_frame_sigma)
     torch.testing.assert_close(corrected.video[0, 0, :, 0, 0], expected)
@@ -5602,3 +5883,404 @@ def test_h3_text_cache_validates_the_keyframe_visual_identity(tmp_path):
     elsewhere = dict(tensors, **{H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["fl2va"])})
     with pytest.raises(ValueError, match="only valid for T2VA"):
         save_text_encoder_output_cache_minimax_h3(item, elsewhere)
+
+
+# --- guidance scale range -------------------------------------------------
+
+
+def _h3_flag_args(*extra):
+    return create_parser().parse_args(["--sdpa", *extra])
+
+
+def test_h3_guidance_scale_range_replaces_the_point_value_and_reports_its_midpoint():
+    args = _h3_flag_args("--h3_guidance_scale_range", "2.5,3.5")
+    trainer = MiniMaxH3NetworkTrainer()
+
+    trainer.handle_model_specific_args(args)
+
+    assert trainer._guidance_scale_range == (2.5, 3.5)
+    # Every downstream gate asks whether a distillation scale is configured;
+    # the midpoint answers yes with the value the drawn family is centred on.
+    assert args.h3_guidance_distillation_scale == 3.0
+    assert trainer.extra_metadata(args)["ss_h3_guidance_scale_range"] == "2.5,3.5"
+
+
+def test_h3_guidance_scale_range_is_absent_by_default():
+    args = _h3_flag_args()
+    trainer = MiniMaxH3NetworkTrainer()
+
+    trainer.handle_model_specific_args(args)
+
+    assert trainer._guidance_scale_range is None
+    assert args.h3_guidance_distillation_scale is None
+    assert trainer._guidance_scale_generator is None
+    assert trainer.extra_metadata(args)["ss_h3_guidance_scale_range"] == "fixed"
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ("1.0,3.0", "greater than 1"),
+        ("0.5,3.0", "greater than 1"),
+        ("3.5,2.5", "must not exceed"),
+        ("2.5", "LOWER,UPPER"),
+        ("2.5,3.5,4.5", "LOWER,UPPER"),
+        ("low,high", "LOWER,UPPER"),
+        ("2.5,inf", "finite"),
+    ],
+)
+def test_h3_guidance_scale_range_rejects_invalid_bounds(spec, message):
+    args = _h3_flag_args("--h3_guidance_scale_range", spec)
+
+    with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_guidance_scale_range_and_point_scale_are_mutually_exclusive():
+    args = _h3_flag_args("--h3_guidance_scale_range", "2.5,3.5", "--h3_guidance_distillation_scale", "3.0")
+
+    with pytest.raises(ValueError, match="set one, not both"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_guidance_scale_draw_is_per_sample_bounded_and_leaves_the_global_stream_untouched():
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._guidance_scale_range = (2.5, 3.5)
+    # Pre-seed the dedicated stream: only its one-time seed is drawn globally,
+    # exactly as for the sparse-branch generators.
+    trainer._guidance_scale_generator = torch.Generator()
+    trainer._guidance_scale_generator.manual_seed(11)
+
+    torch.manual_seed(0)
+    expected_global = torch.rand(4)
+    torch.manual_seed(0)
+    scale = trainer._draw_guidance_scale(_FakeAccelerator(), 8)
+    after_global = torch.rand(4)
+
+    assert scale.shape == (8,)
+    assert bool((scale >= 2.5).all()) and bool((scale <= 3.5).all())
+    assert scale.unique().numel() > 1
+    torch.testing.assert_close(after_global, expected_global)
+
+
+def test_h3_guidance_scale_generator_is_seeded_once_from_the_global_stream():
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._guidance_scale_range = (2.0, 4.0)
+
+    torch.manual_seed(5)
+    first = trainer._draw_guidance_scale(_FakeAccelerator(), 3)
+    generator = trainer._guidance_scale_generator
+    second = trainer._draw_guidance_scale(_FakeAccelerator(), 3)
+
+    assert generator is not None and trainer._guidance_scale_generator is generator
+    assert not torch.equal(first, second)
+
+    replay = MiniMaxH3NetworkTrainer()
+    replay._guidance_scale_range = (2.0, 4.0)
+    torch.manual_seed(5)
+    torch.testing.assert_close(replay._draw_guidance_scale(_FakeAccelerator(), 3), first)
+
+
+def test_h3_guidance_scale_for_sigma_accepts_a_per_sample_vector():
+    sigma = torch.tensor([0.0, 0.5, 1.0])
+    scale = torch.tensor([2.0, 3.0, 5.0])
+
+    torch.testing.assert_close(guidance_scale_for_sigma(scale, sigma, "constant"), scale)
+    torch.testing.assert_close(guidance_scale_for_sigma(scale, sigma, "sigma"), torch.tensor([1.0, 2.0, 5.0]))
+    # The float path is untouched.
+    torch.testing.assert_close(guidance_scale_for_sigma(3.0, sigma, "sigma"), torch.tensor([1.0, 2.0, 3.0]))
+    with pytest.raises(ValueError, match="at least 1"):
+        guidance_scale_for_sigma(torch.tensor([2.0, 0.5]), sigma[:2], "constant")
+    with pytest.raises(TypeError, match="floating point"):
+        guidance_scale_for_sigma(torch.tensor([2, 3]), sigma[:2], "constant")
+
+
+@pytest.mark.parametrize("loss_form", ["normalized", "contrastive"])
+@pytest.mark.parametrize("schedule", ["sigma", "constant"])
+def test_h3_guidance_loss_inputs_apply_a_distinct_scale_to_every_sample(loss_form, schedule):
+    args = _h3_flag_args(
+        "--h3_guidance_scale_range",
+        "2.0,4.0",
+        "--h3_guidance_loss_form",
+        loss_form,
+        "--h3_guidance_loss_schedule",
+        schedule,
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    trainer._guidance_scale_generator = torch.Generator()
+    trainer._guidance_scale_generator.manual_seed(3)
+
+    latents = torch.randn(2, 4, 1, 2, 2)
+    audio = torch.randn(2, 2, 8, 3)
+    inputs = prepare_joint_noisy_inputs(
+        latents,
+        audio,
+        torch.randn_like(latents),
+        torch.randn_like(audio),
+        torch.tensor([0.4, 0.7]),
+    )
+    prediction = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
+    empty = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
+
+    corrected, loss_inputs = trainer._guidance_loss_inputs(args, prediction, empty, inputs, accelerator=_FakeAccelerator())
+
+    if loss_form == "contrastive":
+        # The guided target moves away from the empty field by exactly the scale.
+        recovered = (loss_inputs.video_target - empty.video) / (inputs.video_target - empty.video)
+    else:
+        # The reconstructed conditional divides that displacement by the scale.
+        recovered = (prediction.video - empty.video) / (corrected.video - empty.video)
+    per_sample = recovered.reshape(2, -1)[:, 0]
+    assert bool((per_sample >= 1.0).all()) and bool((per_sample <= 4.0).all())
+    assert not torch.isclose(per_sample[0], per_sample[1])
+
+
+def test_h3_guidance_loss_inputs_read_the_range_midpoint_when_replayed_for_validation():
+    args = _h3_flag_args("--h3_guidance_scale_range", "2.0,4.0", "--h3_guidance_loss_schedule", "constant")
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+
+    latents = torch.randn(2, 4, 1, 2, 2)
+    audio = torch.randn(2, 2, 8, 3)
+    inputs = prepare_joint_noisy_inputs(
+        latents, audio, torch.randn_like(latents), torch.randn_like(audio), torch.tensor([0.4, 0.7])
+    )
+    prediction = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
+    empty = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
+
+    corrected, _ = trainer._guidance_loss_inputs(args, prediction, empty, inputs)
+    fixed = _h3_flag_args("--h3_guidance_distillation_scale", "3.0", "--h3_guidance_loss_schedule", "constant")
+    reference = MiniMaxH3NetworkTrainer()
+    reference.handle_model_specific_args(fixed)
+
+    expected, _ = reference._guidance_loss_inputs(fixed, prediction, empty, inputs)
+    torch.testing.assert_close(corrected.video, expected.video)
+    torch.testing.assert_close(corrected.audio, expected.audio)
+    # No draw was consumed, so validation stays comparable across evaluations.
+    assert trainer._guidance_scale_generator is None
+
+
+def test_h3_guidance_scale_range_composes_with_a_per_frame_sigma():
+    args = _h3_flag_args("--h3_guidance_scale_range", "2.0,4.0", "--h3_guidance_loss_schedule", "constant")
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    trainer._guidance_scale_generator = torch.Generator()
+    trainer._guidance_scale_generator.manual_seed(1)
+
+    latents = torch.randn(2, 4, 3, 2, 2)
+    audio = torch.randn(2, 2, 8, 3)
+    inputs = prepare_joint_noisy_inputs(
+        latents, audio, torch.randn_like(latents), torch.randn_like(audio), torch.tensor([0.4, 0.7])
+    )
+    inputs = replace(inputs, video_frame_sigma=torch.tensor([0.2, 0.5, 0.9]))
+    prediction = H3ModelPrediction(torch.randn(2, 4, 3, 2, 2), torch.randn(2, 2, 8, 3))
+    empty = H3ModelPrediction(torch.randn(2, 4, 3, 2, 2), torch.randn(2, 2, 8, 3))
+
+    corrected, _ = trainer._guidance_loss_inputs(args, prediction, empty, inputs, accelerator=_FakeAccelerator())
+
+    moved = (corrected.video - empty.video) / (prediction.video - empty.video)
+    per_sample = moved.reshape(2, -1)[:, 0]
+    assert corrected.video.shape == prediction.video.shape
+    assert not torch.isclose(per_sample[0], per_sample[1])
+
+
+def test_h3_guidance_point_scale_path_is_unchanged_when_neither_new_flag_is_set():
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 4.0
+    losses = []
+    for _ in range(2):
+        trainer = MiniMaxH3NetworkTrainer()
+        trainer.dit_dtype = torch.float32
+        trainer.backend = _FakeBackend()
+        transformer = _ScaleTransformer()
+        batch = {
+            H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
+            H3_AUDIO_LOSS_MASK_KEY: torch.zeros(1, 3, dtype=torch.bool),
+            "timesteps": [0.5],
+            H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+            H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+        }
+        video = torch.zeros(1, 24, 2, 2, 2)
+        torch.manual_seed(0)
+        loss, _ = trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            None,
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+        losses.append(float(loss.detach()))
+        # The dedicated stream is never touched without the range.
+        assert trainer._guidance_scale_generator is None
+        assert trainer._overlay_network is None
+    assert losses[0] == losses[1]
+
+
+# --- live overlay weights -------------------------------------------------
+
+
+class _OverlayTransformer(nn.Module):
+    """The same tiny block the LoRA-target test uses, under a ``blocks`` list."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([MiniMaxH3TransformerBlock()])
+
+    def forward(self, hidden_states):
+        for block in self.blocks:
+            hidden_states = block(hidden_states)
+        return hidden_states
+
+
+def _overlay_accelerator():
+    return SimpleNamespace(device=torch.device("cpu"), print=lambda *_a, **_k: None, unwrap_model=lambda model: model)
+
+
+def _write_overlay_lora(path, *, width=4, rank=2, alpha=1.0, name="lora_unet_blocks_0_attn"):
+    torch.manual_seed(7)
+    down = torch.randn(rank, width)
+    up = torch.randn(width, rank)
+    save_file(
+        {
+            f"{name}.lora_down.weight": down,
+            f"{name}.lora_up.weight": up,
+            f"{name}.alpha": torch.tensor(float(alpha)),
+        },
+        str(path),
+    )
+    return down, up
+
+
+def test_h3_overlay_weights_add_the_expected_frozen_delta(tmp_path):
+    path = tmp_path / "overlay.safetensors"
+    down, up = _write_overlay_lora(path, alpha=1.0)
+    args = _h3_flag_args("--h3_overlay_weights", str(path), "--h3_overlay_weights_multiplier", "0.5")
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    transformer = _OverlayTransformer()
+    base_weight = transformer.blocks[0].attn.weight.detach().clone()
+    hidden = torch.randn(3, 4)
+    baseline = transformer(hidden)
+
+    overlay = trainer.install_overlay_weights(args, _overlay_accelerator(), transformer)
+
+    expected = baseline + 0.5 * (1.0 / 2) * (hidden @ down.T) @ up.T
+    torch.testing.assert_close(transformer(hidden), expected)
+    # The base weight was never merged into: an INT8 ConvRot checkpoint would
+    # otherwise have to be dequantized and requantized here.
+    torch.testing.assert_close(transformer.blocks[0].attn.weight, base_weight)
+    assert overlay is trainer._overlay_network
+    assert all(not parameter.requires_grad for parameter in overlay.parameters())
+    assert not overlay.training
+
+
+def test_h3_overlay_weights_are_absent_from_the_trained_adapter(tmp_path):
+    path = tmp_path / "overlay.safetensors"
+    _write_overlay_lora(path)
+    args = _h3_flag_args("--h3_overlay_weights", str(path))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    transformer = _OverlayTransformer()
+    network = lora_minimax_h3.create_arch_network(1.0, 2, 2, None, None, transformer)
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+
+    trainer.install_overlay_weights(args, _overlay_accelerator(), transformer)
+
+    saved = network.state_dict()
+    assert saved
+    overlay_network = trainer._overlay_network
+    assert not any(module is overlay_network for module in network.modules())
+    # Every trained tensor belongs to the trainable modules only.
+    trainable = {id(parameter) for parameter in network.parameters()}
+    assert trainable.isdisjoint({id(parameter) for parameter in overlay_network.parameters()})
+    saved_ids = {id(tensor) for tensor in saved.values()}
+    overlay_ids = {id(tensor) for tensor in overlay_network.state_dict().values()}
+    assert saved_ids.isdisjoint(overlay_ids)
+
+
+def test_h3_overlay_stays_active_when_the_trainable_network_is_disabled(tmp_path):
+    path = tmp_path / "overlay.safetensors"
+    down, up = _write_overlay_lora(path)
+    args = _h3_flag_args("--h3_overlay_weights", str(path))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    transformer = _OverlayTransformer()
+    hidden = torch.randn(3, 4)
+    baseline = transformer(hidden)
+    network = lora_minimax_h3.create_arch_network(1.0, 2, 2, None, None, transformer)
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+    # A zero-initialized lora_up makes the trainable delta invisible; give it a
+    # value so "disabled" is distinguishable from "present".
+    for module in network.unet_loras:
+        torch.nn.init.normal_(module.lora_up.weight)
+    trainer.install_overlay_weights(args, _overlay_accelerator(), transformer)
+
+    both = transformer(hidden)
+    network.set_enabled(False)
+    overlay_only = transformer(hidden)
+
+    expected_overlay = baseline + (1.0 / 2) * (hidden @ down.T) @ up.T
+    assert not torch.allclose(both, overlay_only)
+    torch.testing.assert_close(overlay_only, expected_overlay)
+
+
+def test_h3_overlay_weights_refuse_a_key_that_matches_no_module(tmp_path):
+    path = tmp_path / "overlay.safetensors"
+    _write_overlay_lora(path, name="lora_unet_blocks_0_absent_proj")
+    args = _h3_flag_args("--h3_overlay_weights", str(path))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+
+    with pytest.raises(ValueError, match="no matching module"):
+        trainer.install_overlay_weights(args, _overlay_accelerator(), _OverlayTransformer())
+
+
+def test_h3_overlay_weights_are_inert_by_default():
+    args = _h3_flag_args()
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    transformer = _OverlayTransformer()
+    hidden = torch.randn(3, 4)
+    baseline = transformer(hidden)
+
+    assert trainer.install_overlay_weights(args, _overlay_accelerator(), transformer) is None
+    torch.testing.assert_close(transformer(hidden), baseline)
+    assert trainer.extra_metadata(args)["ss_h3_overlay_weights"] == "none"
+
+
+def test_h3_overlay_weights_validate_their_multiplier_and_path():
+    with pytest.raises(ValueError, match="requires --h3_overlay_weights"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_h3_flag_args("--h3_overlay_weights_multiplier", "0.5"))
+    with pytest.raises(FileNotFoundError, match="h3_overlay_weights"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_h3_flag_args("--h3_overlay_weights", "missing.safetensors"))
+
+
+def test_h3_overlay_weights_compose_with_the_trainable_network(tmp_path):
+    path = tmp_path / "overlay.safetensors"
+    down, up = _write_overlay_lora(path)
+    args = _h3_flag_args("--h3_overlay_weights", str(path))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    transformer = _OverlayTransformer()
+    hidden = torch.randn(3, 4)
+    network = lora_minimax_h3.create_arch_network(1.0, 2, 2, None, None, transformer)
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+    for module in network.unet_loras:
+        torch.nn.init.normal_(module.lora_up.weight)
+    trainable_only = transformer(hidden)
+
+    trainer.install_overlay_weights(args, _overlay_accelerator(), transformer)
+
+    overlay_delta = (1.0 / 2) * (hidden @ down.T) @ up.T
+    torch.testing.assert_close(transformer(hidden), trainable_only + overlay_delta)
+    # The trainable adapter still carries gradient through the composed forward.
+    transformer(hidden).sum().backward()
+    assert all(module.lora_up.weight.grad is not None for module in network.unet_loras)

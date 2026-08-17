@@ -224,14 +224,72 @@ def guidance_consistent_prediction(
     )
 
 
-def guidance_scale_for_sigma(configured_scale: float, sigma: torch.Tensor, schedule: str) -> torch.Tensor:
-    """Resolve the per-example guidance scale for one H3 modality."""
-    if configured_scale < 1.0:
-        raise ValueError("H3 guidance distillation scale must be at least 1")
+def _cfg_zero_alpha(reference: torch.Tensor, empty: torch.Tensor, eps: float) -> torch.Tensor:
+    if reference.shape != empty.shape:
+        raise ValueError("H3 CFG-Zero rescaling requires matching reference and empty prediction shapes")
+    batch = empty.shape[0]
+    reference_flat = reference.detach().float().reshape(batch, -1)
+    empty_flat = empty.detach().float().reshape(batch, -1)
+    dot = (reference_flat * empty_flat).sum(dim=1)
+    squared_norm = empty_flat.square().sum(dim=1) + eps
+    alpha = dot / squared_norm
+    return alpha.reshape(batch, *([1] * (empty.ndim - 1)))
+
+
+def cfg_zero_rescaled_empty(
+    empty: H3ModelPrediction,
+    reference: H3ModelPrediction,
+    *,
+    eps: float = 1e-8,
+) -> H3ModelPrediction:
+    """Project the null field onto the reference field before guidance is applied.
+
+    Per sample and per modality, ``alpha = <reference, u> / (||u||^2 + eps)``
+    keeps only the component of the null prediction that the conditional field
+    actually opposes; an orthogonal null branch collapses to zero instead of
+    being extrapolated away from.
+    """
+    if (empty.video is None) != (reference.video is None) or (empty.audio is None) != (reference.audio is None):
+        raise ValueError("H3 CFG-Zero rescaling requires the same modalities in both predictions")
+    video = None
+    if empty.video is not None:
+        alpha = _cfg_zero_alpha(reference.video, empty.video, eps)
+        video = (empty.video.float() * alpha).to(empty.video.dtype)
+    audio = None
+    if empty.audio is not None:
+        alpha = _cfg_zero_alpha(reference.audio, empty.audio, eps)
+        audio = (empty.audio.float() * alpha).to(empty.audio.dtype)
+    return H3ModelPrediction(video=video, audio=audio)
+
+
+def guidance_scale_for_sigma(configured_scale: float | torch.Tensor, sigma: torch.Tensor, schedule: str) -> torch.Tensor:
+    """Resolve the per-example guidance scale for one H3 modality.
+
+    ``configured_scale`` is normally the single authoritative distillation
+    scale. It may also be a tensor, which is how a per-sample scale drawn from
+    ``--h3_guidance_scale_range`` reaches the schedule: the caller is then
+    responsible for a shape that broadcasts against ``sigma`` (e.g. ``[batch,
+    1]`` against a per-frame ``[1, frames]`` sigma). The float path is left
+    bit-for-bit unchanged.
+    """
+    if isinstance(configured_scale, torch.Tensor):
+        if not configured_scale.is_floating_point():
+            raise TypeError("H3 guidance distillation scale must be floating point")
+        if bool((configured_scale < 1.0).any()):
+            raise ValueError("H3 guidance distillation scale must be at least 1")
+        scale: float | torch.Tensor = configured_scale.to(device=sigma.device, dtype=sigma.dtype)
+    else:
+        if configured_scale < 1.0:
+            raise ValueError("H3 guidance distillation scale must be at least 1")
+        scale = configured_scale
     if schedule == "constant":
-        return torch.full_like(sigma, configured_scale)
+        if isinstance(scale, torch.Tensor):
+            # ``full_like`` cannot carry a per-sample value; the multiply is the
+            # broadcasting equivalent and keeps sigma's device and dtype.
+            return scale * torch.ones_like(sigma)
+        return torch.full_like(sigma, scale)
     if schedule == "sigma":
-        return 1.0 + (configured_scale - 1.0) * sigma
+        return 1.0 + (scale - 1.0) * sigma
     raise ValueError(f"unsupported H3 guidance loss schedule: {schedule}")
 
 

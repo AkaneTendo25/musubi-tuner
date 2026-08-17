@@ -540,6 +540,11 @@ pre-quantized base, whose compact AdaLN projections are already baked in.
 
 Generic LoRAs passed through `--base_weights` are merged into the frozen base at load, including a pre-quantized ConvRot base.
 
+`--h3_overlay_weights` applies a LoRA as a separate frozen module instead of merging it: base weights are not modified, so
+it also works on an INT8 ConvRot base. The overlay is excluded from the optimizer and from saved checkpoints, and is active
+on all forwards, including the base-preservation reference. `--h3_overlay_weights_multiplier` (default `1.0`, negative
+allowed) scales its delta. Incompatible with full fine-tuning.
+
 `--h3_adaln_rank` avoids quantizing the AdaLN projections and composes with either quantization mode. It is rejected on
 already-pruned and INT8 ConvRot checkpoints.
 
@@ -688,8 +693,11 @@ not add a complete H3 forward.
 | Option | Purpose |
 | --- | --- |
 | `--h3_guidance_distillation_scale 4` | Guidance-consistent objective using cached empty-text conditioning. A scale of `4` is recommended; `3` is generally too weak. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
+| `--h3_guidance_scale_range 2.5,3.5` | Draw the distillation scale uniformly in `[LOWER, UPPER]`, once per micro-batch sample and step, instead of pinning one value; the adapter then learns a family of guidance strengths rather than a single point. Replaces `--h3_guidance_distillation_scale` and is rejected alongside it. `LOWER` must exceed `1`. The draw uses its own distributed-synchronized generator, so adding it leaves every other random branch of a seeded run untouched; validation reads the midpoint so its loss stays comparable across evaluations. Composes with the sparse probability and with both loss forms and schedules. |
 | `--h3_guidance_distillation_probability 0.5` | Evaluate the empty-conditioning branch on a synchronized random fraction of batches, skipping its extra forward on the rest, and scale the guidance correction by `1 / probability`. `1` (default) applies the objective every batch; smaller values preserve the expected loss, but rare larger corrections are not optimizer-equivalent to applying the dense objective every step. |
 | `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
+| `--h3_guidance_null_source {live,frozen}` | `live` (default) evaluates the null-conditioning branch with the trainable adapter active, so that branch drifts along with training. `frozen` disables the adapter for that forward only, giving the guidance correction a fixed base-model anchor. Requires a network that supports runtime disabling; it replaces the existing empty forward rather than adding one. |
+| `--h3_guidance_cfg_zero` | CFG-Zero* rescale of the null branch before the guidance form is applied: per sample and per modality, `alpha = <conditional, null> / (‖null‖² + 1e-8)` projects the null field onto the conditional one, so a null branch orthogonal to the conditional field collapses instead of being extrapolated away from. |
 | `--h3_base_preservation_loss_weight 0.02` | Recommended starting value. Penalizes drift from the frozen base's prediction and anchors to whichever base is loaded, quantized or not. |
 | `--h3_base_preservation_probability 0.25` | Evaluate preservation on a synchronized random fraction of batches and scale active losses by `1 / probability`. `1` applies the objective every batch; `0.25`–`0.5` is a faster approximation whose rare scaled updates interact differently with clipping and adaptive optimizers. |
 | `--crepa` | Temporal representation alignment for video training. |

@@ -754,8 +754,70 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 _make_issue("error", "training.int8_convrot_base", message, label="Pruned INT8 ConvRot Base", page="training")
             )
             errors.append(_make_issue("error", "training.fp8_base", message, label="FP8 Base", page="training"))
-        if t.h3_guidance_distillation_scale is not None:
-            scale = float(t.h3_guidance_distillation_scale)
+        guidance_range: tuple[float, float] | None = None
+        if t.h3_guidance_scale_range:
+            pieces = [piece.strip() for piece in str(t.h3_guidance_scale_range).split(",")]
+            try:
+                bounds = tuple(float(piece) for piece in pieces)
+            except ValueError:
+                bounds = ()
+            if len(bounds) != 2 or not all(math.isfinite(bound) for bound in bounds):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_guidance_scale_range",
+                        "H3 guidance scale range must be two finite numbers, 'LOWER,UPPER'.",
+                        label="H3 Guidance Scale Range",
+                        page="training",
+                    )
+                )
+            elif bounds[0] <= 1.0 or bounds[0] > bounds[1]:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_guidance_scale_range",
+                        "H3 guidance scale range must satisfy 1 < LOWER <= UPPER.",
+                        label="H3 Guidance Scale Range",
+                        page="training",
+                    )
+                )
+            else:
+                guidance_range = (bounds[0], bounds[1])
+            if t.h3_guidance_distillation_scale is not None:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_guidance_scale_range",
+                        "H3 guidance scale range replaces the single distillation scale; set one, not both.",
+                        label="H3 Guidance Scale Range",
+                        page="training",
+                    )
+                )
+        overlay_multiplier = float(t.h3_overlay_weights_multiplier)
+        if not math.isfinite(overlay_multiplier):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_overlay_weights_multiplier",
+                    "H3 overlay weights multiplier must be finite.",
+                    label="H3 Overlay Weights Multiplier",
+                    page="training",
+                )
+            )
+        elif overlay_multiplier != 1.0 and not t.h3_overlay_weights:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_overlay_weights_multiplier",
+                    "H3 overlay weights multiplier requires an overlay LoRA path.",
+                    label="H3 Overlay Weights Multiplier",
+                    page="training",
+                )
+            )
+        if t.h3_guidance_distillation_scale is not None or guidance_range is not None:
+            scale = (
+                float(t.h3_guidance_distillation_scale) if t.h3_guidance_distillation_scale is not None else sum(guidance_range) / 2
+            )
             if not math.isfinite(scale) or scale <= 1.0:
                 errors.append(
                     _make_issue(
@@ -819,7 +881,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
-        elif guidance_probability < 1 and t.h3_guidance_distillation_scale is None:
+        elif guidance_probability < 1 and t.h3_guidance_distillation_scale is None and not t.h3_guidance_scale_range:
             errors.append(
                 _make_issue(
                     "error",
@@ -829,6 +891,27 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_guidance_distillation_scale is None and not t.h3_guidance_scale_range:
+            if t.h3_guidance_null_source != "live":
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_guidance_null_source",
+                        "H3 guidance null source requires a guidance distillation scale.",
+                        label="H3 Guidance Null Source",
+                        page="training",
+                    )
+                )
+            if t.h3_guidance_cfg_zero:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_guidance_cfg_zero",
+                        "H3 guidance CFG-Zero rescaling requires a guidance distillation scale.",
+                        label="H3 Guidance CFG Zero",
+                        page="training",
+                    )
+                )
         spatial_density_jitter = float(t.h3_spatial_density_jitter)
         if not math.isfinite(spatial_density_jitter) or spatial_density_jitter < 0:
             errors.append(

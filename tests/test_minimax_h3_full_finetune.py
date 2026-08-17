@@ -52,6 +52,12 @@ def test_h3_full_finetune_rejects_frozen_weight_and_lora_paths():
     with pytest.raises(ValueError, match="LoRA-only option"):
         trainer._validate_full_finetune_args(args)
 
+    # A live overlay never reaches a dense checkpoint, so a finished full
+    # fine-tune would not reproduce the field it trained inside.
+    args = create_parser().parse_args(["--sdpa", "--h3_overlay_weights", "overlay.safetensors"])
+    with pytest.raises(ValueError, match="LoRA-only option"):
+        trainer._validate_full_finetune_args(args)
+
 
 def test_h3_trainable_ring_contract_is_checked_before_cuda_setup():
     args = create_parser().parse_args(

@@ -284,11 +284,16 @@ class TrainingConfig(BaseModel):
     reference_video_short_edge: int = 768
     reference_video_max_pixels: int = 1032192
     h3_guidance_distillation_scale: Optional[float] = None
+    h3_guidance_scale_range: Optional[str] = None
     h3_guidance_distillation_probability: float = 1.0
     h3_guidance_loss_form: Literal["normalized", "contrastive"] = "normalized"
     h3_guidance_loss_schedule: Literal["sigma", "constant"] = "sigma"
+    h3_guidance_null_source: Literal["live", "frozen"] = "live"
+    h3_guidance_cfg_zero: bool = False
     h3_base_preservation_loss_weight: float = 0.0
     h3_base_preservation_probability: float = 1.0
+    h3_overlay_weights: str = ""
+    h3_overlay_weights_multiplier: float = 1.0
     h3_attn_auto_dispatch: bool = False
     h3_int8_attention: Literal["off", "aux", "train"] = "off"
     h3_lora_token_refiner: bool = False

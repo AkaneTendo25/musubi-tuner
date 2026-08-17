@@ -101,6 +101,15 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
             raise ValueError("MiniMax H3 full fine-tuning does not accept LoRA network/dropout/max-norm options")
         if args.h3_base_preservation_loss_weight > 0:
             raise ValueError("--h3_base_preservation_loss_weight is not supported by MiniMax H3 full fine-tuning")
+        if getattr(args, "h3_overlay_weights", None):
+            # The overlay is a live module the dense checkpoint cannot contain,
+            # so a finished full fine-tune would not reproduce the field it was
+            # trained inside. It is a LoRA-only recipe.
+            raise ValueError("--h3_overlay_weights is a LoRA-only option; the dense H3 checkpoint cannot carry a live overlay")
+        if args.h3_guidance_null_source != "live":
+            # There is no adapter to disable, so the null branch cannot be pinned
+            # to a base that the trained weights themselves are moving.
+            raise ValueError("--h3_guidance_null_source frozen is not supported by MiniMax H3 full fine-tuning")
         if args.crepa is not None:
             raise ValueError("--crepa is not currently part of the dense H3 checkpoint")
         if args.save_precision not in (None, "bf16"):

@@ -70,6 +70,7 @@ from musubi_tuner.minimax_h3.references import (
 )
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
+    cfg_zero_rescaled_empty,
     contrastive_guidance_target,
     guidance_consistent_prediction,
     guidance_scale_for_sigma,
@@ -176,6 +177,26 @@ def _parse_keyframe_anchors(spec: str) -> tuple[int | str, ...]:
     return tuple(anchors)
 
 
+def _parse_guidance_scale_range(spec: str | None) -> tuple[float, float] | None:
+    """Parse ``--h3_guidance_scale_range LOWER,UPPER`` into a validated pair."""
+    if not spec:
+        return None
+    pieces = [piece.strip() for piece in str(spec).split(",")]
+    if len(pieces) != 2:
+        raise ValueError(f"--h3_guidance_scale_range must be 'LOWER,UPPER', got {spec!r}")
+    try:
+        lower, upper = (float(piece) for piece in pieces)
+    except ValueError as exc:
+        raise ValueError(f"--h3_guidance_scale_range must be 'LOWER,UPPER', got {spec!r}") from exc
+    if not math.isfinite(lower) or not math.isfinite(upper):
+        raise ValueError("--h3_guidance_scale_range bounds must be finite")
+    if lower <= 1.0:
+        raise ValueError("--h3_guidance_scale_range lower bound must be greater than 1")
+    if lower > upper:
+        raise ValueError("--h3_guidance_scale_range lower bound must not exceed its upper bound")
+    return (lower, upper)
+
+
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
     @staticmethod
     def _sparse_branch_active(accelerator: Accelerator, probability: float, generator: torch.Generator | None = None) -> bool:
@@ -236,6 +257,36 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
             self._guidance_probability_generator = generator
         return self._sparse_branch_active(accelerator, probability, generator)
+
+    def _draw_guidance_scale(self, accelerator: Accelerator, batch_size: int) -> torch.Tensor:
+        """Draw one guidance scale per micro-batch sample, shared by every rank.
+
+        A fifth dedicated stream, independent of the guidance-sparsity, recipe,
+        preservation and control-dropout ones and of the global CPU stream that
+        caption dropout, the observed-modality draw and the jitters consume:
+        enabling ``--h3_guidance_scale_range`` must not shift any of them, so a
+        run that only adds the range keeps every other branch decision it had
+        with a fixed point scale. Only the one-time seed comes from the global
+        stream, so a seeded run stays reproducible.
+
+        The draw is made on CPU and rank zero's vector is then authoritative,
+        exactly as in :meth:`_sparse_branch_active`: every rank must correct the
+        same guided field, or the gradients being reduced belong to different
+        objectives.
+        """
+        if self._guidance_scale_range is None:
+            raise RuntimeError("H3 guidance scale range was not configured")
+        lower, upper = self._guidance_scale_range
+        generator = self._guidance_scale_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._guidance_scale_generator = generator
+        draw = torch.rand(batch_size, device="cpu", dtype=torch.float32, generator=generator)
+        scale = (lower + (upper - lower) * draw).to(device=accelerator.device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(scale, src=0)
+        return scale
 
     def _qwen_control_dropout_active(self, accelerator: Accelerator, probability: float) -> bool:
         """Draw one EXPERIMENTAL Qwen-control dropout decision, shared by every rank.
@@ -308,8 +359,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self.backend: H3TrainingBackend | None = None
         self._crepa_config: H3CREPAConfig | None = None
         self._guidance_probability_generator: torch.Generator | None = None
+        self._guidance_scale_generator: torch.Generator | None = None
+        self._guidance_scale_range: tuple[float, float] | None = None
         self._recipe_probability_generator: torch.Generator | None = None
         self._qwen_control_dropout_generator: torch.Generator | None = None
+        self._overlay_network = None
         self._step_recipe: str | None = None
         self._step_qwen_control_dropout = False
         self._crepa: H3CREPA | None = None
@@ -858,10 +912,39 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_observed_modality video trains audio and therefore requires --h3_audio_loss_weight > 0")
         if args.h3_observed_modality == "audio" and modality_loss_weights["h3_video_loss_weight"] == 0:
             raise ValueError("--h3_observed_modality audio trains video and therefore requires --h3_video_loss_weight > 0")
+        self._guidance_scale_range = _parse_guidance_scale_range(getattr(args, "h3_guidance_scale_range", None))
+        if self._guidance_scale_range is not None:
+            if args.h3_guidance_distillation_scale is not None:
+                raise ValueError(
+                    "--h3_guidance_scale_range replaces the single --h3_guidance_distillation_scale; set one, not both"
+                )
+            # Every gate downstream asks whether a distillation scale is
+            # configured. The range answers yes, and its midpoint is the point
+            # value the drawn family is centred on, so the two-pass machinery,
+            # its cache requirements and its metadata all read a meaningful
+            # number without a second flag threaded through them.
+            args.h3_guidance_distillation_scale = 0.5 * sum(self._guidance_scale_range)
+            logger.info(
+                "MiniMax H3 guidance scale drawn per sample in [%s, %s]",
+                self._guidance_scale_range[0],
+                self._guidance_scale_range[1],
+            )
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
+        overlay_weights = getattr(args, "h3_overlay_weights", None)
+        overlay_multiplier = float(getattr(args, "h3_overlay_weights_multiplier", 1.0))
+        if not math.isfinite(overlay_multiplier):
+            raise ValueError("--h3_overlay_weights_multiplier must be finite")
+        if overlay_multiplier != 1.0 and not overlay_weights:
+            raise ValueError("--h3_overlay_weights_multiplier requires --h3_overlay_weights")
+        if overlay_weights and not Path(overlay_weights).is_file():
+            raise FileNotFoundError(f"--h3_overlay_weights file not found: {overlay_weights}")
         if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
+        if args.h3_guidance_null_source != "live" and args.h3_guidance_distillation_scale is None:
+            raise ValueError("--h3_guidance_null_source requires --h3_guidance_distillation_scale")
+        if args.h3_guidance_cfg_zero and args.h3_guidance_distillation_scale is None:
+            raise ValueError("--h3_guidance_cfg_zero requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_guidance_distillation_probability) or not 0 < args.h3_guidance_distillation_probability <= 1:
             raise ValueError("--h3_guidance_distillation_probability must be finite and lie in (0, 1]")
         if args.h3_guidance_distillation_probability < 1.0 and args.h3_guidance_distillation_scale is None:
@@ -1163,6 +1246,69 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         accelerator.register_save_state_pre_hook(save_crepa_state)
         accelerator.register_load_state_pre_hook(load_crepa_state)
 
+    def install_overlay_weights(self, args, accelerator, transformer):
+        """Attach ``--h3_overlay_weights`` as a live, frozen LoRA overlay.
+
+        The overlay is a second :class:`LoRANetwork` applied on top of the
+        trainable one. Nothing is written into the transformer's weights, which
+        is the entire point: a ConvRot INT8 base cannot absorb a LoRA without a
+        dequantize/requantize round trip, so the correction has to stay a
+        separate live module. Because ``LoRAModule.apply_to`` chains onto
+        whatever forward it finds, applying the overlay *after* the trainable
+        network leaves the trainable modules innermost, so they keep the fused
+        ConvRot INT8 LoRA path when it is enabled, and the two deltas simply
+        add.
+
+        Ownership follows from the object graph rather than from bookkeeping:
+        the overlay is not a submodule of the trainable network, is not handed
+        to the optimizer, and is not passed to the accelerator, so it cannot
+        reach a checkpoint, a saved ``state_dict`` or a gradient. Likewise the
+        base-preservation branch toggles ``set_enabled`` on the trainable
+        network alone, which leaves the overlay active on the reference forward:
+        the preserved field is base+overlay, the field the adapter is actually
+        being trained inside.
+        """
+        path = getattr(args, "h3_overlay_weights", None)
+        if not path:
+            return None
+        from musubi_tuner.networks import lora_minimax_h3
+
+        weights_sd = self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3")
+        multiplier = float(getattr(args, "h3_overlay_weights_multiplier", 1.0))
+        overlay = lora_minimax_h3.create_arch_network_from_weights(
+            multiplier,
+            weights_sd,
+            unet=transformer,
+            for_inference=False,
+        )
+        matched = {lora.lora_name for lora in overlay.text_encoder_loras + overlay.unet_loras}
+        unmatched = sorted({key.split(".")[0] for key in weights_sd if "." in key} - matched)
+        if unmatched:
+            raise ValueError(
+                f"{path}: {len(unmatched)} of {len(weights_sd)} tensors have no matching module and would be applied "
+                "to nothing; a live overlay is never partially applied. Its key convention is probably not the one "
+                f"this project expects (`lora_unet_<module_path_with_underscores>.lora_down.weight`), e.g. "
+                f"{', '.join(unmatched[:3])}"
+            )
+        overlay.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+        info = overlay.load_state_dict(weights_sd, False)
+        if info.missing_keys:
+            raise ValueError(f"{path}: overlay LoRA is missing {len(info.missing_keys)} tensor(s), e.g. {info.missing_keys[:3]}")
+        # fp32 matches the trainable network, which stays fp32 and relies on
+        # autocast for the matmul dtype, so both deltas are computed alike.
+        overlay.to(device=accelerator.device, dtype=torch.float32)
+        overlay.requires_grad_(False)
+        overlay.eval()
+        ranks = sorted({int(lora.lora_dim) for lora in overlay.unet_loras})
+        alphas = sorted({float(lora.alpha.item()) for lora in overlay.unet_loras})
+        accelerator.print(
+            f"MiniMax H3 live overlay from {path}: {len(overlay.unet_loras)} module(s) matched, "
+            f"rank={ranks if len(ranks) > 1 else ranks[0]}, alpha={alphas if len(alphas) > 1 else alphas[0]}, "
+            f"multiplier={multiplier}; frozen, never merged, excluded from checkpoints"
+        )
+        self._overlay_network = overlay
+        return overlay
+
     def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):
         if args is not None and args.h3_base_preservation_loss_weight > 0:
             if network is None:
@@ -1170,6 +1316,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             set_enabled = getattr(accelerator.unwrap_model(network), "set_enabled", None)
             if not callable(set_enabled):
                 raise TypeError("H3 base-preservation loss requires a network with set_enabled()")
+        if args is not None:
+            self.install_overlay_weights(args, accelerator, transformer)
         del args, network, transformer
         if self._crepa is None:
             return trainable_params
@@ -1714,28 +1862,80 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return None
 
     @staticmethod
-    def _guidance_loss_inputs(args, prediction, empty_prediction, inputs):
+    def _runtime_network_toggle(accelerator, network, requirement: str):
+        """Return the ``set_enabled`` of the trainable network for a frozen-base forward."""
+        if network is None:
+            raise ValueError(f"{requirement} requires a trainable network")
+        unwrapped_network = accelerator.unwrap_model(network)
+        set_enabled = getattr(unwrapped_network, "set_enabled", None)
+        if not callable(set_enabled):
+            raise TypeError(f"{requirement} requires a network with set_enabled()")
+        return set_enabled
+
+    def _configured_guidance_scale(self, args, accelerator, inputs):
+        """Resolve the guidance scale this step distills towards.
+
+        Without ``--h3_guidance_scale_range`` this is the single authoritative
+        ``--h3_guidance_distillation_scale`` float, unchanged. With the range it
+        is a per-sample vector drawn uniformly in ``[lower, upper]``, so one step
+        teaches the adapter several points of the guidance family at once.
+
+        ``accelerator is None`` marks a replayed evaluation forward: validation
+        must stay comparable between runs, so it reads the range's midpoint
+        instead of consuming a draw.
+        """
+        if self._guidance_scale_range is None:
+            return args.h3_guidance_distillation_scale
+        lower, upper = self._guidance_scale_range
+        if accelerator is None:
+            return 0.5 * (lower + upper)
+        return self._draw_guidance_scale(accelerator, int(inputs.video_sigma.shape[0]))
+
+    def _guidance_loss_inputs(self, args, prediction, empty_prediction, inputs, accelerator=None):
+        configured_scale = self._configured_guidance_scale(args, accelerator, inputs)
+        per_sample = isinstance(configured_scale, torch.Tensor)
         video_sigma = inputs.video_frame_sigma if inputs.video_frame_sigma is not None else inputs.video_sigma
-        video_scale = guidance_scale_for_sigma(
-            args.h3_guidance_distillation_scale,
-            video_sigma,
-            args.h3_guidance_loss_schedule,
-        )
-        if inputs.video_frame_sigma is not None:
-            video_scale = video_scale.reshape(1, 1, -1, 1, 1)
+        if inputs.video_frame_sigma is not None and per_sample:
+            # A per-frame sigma indexes frames, a drawn scale indexes samples:
+            # the schedule is evaluated on their outer product so the resulting
+            # [batch, 1, frames, 1, 1] grid broadcasts over the video latents.
+            video_scale = guidance_scale_for_sigma(
+                configured_scale.reshape(-1, 1),
+                video_sigma.reshape(1, -1),
+                args.h3_guidance_loss_schedule,
+            ).reshape(configured_scale.shape[0], 1, video_sigma.shape[0], 1, 1)
+        else:
+            video_scale = guidance_scale_for_sigma(
+                configured_scale,
+                video_sigma,
+                args.h3_guidance_loss_schedule,
+            )
+            if inputs.video_frame_sigma is not None:
+                video_scale = video_scale.reshape(1, 1, -1, 1, 1)
         audio_scale = guidance_scale_for_sigma(
-            args.h3_guidance_distillation_scale,
+            configured_scale,
             inputs.audio_sigma,
             args.h3_guidance_loss_schedule,
         )
         if args.h3_guidance_loss_form == "contrastive":
+            true_target = H3ModelPrediction(inputs.video_target, inputs.audio_target)
+            if args.h3_guidance_cfg_zero:
+                # The contrastive form extrapolates away from the null field toward
+                # the true flow target, so that target is the reference the null
+                # branch is projected onto.
+                empty_prediction = cfg_zero_rescaled_empty(empty_prediction, true_target)
             target = contrastive_guidance_target(
-                H3ModelPrediction(inputs.video_target, inputs.audio_target),
+                true_target,
                 empty_prediction,
                 video_scale,
                 audio_guidance_scale=audio_scale,
             )
             return prediction, replace(inputs, video_target=target.video, audio_target=target.audio)
+        if args.h3_guidance_cfg_zero:
+            # The normalized form de-guides the model's own guided field, so the
+            # guided prediction is the reference. It enters the projection
+            # detached, matching the anchor treatment of the null branch itself.
+            empty_prediction = cfg_zero_rescaled_empty(empty_prediction, prediction)
         return (
             guidance_consistent_prediction(
                 prediction,
@@ -2190,25 +2390,37 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # optimized. Evaluate it first without retaining its autograd graph.
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
                 int8_context = getattr(transformer, "int8_attention_context", None)
+                # A frozen null branch is a fixed anchor: the adapter is disabled
+                # for this forward only, so the field the guidance correction
+                # inverts cannot drift along with the adapter that is being
+                # trained against it. The base-preservation pass below cannot be
+                # shared for it: guidance only runs on a prompt step, so that pass
+                # always carries prompt conditioning while this one needs empty.
+                null_set_enabled = (
+                    self._runtime_network_toggle(accelerator, network, "--h3_guidance_null_source frozen")
+                    if args.h3_guidance_null_source == "frozen"
+                    else None
+                )
                 with (
                     torch.random.fork_rng(devices=fork_devices),
                     torch.no_grad(),
                     int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
                 ):
-                    empty_prediction = self._predict(
-                        accelerator,
-                        transformer,
-                        batch,
-                        inputs,
-                        conditioning="empty",
-                    )
+                    if null_set_enabled is not None:
+                        null_set_enabled(False)
+                    try:
+                        empty_prediction = self._predict(
+                            accelerator,
+                            transformer,
+                            batch,
+                            inputs,
+                            conditioning="empty",
+                        )
+                    finally:
+                        if null_set_enabled is not None:
+                            null_set_enabled(True)
             if preservation_active:
-                if network is None:
-                    raise ValueError("--h3_base_preservation_loss_weight requires a trainable network")
-                unwrapped_network = accelerator.unwrap_model(network)
-                set_enabled = getattr(unwrapped_network, "set_enabled", None)
-                if not callable(set_enabled):
-                    raise TypeError("H3 base-preservation loss requires a network with set_enabled()")
+                set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_base_preservation_loss_weight")
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
                 # Restoring the RNG state makes the following trainable pass reuse
                 # the stochastic conditioning rows sampled by the frozen branch.
@@ -2251,7 +2463,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         prediction = raw_prediction
         loss_inputs = inputs
         if use_guidance:
-            prediction, loss_inputs = self._guidance_loss_inputs(args, prediction, empty_prediction, inputs)
+            prediction, loss_inputs = self._guidance_loss_inputs(
+                args, prediction, empty_prediction, inputs, accelerator=accelerator
+            )
 
         video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
         audio_sample_weight = self._sample_weight(args, inputs.audio_sigma) if has_audio else None
@@ -2411,9 +2625,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
+            "ss_h3_guidance_scale_range": (
+                "fixed"
+                if self._guidance_scale_range is None
+                else f"{self._guidance_scale_range[0]},{self._guidance_scale_range[1]}"
+            ),
             "ss_h3_guidance_distillation_probability": str(args.h3_guidance_distillation_probability),
+            "ss_h3_overlay_weights": str(getattr(args, "h3_overlay_weights", None) or "none"),
+            "ss_h3_overlay_weights_multiplier": str(getattr(args, "h3_overlay_weights_multiplier", 1.0)),
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_guidance_loss_schedule": args.h3_guidance_loss_schedule,
+            "ss_h3_guidance_null_source": args.h3_guidance_null_source,
+            "ss_h3_guidance_cfg_zero": str(args.h3_guidance_cfg_zero),
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
             "ss_h3_qwen_control_dropout_rate": str(args.h3_qwen_control_dropout_rate),
             "ss_h3_fp8_quantization_mode": args.h3_fp8_quantization_mode,
@@ -2546,6 +2769,36 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
+    )
+    parser.add_argument(
+        "--h3_guidance_scale_range",
+        type=str,
+        default=None,
+        metavar="LOWER,UPPER",
+        help=(
+            "draw the guidance-distillation scale uniformly in [LOWER, UPPER], once per micro-batch sample and step, "
+            "instead of pinning the single --h3_guidance_distillation_scale (mutually exclusive with it). LOWER must "
+            "be greater than 1 and no greater than UPPER. The draw uses its own distributed-synchronized generator, "
+            "so adding the range leaves every other random branch of a seeded run untouched; validation reads the "
+            "midpoint so its loss stays comparable. Composes with --h3_guidance_distillation_probability and with "
+            "both --h3_guidance_loss_form and --h3_guidance_loss_schedule"
+        ),
+    )
+    parser.add_argument(
+        "--h3_overlay_weights",
+        type=str,
+        default=None,
+        help=(
+            "apply a LoRA (Musubi or Diffusers/PEFT keys) as a separate frozen module instead of merging it into the "
+            "base weights; works on an INT8 ConvRot base, is excluded from the optimizer and saved checkpoints, and is "
+            "active on all forwards including the base-preservation reference"
+        ),
+    )
+    parser.add_argument(
+        "--h3_overlay_weights_multiplier",
+        type=float,
+        default=1.0,
+        help="strength of --h3_overlay_weights (default 1.0); requires --h3_overlay_weights",
     )
     parser.add_argument(
         "--h3_guidance_distillation_probability",
@@ -2769,6 +3022,23 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "sigma uses effective_scale = 1 + (configured_scale - 1) * modality_sigma; "
             "constant applies the configured guidance scale at every noise level"
+        ),
+    )
+    parser.add_argument(
+        "--h3_guidance_null_source",
+        choices=("live", "frozen"),
+        default="live",
+        help=(
+            "live evaluates the null-conditioning branch with the trainable adapter active; frozen disables the "
+            "adapter for that forward so the guidance correction inverts a fixed base field"
+        ),
+    )
+    parser.add_argument(
+        "--h3_guidance_cfg_zero",
+        action="store_true",
+        help=(
+            "CFG-Zero* style rescale of the null branch before the guidance form is applied: each sample and "
+            "modality projects the null prediction onto the conditional field"
         ),
     )
     parser.add_argument(

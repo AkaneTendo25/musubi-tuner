@@ -679,18 +679,31 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         crepa_args.append(f"weight={t.crepa_lambda}")
         cmd.append("--crepa")
         cmd += crepa_args
-    if t.h3_guidance_distillation_scale is not None:
-        cmd += ["--h3_guidance_distillation_scale", str(t.h3_guidance_distillation_scale)]
+    # The range replaces the point value rather than complementing it, so the
+    # trainer rejects both at once; emit whichever one the project carries.
+    if t.h3_guidance_scale_range or t.h3_guidance_distillation_scale is not None:
+        if t.h3_guidance_scale_range:
+            cmd += ["--h3_guidance_scale_range", str(t.h3_guidance_scale_range)]
+        else:
+            cmd += ["--h3_guidance_distillation_scale", str(t.h3_guidance_distillation_scale)]
         if t.h3_guidance_distillation_probability != 1.0:
             cmd += ["--h3_guidance_distillation_probability", str(t.h3_guidance_distillation_probability)]
         if t.h3_guidance_loss_form != "normalized":
             cmd += ["--h3_guidance_loss_form", t.h3_guidance_loss_form]
         if t.h3_guidance_loss_schedule != "sigma":
             cmd += ["--h3_guidance_loss_schedule", t.h3_guidance_loss_schedule]
+        if t.h3_guidance_null_source != "live":
+            cmd += ["--h3_guidance_null_source", t.h3_guidance_null_source]
+        if t.h3_guidance_cfg_zero:
+            cmd.append("--h3_guidance_cfg_zero")
     if t.h3_base_preservation_loss_weight > 0:
         cmd += ["--h3_base_preservation_loss_weight", str(t.h3_base_preservation_loss_weight)]
         if t.h3_base_preservation_probability != 1.0:
             cmd += ["--h3_base_preservation_probability", str(t.h3_base_preservation_probability)]
+    if t.h3_overlay_weights:
+        cmd += ["--h3_overlay_weights", t.h3_overlay_weights]
+        if t.h3_overlay_weights_multiplier != 1.0:
+            cmd += ["--h3_overlay_weights_multiplier", str(t.h3_overlay_weights_multiplier)]
     if t.network_weights:
         cmd += ["--network_weights", t.network_weights]
     if t.dim_from_weights:

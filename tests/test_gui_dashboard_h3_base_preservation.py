@@ -878,3 +878,58 @@ def test_h3_layout_contract_prevents_clipped_errors_and_ltx_routes() -> None:
         "/training/techniques",
     ):
         assert f"'{route}'" in layout
+
+
+def test_h3_dashboard_guidance_null_field_options_round_trip(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_cache_guidance_empty = True
+    config.training.h3_guidance_distillation_scale = 4.0
+    config.training.h3_guidance_null_source = "frozen"
+    config.training.h3_guidance_cfg_zero = True
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+
+    assert parsed.h3_guidance_null_source == "frozen"
+    assert parsed.h3_guidance_cfg_zero is True
+    assert validate_training_config(config)["field_errors"] == {}
+
+
+def test_h3_dashboard_guidance_null_field_defaults_stay_off_the_command_line(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_cache_guidance_empty = True
+    config.training.h3_guidance_distillation_scale = 4.0
+
+    command = build_training_cmd(config)
+
+    assert "--h3_guidance_null_source" not in command
+    assert "--h3_guidance_cfg_zero" not in command
+
+
+def test_h3_dashboard_rejects_null_field_options_without_a_guidance_scale(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_guidance_null_source = "frozen"
+    config.training.h3_guidance_cfg_zero = True
+
+    report = validate_training_config(config)
+
+    assert "training.h3_guidance_null_source" in report["field_errors"]
+    assert "training.h3_guidance_cfg_zero" in report["field_errors"]
+
+
+def test_h3_dashboard_training_page_exposes_the_null_field_controls() -> None:
+    page = (
+        Path(__file__).parents[1]
+        / "src"
+        / "musubi_tuner"
+        / "gui_dashboard"
+        / "frontend"
+        / "src"
+        / "routes"
+        / "training"
+        / "+page.svelte"
+    ).read_text(encoding="utf-8")
+
+    assert "training.h3_guidance_null_source" in page
+    assert "training.h3_guidance_cfg_zero" in page
