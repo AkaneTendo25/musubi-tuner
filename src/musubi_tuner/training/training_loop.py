@@ -87,6 +87,47 @@ from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, t
 logger = logging.getLogger("musubi_tuner.hv_train_network")
 
 
+def _enable_transformer_gradient_checkpointing(
+    transformer, activation_cpu_offloading, *, weight_cpu_offloading: bool = False, blocks_to_checkpoint=-1
+) -> None:
+    """Enable gradient checkpointing, passing only the keyword arguments this transformer accepts.
+
+    `weight_cpu_offloading` and `blocks_to_checkpoint` are LTX-2 extensions; other architectures
+    define `enable_gradient_checkpointing(activation_cpu_offloading)` only. The supported keywords
+    are resolved from the signature rather than by catching TypeError, so a TypeError raised inside
+    the method still propagates instead of triggering a second call on a half-configured module.
+    """
+    enable = transformer.enable_gradient_checkpointing
+    try:
+        parameters = inspect.signature(enable).parameters
+    except (TypeError, ValueError):  # builtins and some wrappers have no introspectable signature
+        parameters = {}
+    has_var_keyword = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+    def _accepts(name: str) -> bool:
+        return has_var_keyword or name in parameters
+
+    if weight_cpu_offloading and not _accepts("weight_cpu_offloading"):
+        # --blockwise_checkpointing is an explicit ultra-low-VRAM request; silently downgrading it
+        # would train with a different memory profile than the one that was asked for.
+        raise ValueError(
+            f"--blockwise_checkpointing is not supported by {type(transformer).__name__}. Use --gradient_checkpointing without it."
+        )
+
+    kwargs = {}
+    if weight_cpu_offloading:
+        kwargs["weight_cpu_offloading"] = True
+    if _accepts("blocks_to_checkpoint"):
+        kwargs["blocks_to_checkpoint"] = blocks_to_checkpoint
+    elif blocks_to_checkpoint not in (None, -1):
+        logger.warning(
+            "%s does not support --blocks_to_checkpoint=%s; checkpointing every block instead.",
+            type(transformer).__name__,
+            blocks_to_checkpoint,
+        )
+    enable(activation_cpu_offloading, **kwargs)
+
+
 def train(self, args):
     validate_weight_noise_args(args)
 
@@ -534,17 +575,12 @@ def train(self, args):
     if args.gradient_checkpointing:
         blocks_to_ckpt = getattr(args, "blocks_to_checkpoint", -1)
         if getattr(args, "blockwise_checkpointing", False):
-            try:
-                transformer.enable_gradient_checkpointing(
-                    args.gradient_checkpointing_cpu_offload, weight_cpu_offloading=True, blocks_to_checkpoint=blocks_to_ckpt
-                )
-            except TypeError:
-                logger.warning(
-                    "Transformer %s does not support blocks_to_checkpoint / weight_cpu_offloading; "
-                    "falling back to basic gradient checkpointing.",
-                    type(transformer).__name__,
-                )
-                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
+            _enable_transformer_gradient_checkpointing(
+                transformer,
+                args.gradient_checkpointing_cpu_offload,
+                weight_cpu_offloading=True,
+                blocks_to_checkpoint=blocks_to_ckpt,
+            )
             if hasattr(transformer, "transformer_blocks"):
                 total_blocks = len(transformer.transformer_blocks)
                 if blocks_to_ckpt is None or int(blocks_to_ckpt) == -1:
@@ -564,14 +600,9 @@ def train(self, args):
                     if hasattr(block, "use_pinned_memory"):
                         block.use_pinned_memory = True
         else:
-            try:
-                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload, blocks_to_checkpoint=blocks_to_ckpt)
-            except TypeError:
-                logger.warning(
-                    "Transformer %s does not support blocks_to_checkpoint; falling back to basic gradient checkpointing.",
-                    type(transformer).__name__,
-                )
-                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
+            _enable_transformer_gradient_checkpointing(
+                transformer, args.gradient_checkpointing_cpu_offload, blocks_to_checkpoint=blocks_to_ckpt
+            )
         try:
             network.enable_gradient_checkpointing(
                 args.gradient_checkpointing_cpu_offload,
