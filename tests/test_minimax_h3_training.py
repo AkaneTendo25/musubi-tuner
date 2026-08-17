@@ -4202,6 +4202,43 @@ def test_h3_ref2va_still_rejects_custom_keyframe_anchors():
         )
 
 
+def test_h3_ref2va_scores_an_audio_only_target_behind_its_reference_rows():
+    # Foley / reference-voice training: the target is audio only, the conditioning
+    # video is an arbitrary reference. The packed sequence keeps the reference
+    # prefix and carries no target video rows at all.
+    transformer = _PackedRowRecorder()
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+    audio = torch.zeros(1, 2, 6, 3)
+    batch = _ref2va_conditioning_batch()
+    batch[H3_VIDEO_GEOMETRY_KEY] = [torch.tensor([4, 4])]
+
+    torch.manual_seed(0)
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        None,
+        audio,
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+    )
+
+    assert prediction.video is None
+    assert prediction.audio.shape == audio.shape
+
+    call = transformer.calls[-1]
+    # One image reference row and no target video rows; two reference audio rows
+    # ahead of the six target audio rows.
+    assert call["video_hidden_states"].shape == (1, 1, 16)
+    assert call["audio_hidden_states"].shape == (1, 8, 6)
+    torch.testing.assert_close(call["video_hidden_states"][0, 0], torch.full((16,), 0.999 * 5.0), atol=5e-3, rtol=0)
+    sigma = transformer.row_sigma
+    video_indices, audio_indices = call["video_indices"], call["audio_indices"]
+    assert video_indices.numel() == 1
+    assert float(sigma[video_indices[0]]) == pytest.approx(0.999)
+    assert bool((sigma[audio_indices[:2]] == 1.0).all())
+    assert bool((sigma[audio_indices[2:]] == 0.7).all())
+
+
 def test_h3_random_observed_modality_covers_all_three_tasks():
     # Redrawing the task per step is what keeps one adapter able to do joint
     # generation, A2V and V2A instead of specialising on whichever was fixed.

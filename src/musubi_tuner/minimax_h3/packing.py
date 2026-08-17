@@ -150,6 +150,11 @@ def _validated_density_scale(spatial_density_scale: float) -> float:
 
 
 def _temporal_position_grid(num_latent_frames: int, origin: float) -> torch.Tensor:
+    # An audio-only Ref2VA target has no video rows at all. The concatenated
+    # leading zero below would otherwise make a zero-frame grid one row long and
+    # feed that row into an empty target slice.
+    if num_latent_frames <= 0:
+        return torch.zeros(0, dtype=torch.float64)
     spans = torch.tensor(
         [_ROPE_FRAME_RESCALE * _ROPE_FRAMES_PER_LATENT[index % len(_ROPE_FRAMES_PER_LATENT)] for index in range(num_latent_frames)],
         dtype=torch.float64,

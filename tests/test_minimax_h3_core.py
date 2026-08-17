@@ -74,6 +74,8 @@ from musubi_tuner.minimax_h3.media import (
     fit_audio_length,
     slice_media_asset,
 )
+from musubi_tuner.minimax_h3 import packing as h3_packing
+from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.packing import (
     MiniMaxH3ReferenceGeometry,
     build_ref2va_packed_sequence,
@@ -919,6 +921,163 @@ def test_h3_toml_reference_modality_probabilities_are_attached(tmp_path):
 
     assert item.h3_reference_modality_probabilities == (0.5, 0.25, 0.25)
     assert not hasattr(group.datasets[0], "control_modality_probabilities")
+
+
+def test_h3_audio_target_resolves_control_directory_references(tmp_path):
+    # Foley and reference-voice training: the conditioning video is arbitrary, not the
+    # target's own synchronized track, so an audio-only dataset must reach the Ref2VA
+    # reference path the video datasets use.
+    audio = tmp_path / "audio"
+    controls = tmp_path / "controls"
+    audio.mkdir()
+    controls.mkdir()
+    target = audio / "tone.wav"
+    target.write_bytes(b"target")
+    (controls / "tone.png").write_bytes(b"image")
+    (controls / "tone_0.mp4").write_bytes(b"video")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "audio_directory": str(audio),
+                "h3_target_mode": "audio",
+                "control_directory": str(controls),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512, 22), frame_count=22)
+    assets = adapter.attach(item)
+
+    assert [asset.role for asset in assets] == ["target", "reference", "reference"]
+    assert [asset.modality for asset in assets] == [MediaModality.AUDIO, MediaModality.IMAGE, MediaModality.VIDEO]
+    assert item.h3_target_mode == "audio"
+    # The reference bundle takes part in the cache identity exactly as it does for video targets.
+    assert item.h3_cache_metadata[h3_references.REFERENCE_FINGERPRINT_KEY]
+    # A visual reference makes the video VAE mandatory even though the target has no video.
+    assert adapter.requires_video and adapter.requires_audio
+
+
+def test_h3_audio_target_without_controls_keeps_the_empty_reference_fast_path(tmp_path):
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    target = audio / "tone.wav"
+    target.write_bytes(b"target")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "audio_directory": str(audio),
+                "h3_target_mode": "audio",
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512, 22), frame_count=22)
+    assets = adapter.attach(item)
+
+    assert adapter._targets[h3_dataset._normal_path(target)].references == ()
+    assert len(assets) == 1 and assets[0].role == "target"
+    assert not hasattr(item, "h3_cache_metadata")
+    assert not adapter.requires_video
+
+
+def test_h3_audio_jsonl_control_paths_select_reference_modality(tmp_path):
+    audio = tmp_path / "audio"
+    controls = tmp_path / "controls"
+    audio.mkdir()
+    controls.mkdir()
+    target = audio / "tone.wav"
+    target.write_bytes(b"target")
+    (controls / "anchor.png").write_bytes(b"image")
+    (controls / "scene.mp4").write_bytes(b"video")
+    jsonl = tmp_path / "audio.jsonl"
+    jsonl.write_text(
+        json.dumps(
+            {
+                "audio_path": str(target),
+                "caption": "a clean tone",
+                "control_path_0": "controls/anchor.png",
+                "control_path_1": "controls/scene.mp4",
+                "control_modality_1": "video",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "audio_jsonl_file": str(jsonl),
+                "h3_target_mode": "audio",
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512, 22), frame_count=22)
+    references = adapter.attach(item)[1:]
+
+    assert [reference.path.name for reference in references] == ["anchor.png", "scene.mp4"]
+    assert references[1].metadata["include_audio"] is False
+
+
+def test_h3_audio_dataset_rejects_controls_in_both_directory_and_jsonl(tmp_path):
+    audio = tmp_path / "audio"
+    controls = tmp_path / "controls"
+    audio.mkdir()
+    controls.mkdir()
+    target = audio / "tone.wav"
+    target.write_bytes(b"target")
+    (controls / "tone.png").write_bytes(b"image")
+    jsonl = tmp_path / "audio.jsonl"
+    jsonl.write_text(
+        json.dumps({"audio_path": str(target), "caption": "c", "control_path_0": str(controls / "tone.png")}) + "\n",
+        encoding="utf-8",
+    )
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "audio_jsonl_file": str(jsonl),
+                "h3_target_mode": "audio",
+                "control_directory": str(controls),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="control_directory or the audio JSONL"):
+        h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
+
+
+def test_native_latent_encoder_caches_references_for_an_audio_target():
+    encoder = h3_integration._NativeLatentEncoder(None, None, torch.float32)
+    latent_frames = temporal_shape(124).audio_latent_frames
+    encoder._encode_audio = lambda item: (torch.zeros(2, 32, latent_frames), torch.ones(latent_frames, dtype=torch.bool))
+    encoder._encode_references = lambda item: {f"varlen_{H3_REFERENCE_KINDS_KEY}_int64": torch.tensor([0])}
+    item = SimpleNamespace(
+        item_key="tone.wav",
+        h3_target_mode="audio",
+        original_size=(512, 512),
+        h3_media_assets=(MediaAsset(Path("tone.wav"), MediaModality.AUDIO, "target", metadata={"frame_count": 124}),),
+    )
+
+    (tensors,) = encoder.encode_latents([item])
+
+    assert f"varlen_{H3_REFERENCE_KINDS_KEY}_int64" in tensors
+    assert "mmh3_video_geometry_int64" in tensors
+    assert f"latents_audio_2x32x{latent_frames}_float32" in tensors
 
 
 def test_reference_modality_variants_keep_text_and_latent_geometry_aligned():
@@ -2817,6 +2976,41 @@ def _ref2va_density_layout(scale=None):
         patch_size=(1, 2, 2),
         **({} if scale is None else {"spatial_density_scale": scale}),
     )
+
+
+def test_h3_ref2va_packs_an_audio_only_target_behind_its_reference_prefix():
+    # An audio target contributes no video rows at all: the sequence is
+    # [text | references | target audio] and the target video block is empty.
+    layout = build_ref2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        (
+            MiniMaxH3ReferenceGeometry(kind=0, num_latent_frames=1, latent_height=4, latent_width=4),
+            MiniMaxH3ReferenceGeometry(kind=2, num_audio_latents=3),
+        ),
+        num_latent_frames=0,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=2,
+        patch_size=(1, 2, 2),
+    )
+
+    assert layout.num_condition_video_rows == 4
+    assert layout.num_condition_audio_rows == 6
+    assert layout.sequence_length == 4 + 4 + 6 + 2 * 2
+    # Every video row in the sequence is a reference row; nothing follows the target audio.
+    assert torch.equal(layout.video_indices, torch.arange(4, 8))
+    assert torch.equal(layout.audio_indices, torch.cat((torch.arange(8, 14), torch.arange(14, 18))))
+    assert int(layout.token_tags[layout.video_indices].unique()) == int(MiniMaxH3TokenTag.VIDEO)
+    assert int(layout.token_tags[layout.audio_indices].unique()) == int(MiniMaxH3TokenTag.AUDIO)
+    # The target audio starts after the reference timeline: one image row (+1) then
+    # three audio latents (+3) past the text origin of four rows.
+    target_audio = layout.position_ids[14:, 0]
+    torch.testing.assert_close(target_audio, torch.tensor([8.0, 9.0, 8.0, 9.0], dtype=torch.float64))
+
+
+def test_h3_temporal_position_grid_is_empty_without_video_frames():
+    assert h3_packing._temporal_position_grid(0, 3.0).numel() == 0
+    assert h3_packing._temporal_position_grid(1, 3.0).tolist() == [3.0]
 
 
 def test_h3_spatial_density_scale_is_inert_at_its_default():

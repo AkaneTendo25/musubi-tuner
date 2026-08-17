@@ -1814,13 +1814,16 @@ class _NativeLatentEncoder:
                     raise ValueError(f"H3 audio VAE produced {audio.shape[-1]} rows; expected {expected.audio_latent_frames}")
                 latent_height = int(item.original_size[1]) // 16
                 latent_width = int(item.original_size[0]) // 16
-                results.append(
-                    {
-                        f"{H3_AUDIO_LATENTS_KEY}_2x32x{audio.shape[-1]}_{dtype_name}": audio,
-                        H3_AUDIO_LOSS_MASK_KEY: audio_mask,
-                        f"{H3_VIDEO_GEOMETRY_KEY}_int64": torch.tensor([latent_height, latent_width], dtype=torch.long),
-                    }
-                )
+                tensors = {
+                    f"{H3_AUDIO_LATENTS_KEY}_2x32x{audio.shape[-1]}_{dtype_name}": audio,
+                    H3_AUDIO_LOSS_MASK_KEY: audio_mask,
+                    f"{H3_VIDEO_GEOMETRY_KEY}_int64": torch.tensor([latent_height, latent_width], dtype=torch.long),
+                }
+                # An audio target has no video rows of its own, but Ref2VA references are
+                # cached exactly as they are for a video target: the packed sequence keeps
+                # the reference prefix and only the target video block is empty.
+                tensors.update(self._encode_references(item))
+                results.append(tensors)
                 continue
             conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
             is_image = target.modality is MediaModality.IMAGE and not conditioned_image

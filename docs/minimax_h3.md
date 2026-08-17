@@ -62,7 +62,7 @@ Each training objective has a fixed dataset, conditioning-cache, and transformer
 | First-frame image-to-video+audio | [`i2va.toml`](../examples/minimax_h3/i2va.toml): video source; first frame comes from the target | FL2VA | `i2va` | None |
 | First+last-frame-to-video+audio | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml): video source; keyframes come from the target | FL2VA | `fl2va` | None |
 | Last-frame image-to-video+audio | [`l2va.toml`](../examples/minimax_h3/l2va.toml): video source; last frame comes from the target | FL2VA | `l2va` | None |
-| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; add `control_directory`, `control_path`, or numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
+| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; an audio target may carry references too; add `control_directory`, `control_path`, or numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
 | Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): target image or video; JSONL may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
 
 For observed-modality objectives, the option names the modality supplied as clean **conditioning**, not the prediction target.
@@ -205,7 +205,17 @@ frame_extraction = "uniform"
 
 An audio-only dataset needs **exactly one** `target_frames` value, and it must be on the `17k+5` grid — the multi-value list in
 the example above is video-only. `audio_directory` takes same-stem `.txt` captions; `audio_jsonl_file` takes records with
-`audio_path` and `caption`. Audio-target caches are named `<stem>_audio<hash>_…`, where the hash covers the absolute source
+`audio_path` and `caption`.
+
+An audio target may also declare Ref2VA references, with the same fields a video target uses: `control_directory`,
+`control_video_directory` + `control_audio_directory`, or per-record `control_path_N` / `control_video_path_N` +
+`control_audio_path_N` / `control_modality_N` in the audio JSONL. That trains video-to-audio with an **arbitrary** conditioning
+video (Foley), or audio generation from a reference voice clip plus a visual anchor. Ref2VA still requires at least one image or
+video reference, so a reference audio clip must accompany a visual one. Cache with `--task ref2va` and train with
+`--h3_training_mode ref2va`; the packed sequence is `[text | references | target audio]` and no target video rows are emitted.
+Reference video length follows the target's `target_frames`, and the RoPE spatial grid comes from the dataset `resolution` (the
+same geometry an audio-only cache already records). Because the references are visual, `--vae` is then required for latent
+caching even though the target has no video. Audio-target caches are named `<stem>_audio<hash>_…`, where the hash covers the absolute source
 path, so an audio file never overwrites a video cache of the same stem and two same-stem audio files from different directories
 stay apart in one `cache_directory`. Audio caches written before this naming are rebuilt once.
 
@@ -229,7 +239,7 @@ python minimax_h3_cache_text_encoder_outputs.py \
   --task t2va --device cuda
 ```
 
-Omit `--audio_vae` for image-only or video-only datasets; omit `--vae` for audio-only. Add `--cache_guidance_empty` if you plan to
+Omit `--audio_vae` for image-only or video-only datasets; omit `--vae` for audio-only datasets without visual references. Add `--cache_guidance_empty` if you plan to
 use caption dropout or the guidance objective.
 
 `--task` must match how you intend to train: `t2va` (text only), `i2va` (first frame), `fl2va` (first+last), `l2va`
@@ -548,8 +558,10 @@ normally do not speed up an H3 run whose cached batches already keep the GPU bus
 These modes use target-derived conditioning and therefore use a `t2va` conditioning cache, except where the table below says
 otherwise: masking and `per_row_sigma` extension only pin rows inside the target block, so they also combine with
 `--h3_training_mode ref2va` / `ref2va_omni` and their reference caches. For observed-modality training,
-`h3_target_mode = "av"` is required and each target video must contain its synchronized soundtrack. An audio-only dataset has no
-video rows and cannot train video-to-audio conditioning. The observed modality remains in the packed attention sequence but its
+`h3_target_mode = "av"` is required and each target video must contain its synchronized soundtrack — an audio-only dataset has no
+video rows to observe, so `--h3_observed_modality` cannot be used with it. Conditioning an audio target on video is still
+possible through Ref2VA references instead, which supply an arbitrary conditioning video rather than the target's own track; see
+[Dataset](#dataset). The observed modality remains in the packed attention sequence but its
 loss weight is forced to zero; this isolates direct supervision, not H3's shared attention parameters.
 
 | Option | Trains |

@@ -327,6 +327,67 @@ def _read_media_jsonl(path: str, *, resolve_paths: bool = False) -> list[dict[st
     return records
 
 
+def _directory_references(
+    control_directory: str | None,
+    control_video_directory: str | None,
+    control_audio_directory: str | None,
+    target_paths: Sequence[str],
+) -> dict[str, tuple[Any, ...]]:
+    """Resolve ``control_directory`` / paired control directories for every target."""
+    ordinary_reference_paths = _references_from_directory(control_directory, target_paths) if control_directory else {}
+    paired_reference_paths = (
+        _paired_references_from_directories(control_video_directory, control_audio_directory, target_paths)
+        if control_video_directory
+        else {}
+    )
+    return {target: (*ordinary_reference_paths.get(target, ()), *paired_reference_paths.get(target, ())) for target in target_paths}
+
+
+def _record_references(records: Sequence[dict[str, Any]], target_keys: Sequence[str]) -> dict[str, tuple[MediaAsset, ...]]:
+    """Resolve per-record ``control_path[_N]`` / paired controls and their modality overrides."""
+    reference_paths: dict[str, tuple[MediaAsset, ...]] = {}
+    for record, target_key in zip(records, target_keys):
+        controls = _ordered_control_paths(record)
+        paired_controls = _paired_control_assets(record)
+        modes = _reference_modes(record)
+        if not (controls or paired_controls):
+            continue
+        if not target_key:
+            raise ValueError("H3 media JSONL records must contain a target path")
+        ordinary_assets = tuple(MediaAsset(path, _modality_for_path(path), "reference") for path in controls)
+        references = (*ordinary_assets, *paired_controls)
+        unknown_modes = sorted(set(modes) - set(range(len(references))))
+        if unknown_modes:
+            raise ValueError(f"control_modality_N has no matching reference indices: {unknown_modes}")
+        reference_paths[target_key] = tuple(
+            _select_reference_modality(reference, modes[index], index=index) if index in modes else reference
+            for index, reference in enumerate(references)
+        )
+    return reference_paths
+
+
+def _dataset_references(
+    source: dict[str, Any],
+    general: dict[str, Any],
+    target: str,
+    raw_references: Sequence[Any],
+) -> tuple[tuple[MediaAsset, ...], tuple[float, float, float] | None]:
+    """Apply the dataset-level modality selection to one target's resolved references."""
+    references = tuple(
+        reference if isinstance(reference, MediaAsset) else MediaAsset(reference, _modality_for_path(reference), "reference")
+        for reference in raw_references
+    )
+    modes = _dataset_reference_modes(source, general, len(references))
+    probabilities = _dataset_reference_probabilities(source, general)
+    if probabilities is not None:
+        _validate_reference_modality_probabilities(target, references, probabilities)
+    references = tuple(
+        _select_reference_modality(reference, mode, index=index) if mode is not None else reference
+        for index, (reference, mode) in enumerate(zip(references, modes))
+    )
+    return references, probabilities
+
+
 def _effective(dataset: dict[str, Any], general: dict[str, Any], key: str) -> Any:
     value = dataset.get(key)
     return general.get(key) if value is None else value
@@ -397,11 +458,47 @@ class H3DatasetAdapter:
                 self.audio_datasets.append(audio_dataset)
                 self.dataset_kinds.append("audio")
                 paths = tuple(str(path) for path, _ in audio_dataset.records)
+                # An audio target carries no synchronized conditioning video, but it may still
+                # declare Ref2VA references: an arbitrary conditioning video, a reference voice
+                # clip, a visual anchor. The parsing is the one video targets use.
+                audio_control_directory = _effective(source, general, "control_directory")
+                audio_control_video_directory = _effective(source, general, "control_video_directory")
+                audio_control_audio_directory = _effective(source, general, "control_audio_directory")
+                if bool(audio_control_video_directory) != bool(audio_control_audio_directory):
+                    raise ValueError("control_video_directory and control_audio_directory must be specified together")
+                audio_records = _read_media_jsonl(audio_jsonl_file) if audio_jsonl_file else None
+                if audio_records is not None and len(audio_records) != len(paths):
+                    raise ValueError("H3 audio JSONL control parsing disagrees with the audio dataset records")
+                if (
+                    (audio_control_directory or audio_control_video_directory)
+                    and audio_records
+                    and any(_ordered_control_paths(record) or _paired_control_assets(record) for record in audio_records)
+                ):
+                    raise ValueError("specify H3 controls in control_directory or the audio JSONL, not both")
+                if audio_control_directory or audio_control_video_directory:
+                    audio_reference_paths = _directory_references(
+                        audio_control_directory,
+                        audio_control_video_directory,
+                        audio_control_audio_directory,
+                        paths,
+                    )
+                elif audio_records is not None:
+                    audio_reference_paths = _record_references(audio_records, paths)
+                else:
+                    audio_reference_paths = {}
                 for target in paths:
                     normal = _normal_path(target)
-                    self._targets[normal] = _ResolvedTarget(Path(target), ())
+                    references, probabilities = _dataset_references(
+                        source,
+                        general,
+                        target,
+                        audio_reference_paths.get(target, ()),
+                    )
+                    self._targets[normal] = _ResolvedTarget(Path(target), references)
                     self._target_modalities[normal] = MediaModality.AUDIO
                     self._target_modes[normal] = "audio"
+                    if probabilities is not None:
+                        self._target_reference_probabilities[normal] = probabilities
                 self._target_groups.append(tuple(_normal_path(target) for target in paths))
                 continue
             if target_mode == "audio":
@@ -513,39 +610,14 @@ class H3DatasetAdapter:
             ):
                 raise ValueError("specify H3 controls in control_directory or video JSONL, not both")
             if control_directory or control_video_directory:
-                ordinary_reference_paths = _references_from_directory(control_directory, target_paths) if control_directory else {}
-                paired_reference_paths = (
-                    _paired_references_from_directories(
-                        control_video_directory,
-                        control_audio_directory,
-                        target_paths,
-                    )
-                    if control_video_directory
-                    else {}
+                reference_paths = _directory_references(
+                    control_directory,
+                    control_video_directory,
+                    control_audio_directory,
+                    target_paths,
                 )
-                reference_paths = {
-                    target: (*ordinary_reference_paths.get(target, ()), *paired_reference_paths.get(target, ()))
-                    for target in target_paths
-                }
             elif records is not None:
-                reference_paths = {}
-                for record in records:
-                    controls = _ordered_control_paths(record)
-                    paired_controls = _paired_control_assets(record)
-                    modes = _reference_modes(record)
-                    if controls or paired_controls:
-                        target_key = record.get("video_path") or record.get("image_path") or record.get("image_path_0")
-                        if target_key is None:
-                            raise ValueError("H3 media JSONL records must contain a target path")
-                        ordinary_assets = tuple(MediaAsset(path, _modality_for_path(path), "reference") for path in controls)
-                        references = (*ordinary_assets, *paired_controls)
-                        unknown_modes = sorted(set(modes) - set(range(len(references))))
-                        if unknown_modes:
-                            raise ValueError(f"control_modality_N has no matching reference indices: {unknown_modes}")
-                        reference_paths[target_key] = tuple(
-                            _select_reference_modality(reference, modes[index], index=index) if index in modes else reference
-                            for index, reference in enumerate(references)
-                        )
+                reference_paths = _record_references(records, target_paths)
             else:
                 reference_paths = {}
 
@@ -555,21 +627,7 @@ class H3DatasetAdapter:
                     raise ValueError(f"MiniMax H3 video datasets must resolve video targets, got {target}")
                 if (image_directory or image_jsonl_file) and modality is not MediaModality.IMAGE:
                     raise ValueError(f"MiniMax H3 image datasets must resolve image targets, got {target}")
-                raw_references = reference_paths.get(target, ())
-                references = tuple(
-                    reference
-                    if isinstance(reference, MediaAsset)
-                    else MediaAsset(reference, _modality_for_path(reference), "reference")
-                    for reference in raw_references
-                )
-                modes = _dataset_reference_modes(source, general, len(references))
-                probabilities = _dataset_reference_probabilities(source, general)
-                if probabilities is not None:
-                    _validate_reference_modality_probabilities(target, references, probabilities)
-                references = tuple(
-                    _select_reference_modality(reference, mode, index=index) if mode is not None else reference
-                    for index, (reference, mode) in enumerate(zip(references, modes))
-                )
+                references, probabilities = _dataset_references(source, general, target, reference_paths.get(target, ()))
                 resolved = _ResolvedTarget(Path(target), references)
                 normal = _normal_path(target)
                 existing = self._targets.get(normal)
