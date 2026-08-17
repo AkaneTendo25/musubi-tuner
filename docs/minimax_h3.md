@@ -18,7 +18,7 @@ Two released transformers, with different conditioning contracts:
 - [Task contracts](#task-contracts)
 - [Model download](#model-download)
 - [Dataset](#dataset)
-  - [Qwen control visuals (experimental)](#qwen-control-visuals-experimental)
+  - [Qwen control visuals](#qwen-control-visuals)
 - [Pre-caching](#pre-caching)
 - [Training](#training)
   - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
@@ -29,6 +29,7 @@ Two released transformers, with different conditioning contracts:
   - [Training modes](#training-modes)
   - [Auxiliary objectives](#auxiliary-objectives)
   - [Validation](#validation)
+  - [Sampling during training](#sampling-during-training)
 - [Inference](#inference)
 - [Training dashboard](#training-dashboard)
 
@@ -40,9 +41,9 @@ Two released transformers, with different conditioning contracts:
 1. Follow the upstream Musubi Tuner [installation instructions](https://github.com/kohya-ss/musubi-tuner#installation), including its Python and PyTorch requirements.
 2. Prepare a TOML dataset using the shared upstream [dataset configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md). The H3-specific task and media requirements are listed in [Task contracts](#task-contracts) and [Dataset](#dataset) below.
 3. Configure Accelerate as described in the upstream [usage guide](https://github.com/kohya-ss/musubi-tuner#configuration-of-accelerate).
-4. Download the H3 checkpoints, run [Pre-caching](#pre-caching), and then start [Training](#training). The [training dashboard](#training-dashboard) provides the same H3 caching, training, validation, sampling, and inference controls.
+4. Download the H3 checkpoints, run [Pre-caching](#pre-caching), and then start [Training](#training). The [training dashboard](#training-dashboard) exposes the same controls.
 
-Common installation, dataset, Accelerate, and environment setup is intentionally not duplicated here. This page documents only the MiniMax H3 files, contracts, and commands that differ from upstream Musubi Tuner.
+This page documents only the MiniMax H3 files, contracts, and commands that differ from upstream Musubi Tuner.
 
 ## Task contracts
 
@@ -66,9 +67,9 @@ Each training objective has a fixed dataset, conditioning-cache, and transformer
 | Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; an audio target may carry references too; add `control_directory`, `control_path`, or numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
 | Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): target image or video; JSONL may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
 
-For observed-modality objectives, the option names the modality supplied as clean **conditioning**, not the prediction target.
-Consequently, `--h3_observed_modality video` defines video-to-audio training. See [Training modes](#training-modes) for the
-corresponding noise and loss contracts.
+For observed-modality objectives, the option names the modality supplied as clean **conditioning**, not the prediction target:
+`--h3_observed_modality video` defines video-to-audio training. See [Training modes](#training-modes) for the corresponding
+noise and loss contracts.
 
 ## Model download
 
@@ -85,6 +86,7 @@ All files come from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/Mini
 | [`vae/minimax_h3_audio_vae_fp32.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_audio_vae_fp32.safetensors) | Audio latents |
 | [`text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors) | Optional pre-quantized conditioner |
 | [`diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors) | Optional pre-quantized transformer |
+| [`diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) | Optional pre-quantized Ref2VA transformer |
 
 ```shell
 hf download Comfy-Org/MiniMax-H3 \
@@ -108,7 +110,8 @@ hf download Comfy-Org/MiniMax-H3 \
 ├── diffusion_models/
 │   ├── minimax_h3_fl2va_bf16.safetensors
 │   ├── minimax_h3_fl2va_pruned_int8_convrot.safetensors  # optional
-│   └── minimax_h3_ref2va_bf16.safetensors                # Ref2VA only
+│   ├── minimax_h3_ref2va_bf16.safetensors                # Ref2VA only
+│   └── minimax_h3_ref2va_pruned_int8_convrot.safetensors # optional, Ref2VA only
 ├── text_encoders/
 │   ├── qwen3vl_32b_minimax_h3_bf16.safetensors
 │   └── qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors      # optional
@@ -117,8 +120,8 @@ hf download Comfy-Org/MiniMax-H3 \
     └── minimax_h3_audio_vae_fp32.safetensors
 ```
 
-The tokenizer and processor metadata ship with the package, so `--tokenizer` is not needed. The loader validates which variant it
-was given and never aliases an FL2VA checkpoint to Ref2VA.
+The tokenizer and processor metadata ship with the package, so `--tokenizer` is not needed. A checkpoint of the wrong variant is
+rejected.
 
 To list a checkpoint's components, shards, tensor and parameter counts without allocating tensor storage:
 
@@ -131,11 +134,11 @@ python minimax_h3_generate_video.py \
 
 ## Dataset
 
-H3 uses Musubi's [shared dataset schema](./dataset_config.md) for video, image, and control fields. A target video's embedded soundtrack is the audio target; a video with
+H3 uses Musubi's [shared dataset schema](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md) for video, image, and control fields. A target video's embedded soundtrack is the audio target; a video with
 no audio stream trains as video-only with its audio loss masked. `control_directory` holds references whose basename matches
 each target: controls for target `X` are `X.<ext>` or `X_<n>.<ext>`. A target whose own name ends in `_<n>` and that has no
-direct match falls back to the shared prefix, but only over controls no other target claims; contested files are an error
-rather than a silent reassignment. Relative `control_path`, `control_path_N`, `control_video_path_N`, and `control_audio_path_N`
+direct match falls back to the shared prefix, but only over controls no other target claims; contested files are an error.
+Relative `control_path`, `control_path_N`, `control_video_path_N`, and `control_audio_path_N`
 values in a JSONL always resolve against that JSONL's directory. To combine separately stored video and audio as one
 synchronized AV reference, use matching directories:
 
@@ -153,12 +156,12 @@ The three directories must contain basename-matched files. Set `control_modality
 `control_modality = "audio"` to retain only reference audio. For multiple references matched through `control_directory`, use an
 ordered `control_modalities = ["video", "audio", "av"]` list. The choice is part of latent and text caching; recache both after
 changing it. An audio-only reference set — a voice clip and a caption, with no image or video reference — is legal for training
-(**experimental**): it is a deliberate deviation from the released inference distribution, where reference audio must accompany
-an image or video, so a LoRA trained this way is exercised off the base model's reference statistics and its outputs need careful
-validation. Inference guards are unchanged: `--reference_audio` still requires `--reference_image` or `--reference_video`.
+(**experimental**): the released inference distribution always pairs reference audio with an image or video, so a LoRA trained
+this way runs off the base model's reference statistics and needs careful validation. Inference guards are unchanged:
+`--reference_audio` still requires `--reference_image` or `--reference_video`.
 
 Both caches record which reference files produced them, so swapping, reordering, or editing a reference rebuilds that item under
-`--skip_existing`. Reference caches written before this identity was recorded are rebuilt once.
+`--skip_existing`.
 
 For modality dropout, replace the static modality setting with probabilities in `[av, video, audio]` order:
 
@@ -175,11 +178,12 @@ a video reference contributes only its soundtrack in that mode and may not have 
 off-distribution caveat above. On a reference set that is already audio-only the `audio` mode is the identity — it selects exactly
 the same references as `av` — so dropout between those two weights has no effect there.
 
-Reference audio is cropped or zero-padded to the canonical sample count of its reference video span (`temporal_shape`), the same
-grid the target audio uses. Reference rows carry no validity mask, so padding added to a short reference track is
+Reference audio is cropped or zero-padded to a canonical sample count (`temporal_shape`): audio paired with a video reference is
+sized to that video's span, while a standalone audio reference is sized to the target's frame count. Reference rows carry no
+validity mask, so padding added to a short reference track is
 indistinguishable from silence to the model; keep reference audio at least as long as its reference video.
 
-### Qwen control visuals (experimental)
+### Qwen control visuals
 
 `qwen_control_directory`, `qwen_control_path`, and `qwen_control_path_N` attach control imagery — pose, depth, edges, sketch —
 shown to the Qwen3-VL conditioner as visual context. Matching follows the `control_directory` rule (`X.<ext>` or `X_<n>.<ext>`);
@@ -205,9 +209,8 @@ target_frames = [33]
 Control spans close the visual prefix — after any keyframes or references, before the caption — continuing the existing
 `<Picture N>` / `<Video N>` numbering. `--h3_text_visual_max_pixels` caps their size; control videos sample at
 `--reference_video_fps` when set, otherwise at 2 fps, with no VAE preparation or soundtrack, within the 32768-token budget.
-Every task accepts them and they compose with real Ref2VA references; under `t2va` the cache records an
-`mmh3_qwen_control_visuals` marker so the text-only check passes. The text cache fingerprints the control files
-(`qwen_control_fingerprint`): any change rebuilds it under `--skip_existing`; latent caches are unaffected. Per-sample control
+Every task accepts them, `t2va` included, and they compose with real Ref2VA references. The text cache fingerprints the control
+files (`qwen_control_fingerprint`): any change rebuilds it under `--skip_existing`; latent caches are unaffected. Per-sample control
 dropout is not implemented — to compare against a control-free baseline, cache a second dataset copy without `qwen_control_*`.
 
 Experimental: the released H3 never saw control imagery in this channel, so verify control adherence against a prompt-only
@@ -250,14 +253,14 @@ the example above is video-only. `audio_directory` takes same-stem `.txt` captio
 An audio target may also declare Ref2VA references, with the same fields a video target uses: `control_directory`,
 `control_video_directory` + `control_audio_directory`, or per-record `control_path_N` / `control_video_path_N` +
 `control_audio_path_N` / `control_modality_N` in the audio JSONL. That trains video-to-audio with an **arbitrary** conditioning
-video (Foley), or audio generation from a reference voice clip plus a visual anchor. Ref2VA still requires at least one image or
-video reference, so a reference audio clip must accompany a visual one. Cache with `--task ref2va` and train with
+video (Foley), or audio generation from a reference voice clip plus a visual anchor. Reference composition follows the rule
+above. Cache with `--task ref2va` and train with
 `--h3_training_mode ref2va`; the packed sequence is `[text | references | target audio]` and no target video rows are emitted.
 Reference video length follows the target's `target_frames`, and the RoPE spatial grid comes from the dataset `resolution` (the
-same geometry an audio-only cache already records). Because the references are visual, `--vae` is then required for latent
+same geometry an audio-only cache already records). With visual references, `--vae` is then required for latent
 caching even though the target has no video. Audio-target caches are named `<stem>_audio<hash>_…`, where the hash covers the absolute source
 path, so an audio file never overwrites a video cache of the same stem and two same-stem audio files from different directories
-stay apart in one `cache_directory`. Audio caches written before this naming are rebuilt once.
+stay apart in one `cache_directory`.
 
 The released processor uses a 768-pixel short edge with a 1344×768 area cap. Other 32-pixel-aligned sizes work but sit outside
 the released canvas distribution.
@@ -279,7 +282,9 @@ python minimax_h3_cache_text_encoder_outputs.py \
   --task t2va --device cuda
 ```
 
-Omit `--audio_vae` for image-only or video-only datasets; omit `--vae` for audio-only datasets without visual references. Add `--cache_guidance_empty` if you plan to
+Omit `--audio_vae` for image-only or video-only datasets whose references carry no audio either; it stays required whenever a
+reference does (paired AV, an audio reference, or `control_audio_directory`). Omit `--vae` for audio-only datasets without
+visual references. Add `--cache_guidance_empty` if you plan to
 use caption dropout or the guidance objective.
 
 `--task` must match how you intend to train: `t2va` (text only), `i2va` (first frame), `fl2va` (first+last), `l2va`
@@ -329,7 +334,7 @@ python minimax_h3_cache_text_encoder_outputs.py \
   --task t2va --device cuda
 ```
 
-All three are precision trade-offs, not equivalents. They reduce GPU residency only: the BF16 checkpoint is still memory-mapped
+They reduce GPU residency only: the BF16 checkpoint is still memory-mapped
 into host address space while weights are converted, so the host RAM requirement is unchanged.
 
 If the conditioner still does not fit, `--h3_text_encoder_blocks_to_stream N` keeps `N` of its 50 frozen language layers in
@@ -339,7 +344,7 @@ trade less transfer overhead for less memory saved. This is opt-in, requires CUD
 
 On a Blackwell GPU with PyTorch 2.10 or newer, `--h3_nvfp4_scaled_mm` additionally quantizes Qwen activations to FP4 and
 uses the hardware W4A4 matrix kernel. It applies only to a native `nvfp4_awq` conditioner and fails early on unsupported
-hardware instead of changing execution silently. Leave it off when conditioning fidelity matters most: the default path
+hardware. Leave it off when conditioning fidelity matters most: the default path
 keeps BF16 activations and uses NVFP4 only for stored weights.
 
 ## Training
@@ -371,8 +376,7 @@ H3 is guidance-distilled, so direct LoRA training can be inefficient or alter it
 strategies address different goals:
 
 1. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base. Add
-   `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with inverse-probability loss scaling. This
-   preserves the expected loss, but rare larger updates are not optimizer-equivalent to applying the dense loss every step.
+   `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with inverse-probability loss scaling.
 2. If a compatible de-distillation training adapter is provided, load it through `--base_weights` while training the concept
    LoRA, then remove it for inference. Adapters are checkpoint-specific: the Ref2VA checkpoint needs its own adapter, not one
    made for FL2VA. One community example is
@@ -380,12 +384,10 @@ strategies address different goals:
    `minimax_h3_ref2va_training_adapter_v1.safetensors` targets the Ref2VA checkpoint.
 
 For concept LoRA training over a de-distillation adapter, sparse preservation can provide an additional anchor, but the two
-objectives are not equivalent: preservation retains the loaded base's predictions, while a de-distillation adapter deliberately
-changes them. The adapter remains loaded only during LoRA training; validate the resulting concept LoRA against stock H3.
+objectives are not equivalent: preservation retains the loaded base's predictions, while a de-distillation adapter changes them.
+The adapter remains loaded only during LoRA training; validate the resulting concept LoRA against stock H3.
 
-The training adapter is an approximation. The community does not have MiniMax's original undistilled teacher, so no adapter can
-reliably reconstruct the ideal undistilled prediction for every prompt, timestep, modality, and concept. Validate short runs and
-check samples again after removing the adapter.
+The training adapter approximates the undistilled model. Validate short runs and check samples again after removing it.
 
 ### Full-parameter BF16 training
 
@@ -442,10 +444,8 @@ conditioning cache plus reference latents, and `--h3_training_mode ref2va`.
 
 ### Saving and resuming
 
-The recommended command above uses `--save_state --autoresume`: every periodic checkpoint gets a resumable `*-state`
-directory, and restarting the same command automatically selects the highest-step complete state matching `--output_name`.
-More generally, add `--save_state` alongside `--save_every_n_steps N` or `--save_every_n_epochs N` to create resumable states.
-Resume by pointing `--resume` at that directory, not at its neighboring `.safetensors` LoRA file:
+Add `--save_state` alongside `--save_every_n_steps N` or `--save_every_n_epochs N` to give every periodic checkpoint a resumable
+`*-state` directory. Resume by pointing `--resume` at that directory, not at its neighboring `.safetensors` LoRA file:
 
 ```shell
 --resume output/h3_style-step00001000-state
@@ -457,8 +457,7 @@ scheduler, and step start at zero. Use `--save_state_on_train_end` if only the f
 rejected instead of silently restarting at step zero. Add `--autoresume` to select the highest-step complete state matching
 `--output_name` in `--output_dir`; an explicit `--resume` path takes priority.
 
-Add `--async_checkpoint_save` to keep periodic saves off the training thread: the loop pauses only long enough to copy the
-LoRA weights to CPU, and hashing plus the file write finish in the background, so the file appears shortly after the step.
+Add `--async_checkpoint_save` to keep periodic saves off the training thread; see [Key options](#key-options).
 
 For an external save trigger, provide one or both request paths:
 
@@ -477,27 +476,27 @@ the model checkpoint. Requests received during gradient accumulation wait for th
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--sdpa`, `--flash_attn`, `--flash3` | `--sdpa` | Attention backend. Each FlashAttention flag needs its package, and `--flash3` needs a Hopper GPU. Both fall back to SDPA on padded batches. |
+| `--sdpa`, `--flash_attn`, `--flash3` | required, `--sdpa` recommended | Attention backend; one of the three must be passed. Each FlashAttention flag needs its package, and `--flash3` needs a Hopper GPU. Both fall back to SDPA on padded batches. |
 | `--h3_attn_auto_dispatch` | off | Prefer cuDNN SDPA for large maskless workloads. Changes rounding; benchmark first. |
 | `--h3_int8_attention {off,aux,train}` | `off` | Experimental native INT8-QK forward with BF16/FP16 P×V and an optimized training backward. `aux` affects only guidance and base-preservation teacher forwards; `train` also affects the trainable forward. Requires CUDA, Triton, and head width 128; masked or padded batches use the selected regular backend. Incompatible with `--compile`. |
-| `--h3_lora_token_refiner` | off | Also place LoRA adapters on the two text token-refiner blocks. This experimental target can strengthen trigger or identity binding, adds eight adapter modules, and otherwise leaves the existing main-block targets unchanged. |
+| `--h3_lora_token_refiner` | off | Also place LoRA adapters on the two text token-refiner blocks. This experimental target can strengthen trigger or identity binding and adds eight adapter modules. |
 | `--compile` | off | Regionally compile all H3 blocks with the selected backend/mode. Compatible with full or partial gradient checkpointing and with block swap; swapped Linear calls stay eager. |
-| `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It is faster but changes BF16 rounding, so it is opt-in. |
+| `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It is faster but changes BF16 rounding. |
 | `--h3_fused_indexed_adaln` | off | Fuse main-block RMSNorm with token-indexed AdaLN shift/scale for a frozen LoRA base. Requires CUDA and Triton; unsupported layouts, trainable norm/AdaLN parameters, and compiled blocks use the regular path. It changes BF16 rounding and is most useful with gradient checkpointing. |
 | `--h3_fused_swiglu` | off | Fuse the SwiGLU activation in main and token-refiner feed-forward layers. Requires CUDA and Triton; unsupported layouts and compiled blocks use the regular path. It changes BF16 rounding, so benchmark and validate it before a long run. |
 | `--h3_swiglu_chunk_rows N` | `0` | Process each main-block feed-forward layer in sequence-row chunks to reduce peak VRAM. Start with `2048`; smaller values may save more memory but add overhead. Incompatible with `--compile`. |
 | `--h3_gradient_checkpointing_cpu_offload_pin_memory` | off | Pin CPU-offloaded checkpoint activations for faster transfers. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and substantial free system RAM. |
 | `--h3_reusable_activation_offload` | off | Reuse pinned CPU checkpoint buffers and prefetch activations in reverse block order. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and sufficient free system RAM. |
-| `--gradient_checkpointing_cpu_offload_dtype` | `none` | Wire dtype of the offloaded activations. `fp8_e4m3` quantizes each large bf16/fp16 activation on the GPU (per-tensor scale) before the D2H copy, halving PCIe traffic and pinned host memory; the recomputation then consumes a lossy activation (e4m3 keeps three mantissa bits, roughly 3% relative resolution), so gradients differ from an exact run (deterministically, but not bit-identically). What the offloader stores is one block-boundary hidden state per checkpointed block, and re-running a block from a slightly perturbed input is well conditioned: measured gradient error stays around 1-2% of the gradient's own magnitude. Payloads under 1 MiB, integer/boolean saves, and fp32 activations pass through unquantized. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload --h3_reusable_activation_offload`. Use it when long Ref2VA sequences make pinned host memory or PCIe bandwidth the bottleneck; keep `none` for exactness-sensitive runs. |
-| `--h3_gradient_checkpointing_blocks N` | all 50 | Checkpoint only the last N main blocks. This explicit speed/VRAM trade-off requires `--gradient_checkpointing` and resident eager blocks. It can be combined with `--compile` (the eager blocks add one extra compiled variant) but not with block swap, whose streamed weights are only safe to reuse at recompute time. Each eager block retains its full activations, which at video sequence lengths costs several GB per block; on 80 GB, video training fits only a few eager blocks. |
-| `--h3_shift_video` / `--h3_shift_audio` | `12.0` / `3.0` | Released per-modality flow shifts. Both derive from one shared coordinate; keep the defaults unless reproducing a measured experiment. |
+| `--gradient_checkpointing_cpu_offload_dtype` | `none` | Wire dtype of the offloaded activations. `fp8_e4m3` quantizes each large bf16/fp16 activation on the GPU (per-tensor scale) before the D2H copy, halving PCIe traffic and pinned host memory. Recomputation then consumes a lossy activation, so gradients differ from an exact run deterministically but not bit-identically. Payloads under 1 MiB, integer/boolean saves, and fp32 activations pass through unquantized. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload --h3_reusable_activation_offload`; keep `none` for exactness-sensitive runs. |
+| `--h3_gradient_checkpointing_blocks N` | all 50 | Checkpoint only the last N main blocks. This explicit speed/VRAM trade-off requires `--gradient_checkpointing` and resident eager blocks. It can be combined with `--compile` (the eager blocks add one extra compiled variant) but not with block swap, whose streamed weights are only safe to reuse at recompute time. Each eager block retains its full activations, which at video sequence lengths costs several GB per block; on 80 GB, video training fits only a few eager blocks. Enabling `--h3_fused_qk_norm_rope`, `--h3_fused_indexed_adaln`, and `--h3_fused_swiglu` roughly halves each eager block's retained activation memory. |
+| `--h3_shift_video` / `--h3_shift_audio` | `12.0` / `3.0` | Released per-modality flow shifts. Both derive from one shared coordinate; keep the defaults. |
 | `--timestep_sampling` | `uniform` | Shape of the shared unshifted schedule. Keep `uniform` unless deliberately testing a different distribution. `sigmoid`, `logsnr`, and `sigma` are experimental alternatives; `shift` with H3's required `--discrete_flow_shift 1` is equivalent to sigmoid sampling. Model-specific dynamic-shift modes are rejected because H3 applies its own video/audio shifts afterward. |
 | `--weighting_scheme` | `none` | Optional loss weighting. H3 bounds `sigma_sqrt` inverse-square weighting so that a near-zero draw cannot dominate a batch-1 optimizer step; `cosmap` is intrinsically bounded. |
 | `--h3_sigma_sqrt_max_weight` | `10` | Maximum per-sample weight used by `sigma_sqrt`. It preserves extra emphasis at low sigma without the generic unbounded spike and has no effect with the default `none` scheme. |
 | `--discrete_flow_shift` | `1.0` | Must stay at the default; H3 applies its own shifts. |
 | `--h3_image_flow_shift` | auto | Fixed shift for image batches only. |
 | `--h3_timestep_focus_probability` | `0` | Optional video/AV curriculum: draw this fraction of the uniform base schedule from `--h3_timestep_focus_min` through `--h3_timestep_focus_max` (defaults `0.4` and `0.8`) while retaining full-range samples. Image batches keep their resolution-aware schedule. Requires `uniform` and cannot be combined with min/max timestep clipping. |
-| `--num_timestep_buckets` | off | Stratifies base timesteps across an epoch to reduce sampling imbalance; it does not change the intended distribution or make a step faster. It is incompatible with `--timestep_sampling sigma`. |
+| `--num_timestep_buckets` | off | Stratifies base timesteps across an epoch to reduce sampling imbalance. Incompatible with `--timestep_sampling sigma`. |
 | `--h3_video_loss_weight` / `--h3_audio_loss_weight` | `1.0` | Modality weights. `--h3_loss_balance token` switches from equal modality means to element weighting. |
 | `--async_checkpoint_save` | off | Hash and write periodic checkpoints on a background thread. The step pauses only for the CPU snapshot, so the `.safetensors` file lands shortly after the step instead of stalling training for the write. Saves stay ordered and never overlap; the final checkpoint and `--save_state` remain synchronous. |
 
@@ -509,17 +508,15 @@ Quantize the frozen base, reduce AdaLN, then swap blocks — in that order.
   --h3_convrot_int8 --h3_convrot_int8_fwd bf16 --h3_adaln_rank 16
 ```
 
-This is the recommended configuration. ConvRot INT8 stores the frozen linear weights at one byte per value,
-`--h3_convrot_int8_fwd bf16` evaluates those weights with BF16 activations, and rank 16 replaces the full AdaLN projections with
-compact factors.
+Recommended configuration.
 
 | Option | Purpose |
 | --- | --- |
 | `--h3_convrot_int8` | Quantize the released BF16 checkpoint to ConvRot INT8 at load. Rejects `--fp8_base` and `--int8_convrot_base`. |
 | `--h3_convrot_int8_fwd bf16` | Recommended. Evaluates the matmul in BF16 without changing stored weights. |
-| `--h3_convrot_int8_bwd int8` | INT8 input-gradient path for GPUs without FP8 support. |
+| `--h3_convrot_int8_bwd int8` | INT8 input-gradient path. Requires Triton; incompatible with `--h3_convrot_int8_fwd bf16`, which leaves no rotated activations. |
 | `--h3_convrot_int8_lora_fused` | Fuse LoRA application into supported ConvRot INT8 linear calls. Requires an INT8 ConvRot base (online or pre-quantized), `--h3_convrot_int8_fwd int8`, `--h3_convrot_int8_bwd int8`, and triton. |
-| `--fp8_base` | Scaled FP8. `--h3_fp8_quantization_mode` selects `block` (default, fastest), `channel`, or `tensor`. |
+| `--fp8_base` | Scaled FP8. `--h3_fp8_quantization_mode` selects `block` (default, finest), `channel`, or `tensor`. |
 | `--int8_convrot_base` | Load the released pre-quantized checkpoint instead of quantizing at load (see below). |
 | `--h3_adaln_rank 16` | Reduce the AdaLN projections, the largest parameter group (13.0B of 33.1B), to ~77M. |
 
@@ -535,11 +532,9 @@ accelerate launch minimax_h3_train_network.py \
 ```
 
 `--h3_convrot_int8_fwd {int8,bf16}`, `--h3_convrot_int8_bwd`, and the fused ConvRot LoRA path also apply to this
-pre-quantized base. Its compact AdaLN projections are already baked into the checkpoint, so do not pass `--h3_adaln_rank`.
+pre-quantized base, whose compact AdaLN projections are already baked in.
 
-Generic LoRAs passed through `--base_weights` are merged while H3 loads. With a pre-quantized ConvRot base, only affected layers
-are dequantized, all requested LoRAs and `--base_weights_multiplier` values are accumulated in FP32, and each layer is
-requantized once. The resulting frozen base is then used for ordinary LoRA training.
+Generic LoRAs passed through `--base_weights` are merged into the frozen base at load, including a pre-quantized ConvRot base.
 
 `--h3_adaln_rank` avoids quantizing the AdaLN projections and composes with either quantization mode. It is rejected on
 already-pruned and INT8 ConvRot checkpoints.
@@ -577,27 +572,25 @@ PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch minimax_h3_train_n
   --output_dir output --output_name h3_style
 ```
 
-If this configuration exceeds available VRAM, raise `--blocks_to_swap` to `50` and use `--block_swap_ring_size 1`; those
-settings trade throughput for lower device residency. `--block_swap_granularity layer` is rejected here because it bypasses the
-ConvRot INT8 forward. Block-swap loading materializes CPU-master copies only for swapped blocks, so
-`--blocks_to_swap` affects both host and device residency. Total training memory also depends on packed sequence length,
-attention workspaces, adapter rank, gradients, and optimizer state.
+If this configuration exceeds available VRAM, keep `--blocks_to_swap 48` — the maximum without layer granularity, which is
+rejected here because it bypasses the ConvRot INT8 forward — and use `--block_swap_ring_size 1`, trading throughput for lower
+device residency. Block-swap loading materializes CPU-master copies only for swapped blocks, so `--blocks_to_swap` affects both
+host and device residency.
 
-Use `--h3_gradient_checkpointing_cpu_offload_pin_memory` only when the host has substantial free RAM. Long Ref2VA sequences can
-require substantial pinned memory in addition to model-loading and dataset memory. When that pinned footprint is the binding
-constraint, `--h3_reusable_activation_offload --gradient_checkpointing_cpu_offload_dtype fp8_e4m3` halves it.
+When pinned host memory is the binding constraint,
+`--h3_reusable_activation_offload --gradient_checkpointing_cpu_offload_dtype fp8_e4m3` halves it.
 
 DataLoader tuning affects cache delivery, not transformer compute. Increase `--max_data_loader_n_workers` only when storage or
 CPU loading leaves the GPU idle; `--persistent_data_loader_workers` avoids restarting those workers each epoch, and
 `--dataloader_prefetch_factor N` controls queued batches per worker. `--dataloader_pin_memory` enables pinned batch buffers and
-non-blocking device copies, but consumes locked host RAM. These options are off/default-controlled unless explicitly set and
-normally do not speed up an H3 run whose cached batches already keep the GPU busy.
+non-blocking device copies, but consumes locked host RAM.
 
 ### Training modes
 
-These modes use target-derived conditioning and therefore use a `t2va` conditioning cache, except where the table below says
+Extension, keyframes, and masking add or pin conditioning rows, so they need a `t2va` cache except where the table below says
 otherwise: masking and `per_row_sigma` extension only pin rows inside the target block, so they also combine with
-`--h3_training_mode ref2va` / `ref2va_omni` and their reference caches. For observed-modality training,
+`--h3_training_mode ref2va` / `ref2va_omni` and their reference caches. Observed-modality training and the two jitters place no
+conditioning rows and work with any cache. For observed-modality training,
 `h3_target_mode = "av"` is required and each target video must contain its synchronized soundtrack — an audio-only dataset has no
 video rows to observe, so `--h3_observed_modality` cannot be used with it. Conditioning an audio target on video is still
 possible through Ref2VA references instead, which supply an arbitrary conditioning video rather than the target's own track; see
@@ -610,7 +603,7 @@ loss weight is forced to zero; this isolates direct supervision, not H3's shared
 | `--h3_extension_video_frames N` / `--h3_extension_audio_latents N` | Continuation from an observed prefix. Counts are in **latent** units and each must be shorter than its target; the two are independent, so setting one leaves the other generated in full. Under Ref2VA only the `per_row_sigma` route is supported |
 | `--h3_extension_probability P` | Train the extension recipe on a synchronized random fraction of steps; the rest train the plain objective. Requires the extension flags. `1` (default) applies it every step |
 | `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary anchors. FL2VA/`t2va` caches only |
-| `--h3_mask_mode {box,border,segment,dataset}` | Inpainting, outpainting, temporal infilling from a procedural mask, or the region the dataset authored. Also available under Ref2VA |
+| `--h3_mask_mode {off,box,border,segment,dataset}` | Inpainting, outpainting, temporal infilling from a procedural mask, or the region the dataset authored. `off` is the default. Also available under Ref2VA |
 | `--h3_mask_probability P` | Train the masked recipe on a synchronized random fraction of steps; the rest train the plain objective. Requires `--h3_mask_mode` or `--h3_mask_audio`. `1` (default) applies it every step |
 | `--h3_frame_sigma_jitter 0.2` | Spreads target-frame noise levels across the schedule in one step. Supported by native T2VA/I2VA/FL2VA/L2VA/Ref2VA caches, including guidance-consistent loss, and skipped for images; cannot be combined with in-target observed-row options or sigma-dependent loss weighting; `0` disables it |
 | `--h3_spatial_density_jitter 0.2` | Perturbs the area normalization of the spatial RoPE grids each step, drawn log-uniformly from `[1/1.2, 1.2]`, so fixed-resolution data still trains a range of token spacings. One factor covers every grid in the packed sequence; `0` disables it |
@@ -619,19 +612,14 @@ loss weight is forced to zero; this isolates direct supervision, not H3's shared
 Extension, keyframes, and masking all claim the observed rows, so **only one may be active on a step**.
 
 **Mixing recipes.** `--h3_mask_probability` and `--h3_extension_probability` turn the choice into one categorical draw per
-optimizer step — shared by every item of the batch, by the guidance and preservation branches, and across distributed ranks — so a
-single run can teach masking, extension and the plain objective. Setting both allows masking and extension in the same run,
-provided the two probabilities sum to at most `1`; the draw selects at most one of them per step and the remainder trains the plain
-objective. Without probabilities the two remain mutually exclusive. Keyframes stay exclusive either way. A step that does not
-select a recipe builds exactly the tensors of a run without those flags: unlike guidance distillation and base preservation, no
-loss is rescaled by its probability, because mixing trains different objectives on different steps rather than a sparse estimate
-of one — the same convention as caption dropout and `--h3_observed_modality random`. Validation keeps measuring one fixed recipe
-(the masked one in a mixed run) so its numbers stay comparable. `h3/recipe_mask_active` and `h3/recipe_extension_active` are
-logged only once a probability below `1` is set.
+optimizer step. The draw is shared by every item of the batch, by the guidance and preservation branches, and across distributed
+ranks. Setting both allows masking and extension in the same run, provided the two probabilities sum to at most `1`; the draw
+selects at most one of them per step and the remainder trains the plain objective. No loss is rescaled by its probability.
+`h3/recipe_mask_active` and `h3/recipe_extension_active` are logged only once a probability below `1` is set.
 
-**Observed modality.** The observed side is pinned to the noise level the release already uses for conditioning of that kind, and
-carries no training signal — its loss weight is forced to zero. Datasets must cache both modalities. `random` redraws the task
-each step; validation still reports the joint objective so its numbers stay comparable.
+**Observed modality.** The observed side is pinned to the noise level the release already uses for conditioning of that kind.
+Datasets must cache both modalities. `random` redraws the task each step; validation then reports `val/joint`, `val/v2a`, and
+`val/a2v` separately.
 
 **Extension.** `--h3_extension_route` chooses the presentation: `condition_rows` (default) duplicates the context as clean rows,
 matching the released keyframe contract but costing sequence length; `per_row_sigma` pins it in place with no extra tokens, at the
@@ -640,13 +628,13 @@ cost of intra-block noise levels the released weights have not seen. The observe
 Ref2VA layout does not have, so pass `--h3_extension_route per_row_sigma`.
 
 **Keyframes.** Entries are `first`, `last`, or a latent frame index. Anchors stay in the loss, matching the released contract.
-`last` is the final *pixel* frame, deliberately not the same anchor as the integer `frames - 1`. Keyframes remain FL2VA-only;
-they add condition rows that only the T2VA packer can place.
+`last` is the final *pixel* frame, not the same anchor as the integer `frames - 1`.
 
-**Masking.** Masks are drawn per step, so the occlusion distribution changes without re-caching. Masks combine with every
-training mode: under Ref2VA the observed rows are pinned inside the target block, the reference rows keep their own conditioning
-noise level, and neither is scored. `--h3_mask_min_fraction` and
-`--h3_mask_max_fraction` bound the masked fraction; `--h3_mask_audio` also hides a run of audio latents. Masks are reduced to the
+**Masking.** Masks are drawn per step, so the occlusion distribution changes without re-caching. Masks combine with `t2va` and
+`ref2va`/`ref2va_omni` caches; `i2va`/`fl2va`/`l2va` caches reject observed rows. Under Ref2VA the observed rows are pinned
+inside the target block, the reference rows keep their own conditioning noise level, and neither is scored.
+`--h3_mask_min_fraction` and `--h3_mask_max_fraction` bound the generated fraction of **each masked axis**, defaulting to `0.25`
+and `0.75`; `--h3_mask_audio` also hides a run of audio latents. Masks are reduced to the
 `(1, 2, 2)` patch grid and a patch counts as generated when any latent inside it is, so at small latent resolutions a wide
 fraction range can leave nothing observed.
 
@@ -659,22 +647,21 @@ maps, mattes, or hand-drawn regions.
 | Field | Behavior |
 | --- | --- |
 | `conditioning_mask_directory` | Directory of mask images matched to targets by basename, exactly one per target |
-| `conditioning_mask_path` | Per-record override in an image or video JSONL, resolved against the JSONL's directory |
+| `conditioning_mask_path` | Per-record alternative in an image or video JSONL, resolved against the JSONL's directory; setting it together with the directory is an error |
 
 Masks are still images (`png`, `jpg`, …), read as luma: pixels above `127` are **observed context**, everything else is the
-region to generate. The same plane applies to every frame — video masks are not supported this round. The mask is resized to the
+region to generate. The same plane applies to every frame; video masks are not supported. The mask is resized to the
 item's bucket resolution with nearest-neighbour sampling and no antialiasing (aspect ratio is not preserved, since a mask is
 authored against its target), then reduced to latent cells: a cell is observed only when every pixel inside it is, which keeps
 the region boundary on the generated side just as the patch reduction does. Masks are applied to the packed rows at train time,
-so they never enter the latent cache and never invalidate it — adding, editing, or removing one needs no re-cache.
+so adding, editing, or removing one needs no re-cache.
 
-Downstream the behavior is identical to a procedural mask: observed rows are pinned clean at the conditioning noise level and
-excluded from the loss, under `t2va`, `ref2va` and `ref2va_omni` alike, and `--h3_mask_probability` mixes it with the plain
-objective per step as usual. `--h3_mask_min_fraction` / `--h3_mask_max_fraction` do not apply — the region is authored, not
-drawn — but a mask that reduces to all-observed or all-generated is warned about once, naming the item. `--h3_mask_audio` stays
-procedural: dataset masks are video-only, and declaring one on an audio dataset is an error. Because the observed rows are shared
-by the whole batch, a batch whose items carry different masks is rejected; use `batch_size = 1` for such datasets. A config that
-declares masks under a procedural mode, or selects `dataset` without them, is rejected when the dataset config is parsed.
+Downstream the behavior is identical to a procedural mask, with four differences. `--h3_mask_min_fraction` /
+`--h3_mask_max_fraction` do not apply. A mask that reduces to all-observed or all-generated is warned about once, naming the
+item. `--h3_mask_audio` stays procedural: dataset masks are video-only, and declaring one on an audio dataset is an error. The
+observed rows are shared by the whole batch, so a batch whose items carry different masks is rejected; use `batch_size = 1`. A
+config that declares masks under a procedural mode, or selects `dataset` without them, is rejected when the dataset config is
+parsed.
 
 ```toml
 [[datasets]]
@@ -714,7 +701,7 @@ accelerate launch minimax_h3_train_network.py ... \
 | Field | Default | Meaning |
 | --- | ---: | --- |
 | `mode` | `backbone` | `backbone` uses a later H3 block as teacher; `dino` uses cached DINOv2 features. |
-| `student_block` / `teacher_block` | `16` / `33` | Zero-based blocks; student must precede teacher, teacher below 50. |
+| `student_block` / `teacher_block` | `16` / `33` | Zero-based blocks; in `backbone` mode the student must precede the teacher, and both must be below the transformer's block count, checked when CREPA is installed. |
 | `dino_model` | `dinov2_vitb14` | `dinov2_vits14`, `dinov2_vitb14`, `dinov2_vitl14`, or `dinov2_vitg14`. Must match the cache. |
 | `weight` | `0.05` | Multiplier on the alignment objective. |
 | `tau` | `1.0` | Temporal distance temperature; offset `d` is weighted `exp(-|d| / tau)`. |
@@ -749,18 +736,22 @@ accelerate launch minimax_h3_train_network.py ... \
   --max_validation_items 8
 ```
 
-The validation TOML uses the same format and prebuilt caches as training, with `batch_size = 1`. Evaluation is deterministic —
-each index and bin draws stable noise from `--validation_seed`, defaulting to the training seed — and restores RNG state, so
-enabling it does not change training randomness.
+The validation TOML uses the same format and prebuilt caches as training, with `batch_size = 1`. Evaluation is deterministic:
+each index and bin draws stable noise from `--validation_seed`, which defaults to the training seed. RNG state is restored
+afterwards, so enabling validation does not change training randomness. Validation measures one fixed recipe — the masked one in
+a run that mixes masking and extension — so successive numbers stay comparable.
 
 Bins are equal-width midpoints between `--validation_min_timestep` and `--validation_max_timestep` in the shared *unshifted*
 coordinate; video and audio then receive their own shifts, and image batches use the same `--h3_image_flow_shift` or automatic
-image shift as image training. TensorBoard receives `val/loss`, `val/loss/video`, `val/loss/audio`, and `val/loss/bin_NN`. CREPA and base-preservation are excluded, since they are regularizers rather than
-held-out reconstruction quality.
+image shift as image training. TensorBoard receives `val/loss`, `val/loss/video`, `val/loss/audio`, and `val/loss/bin_NN`. CREPA
+and base-preservation are excluded. Guidance distillation is applied during validation whenever
+`--h3_guidance_distillation_scale` is set, so the cached empty-text conditioning must be present. With `--weighting_scheme`
+active, sample weights fold into both the numerator and the denominator; `val/loss` pools those sums across bins with the
+modality balance weights, while `val/loss/video` and `val/loss/audio` are plain means that ignore them.
 
 When generated or reference modalities are randomized during training, validation evaluates every enabled task deterministically
 and prefixes metrics with `joint`, `v2a`, `a2v`, and, when applicable, `ref_av`, `ref_video`, or `ref_audio`. This adds validation
-forwards only for the extra tasks; ordinary fixed-task validation keeps its original cost.
+forwards only for the extra tasks.
 
 ### Sampling during training
 
@@ -802,11 +793,14 @@ python minimax_h3_generate_video.py \
 | `--reference_image_size_mode` | Ref2VA image sizing: `short_edge` keeps the released behavior; `target_area` preserves aspect ratio and uses approximately the target output area. |
 | `--reference_image_short_edge` | Reference-image short edge in `short_edge` mode (default 2048). |
 | `--reference_image_max_pixels` | Optional pixel-area cap in `target_area` mode; `0` uses the target output area. |
-| `--reference_video_short_edge` | Reference-video short edge (default 768, minimum 32). Lower values reduce Ref2VA reference rows, speed cost, and VRAM. Use the same value for latent caching, text caching, training, and inference. |
-| `--reference_video_max_pixels` | Maximum pixels per reference-video frame after aspect-preserving resize (default 768×1344, minimum 1024). The cap is enforced on the final 32-aligned dimensions, so extreme aspect ratios are downscaled rather than rounded back over it. Use the same value at every stage. |
-| `--reference_video_fps` | Caching and training only (no inference flag yet). Subsample every reference video to this many frames per **source** second so the whole clip conditions the model instead of only its opening span. `0` (default) keeps the released behavior of truncating the reference to the target's frame count, bit for bit. Frame `k` is source frame `round(k × source_fps / F)` (half up, deterministic), and the result is snapped to the nearest legal reference length (`1` or `17n+5`) that still fits the target's frame budget, padding with the final frame when it lands short. A reference video's paired soundtrack cannot be subsampled without pitch artifacts, so the asymmetry is deliberate: the subsampled reference video spans the whole clip, while its paired soundtrack still covers the clip's opening span. Changing the value changes the reference latents, so it enters the cache identity: pass the same value to `minimax_h3_cache_latents`, `minimax_h3_cache_text_encoder_outputs`, and training, and re-cache both stages when it changes. |
+| `--reference_video_short_edge` | Reference-video short edge (default 768, minimum 32). Lower values reduce Ref2VA reference rows, speed cost, and VRAM. |
+| `--reference_video_max_pixels` | Maximum pixels per reference-video frame after aspect-preserving resize (default 768×1344, minimum 1024). The cap is enforced on the final 32-aligned dimensions, so extreme aspect ratios are downscaled rather than rounded back over it. |
+| `--reference_video_fps` | Caching and training only; no inference flag. Subsample every reference video to this many frames per **source** second so the whole clip conditions the model instead of only its opening span. `0` (default) truncates the reference to the target's frame count. Frame `k` is source frame `round(k × source_fps / F)`, and the result is snapped to the nearest legal reference length (`1` or `17n+5`) that still fits the target's frame budget, truncating or padding with the final frame to reach it. The subsampled reference video spans the whole clip while its paired soundtrack still covers only the clip's opening span. |
 | `--lora_weight` / `--lora_multiplier` | Attach saved adapters. |
 | `--steps` | Sigma grid points including terminal zero, so `20` runs 19 evaluations. |
+
+The `--reference_video_*` values enter the cache identity: pass the same value to `minimax_h3_cache_latents`,
+`minimax_h3_cache_text_encoder_outputs`, training, and inference, and re-cache both stages when one changes.
 
 For a conditioned still image, select `--h3_image_mode first` with `--first_frame`, or `first_last` with both endpoint
 images, and use an image extension for `--output`. The default 5-frame grid is decoded through the video VAE and
@@ -820,9 +814,9 @@ The released weights are CFG-distilled: inference runs one evaluation per step w
 ## Training dashboard
 
 > [!WARNING]
-> The dashboard is a proof of concept and is not guaranteed to be maintained. Review every generated command before starting a long or expensive job. The original dashboard was created by [@Ada123-a](https://github.com/Ada123-a) in [PR #112](https://github.com/AkaneTendo25/musubi-tuner/pull/112).
+> The dashboard is a proof of concept and is not guaranteed to be maintained. Review every generated command before starting a long or expensive job. Dashboard contributed by [@Ada123-a](https://github.com/Ada123-a) in [PR #112](https://github.com/AkaneTendo25/musubi-tuner/pull/112).
 
-The H3 web dashboard creates project configurations, runs H3 caching, training, and inference commands, shows live process output and training metrics, previews samples, and stops training gracefully.
+The dashboard generates and runs H3 caching, training, and inference commands, and shows live output, metrics, and samples.
 
 Install the dashboard Python dependencies. Release checkouts include the prebuilt frontend, so users do not need Node.js or npm:
 
@@ -830,15 +824,16 @@ Install the dashboard Python dependencies. Release checkouts include the prebuil
 pip install -e ".[dashboard]"
 ```
 
-Start it from the repository root and open <http://127.0.0.1:7860>:
+Start it from the repository root and open <http://127.0.0.1:7860>. `--host` defaults to `0.0.0.0`, so pass `--host 127.0.0.1`
+explicitly to keep it local:
 
 ```bash
 python -m musubi_tuner.gui_dashboard --host 127.0.0.1 --port 7860
 ```
 
-On Windows, run `launch_musubi_dashboard.bat`. Create or load an H3 project, fill in the DiT, video/audio VAE, Qwen3-VL encoder, tokenizer, and dataset paths, review the generated commands, then cache and train. **Stop** requests a graceful shutdown so a state checkpoint can be written; keep `--save_state --autoresume` enabled to resume from the latest complete matching state.
+On Windows, run `launch_musubi_dashboard.bat`, which passes `--host 127.0.0.1`. Create or load an H3 project, fill in the DiT, video/audio VAE, Qwen3-VL encoder, tokenizer, and dataset paths, review the generated commands, then cache and train. **Stop** requests a graceful shutdown so a state checkpoint can be written; keep `--save_state --autoresume` enabled to resume from the latest complete matching state.
 
 > [!WARNING]
 > The dashboard can launch arbitrary training processes with the permissions of its user. Do not bind it to a public interface unless access is protected. For remote use, keep `--host 127.0.0.1` and use an SSH tunnel.
 
-Frontend developers can rebuild the bundled assets with `npm ci && npm run build` in `src/musubi_tuner/gui_dashboard/frontend`. Node.js is only a development dependency.
+Frontend developers can rebuild the bundled assets with `npm ci && npm run build` in `src/musubi_tuner/gui_dashboard/frontend`.

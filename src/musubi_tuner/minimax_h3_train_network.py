@@ -2774,8 +2774,9 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_convrot_int8_lora_fused",
         action="store_true",
         help=(
-            "fuse the LoRA-up projection into the ConvRot INT8 dequantization epilogue; requires online ConvRot "
-            "with INT8 forward and backward, and automatically falls back for LoRA dropout or split dimensions"
+            "fuse the LoRA-up projection into the ConvRot INT8 dequantization epilogue; requires online or "
+            "pre-quantized ConvRot INT8 weights with INT8 forward and backward, and automatically falls back for "
+            "LoRA dropout or split dimensions"
         ),
     )
     parser.add_argument(
