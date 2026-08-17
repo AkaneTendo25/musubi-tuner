@@ -99,6 +99,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
     - [Low Main-RAM Training](#low-main-ram-training)
       - [Reducing the Main-RAM Cost of Block Swap](#reducing-the-main-ram-cost-of-block-swap)
+        - [Skipping CPU Staging Without Streamed Placement](#skipping-cpu-staging-without-streamed-placement)
     - [NF4 Quantization](#nf4-quantization)
     - [NVFP4 (FP4 E2M1) Checkpoints](#nvfp4-fp4-e2m1-checkpoints)
     - [int8 Base (Optimum-Quanto)](#int8-base-optimum-quanto)
@@ -1938,6 +1939,15 @@ Notes:
 - Rejected together with `--loftq_init`, AWQ calibration, `--blockwise_checkpointing` and `--gradient_checkpointing_cpu_offload`, which all move state back through main RAM.
 - Works with `--block_swap_h2d_only`, whose offloaded blocks are chosen differently from classic block swap.
 - The option changes only where weights are written during loading, not what is computed.
+- Available in `ltx2_train.py` as well as `ltx2_train_network.py`. In full fine-tuning it is rejected together with model parallel, remote-stage block pruning, `--qgalore_load_device cpu` and `--int8_weights`, which all stage the transformer on CPU.
+
+##### Skipping CPU Staging Without Streamed Placement
+
+`--ltx2_gpu_load` (`ltx2_train.py` only) is the blunt alternative for cases `--ltx2_low_ram_load` rejects, such as a quantized base or `--gradient_checkpointing_cpu_offload`. With `--blocks_to_swap` set it loads the transformer straight onto the GPU instead of staging it in main RAM, which shortens startup.
+
+The trade is the opposite one: the whole model is materialized on the GPU before block swap moves the swapped blocks back to CPU, so the load-time VRAM peak is the full checkpoint rather than the resident set. Use it only when that peak fits. A warning is printed when the checkpoint is larger than the free VRAM, and a load that runs out of memory falls back to the ordinary CPU staging path instead of failing.
+
+If both options are given, `--ltx2_low_ram_load` wins, because streamed placement reaches the same layout without the peak.
 
 ### NF4 Quantization
 <sub>[↑ contents](#table-of-contents)</sub>
