@@ -2223,6 +2223,18 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         ),
     )
     parser.add_argument(
+        "--ltx2_gpu_load",
+        action="store_true",
+        default=None,
+        help=(
+            "Load the transformer directly onto the GPU even when --blocks_to_swap is set, skipping the "
+            "CPU-staging round trip. The whole model is materialized on the GPU before block swap evicts "
+            "the swapped blocks, so the load-time peak is the full checkpoint, not the resident set; only "
+            "use it when that peak fits. Falls back to CPU loading if the GPU load runs out of memory. "
+            "--ltx2_low_ram_load is the better path when its loader supports the base."
+        ),
+    )
+    parser.add_argument(
         "--adafactor_triton",
         action="store_true",
         help=(
@@ -3250,6 +3262,37 @@ def _run_noise_scale_probe_ft(trainer, args, accelerator, transformer, noise_sch
         accelerator.print("[noise-scale/FT] RESULT: no finite estimate (raise K / check setup).")
 
 
+def _warn_if_gpu_load_peak_exceeds_free_vram(checkpoint_path: Any, device: torch.device) -> None:
+    """Warn when --ltx2_gpu_load is unlikely to fit before block swap evicts the swapped blocks.
+
+    The checkpoint size is an upper bound on the load-time peak: a unified LTX checkpoint also
+    carries VAE/vocoder weights that the transformer load discards. It is therefore only used to
+    warn; the actual out-of-memory case is handled by falling back to CPU loading.
+    """
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        return
+    paths = checkpoint_path if isinstance(checkpoint_path, (list, tuple)) else [checkpoint_path]
+    total_bytes = 0
+    for path in paths:
+        try:
+            total_bytes += os.path.getsize(path)
+        except OSError:
+            return
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    except Exception:
+        return
+    if total_bytes > free_bytes * 0.9:
+        logger.warning(
+            "--ltx2_gpu_load materializes the whole transformer on %s before block swap evicts the swapped "
+            "blocks. The checkpoint is %.1f GiB and only %.1f GiB is free, so the load may run out of memory "
+            "and fall back to CPU loading. Drop the flag, or use --ltx2_low_ram_load instead.",
+            device,
+            total_bytes / 1024**3,
+            free_bytes / 1024**3,
+        )
+
+
 def main() -> None:
     parser = setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -3825,18 +3868,18 @@ def main() -> None:
     # on high-VRAM cards the CPU-staging round trip costs more wall-clock time than the peak-VRAM
     # it saves. The remaining conditions are explicit opt-ins or memory-bounded features that
     # require CPU loading regardless.
+    force_cpu_load = ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load or int8_weights_cpu_load
     gpu_load = bool(getattr(args, "ltx2_gpu_load", False))
+    if gpu_load and force_cpu_load:
+        logger.warning(
+            "--ltx2_gpu_load is ignored: model parallel, remote-stage block pruning, --qgalore_load_device cpu, "
+            "and --int8_weights all require staging the transformer on CPU."
+        )
+        gpu_load = False
     if gpu_load and blocks_to_swap > 0:
         logger.info("--ltx2_gpu_load: loading transformer directly onto %s despite --blocks_to_swap", accelerator.device)
-    loading_device = (
-        "cpu"
-        if (blocks_to_swap > 0 and not gpu_load)
-        or ltx2_model_parallel
-        or remote_prune_local_blocks
-        or qgalore_cpu_load
-        or int8_weights_cpu_load
-        else accelerator.device
-    )
+        _warn_if_gpu_load_peak_exceeds_free_vram(args.ltx2_checkpoint, accelerator.device)
+    loading_device = "cpu" if (blocks_to_swap > 0 and not gpu_load) or force_cpu_load else accelerator.device
     if qgalore_cpu_load:
         logger.info("Q-GaLore CPU load enabled: load/replace/quantize transformer on CPU before moving to %s", accelerator.device)
 
@@ -3853,15 +3896,31 @@ def main() -> None:
     else:
         attn_mode = "torch"
 
-    transformer = trainer.load_transformer(
-        accelerator=accelerator,
-        args=args,
-        dit_path=args.ltx2_checkpoint,
-        attn_mode=attn_mode,
-        split_attn=bool(getattr(args, "split_attn", False)),
-        loading_device=loading_device,
-        dit_weight_dtype=None,
-    )
+    def _load_transformer(device_for_load):
+        return trainer.load_transformer(
+            accelerator=accelerator,
+            args=args,
+            dit_path=args.ltx2_checkpoint,
+            attn_mode=attn_mode,
+            split_attn=bool(getattr(args, "split_attn", False)),
+            loading_device=device_for_load,
+            dit_weight_dtype=None,
+        )
+
+    try:
+        transformer = _load_transformer(loading_device)
+    except torch.cuda.OutOfMemoryError:
+        if not gpu_load or loading_device == "cpu":
+            raise
+        # The whole checkpoint did not fit on the GPU before block swap could evict the swapped
+        # blocks. Discard the partial load and retry through the default CPU staging path.
+        import gc
+
+        logger.warning("--ltx2_gpu_load ran out of memory on %s; retrying with the default CPU staging path.", accelerator.device)
+        gc.collect()
+        torch.cuda.empty_cache()
+        loading_device = "cpu"
+        transformer = _load_transformer(loading_device)
 
     transformer.train()
     if getattr(args, "int8_base", False) or getattr(args, "int8_base_dynamic", False):
