@@ -576,6 +576,40 @@ def test_h3_reference_modality_probabilities_reject_unsatisfiable_variants(tmp_p
     assert item.h3_reference_modality_probabilities == (0.5, 0.5, 0.0)
 
 
+def test_h3_reference_modality_probabilities_accept_an_audio_only_reference_set(tmp_path):
+    targets = tmp_path / "targets"
+    controls = tmp_path / "controls"
+    for directory in (targets, controls):
+        directory.mkdir()
+    (targets / "scene.mp4").write_bytes(b"target")
+    (controls / "scene.wav").write_bytes(b"voice")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_directory": str(targets),
+                "control_directory": str(controls),
+                # av keeps the audio reference, and so does the audio variant:
+                # both are satisfiable without any visual reference.
+                "control_modality_probabilities": [0.5, 0.0, 0.5],
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(targets / "scene.mp4"), "prompt", (512, 512), (512, 512), frame_count=22)
+    adapter.attach(item)
+
+    assert item.h3_reference_modality_probabilities == (0.5, 0.0, 0.5)
+
+    # The video variant still needs a visual survivor.
+    config["datasets"][0]["control_modality_probabilities"] = [0.5, 0.25, 0.25]
+    with pytest.raises(ValueError, match="video variant probability 0.25"):
+        create_h3_dataset_group(config, Namespace(debug_dataset=False))
+
+
 def test_h3_image_target_keeps_basename_matched_ref2va_reference(tmp_path):
     images = tmp_path / "images"
     controls = tmp_path / "controls"
@@ -1105,6 +1139,37 @@ def test_reference_modality_variants_keep_text_and_latent_geometry_aligned():
     assert [reference.kind for reference in video_only] == [0, 1]
     assert all(reference.waveform is None for reference in video_only)
     assert [reference.kind for reference in audio_only] == [0, 2, 2]
+
+
+def test_h3_audio_only_reference_set_is_legal_for_training(monkeypatch):
+    # Voice cloning from a reference clip needs no dummy visual. The released
+    # inference contract still demands one, so this is a training-only recipe.
+    voice = MediaAsset(Path("voice.wav"), MediaModality.AUDIO, "reference")
+    item = SimpleNamespace(h3_media_assets=(voice,), frame_count=22)
+    monkeypatch.setattr(h3_references, "_prepare_audio", lambda _asset, frames: torch.zeros(2, frames * 10))
+
+    assert h3_references.reference_assets(item) == (voice,)
+
+    (reference,) = h3_references.prepare_references(item)
+
+    assert reference.kind is H3ReferenceKind.AUDIO
+    assert reference.has_audio
+    assert reference.image is None and reference.frames is None
+
+
+def test_h3_reference_modality_variants_accept_audio_only_survivors_but_not_empty_ones():
+    audio = H3PreparedReference(kind=H3ReferenceKind.AUDIO, waveform=torch.zeros(2, 100))
+
+    # On an audio-only set the audio variant is the identity, i.e. the av set.
+    assert reference_modality_variant((audio,), "audio") == (audio,)
+    assert reference_modality_variant((audio,), "av") == (audio,)
+
+    with pytest.raises(ValueError, match="video-reference variant keeps no reference"):
+        reference_modality_variant((audio,), "video")
+
+    silent = H3PreparedReference(kind=H3ReferenceKind.VIDEO, frames=np.zeros((5, 8, 8, 3), dtype=np.uint8))
+    with pytest.raises(ValueError, match="audio-reference variant keeps no reference"):
+        reference_modality_variant((silent,), "audio")
 
 
 def test_h3_image_dataset_uses_existing_musubi_fields_and_needs_no_audio_vae(tmp_path):
@@ -1724,6 +1789,20 @@ def test_reference_fingerprint_tracks_file_identity_kind_and_order(tmp_path):
     target = MediaAsset(first, MediaModality.IMAGE, "target")
     assert h3_references.reference_fingerprint((target,)) is None
     assert h3_references.reference_fingerprint((target, *assets)) == h3_references.reference_fingerprint(assets)
+
+
+def test_reference_fingerprint_round_trips_an_audio_only_reference_set(tmp_path):
+    voice = tmp_path / "voice.wav"
+    voice.write_bytes(b"voice")
+    assets = _reference_item([voice], [MediaModality.AUDIO]).h3_media_assets
+
+    baseline = h3_references.reference_fingerprint(assets)
+    assert len(baseline) == 64
+    assert h3_references.reference_fingerprint(_reference_item([voice], [MediaModality.AUDIO]).h3_media_assets) == baseline
+    assert baseline != h3_references.reference_fingerprint(_reference_item([voice], [MediaModality.IMAGE]).h3_media_assets)
+
+    voice.write_bytes(b"another take")
+    assert h3_references.reference_fingerprint(assets) != baseline
 
 
 def test_reference_fingerprint_tracks_paired_reference_soundtracks(tmp_path):
@@ -3195,6 +3274,33 @@ def test_h3_ref2va_packs_an_audio_only_target_behind_its_reference_prefix():
     # three audio latents (+3) past the text origin of four rows.
     target_audio = layout.position_ids[14:, 0]
     torch.testing.assert_close(target_audio, torch.tensor([8.0, 9.0, 8.0, 9.0], dtype=torch.float64))
+
+
+def test_h3_ref2va_packs_an_audio_only_reference_prefix():
+    # A voice-cloning sample carries no visual reference at all: the prefix is
+    # audio rows only, and the target keeps its ordinary video block.
+    layout = build_ref2va_packed_sequence(
+        torch.ones(3, dtype=torch.long),
+        (MiniMaxH3ReferenceGeometry(kind=2, num_audio_latents=2),),
+        num_latent_frames=1,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=2,
+        patch_size=(1, 2, 2),
+    )
+
+    assert layout.num_condition_video_rows == 0
+    assert layout.num_condition_audio_rows == 4
+    assert layout.sequence_length == 3 + 4 + 4 + 4
+    assert torch.equal(layout.video_indices, torch.arange(11, 15))
+    assert torch.equal(layout.audio_indices, torch.arange(3, 11))
+    assert int(layout.token_tags[3:11].unique()) == int(MiniMaxH3TokenTag.AUDIO)
+    assert int(layout.token_tags[11:].unique()) == int(MiniMaxH3TokenTag.VIDEO)
+    # The reference audio opens at the text origin and the target timeline
+    # resumes two audio latents later.
+    torch.testing.assert_close(layout.position_ids[3:7, 0], torch.tensor([3.0, 4.0, 3.0, 4.0], dtype=torch.float64))
+    torch.testing.assert_close(layout.position_ids[7:11, 0], torch.tensor([5.0, 6.0, 5.0, 6.0], dtype=torch.float64))
+    assert set(layout.position_ids[11:, 0].tolist()) == {5.0}
 
 
 def test_h3_temporal_position_grid_is_empty_without_video_frames():

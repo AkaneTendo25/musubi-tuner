@@ -94,8 +94,10 @@ def reference_assets(item: Any) -> tuple[MediaAsset, ...]:
             raise ValueError(f"MiniMax H3 accepts at most {limits[kind]} {kind.name.lower()} references, got {count}")
     if len(assets) > MAX_REFERENCES:
         raise ValueError(f"MiniMax H3 accepts at most {MAX_REFERENCES} references, got {len(assets)}")
-    if assets and all(asset.modality is MediaModality.AUDIO for asset in assets):
-        raise ValueError("MiniMax H3 audio references require at least one image or video reference")
+    # An audio-only reference set is legal for TRAINING. The released inference
+    # contract still requires a visual reference (request.py keeps that guard),
+    # so a run built this way is off-distribution by construction; the packer,
+    # the Qwen presentation and the cache all handle kind=2-only sets natively.
     return assets
 
 
@@ -488,12 +490,22 @@ def prepare_references(
             if waveform is None:
                 raise ValueError(f"H3 audio reference produced no waveform: {asset.path}")
             prepared.append(H3PreparedReference(kind=kind, waveform=waveform))
-    if prepared and not any(reference.kind is not H3ReferenceKind.AUDIO for reference in prepared):
-        raise ValueError("MiniMax H3 audio references require at least one image or video reference")
+    # No visual-composition guard: see ``reference_assets``. An audio-only set
+    # presents to Qwen as text alone (reference audio is never shown to it) and
+    # packs as a kind=2-only reference prefix.
     return tuple(prepared)
 
 
 def reference_modality_variant(references: tuple[H3PreparedReference, ...], modality: str) -> tuple[H3PreparedReference, ...]:
+    """Project a reference set onto one drawn modality.
+
+    ``video`` keeps images and silent video, so it needs a visual reference to
+    survive. ``audio`` keeps images, audio references and the soundtrack of any
+    sound-bearing video, so an audio-only set survives it unchanged -- the
+    variant is then the identity, exactly the ``av`` set. The only requirement
+    is that something survives: a variant that keeps no reference at all would
+    silently turn a Ref2VA sample into a T2VA one.
+    """
     if modality == "av":
         return references
     selected: list[H3PreparedReference] = []
@@ -514,6 +526,6 @@ def reference_modality_variant(references: tuple[H3PreparedReference, ...], moda
             selected.append(reference)
         elif reference.waveform is not None:
             selected.append(H3PreparedReference(kind=H3ReferenceKind.AUDIO, waveform=reference.waveform))
-    if not any(reference.kind is not H3ReferenceKind.AUDIO for reference in selected):
-        raise ValueError(f"H3 stochastic {modality}-reference variant requires at least one visual reference")
+    if not selected:
+        raise ValueError(f"H3 stochastic {modality}-reference variant keeps no reference")
     return tuple(selected)

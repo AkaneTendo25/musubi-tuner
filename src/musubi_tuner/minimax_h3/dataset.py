@@ -339,17 +339,20 @@ def _validate_reference_modality_probabilities(
 
     ``reference_modality_variant`` keeps image references in every variant, keeps video references
     (audio stripped) in the ``video`` variant, and turns video references into audio rows in the
-    ``audio`` variant. Each variant must retain one non-audio reference, so ``video`` needs an image
-    or video reference and ``audio`` needs an image reference.
+    ``audio`` variant. Each variant must retain at least one reference -- audio-only survivors are
+    legal for training -- so ``video`` needs an image or video reference, while ``audio`` needs an
+    image or an audio reference. A video reference may or may not carry a soundtrack, which is not
+    knowable from the config, so it does not count towards the ``audio`` variant here.
     """
     if not references:
         raise ValueError("control_modality_probabilities requires at least one reference")
     has_image = any(reference.modality is MediaModality.IMAGE for reference in references)
     has_visual = has_image or any(reference.modality is MediaModality.VIDEO for reference in references)
+    has_audio = any(reference.modality is MediaModality.AUDIO for reference in references)
     requirements = (
-        ("av", probabilities[0], has_visual, "an image or video reference"),
+        ("av", probabilities[0], True, "at least one reference"),
         ("video", probabilities[1], has_visual, "an image or video reference"),
-        ("audio", probabilities[2], has_image, "an image reference"),
+        ("audio", probabilities[2], has_image or has_audio, "an image or audio reference"),
     )
     for name, probability, satisfied, requirement in requirements:
         if probability > 0 and not satisfied:

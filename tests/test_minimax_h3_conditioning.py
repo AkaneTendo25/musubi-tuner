@@ -390,6 +390,23 @@ def test_t2va_qwen_controls_add_vision_spans_and_a_cache_marker(monkeypatch):
     assert int(cached[H3_QWEN_CONTROL_VISUALS_KEY]) == 1
 
 
+def test_ref2va_audio_only_references_produce_a_text_only_presentation(monkeypatch):
+    # Reference audio never reaches the vision tower, so an audio-only reference
+    # set presents to Qwen as labelled text alone -- no vision spans at all.
+    processor = _RefProcessor()
+    encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "ref2va")
+    references = (H3PreparedReference(kind=H3ReferenceKind.AUDIO, waveform=torch.zeros(2, 100)),)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_references", lambda *_a, **_k: references)
+    item = SimpleNamespace(caption="one", content=np.zeros((5, 4, 4, 3), dtype=np.uint8))
+
+    cached = encoder.encode_conditioning([item])[0]
+
+    assert processor.tokenizer.calls == ["<Audio 1>: ", "one"]
+    tags = cached[f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64"]
+    assert tags.tolist() == [1, 1, 1]
+    assert cached[f"varlen_{H3_TEXT_HIDDEN_KEY}_bfloat16"].shape == (3, 5120)
+
+
 def test_qwen_controls_compose_with_ref2va_references_and_continue_the_numbering(monkeypatch):
     processor = _RefProcessor()
     encoder = MiniMaxH3ConditioningEncoder(processor, _TextModel(), torch.bfloat16, "ref2va")

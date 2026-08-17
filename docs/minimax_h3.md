@@ -152,7 +152,10 @@ target_frames = [33]
 The three directories must contain basename-matched files. Set `control_modality = "video"` to omit reference soundtracks or
 `control_modality = "audio"` to retain only reference audio. For multiple references matched through `control_directory`, use an
 ordered `control_modalities = ["video", "audio", "av"]` list. The choice is part of latent and text caching; recache both after
-changing it. Ref2VA requires at least one visual reference, so an audio-only entry must accompany an image or video reference.
+changing it. An audio-only reference set — a voice clip and a caption, with no image or video reference — is legal for training
+(**experimental**): it is a deliberate deviation from the released inference distribution, where reference audio must accompany
+an image or video, so a LoRA trained this way is exercised off the base model's reference statistics and its outputs need careful
+validation. Inference guards are unchanged: `--reference_audio` still requires `--reference_image` or `--reference_video`.
 
 Both caches record which reference files produced them, so swapping, reordering, or editing a reference rebuilds that item under
 `--skip_existing`. Reference caches written before this identity was recorded are rebuilt once.
@@ -166,9 +169,11 @@ control_modality_probabilities = [0.5, 0.25, 0.25]
 The text cache stores every enabled presentation and training draws one mode per item. The same draw is reused by the trainable,
 guidance, and preservation forwards. Video-only removes reference soundtracks; audio-only retains image references as visual
 anchors and uses the audio from paired AV references. Recache text outputs after changing the probabilities. Latent caches do not
-need to be rebuilt. Every enabled mode must leave at least one image or video reference, as required by the released Ref2VA
-model, and this is checked when the dataset config is parsed: a nonzero `video` weight needs an image or video reference, and a
-nonzero `audio` weight needs an image reference, since video references become audio in that mode.
+need to be rebuilt. Every enabled mode must leave at least one reference of some kind, checked when the dataset config is parsed:
+a nonzero `video` weight needs an image or video reference, and a nonzero `audio` weight needs an image or audio reference, since
+a video reference contributes only its soundtrack in that mode and may not have one. Audio-only survivors are permitted, with the
+off-distribution caveat above. On a reference set that is already audio-only the `audio` mode is the identity — it selects exactly
+the same references as `av` — so dropout between those two weights has no effect there.
 
 Reference audio is cropped or zero-padded to the canonical sample count of its reference video span (`temporal_shape`), the same
 grid the target audio uses. Reference rows carry no validity mask, so padding added to a short reference track is

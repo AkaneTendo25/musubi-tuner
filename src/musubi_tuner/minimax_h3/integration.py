@@ -1117,7 +1117,13 @@ class _NativeTrainingBackend:
         if task in ("i2va", "fl2va", "l2va") and not has_vision:
             raise ValueError(f"MiniMax H3 {task.upper()} training requires keyframe vision rows; re-cache with --task {task}")
         if task == "ref2va" and not has_vision:
-            raise ValueError("MiniMax H3 Ref2VA training requires a reference presentation; re-cache with --task ref2va")
+            # An audio-only reference set is presented to Qwen as text alone --
+            # reference audio never reaches the vision tower -- so a text-only
+            # presentation is legitimate exactly when the cached reference bundle
+            # is kind=2 throughout. Anything else is a stale or mismatched cache.
+            cached_kinds = self._cached_reference_kinds(batch)
+            if cached_kinds is None or bool((cached_kinds != int(H3ReferenceKind.AUDIO)).any()):
+                raise ValueError("MiniMax H3 Ref2VA training requires a reference presentation; re-cache with --task ref2va")
 
         patch_size = tuple(config.patch_size)
         model_device = present.device
@@ -1504,6 +1510,22 @@ class _NativeTrainingBackend:
         selected = torch.cat(tuple(chunks[0 if anchor == "first" else 1] for anchor in anchors))
         return selected.to(device=device, dtype=dtype)
 
+    def _cached_reference_kinds(self, batch: dict) -> torch.Tensor | None:
+        """Peek at the cached reference kinds without unpacking the whole bundle."""
+        suffix = reference_key_suffix(
+            self.reference_image_short_edge,
+            self.reference_image_size_mode,
+            self.reference_image_max_pixels,
+            self.reference_video_short_edge,
+            self.reference_video_max_pixels,
+            self.reference_video_fps,
+        )
+        kinds_key = f"{H3_REFERENCE_KINDS_KEY}{suffix}"
+        if kinds_key not in batch:
+            return None
+        kinds = self._one_conditioning_item(batch, kinds_key, expected_ndim=1).to(torch.long)
+        return kinds if kinds.numel() else None
+
     def _reference_cache(
         self,
         batch: dict,
@@ -1610,8 +1632,11 @@ class _NativeTrainingBackend:
                     )
                     selected_audio_rows.append(audio_chunk)
             references = tuple(selected_references)
-            if not any(reference.kind != int(H3ReferenceKind.AUDIO) for reference in references):
-                raise ValueError(f"H3 stochastic {reference_modality}-reference variant has no visual reference")
+            # Mirrors ``reference_modality_variant``: an audio-only survivor set
+            # is legal, an empty one is not -- it would silently degrade the
+            # sample to T2VA while the cached variant text still says Ref2VA.
+            if not references:
+                raise ValueError(f"H3 stochastic {reference_modality}-reference variant keeps no reference")
             video_rows = torch.cat(selected_video_rows) if selected_video_rows else video_rows.new_empty((0, video_width))
             audio_rows = torch.cat(selected_audio_rows) if selected_audio_rows else audio_rows.new_empty((0, audio_width))
         return references, video_rows.to(device=device, dtype=dtype), audio_rows.to(device=device, dtype=dtype)

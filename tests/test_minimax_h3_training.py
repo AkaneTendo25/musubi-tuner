@@ -1556,6 +1556,66 @@ def test_native_h3_strict_ref2va_still_rejects_text_only_conditioning():
         )
 
 
+def test_native_h3_ref2va_accepts_a_text_only_presentation_for_audio_only_references():
+    # An audio-only reference set has no vision spans to show Qwen, so the
+    # text-only presentation is legitimate; the reference bundle proves it.
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=2,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 1, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["ref2va"])],
+        H3_REFERENCE_KINDS_KEY: [torch.tensor([2])],
+        H3_REFERENCE_VIDEO_SHAPES_KEY: [torch.tensor([[0, 0, 0]])],
+        H3_REFERENCE_AUDIO_LENGTHS_KEY: [torch.tensor([1])],
+        H3_REFERENCE_VIDEO_ROWS_KEY: [torch.zeros(0, 16)],
+        H3_REFERENCE_AUDIO_ROWS_KEY: [torch.randn(2, 6)],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        torch.randn(1, 4, 1, 2, 2),
+        torch.randn(1, 2, 6, 1),
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+    )
+
+    assert torch.isfinite(prediction.video).all()
+
+    # A visual reference with no vision spans is still a stale cache.
+    batch[H3_REFERENCE_KINDS_KEY] = [torch.tensor([0])]
+    batch[H3_REFERENCE_VIDEO_SHAPES_KEY] = [torch.tensor([[1, 2, 2]])]
+    batch[H3_REFERENCE_AUDIO_LENGTHS_KEY] = [torch.tensor([0])]
+    batch[H3_REFERENCE_VIDEO_ROWS_KEY] = [torch.randn(1, 16)]
+    batch[H3_REFERENCE_AUDIO_ROWS_KEY] = [torch.zeros(0, 6)]
+    with pytest.raises(ValueError, match="reference presentation"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 1, 2, 2),
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.4]),
+            torch.tensor([0.7]),
+        )
+
+
 def test_native_h3_ref2va_rejects_mismatched_text_cache_reference_size():
     transformer = SimpleNamespace(config=SimpleNamespace(in_channels=4, audio_in_channels=6, text_dim=8))
     backend = _NativeTrainingBackend(transformer, mode="ref2va", reference_image_short_edge=384)
