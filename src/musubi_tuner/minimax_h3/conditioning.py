@@ -19,6 +19,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
+    H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
@@ -42,6 +43,7 @@ from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
+    REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
     H3PreparedReference,
@@ -287,6 +289,7 @@ class MiniMaxH3ConditioningEncoder:
         reference_image_max_pixels: int = 0,
         reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
         reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+        reference_video_fps: float = REFERENCE_VIDEO_FPS,
         max_caption_tokens: int = 0,
     ) -> None:
         self.processor = processor
@@ -301,6 +304,7 @@ class MiniMaxH3ConditioningEncoder:
         self.reference_image_max_pixels = reference_image_max_pixels
         self.reference_video_short_edge = reference_video_short_edge
         self.reference_video_max_pixels = reference_video_max_pixels
+        self.reference_video_fps = reference_video_fps
         # Even T2VA enumerates decoded video crops so its cache filename shares
         # the same crop identity as FL2VA and the corresponding latent cache.
         self.conditioning_requires_content = True
@@ -355,7 +359,7 @@ class MiniMaxH3ConditioningEncoder:
             if videos:
                 if any(reference.frames is None for reference in videos):
                     raise ValueError("H3 prepared video reference has no frames")
-                sampled = [sample_reference_video_frames(reference.frames) for reference in videos]
+                sampled = [sample_reference_video_frames(reference.frames, reference.sample_fps) for reference in videos]
                 for reference, (_, timestamps) in zip(videos, sampled):
                     reference.block_timestamps = timestamps
                 vision = self.processor.video_processor(
@@ -529,6 +533,7 @@ class MiniMaxH3ConditioningEncoder:
                     self.reference_image_max_pixels,
                     self.reference_video_short_edge,
                     self.reference_video_max_pixels,
+                    self.reference_video_fps,
                 )
                 if self.task in ("ref2va", "ref2va_omni")
                 else None
@@ -569,6 +574,7 @@ class MiniMaxH3ConditioningEncoder:
                 tensors[H3_REFERENCE_IMAGE_MAX_PIXELS_KEY] = torch.tensor(self.reference_image_max_pixels, dtype=torch.long)
                 tensors[H3_REFERENCE_VIDEO_SHORT_EDGE_KEY] = torch.tensor(self.reference_video_short_edge, dtype=torch.long)
                 tensors[H3_REFERENCE_VIDEO_MAX_PIXELS_KEY] = torch.tensor(self.reference_video_max_pixels, dtype=torch.long)
+                tensors[H3_REFERENCE_VIDEO_FPS_KEY] = torch.tensor(float(self.reference_video_fps), dtype=torch.float64)
                 if references and any(reference.kind is H3ReferenceKind.VIDEO for reference in references):
                     tensors[H3_REFERENCE_TEMPORAL_CONTRACT_KEY] = torch.tensor(
                         H3_REFERENCE_TEMPORAL_CONTRACT_VERSION, dtype=torch.long

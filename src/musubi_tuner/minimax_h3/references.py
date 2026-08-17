@@ -36,6 +36,7 @@ REFERENCE_VIDEO_SHORT_EDGE = 768
 REFERENCE_VIDEO_MAX_PIXELS = 768 * 1344
 REFERENCE_VIDEO_SAMPLE_FPS = 2
 REFERENCE_VIDEO_TEMPORAL_PATCH = 2
+REFERENCE_VIDEO_FPS = 0.0
 MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
@@ -55,6 +56,10 @@ class H3PreparedReference:
     frames: np.ndarray | None = None
     waveform: torch.Tensor | None = None
     block_timestamps: tuple[float, ...] = ()
+    # Rate of ``frames`` in source seconds. The truncation path resamples to the
+    # released 24 fps grid; temporal subsampling instead keeps its own rate, and
+    # the Qwen presentation needs it to label the frames with real source times.
+    sample_fps: float = float(VIDEO_FPS)
 
     @property
     def has_audio(self) -> bool:
@@ -184,6 +189,14 @@ def validate_reference_video_sizing(short_edge: int, max_pixels: int) -> tuple[i
     return short_edge, max_pixels
 
 
+def validate_reference_video_fps(sample_fps: float) -> float:
+    """Accept the opt-in reference subsampling rate; 0 keeps the released truncation."""
+    value = float(sample_fps)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"H3 reference video fps must be a finite non-negative rate (0 disables), got {sample_fps}")
+    return value
+
+
 def resolve_reference_video_size(
     width: int,
     height: int,
@@ -250,6 +263,54 @@ def resample_reference_frames(frames: np.ndarray, source_fps: float) -> np.ndarr
     return np.repeat(frames, repeats, axis=0)
 
 
+def subsample_reference_frames(frames: np.ndarray, source_fps: float, sample_fps: float) -> np.ndarray:
+    """Take ``sample_fps`` frames per source second across the WHOLE reference clip.
+
+    The grid is deterministic: sample ``k`` is source frame
+    ``floor(k * source_fps / sample_fps + 0.5)`` -- round-half-up, no RNG -- and
+    sampling stops at the end of the clip. A rate at or above the source rate
+    degenerates to every frame exactly once, because a repeated index is dropped
+    rather than duplicated.
+    """
+    if source_fps <= 0 or sample_fps <= 0:
+        raise ValueError("H3 reference video subsampling requires positive source and sample frame rates")
+    stride = source_fps / sample_fps
+    total = int(frames.shape[0])
+    indices: list[int] = []
+    step = 0
+    while True:
+        index = math.floor(step * stride + 0.5)
+        if index >= total:
+            break
+        if not indices or index > indices[-1]:
+            indices.append(index)
+        step += 1
+    if not indices:
+        raise ValueError("H3 reference video subsampling produced no frames")
+    return frames[indices]
+
+
+def land_reference_frame_count(count: int, target_frames: int) -> int:
+    """Snap a subsampled length onto the packer's legal grid within the target budget.
+
+    Legal reference lengths are one frame or ``17n + 5``; the ceiling is the same
+    one the truncation path enforces -- the largest legal count that still fits
+    the target's frame budget. Below that ceiling the nearest legal count wins,
+    ties padding upwards, so a subsampled span is completed rather than cut back
+    to a much shorter legal length.
+    """
+    if count < 1:
+        raise ValueError(f"H3 reference video must provide at least one subsampled frame, got {count}")
+    budget = trim_reference_frames(target_frames)
+    if count >= budget:
+        return budget
+    lower = trim_reference_frames(count)
+    upper = 5 if lower == 1 else lower + 17
+    if upper > budget:
+        return lower
+    return upper if upper - count <= count - lower else lower
+
+
 def _prepare_image(asset: MediaAsset, short_edge: int, size_mode: str, target_pixels: int) -> Image.Image:
     with Image.open(asset.path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
@@ -262,10 +323,27 @@ def _prepare_image(asset: MediaAsset, short_edge: int, size_mode: str, target_pi
         return image.copy()
 
 
-def _prepare_video(asset: MediaAsset, target_frames: int, short_edge: int, max_pixels: int) -> np.ndarray:
-    frames, source_fps = _decode_video(asset.path, target_frames)
-    frames = resample_reference_frames(frames, source_fps)
-    frames = frames[:target_frames]
+def _prepare_video(
+    asset: MediaAsset,
+    target_frames: int,
+    short_edge: int,
+    max_pixels: int,
+    sample_fps: float = REFERENCE_VIDEO_FPS,
+) -> np.ndarray:
+    if validate_reference_video_fps(sample_fps):
+        # Subsampling conditions on the whole clip, so the decode cannot stop at
+        # the target's worth of source frames the way the truncation path does.
+        frames, source_fps = _decode_video(asset.path)
+        frames = subsample_reference_frames(frames, source_fps, sample_fps)
+        count = land_reference_frame_count(frames.shape[0], target_frames)
+        if frames.shape[0] > count:
+            frames = frames[:count]
+        elif frames.shape[0] < count:
+            frames = np.concatenate((frames, np.repeat(frames[-1:], count - frames.shape[0], axis=0)))
+    else:
+        frames, source_fps = _decode_video(asset.path, target_frames)
+        frames = resample_reference_frames(frames, source_fps)
+        frames = frames[:target_frames]
     height, width = resolve_reference_video_size(frames.shape[2], frames.shape[1], short_edge, max_pixels)
     if frames.shape[1:3] != (height, width):
         frames = np.stack(
@@ -310,15 +388,27 @@ def _reference_audio_asset(asset: MediaAsset) -> MediaAsset:
     )
 
 
-def sample_reference_video_frames(frames: np.ndarray) -> tuple[list[np.ndarray], tuple[float, ...]]:
-    stride = VIDEO_FPS / REFERENCE_VIDEO_SAMPLE_FPS
+def sample_reference_video_frames(
+    frames: np.ndarray,
+    frames_fps: float = float(VIDEO_FPS),
+) -> tuple[list[np.ndarray], tuple[float, ...]]:
+    """Present the prepared frames to Qwen at 2 fps, labelled with source time.
+
+    ``frames_fps`` is the rate the prepared frames already carry: the released
+    24 fps grid, or the opt-in subsampling rate. Timestamps come from the chosen
+    source frame rather than its position, so a clip already below 2 fps keeps
+    every frame and is still labelled with the seconds it actually spans.
+    """
+    if frames_fps <= 0:
+        raise ValueError("H3 reference video presentation requires a positive frame rate")
+    stride = frames_fps / REFERENCE_VIDEO_SAMPLE_FPS
     indices: list[int] = []
     cursor = 0.0
     while round(cursor) < frames.shape[0]:
         if not indices or round(cursor) > indices[-1]:
             indices.append(round(cursor))
         cursor += stride
-    timestamps = [index / REFERENCE_VIDEO_SAMPLE_FPS for index in range(len(indices))]
+    timestamps = [index / frames_fps for index in indices]
     timestamps += [timestamps[-1]] * (-len(timestamps) % REFERENCE_VIDEO_TEMPORAL_PATCH)
     blocks = tuple(
         (timestamps[index] + timestamps[index + REFERENCE_VIDEO_TEMPORAL_PATCH - 1]) / 2
@@ -342,11 +432,13 @@ def prepare_references(
     image_max_pixels: int = 0,
     video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+    video_sample_fps: float = REFERENCE_VIDEO_FPS,
 ) -> tuple[H3PreparedReference, ...]:
     assets = reference_assets(item)
     validate_reference_image_short_edge(image_short_edge)
     validate_reference_image_sizing(image_size_mode, image_max_pixels)
     validate_reference_video_sizing(video_short_edge, video_max_pixels)
+    video_sample_fps = validate_reference_video_fps(video_sample_fps)
     target_size = getattr(item, "bucket_size", None) or getattr(item, "original_size", None)
     if image_size_mode == "target_area":
         if target_size is None or len(target_size) < 2:
@@ -372,7 +464,7 @@ def prepare_references(
             )
         elif kind is H3ReferenceKind.VIDEO:
             include_audio = bool(asset.metadata.get("include_audio", True))
-            frames = _prepare_video(asset, target_frames, video_short_edge, video_max_pixels)
+            frames = _prepare_video(asset, target_frames, video_short_edge, video_max_pixels, video_sample_fps)
             # The H3 video VAE accepts only 17n+5 frames (or a single image).
             # Trim once at the shared preparation boundary so Qwen's visual
             # presentation, the DiT latent rows, and any paired soundtrack all
@@ -383,7 +475,12 @@ def prepare_references(
                 H3PreparedReference(
                     kind=kind,
                     frames=frames,
+                    # A subsampled reference spans the whole clip while its paired
+                    # soundtrack still covers the clip's opening span: audio cannot
+                    # be subsampled without pitch artefacts, so the crop rule below
+                    # is the same one the truncation path uses.
                     waveform=_prepare_audio(_reference_audio_asset(asset), frames.shape[0]) if include_audio else None,
+                    sample_fps=video_sample_fps or float(VIDEO_FPS),
                 )
             )
         else:
@@ -410,6 +507,7 @@ def reference_modality_variant(references: tuple[H3PreparedReference, ...], moda
                         kind=reference.kind,
                         frames=reference.frames,
                         block_timestamps=reference.block_timestamps,
+                        sample_fps=reference.sample_fps,
                     )
                 )
         elif reference.kind is H3ReferenceKind.AUDIO:

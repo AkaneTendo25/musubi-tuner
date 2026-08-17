@@ -27,6 +27,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_AUDIO_ROWS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_KINDS_KEY,
+    H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
@@ -79,6 +80,39 @@ from musubi_tuner.minimax_h3_cache_dino_features import (
 )
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
 from musubi_tuner.networks import lora_minimax_h3
+
+
+def _ref2va_identity_batch(**extra):
+    return {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["ref2va"])],
+        **extra,
+    }
+
+
+def test_ref2va_training_rejects_text_caches_built_with_another_reference_video_fps():
+    transformer = SimpleNamespace(config=SimpleNamespace(in_channels=4, audio_in_channels=6, text_dim=8, patch_size=(1, 2, 2)))
+    backend = _NativeTrainingBackend(transformer, mode="ref2va", reference_video_fps=2.0)
+
+    def predict(batch):
+        backend.predict_training(transformer, batch, torch.randn(1, 4, 1, 2, 2), None, torch.tensor([0.4]), torch.tensor([0.7]))
+
+    with pytest.raises(ValueError, match="lacks reference-video fps identity"):
+        predict(_ref2va_identity_batch())
+    with pytest.raises(ValueError, match="reference_video_fps=3.0"):
+        predict(_ref2va_identity_batch(**{H3_REFERENCE_VIDEO_FPS_KEY: [torch.tensor(3.0, dtype=torch.float64)]}))
+
+    # The matching identity passes the check and the run continues to the cache lookup.
+    with pytest.raises(KeyError, match=H3_REFERENCE_KINDS_KEY):
+        predict(_ref2va_identity_batch(**{H3_REFERENCE_VIDEO_FPS_KEY: [torch.tensor(2.0, dtype=torch.float64)]}))
+
+    # A default trainer still accepts every cache written before subsampling existed.
+    default_backend = _NativeTrainingBackend(transformer, mode="ref2va")
+    with pytest.raises(KeyError, match=H3_REFERENCE_KINDS_KEY):
+        default_backend.predict_training(
+            transformer, _ref2va_identity_batch(), torch.randn(1, 4, 1, 2, 2), None, torch.tensor([0.4]), torch.tensor([0.7])
+        )
 
 
 def test_ref2va_reference_cache_selects_matching_video_and_audio_variants():

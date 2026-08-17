@@ -22,6 +22,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
+    H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -35,6 +36,7 @@ from musubi_tuner.minimax_h3.references import (
     REFERENCE_FINGERPRINT_KEY,
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
+    REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
     reference_assets,
@@ -123,6 +125,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="maximum pixels per Ref2VA reference-video frame; keep it equal to latent caching",
     )
     parser.add_argument(
+        "--reference_video_fps",
+        type=float,
+        default=REFERENCE_VIDEO_FPS,
+        help=(
+            "subsample every Ref2VA reference video to this many frames per source second; 0 (default) keeps the "
+            "released truncation. Keep it equal to latent caching and training"
+        ),
+    )
+    parser.add_argument(
         "--cache_guidance_empty",
         action="store_true",
         help="also cache H3's empty-text conditioning for the optional guidance-consistent training objective",
@@ -168,6 +179,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         reference_image_max_pixels=args.reference_image_max_pixels,
         reference_video_short_edge=args.reference_video_short_edge,
         reference_video_max_pixels=args.reference_video_max_pixels,
+        reference_video_fps=args.reference_video_fps,
         text_visual_max_pixels=args.h3_text_visual_max_pixels,
     )
 
@@ -201,6 +213,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                     if int(handle.get_tensor(H3_REFERENCE_VIDEO_SHORT_EDGE_KEY)) != args.reference_video_short_edge:
                         return False
                     if int(handle.get_tensor(H3_REFERENCE_VIDEO_MAX_PIXELS_KEY)) != args.reference_video_max_pixels:
+                        return False
+                    # A cache written before temporal subsampling existed carries no
+                    # fps identity and therefore describes the truncation path only.
+                    if H3_REFERENCE_VIDEO_FPS_KEY not in keys:
+                        if args.reference_video_fps != REFERENCE_VIDEO_FPS:
+                            return False
+                    elif float(handle.get_tensor(H3_REFERENCE_VIDEO_FPS_KEY)) != float(args.reference_video_fps):
                         return False
                     if (
                         H3_REFERENCE_IMAGE_SHORT_EDGE_KEY not in keys

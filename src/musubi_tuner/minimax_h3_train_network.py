@@ -62,8 +62,10 @@ from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
+    REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
+    validate_reference_video_fps,
     validate_reference_video_sizing,
 )
 from musubi_tuner.minimax_h3.training import (
@@ -958,6 +960,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # Defer to the canonical validator so a value accepted here cannot fail
         # later inside reference_key_suffix() with a different lower bound.
         validate_reference_video_sizing(args.reference_video_short_edge, args.reference_video_max_pixels)
+        validate_reference_video_fps(args.reference_video_fps)
         if args.h3_max_caption_tokens < 0:
             raise ValueError("MiniMax H3 --h3_max_caption_tokens must be non-negative")
         if args.reference_image_size_mode == "short_edge" and args.reference_image_max_pixels:
@@ -1382,6 +1385,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if reference_video_short_edge != REFERENCE_VIDEO_SHORT_EDGE or reference_video_max_pixels != REFERENCE_VIDEO_MAX_PIXELS:
             backend_kwargs["reference_video_short_edge"] = reference_video_short_edge
             backend_kwargs["reference_video_max_pixels"] = reference_video_max_pixels
+        reference_video_fps = float(getattr(args, "reference_video_fps", REFERENCE_VIDEO_FPS) or REFERENCE_VIDEO_FPS)
+        if reference_video_fps != REFERENCE_VIDEO_FPS:
+            backend_kwargs["reference_video_fps"] = reference_video_fps
         text_visual_max_pixels = int(getattr(args, "h3_text_visual_max_pixels", 0) or 0)
         if text_visual_max_pixels:
             backend_kwargs["text_visual_max_pixels"] = text_visual_max_pixels
@@ -2368,6 +2374,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_reference_image_max_pixels": str(args.reference_image_max_pixels),
             "ss_h3_reference_video_short_edge": str(args.reference_video_short_edge),
             "ss_h3_reference_video_max_pixels": str(args.reference_video_max_pixels),
+            "ss_h3_reference_video_fps": str(args.reference_video_fps),
             "ss_h3_text_visual_max_pixels": str(args.h3_text_visual_max_pixels),
             "ss_h3_max_caption_tokens": str(args.h3_max_caption_tokens),
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
@@ -2610,6 +2617,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=REFERENCE_VIDEO_MAX_PIXELS,
         help="maximum pixels per Ref2VA reference-video frame (default 768x1344)",
+    )
+    parser.add_argument(
+        "--reference_video_fps",
+        type=float,
+        default=REFERENCE_VIDEO_FPS,
+        help=(
+            "reference-video subsampling rate in frames per source second the Ref2VA caches were built with; "
+            "0 (default) selects the truncating caches and must equal the value given to both caching stages"
+        ),
     )
     parser.add_argument(
         "--h3_mask_mode",

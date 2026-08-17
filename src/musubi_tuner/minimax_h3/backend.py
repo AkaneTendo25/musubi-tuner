@@ -8,10 +8,12 @@ import torch
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
+    REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
     validate_reference_image_short_edge,
     validate_reference_image_sizing,
+    validate_reference_video_fps,
     validate_reference_video_sizing,
 )
 from musubi_tuner.minimax_h3.request import H3GenerationRequest
@@ -89,6 +91,14 @@ def _reference_video_sizing_kwargs(short_edge: int, max_pixels: int) -> dict[str
     return {"reference_video_short_edge": short_edge, "reference_video_max_pixels": max_pixels}
 
 
+def _reference_video_fps_kwargs(sample_fps: float) -> dict[str, float]:
+    """Route the opt-in reference subsampling rate only when it is enabled."""
+    validate_reference_video_fps(sample_fps)
+    if sample_fps == REFERENCE_VIDEO_FPS:
+        return {}
+    return {"reference_video_fps": float(sample_fps)}
+
+
 def create_latent_encoder(
     *,
     video_vae: Path,
@@ -100,6 +110,7 @@ def create_latent_encoder(
     reference_image_max_pixels: int = 0,
     reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+    reference_video_fps: float = REFERENCE_VIDEO_FPS,
 ) -> H3LatentEncoder:
     """Load the video VAE and, for video datasets, the audio VAE used by latent caching."""
     _validate_dtype(dtype)
@@ -114,6 +125,7 @@ def create_latent_encoder(
         **_reference_short_edge_kwargs(reference_image_short_edge),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
         **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
+        **_reference_video_fps_kwargs(reference_video_fps),
     )
 
 
@@ -133,6 +145,7 @@ def create_conditioning_encoder(
     reference_image_max_pixels: int = 0,
     reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+    reference_video_fps: float = REFERENCE_VIDEO_FPS,
     text_visual_max_pixels: int = 0,
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
@@ -154,6 +167,7 @@ def create_conditioning_encoder(
         **({} if max_caption_tokens == 0 else {"max_caption_tokens": max_caption_tokens}),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
         **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
+        **_reference_video_fps_kwargs(reference_video_fps),
     )
 
 
@@ -275,6 +289,7 @@ def create_training_backend(
     reference_image_max_pixels: int = 0,
     reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+    reference_video_fps: float = REFERENCE_VIDEO_FPS,
     text_visual_max_pixels: int = 0,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
@@ -322,5 +337,6 @@ def create_training_backend(
         **({} if max_caption_tokens == 0 else {"max_caption_tokens": max_caption_tokens}),
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
         **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
+        **_reference_video_fps_kwargs(reference_video_fps),
         **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
     )

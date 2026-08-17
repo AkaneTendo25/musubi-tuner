@@ -32,6 +32,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
+    H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_REFERENCE_KINDS_KEY,
@@ -79,6 +80,7 @@ from musubi_tuner.minimax_h3.packing import (
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
+    REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
     H3ReferenceKind,
@@ -170,6 +172,7 @@ def create_latent_encoder(
     reference_image_max_pixels: int = 0,
     reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+    reference_video_fps: float = REFERENCE_VIDEO_FPS,
 ):
     """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
@@ -185,6 +188,7 @@ def create_latent_encoder(
         reference_image_max_pixels,
         reference_video_short_edge,
         reference_video_max_pixels,
+        reference_video_fps,
     )
 
 
@@ -203,6 +207,7 @@ def create_conditioning_encoder(
     reference_image_max_pixels: int = 0,
     reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+    reference_video_fps: float = REFERENCE_VIDEO_FPS,
     text_visual_max_pixels: int = 0,
     max_caption_tokens: int = 0,
 ):
@@ -230,6 +235,7 @@ def create_conditioning_encoder(
         reference_image_max_pixels=reference_image_max_pixels,
         reference_video_short_edge=reference_video_short_edge,
         reference_video_max_pixels=reference_video_max_pixels,
+        reference_video_fps=reference_video_fps,
         max_caption_tokens=max_caption_tokens,
     )
 
@@ -763,6 +769,7 @@ def create_training_backend(
     reference_image_max_pixels: int = 0,
     reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+    reference_video_fps: float = REFERENCE_VIDEO_FPS,
     text_visual_max_pixels: int = 0,
     max_caption_tokens: int = 0,
 ):
@@ -801,6 +808,7 @@ def create_training_backend(
         reference_image_max_pixels,
         reference_video_short_edge,
         reference_video_max_pixels,
+        reference_video_fps,
         text_visual_max_pixels,
         max_caption_tokens,
     )
@@ -897,6 +905,7 @@ class _NativeTrainingBackend:
         reference_image_max_pixels: int = 0,
         reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
         reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+        reference_video_fps: float = REFERENCE_VIDEO_FPS,
         text_visual_max_pixels: int = 0,
         max_caption_tokens: int = 0,
     ):
@@ -908,6 +917,7 @@ class _NativeTrainingBackend:
         self.reference_image_max_pixels = reference_image_max_pixels
         self.reference_video_short_edge = reference_video_short_edge
         self.reference_video_max_pixels = reference_video_max_pixels
+        self.reference_video_fps = reference_video_fps
         self.text_visual_max_pixels = text_visual_max_pixels
 
     def get_training_transformer(self) -> torch.nn.Module:
@@ -1034,6 +1044,17 @@ class _NativeTrainingBackend:
                     or int(cached_video_max_pixels) != self.reference_video_max_pixels
                 ):
                     raise ValueError("H3 Ref2VA text cache uses different reference-video sizing; re-cache conditioning")
+            cached_video_fps = batch.get(H3_REFERENCE_VIDEO_FPS_KEY)
+            if cached_video_fps is None:
+                if self.reference_video_fps != REFERENCE_VIDEO_FPS:
+                    raise ValueError("legacy H3 Ref2VA text cache lacks reference-video fps identity; re-cache conditioning")
+            else:
+                cached_video_fps = self._one_conditioning_item(batch, H3_REFERENCE_VIDEO_FPS_KEY, expected_ndim=0)
+                if float(cached_video_fps) != float(self.reference_video_fps):
+                    raise ValueError(
+                        f"H3 Ref2VA text cache uses reference_video_fps={float(cached_video_fps)}, "
+                        f"but training requested {float(self.reference_video_fps)}; re-cache conditioning"
+                    )
         if text_hidden.ndim != 2 or text_hidden.shape[-1] != config.text_dim:
             raise ValueError(f"H3 {hidden_key} must have shape [tokens, {config.text_dim}]")
         if text_tags.dtype != torch.long or text_tags.shape != (text_hidden.shape[0],):
@@ -1491,6 +1512,7 @@ class _NativeTrainingBackend:
             self.reference_image_max_pixels,
             self.reference_video_short_edge,
             self.reference_video_max_pixels,
+            self.reference_video_fps,
         )
         kinds_key = f"{H3_REFERENCE_KINDS_KEY}{suffix}"
         video_shapes_key = f"{H3_REFERENCE_VIDEO_SHAPES_KEY}{suffix}"
@@ -1614,6 +1636,7 @@ class _NativeLatentEncoder:
         reference_image_max_pixels: int = 0,
         reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
         reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+        reference_video_fps: float = REFERENCE_VIDEO_FPS,
     ) -> None:
         self.video_encoder = video_encoder
         self.audio_encoder = audio_encoder
@@ -1623,6 +1646,7 @@ class _NativeLatentEncoder:
         self.reference_image_max_pixels = reference_image_max_pixels
         self.reference_video_short_edge = reference_video_short_edge
         self.reference_video_max_pixels = reference_video_max_pixels
+        self.reference_video_fps = reference_video_fps
 
     @staticmethod
     def _target_asset(item: Any):
@@ -1726,6 +1750,7 @@ class _NativeLatentEncoder:
             self.reference_image_max_pixels,
             self.reference_video_short_edge,
             self.reference_video_max_pixels,
+            self.reference_video_fps,
         )
         if not references:
             return {}
@@ -1767,6 +1792,7 @@ class _NativeLatentEncoder:
             self.reference_image_max_pixels,
             self.reference_video_short_edge,
             self.reference_video_max_pixels,
+            self.reference_video_fps,
         )
         tensors = {
             f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64": torch.tensor(kinds, dtype=torch.long),

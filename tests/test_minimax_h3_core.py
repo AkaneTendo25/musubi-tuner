@@ -56,6 +56,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_KINDS_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
+    H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -83,19 +84,24 @@ from musubi_tuner.minimax_h3.packing import (
 )
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
     H3PreparedReference,
     H3ReferenceKind,
     _reference_audio_asset,
     _source_frame_limit,
+    land_reference_frame_count,
     reference_modality_variant,
     resample_reference_frames,
     resolve_reference_image_size,
     resolve_reference_image_area_size,
     resolve_reference_video_size,
+    sample_reference_video_frames,
+    subsample_reference_frames,
     trim_reference_frames,
     validate_reference_image_short_edge,
+    validate_reference_video_fps,
 )
 from musubi_tuner.minimax_h3.request import H3GenerationRequest, H3Reference, ReferenceKind, ReferenceRole
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, inspect_checkpoint
@@ -1304,7 +1310,7 @@ def test_h3_reference_video_is_trimmed_before_text_and_paired_audio_preparation(
     monkeypatch.setattr(
         h3_references,
         "_prepare_video",
-        lambda _asset, _target_frames, _short_edge, _max_pixels: np.zeros((30, 8, 8, 3), dtype=np.uint8),
+        lambda _asset, _target_frames, _short_edge, _max_pixels, _sample_fps=0.0: np.zeros((30, 8, 8, 3), dtype=np.uint8),
     )
 
     def prepare_audio(_asset, target_frames):
@@ -1360,6 +1366,144 @@ def test_reference_video_sizing_is_configurable_and_names_the_cache():
         )
         == "_vse384_vmp258048"
     )
+
+
+def _reference_frame_stack(count: int) -> np.ndarray:
+    return np.arange(count, dtype=np.uint8).reshape(-1, 1, 1, 1) * np.ones((1, 32, 32, 3), dtype=np.uint8)
+
+
+def _fake_decoder(monkeypatch, frames: np.ndarray, source_fps: float) -> None:
+    """Stand in for PyAV, honouring the decode limit the truncation path relies on."""
+
+    def decode(_path, target_frames=None):
+        limit = None if target_frames is None else _source_frame_limit(target_frames, source_fps)
+        return (frames if limit is None else frames[:limit]), source_fps
+
+    monkeypatch.setattr(h3_references, "_decode_video", decode)
+
+
+def test_reference_video_fps_default_keeps_the_released_truncation(monkeypatch):
+    frames = _reference_frame_stack(60)
+    _fake_decoder(monkeypatch, frames, 30.0)
+    asset = MediaAsset(Path("reference.mp4"), MediaModality.VIDEO, "reference")
+
+    prepared = h3_references._prepare_video(asset, 22, CANVAS_MULTIPLE, CANVAS_MULTIPLE**2)
+
+    # Pinned against the truncation behaviour: 30 fps resampled onto H3's 24 fps
+    # grid, cut at the target's frame count, never reaching the clip's tail.
+    assert [int(frame[0, 0, 0]) for frame in prepared] == [index for index in range(27) if index % 5 != 2]
+    assert prepared.shape == (22, CANVAS_MULTIPLE, CANVAS_MULTIPLE, 3)
+    assert h3_references._prepare_video(asset, 22, CANVAS_MULTIPLE, CANVAS_MULTIPLE**2, 0).shape == prepared.shape
+
+
+def test_subsample_reference_frames_walks_a_deterministic_half_up_grid():
+    frames = _reference_frame_stack(100)
+
+    assert [int(frame[0, 0, 0]) for frame in subsample_reference_frames(frames, 30.0, 2.0)] == [0, 15, 30, 45, 60, 75, 90]
+    # 25 fps at 2 fps steps by 12.5 frames, rounded half up: 12.5 -> 13.
+    assert [int(frame[0, 0, 0]) for frame in subsample_reference_frames(frames, 25.0, 2.0)] == [0, 13, 25, 38, 50, 63, 75, 88]
+    assert [int(frame[0, 0, 0]) for frame in subsample_reference_frames(frames, 24.0, 3.0)][:4] == [0, 8, 16, 24]
+    # A rate at or above the source rate keeps every frame exactly once.
+    assert subsample_reference_frames(frames, 24.0, 24.0).shape[0] == 100
+    assert subsample_reference_frames(frames, 24.0, 96.0).shape[0] == 100
+    assert subsample_reference_frames(frames, 24.0, 0.5).shape[0] == 3
+
+    for rate in (0, -1.0):
+        with pytest.raises(ValueError, match="positive source and sample"):
+            subsample_reference_frames(frames, 24.0, rate)
+
+
+def test_reference_frame_count_lands_on_the_legal_grid_within_the_target_budget():
+    # Legal reference lengths are one frame or 17n+5, capped by the same budget
+    # the truncation path enforces.
+    counts = (1, 4, 5, 6, 13, 14, 22, 30, 124, 400)
+    assert [land_reference_frame_count(count, 124) for count in counts] == [1, 5, 5, 5, 5, 22, 22, 22, 124, 124]
+    assert [land_reference_frame_count(count, 22) for count in (3, 13, 14, 22, 50)] == [5, 5, 22, 22, 22]
+    assert land_reference_frame_count(9, 4) == 1
+    with pytest.raises(ValueError, match="at least one subsampled frame"):
+        land_reference_frame_count(0, 124)
+
+
+@pytest.mark.parametrize("sample_fps", (0, -0.5, float("inf"), float("nan")))
+def test_reference_video_fps_rejects_unusable_rates(sample_fps):
+    if sample_fps == 0:
+        assert validate_reference_video_fps(sample_fps) == REFERENCE_VIDEO_FPS
+        return
+    with pytest.raises(ValueError, match="reference video fps"):
+        validate_reference_video_fps(sample_fps)
+
+
+def test_reference_video_fps_spans_the_whole_clip_and_lands_on_a_legal_count(monkeypatch):
+    frames = _reference_frame_stack(240)
+    _fake_decoder(monkeypatch, frames, 24.0)
+    asset = MediaAsset(Path("reference.mp4"), MediaModality.VIDEO, "reference")
+
+    prepared = h3_references._prepare_video(asset, 124, CANVAS_MULTIPLE, CANVAS_MULTIPLE**2, 2.0)
+
+    # Ten source seconds at 2 fps is 20 frames, padded up to the nearest legal
+    # count with the final frame; the span still reaches the end of the clip.
+    assert prepared.shape[0] == 22
+    assert [int(frame[0, 0, 0]) for frame in prepared] == [12 * index for index in range(20)] + [228, 228]
+
+    # A source longer than the budget can hold is cut back to the budget, exactly
+    # like the truncation path's ceiling.
+    _fake_decoder(monkeypatch, _reference_frame_stack(250), 1.0)
+    capped = h3_references._prepare_video(asset, 124, CANVAS_MULTIPLE, CANVAS_MULTIPLE**2, 2.0)
+    assert capped.shape[0] == 124
+
+
+def test_reference_video_fps_pairs_audio_with_the_clips_opening_span(monkeypatch):
+    frames = _reference_frame_stack(240)
+    _fake_decoder(monkeypatch, frames, 24.0)
+    asset = MediaAsset(Path("reference.mp4"), MediaModality.VIDEO, "reference")
+    item = SimpleNamespace(h3_media_assets=(asset,), frame_count=124)
+    audio_frame_counts = []
+
+    def prepare_audio(_asset, target_frames):
+        audio_frame_counts.append(target_frames)
+        return torch.zeros(2, temporal_shape(target_frames, align=True).audio_samples)
+
+    monkeypatch.setattr(h3_references, "_prepare_audio", prepare_audio)
+
+    (reference,) = h3_references.prepare_references(
+        item,
+        video_short_edge=CANVAS_MULTIPLE,
+        video_max_pixels=CANVAS_MULTIPLE**2,
+        video_sample_fps=2.0,
+    )
+
+    # The subsampled video spans the whole clip; the paired soundtrack still
+    # covers only the opening span, because audio cannot be subsampled.
+    assert reference.frames.shape[0] == 22
+    assert reference.sample_fps == 2.0
+    assert audio_frame_counts == [22]
+    assert reference.waveform.shape[-1] == temporal_shape(22, align=True).audio_samples
+
+
+def test_reference_video_presentation_labels_frames_with_source_time():
+    # The released 24 fps path is unchanged: every twelfth frame, half a second apart.
+    sampled, blocks = sample_reference_video_frames(_reference_frame_stack(48))
+    assert [int(frame[0, 0, 0]) for frame in sampled] == [0, 12, 24, 36]
+    assert blocks == (0.25, 1.25)
+
+    # Frames already subsampled to 2 fps are presented whole, still labelled in
+    # source seconds rather than by position.
+    sampled, blocks = sample_reference_video_frames(_reference_frame_stack(4), 2.0)
+    assert [int(frame[0, 0, 0]) for frame in sampled] == [0, 1, 2, 3]
+    assert blocks == (0.25, 1.25)
+
+    _, blocks = sample_reference_video_frames(_reference_frame_stack(4), 1.0)
+    assert blocks == (0.5, 2.5)
+
+
+def test_reference_video_fps_names_the_cache_only_when_enabled():
+    assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, video_sample_fps=REFERENCE_VIDEO_FPS) == ""
+    assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, video_sample_fps=2) == "_vfps2"
+    assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, video_sample_fps=2.5) == "_vfps2p5"
+    assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, video_sample_fps=0.5) == "_vfps0p5"
+    assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, video_short_edge=384, video_sample_fps=2) == "_vse384_vfps2"
+    with pytest.raises(ValueError, match="reference video fps"):
+        reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, video_sample_fps=-2)
 
 
 def test_reference_video_sizing_keeps_released_defaults_and_never_overshoots_the_cap():
@@ -1469,6 +1613,13 @@ def test_skip_existing_rejects_reference_caches_written_with_other_sizing(monkey
     )
     assert capped_area_valid(item, capped_area_cache) is True
     assert capped_area_valid(item, target_area_cache) is False
+
+    subsampled_cache = _reference_latent_cache(tmp_path / "subsampled.safetensors", "_vfps2")
+    assert default_valid(item, subsampled_cache) is False
+    subsampled_valid = _latent_cache_predicate(monkeypatch, ["--reference_video_fps", "2"])
+    assert subsampled_valid(item, subsampled_cache) is True
+    assert subsampled_valid(item, default_cache) is False
+    assert _latent_cache_predicate(monkeypatch, ["--reference_video_fps", "2.5"])(item, subsampled_cache) is False
 
     assert default_valid(SimpleNamespace(has_references=False), short_edge_cache) is True
 
@@ -1690,6 +1841,31 @@ def test_skip_existing_rejects_reference_caches_sized_with_another_image_strateg
     assert _text_cache_predicate(monkeypatch, ["--task", "ref2va"])(item, legacy) is False
 
 
+def test_skip_existing_rejects_reference_text_caches_with_another_subsampling_rate(monkeypatch, tmp_path):
+    truncating = _reference_text_cache(tmp_path / "truncating.safetensors")
+    subsampled = _identity_text_cache(
+        tmp_path / "subsampled.safetensors",
+        task="ref2va",
+        tensors={
+            H3_REFERENCE_IMAGE_SHORT_EDGE_KEY: torch.tensor(REFERENCE_IMAGE_SHORT_EDGE),
+            H3_REFERENCE_IMAGE_SIZE_MODE_KEY: torch.tensor(0),
+            H3_REFERENCE_IMAGE_MAX_PIXELS_KEY: torch.tensor(0),
+            H3_REFERENCE_VIDEO_SHORT_EDGE_KEY: torch.tensor(REFERENCE_VIDEO_SHORT_EDGE),
+            H3_REFERENCE_VIDEO_MAX_PIXELS_KEY: torch.tensor(REFERENCE_VIDEO_MAX_PIXELS),
+            H3_REFERENCE_VIDEO_FPS_KEY: torch.tensor(2.0, dtype=torch.float64),
+        },
+    )
+    item = _fingerprint_item("fingerprint")
+
+    # A cache written before subsampling existed carries no fps identity and
+    # therefore describes the truncation path only.
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va"])(item, truncating) is True
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va", "--reference_video_fps", "2"])(item, truncating) is False
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va", "--reference_video_fps", "2"])(item, subsampled) is True
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va", "--reference_video_fps", "3"])(item, subsampled) is False
+    assert _text_cache_predicate(monkeypatch, ["--task", "ref2va"])(item, subsampled) is False
+
+
 def test_skip_existing_rejects_text_caches_without_the_requested_empty_pair(monkeypatch, tmp_path):
     prompt_only = _identity_text_cache(tmp_path / "prompt.safetensors")
     with_empty = _identity_text_cache(
@@ -1753,6 +1929,15 @@ def test_reference_video_sizing_flags_are_registered_on_every_entrypoint():
         max_pixels = next(a for a in parser._actions if a.dest == "reference_video_max_pixels")
         assert short_edge.default == REFERENCE_VIDEO_SHORT_EDGE
         assert max_pixels.default == REFERENCE_VIDEO_MAX_PIXELS
+
+
+def test_reference_video_fps_flag_is_registered_on_every_cache_and_training_entrypoint():
+    from musubi_tuner.minimax_h3_train_network import create_parser as create_training_parser
+
+    for parser in (create_cache_latents_parser(), create_cache_text_parser(), create_training_parser()):
+        sample_fps = next(a for a in parser._actions if a.dest == "reference_video_fps")
+        assert sample_fps.type is float
+        assert sample_fps.default == REFERENCE_VIDEO_FPS
 
 
 def test_audio_file_decode_resample_and_mask(tmp_path):

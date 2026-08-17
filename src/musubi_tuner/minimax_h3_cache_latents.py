@@ -24,6 +24,7 @@ from musubi_tuner.minimax_h3.references import (
     REFERENCE_FINGERPRINT_KEY,
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
+    REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
     reference_assets,
@@ -72,6 +73,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=REFERENCE_VIDEO_MAX_PIXELS,
         help="maximum pixels per Ref2VA reference-video frame after aspect-preserving resize",
     )
+    parser.add_argument(
+        "--reference_video_fps",
+        type=float,
+        default=REFERENCE_VIDEO_FPS,
+        help=(
+            "subsample every Ref2VA reference video to this many frames per source second so the whole clip "
+            "conditions the model; 0 (default) keeps the released behaviour of truncating to the target length"
+        ),
+    )
     parser.set_defaults(vae_dtype="float32")
     add_image_training_arguments(parser)
     return parser
@@ -116,6 +126,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         reference_image_max_pixels=args.reference_image_max_pixels,
         reference_video_short_edge=args.reference_video_short_edge,
         reference_video_max_pixels=args.reference_video_max_pixels,
+        reference_video_fps=args.reference_video_fps,
     )
 
     def encode(batch: list[ItemInfo]) -> None:
@@ -138,6 +149,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.reference_image_max_pixels,
             args.reference_video_short_edge,
             args.reference_video_max_pixels,
+            args.reference_video_fps,
         )
         kinds_key = f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64"
         try:

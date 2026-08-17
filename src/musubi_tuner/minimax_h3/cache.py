@@ -13,10 +13,12 @@ from musubi_tuner.minimax_h3.media import MediaModality
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
+    REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
     validate_reference_image_short_edge,
     validate_reference_image_sizing,
+    validate_reference_video_fps,
     validate_reference_video_sizing,
 )
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
@@ -36,6 +38,7 @@ H3_REFERENCE_IMAGE_SIZE_MODE_KEY = "mmh3_reference_image_size_mode"
 H3_REFERENCE_IMAGE_MAX_PIXELS_KEY = "mmh3_reference_image_max_pixels"
 H3_REFERENCE_VIDEO_SHORT_EDGE_KEY = "mmh3_reference_video_short_edge"
 H3_REFERENCE_VIDEO_MAX_PIXELS_KEY = "mmh3_reference_video_max_pixels"
+H3_REFERENCE_VIDEO_FPS_KEY = "mmh3_reference_video_fps"
 H3_CONDITIONING_TASK_IDS = {"t2va": 0, "i2va": 1, "fl2va": 2, "ref2va": 3, "ref2va_omni": 4, "l2va": 5}
 H3_KEYFRAME_VIDEO_ROWS_KEY = "mmh3_keyframe_video_rows"
 H3_REFERENCE_KINDS_KEY = "mmh3_reference_kinds"
@@ -54,22 +57,33 @@ def reference_variant_key(key: str, modality: str) -> str:
     return f"{key}_reference_{modality}"
 
 
+def format_reference_video_fps(sample_fps: float) -> str:
+    """Spell a subsampling rate for a cache key: 2.0 as ``2``, 2.5 as ``2p5``."""
+    return f"{float(sample_fps):g}".replace(".", "p").replace("+", "")
+
+
 def reference_key_suffix(
     image_short_edge: int,
     image_size_mode: str = REFERENCE_IMAGE_SIZE_MODE,
     image_max_pixels: int = 0,
     video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
+    video_sample_fps: float = REFERENCE_VIDEO_FPS,
 ) -> str:
     """Name reference caches whose pixels were scaled to a non-released short edge."""
     validate_reference_image_short_edge(image_short_edge)
     validate_reference_image_sizing(image_size_mode, image_max_pixels)
     validate_reference_video_sizing(video_short_edge, video_max_pixels)
+    video_sample_fps = validate_reference_video_fps(video_sample_fps)
     video_suffix = ""
     if video_short_edge != REFERENCE_VIDEO_SHORT_EDGE:
         video_suffix += f"_vse{video_short_edge}"
     if video_max_pixels != REFERENCE_VIDEO_MAX_PIXELS:
         video_suffix += f"_vmp{video_max_pixels}"
+    if video_sample_fps != REFERENCE_VIDEO_FPS:
+        # Only a non-default rate is named, so caches written before temporal
+        # subsampling existed keep their identity.
+        video_suffix += f"_vfps{format_reference_video_fps(video_sample_fps)}"
     if image_size_mode == "target_area":
         image_suffix = "_ta" if image_max_pixels == 0 else f"_ta{image_max_pixels}"
     else:
@@ -278,6 +292,14 @@ def save_text_encoder_output_cache_minimax_h3(
         if video_max_pixels.dtype != torch.long or video_max_pixels.ndim != 0:
             raise ValueError(f"H3 {H3_REFERENCE_VIDEO_MAX_PIXELS_KEY} must be a scalar int64 value")
         validate_reference_video_sizing(int(video_short_edge), int(video_max_pixels))
+    video_fps_matches = [tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_VIDEO_FPS_KEY]
+    if video_fps_matches:
+        if len(video_fps_matches) != 1:
+            raise ValueError(f"H3 conditioning cache must contain at most one {H3_REFERENCE_VIDEO_FPS_KEY} tensor")
+        video_fps = video_fps_matches[0]
+        if video_fps.dtype is not torch.float64 or video_fps.ndim != 0:
+            raise ValueError(f"H3 {H3_REFERENCE_VIDEO_FPS_KEY} must be a scalar float64 value")
+        validate_reference_video_fps(float(video_fps))
     reference_contract_matches = [
         tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_TEMPORAL_CONTRACT_KEY
     ]
