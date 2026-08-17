@@ -191,6 +191,29 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return bool(active.item())
 
     @staticmethod
+    def _sparse_branch_choice(accelerator: Accelerator, weights, generator: torch.Generator | None = None) -> int:
+        """Draw one categorical branch index shared by every distributed rank.
+
+        The same contract as ``_sparse_branch_active`` generalized past two
+        outcomes: one CPU draw off the caller's stream, bucketed by the
+        cumulative weights, then broadcast so every rank builds the same
+        conditioning. An index equal to ``len(weights)`` means the residual
+        ``1 - sum(weights)`` outcome was drawn.
+        """
+        draw = float(torch.rand((), device="cpu", generator=generator))
+        index = len(weights)
+        cumulative = 0.0
+        for position, weight in enumerate(weights):
+            cumulative += float(weight)
+            if draw < cumulative:
+                index = position
+                break
+        selected = torch.tensor(index, device=accelerator.device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(selected, src=0)
+        return int(selected.item())
+
+    @staticmethod
     def _base_preservation_active(accelerator: Accelerator, probability: float) -> bool:
         """Draw one preservation decision shared by every distributed rank."""
         return MiniMaxH3NetworkTrainer._sparse_branch_active(accelerator, probability)
@@ -211,6 +234,51 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._guidance_probability_generator = generator
         return self._sparse_branch_active(accelerator, probability, generator)
 
+    def _draw_step_recipe(self, accelerator: Accelerator, args: argparse.Namespace) -> str | None:
+        """Draw which conditioning recipe this step trains, shared by every rank.
+
+        ``None`` means no mixing is configured and the step keeps whatever single
+        recipe the flags select, bit-for-bit as before. Otherwise exactly one of
+        ``mask``, ``extension`` or ``plain`` is drawn: masking and extension both
+        claim the observed rows, so a step never carries both.
+        """
+        mask_configured, extension_configured = self._configured_recipes()
+        mask_probability = float(args.h3_mask_probability) if mask_configured else 1.0
+        extension_probability = float(args.h3_extension_probability) if extension_configured else 1.0
+        if mask_probability >= 1.0 and extension_probability >= 1.0:
+            return None
+        generator = self._recipe_probability_generator
+        if generator is None:
+            # A third dedicated stream, independent of the guidance and
+            # preservation ones and of the global CPU stream that caption
+            # dropout, the observed-modality draw and the jitters consume:
+            # enabling recipe mixing must not shift any of them. Only the
+            # one-time seed comes from the global stream, so a seeded run stays
+            # reproducible.
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._recipe_probability_generator = generator
+        weights = (
+            mask_probability if mask_configured else 0.0,
+            extension_probability if extension_configured else 0.0,
+        )
+        return ("mask", "extension", "plain")[self._sparse_branch_choice(accelerator, weights, generator)]
+
+    def _configured_recipes(self) -> tuple[bool, bool]:
+        """Report whether masking and extension are configured for this run."""
+        return (
+            self._mask_mode != "off" or self._mask_audio,
+            bool(self._extension_video_frames or self._extension_audio_latents),
+        )
+
+    @property
+    def _active_extension_video_frames(self) -> int:
+        return self._extension_video_frames if self._step_recipe in (None, "extension") else 0
+
+    @property
+    def _active_extension_audio_latents(self) -> int:
+        return self._extension_audio_latents if self._step_recipe in (None, "extension") else 0
+
     supports_validation = True
 
     def __init__(self):
@@ -218,6 +286,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self.backend: H3TrainingBackend | None = None
         self._crepa_config: H3CREPAConfig | None = None
         self._guidance_probability_generator: torch.Generator | None = None
+        self._recipe_probability_generator: torch.Generator | None = None
+        self._step_recipe: str | None = None
         self._crepa: H3CREPA | None = None
         self._extension_video_frames = 0
         self._extension_audio_latents = 0
@@ -340,6 +410,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_spatial_density_scale = None
         self._step_keyframes = None
         self._step_reference_modality = "av"
+        self._step_recipe = None
         if self._validation_dataloader is None:
             self._validation_dataloader = self._build_validation_dataloader(args, accelerator)
 
@@ -409,6 +480,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._step_mask = None
             self._step_keyframes = None
             self._step_reference_modality = "av"
+            self._step_recipe = None
             if block_swap_active:
                 transformer.switch_block_swap_for_training()
             transformer.train(transformer_was_training)
@@ -592,15 +664,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         seed_validation_forward(conditioning_seed)
         self._step_keyframes = self._resolve_keyframe_anchors(inputs.video)
+        # Validation measures one fixed recipe so successive numbers stay
+        # comparable; a run that mixes masking and extension per step reports the
+        # masked one, since the two cannot share a step.
+        self._step_recipe = "mask" if all(self._configured_recipes()) else None
         self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
         effective_video_mask = self._mask_to_loss(
-            self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._extension_video_frames, axis=-3),
+            self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3),
             inputs.video_target,
             None if self._step_mask is None else self._step_mask.video_latent,
             axis=-3,
         )
         effective_audio_mask = self._mask_to_loss(
-            self._extension_masked(batch.get("audio_loss_mask"), inputs.audio_target, self._extension_audio_latents, axis=-1),
+            self._extension_masked(
+                batch.get("audio_loss_mask"), inputs.audio_target, self._active_extension_audio_latents, axis=-1
+            ),
             inputs.audio_target,
             None if self._step_mask is None else self._step_mask.audio_latent,
             axis=-1,
@@ -666,6 +744,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         self._step_mask = None
         self._step_keyframes = None
+        self._step_recipe = None
 
     def handle_model_specific_args(self, args: argparse.Namespace):
         self.dit_dtype = (
@@ -819,8 +898,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if not 0.0 < args.h3_mask_min_fraction <= args.h3_mask_max_fraction <= 1.0:
             raise ValueError("H3 mask fractions must satisfy 0 < min <= max <= 1")
         masking = args.h3_mask_mode != "off" or args.h3_mask_audio
-        if masking and (args.h3_extension_video_frames or args.h3_extension_audio_latents):
-            raise ValueError("H3 masked conditioning and extension both claim the observed rows; enable only one")
+        extension = bool(args.h3_extension_video_frames or args.h3_extension_audio_latents)
+        for name in ("h3_mask_probability", "h3_extension_probability"):
+            value = float(getattr(args, name))
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"--{name} must be finite and lie in [0, 1]")
+        if args.h3_mask_probability < 1.0 and not masking:
+            raise ValueError("--h3_mask_probability requires --h3_mask_mode or --h3_mask_audio")
+        if args.h3_extension_probability < 1.0 and not extension:
+            raise ValueError("--h3_extension_probability requires --h3_extension_video_frames or --h3_extension_audio_latents")
+        if masking and extension:
+            # Both recipes claim the observed rows, so they may share a run only
+            # when a per-step draw picks at most one of them for each step.
+            if args.h3_mask_probability >= 1.0 and args.h3_extension_probability >= 1.0:
+                raise ValueError("H3 masked conditioning and extension both claim the observed rows; enable only one")
+            if args.h3_mask_probability + args.h3_extension_probability > 1.0:
+                raise ValueError(
+                    "--h3_mask_probability and --h3_extension_probability select at most one recipe per step, "
+                    "so together they must not exceed 1"
+                )
         # Masking and per-row-sigma extension only pin rows inside the target
         # block, which every layout carries, so both combine with Ref2VA.
         # condition_rows extension instead duplicates the observed span as extra
@@ -1434,6 +1530,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         """
         if self._mask_mode == "off" and not self._mask_audio:
             return None
+        # A mixed run draws one recipe per step; a step that drew extension or the
+        # plain objective must present no masked rows at all.
+        if self._step_recipe not in (None, "mask"):
+            return None
         generator = torch.Generator(device="cpu")
         generator.manual_seed(int(torch.randint(0, 2**31 - 1, (1,)).item()))
         video_rows = audio_rows = video_latent = audio_latent = None
@@ -1598,17 +1698,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if self._step_mask.audio_rows is not None:
                 extension_kwargs["observed_audio_rows"] = self._step_mask.audio_rows
                 extension_kwargs["clean_audio_latents"] = self._clean_latents(inputs.audio, inputs.audio_target, inputs.audio_sigma)
-        if self._extension_video_frames or self._extension_audio_latents:
+        # Zero on a step whose recipe draw did not select extension, which leaves
+        # the packed layout identical to a run without the extension flags.
+        extension_video_frames = self._active_extension_video_frames
+        extension_audio_latents = self._active_extension_audio_latents
+        if extension_video_frames or extension_audio_latents:
             extension_kwargs["extension_route"] = self._extension_route
-        if self._extension_video_frames:
-            extension_kwargs["extension_video_frames"] = self._extension_video_frames
+        if extension_video_frames:
+            extension_kwargs["extension_video_frames"] = extension_video_frames
             extension_kwargs["extension_video_context"] = self._clean_context(
-                inputs.video, inputs.video_target, inputs.video_sigma, self._extension_video_frames, axis=-3
+                inputs.video, inputs.video_target, inputs.video_sigma, extension_video_frames, axis=-3
             )
-        if self._extension_audio_latents:
-            extension_kwargs["extension_audio_latents"] = self._extension_audio_latents
+        if extension_audio_latents:
+            extension_kwargs["extension_audio_latents"] = extension_audio_latents
             extension_kwargs["extension_audio_context"] = self._clean_context(
-                inputs.audio, inputs.audio_target, inputs.audio_sigma, self._extension_audio_latents, axis=-1
+                inputs.audio, inputs.audio_target, inputs.audio_sigma, extension_audio_latents, axis=-1
             )
         if self._step_reference_modality != "av":
             extension_kwargs["reference_modality"] = self._step_reference_modality
@@ -1661,6 +1765,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         guidance_active = args.h3_guidance_distillation_scale is not None and self._guidance_distillation_active(
             accelerator, args.h3_guidance_distillation_probability
         )
+        # One recipe per optimizer step: every item of a batch trains the same
+        # conditioning objective, exactly as the preservation and guidance draws
+        # above are shared. Its stream is independent of theirs, so the draw order
+        # here does not couple the three.
+        recipe = self._draw_step_recipe(accelerator, args)
         if batch_size == 1:
             return self._process_single_batch(
                 args,
@@ -1677,6 +1786,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 global_step,
                 preservation_active_override=preservation_active,
                 guidance_active_override=guidance_active,
+                recipe_override=recipe,
             )
 
         # The released H3 transformer accepts one shared packed layout, while
@@ -1711,6 +1821,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     global_step,
                     preservation_active_override=preservation_active,
                     guidance_active_override=guidance_active,
+                    recipe_override=recipe,
                     crepa_update_similarity_threshold=False,
                 )
                 accelerator.backward(item_loss / batch_size)
@@ -1799,6 +1910,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         *,
         preservation_active_override: bool | None = None,
         guidance_active_override: bool | None = None,
+        recipe_override: str | None = None,
         crepa_update_similarity_threshold: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         del network_dtype, vae
@@ -1908,6 +2020,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             args, inputs, video_latents, video_noise, base_sigma, is_image
         )
         self._step_spatial_density_scale = self._draw_spatial_density_scale()
+        # Bind this step's conditioning recipe before anything reads it. ``None``
+        # means no mixing is configured, so the mask draw and the extension
+        # context below behave exactly as they did before recipe mixing existed.
+        self._step_recipe = recipe_override if recipe_override is not None else self._draw_step_recipe(accelerator, args)
         self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
         # Drawn once per step for the same reason the mask is: the guidance and
         # base-preservation branches must condition on the same anchors as the
@@ -2036,13 +2152,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         video_weight = 0.0 if observed == "video" else args.h3_video_loss_weight
         audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
         effective_video_mask = self._mask_to_loss(
-            self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._extension_video_frames, axis=-3),
+            self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3),
             inputs.video_target,
             None if self._step_mask is None else self._step_mask.video_latent,
             axis=-3,
         )
         effective_audio_mask = self._mask_to_loss(
-            self._extension_masked(batch.get("audio_loss_mask"), inputs.audio_target, self._extension_audio_latents, axis=-1),
+            self._extension_masked(
+                batch.get("audio_loss_mask"), inputs.audio_target, self._active_extension_audio_latents, axis=-1
+            ),
             inputs.audio_target,
             None if self._step_mask is None else self._step_mask.audio_latent,
             axis=-1,
@@ -2085,6 +2203,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Only reported when the feature is on, so an existing run's metric
             # set is unchanged.
             metrics["h3/caption_dropped"] = float(conditioning == "empty")
+        if self._step_recipe is not None:
+            # Only reported once a probability below 1 turns mixing on, so a
+            # single-recipe run's metric set is unchanged. Recipe mixing trains a
+            # different objective on the selected steps rather than a sparse
+            # estimate of one objective, so no loss is rescaled by its probability.
+            mask_configured, extension_configured = self._configured_recipes()
+            if mask_configured:
+                metrics["h3/recipe_mask_active"] = float(self._step_recipe == "mask")
+            if extension_configured:
+                metrics["h3/recipe_extension_active"] = float(self._step_recipe == "extension")
         loss = result.loss
         # Dense-equivalent objective, free of inverse-probability scaling and of
         # auxiliary terms. Reported as the averaged loss whenever the optimized
@@ -2150,6 +2278,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_spatial_density_scale = None
         self._step_keyframes = None
         self._step_reference_modality = "av"
+        self._step_recipe = None
         return loss, metrics
 
     def call_dit(self, *args, **kwargs):
@@ -2191,6 +2320,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
+            "ss_h3_extension_probability": str(args.h3_extension_probability),
+            "ss_h3_mask_probability": str(args.h3_mask_probability),
             "ss_h3_frame_sigma_jitter": str(args.h3_frame_sigma_jitter),
             "ss_h3_spatial_density_jitter": str(args.h3_spatial_density_jitter),
             "ss_h3_keyframe_anchors": args.h3_keyframe_anchors or "none",
@@ -2329,6 +2460,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="leading audio latents observed as context instead of generated, training audio extension",
     )
     parser.add_argument(
+        "--h3_extension_probability",
+        type=float,
+        default=1.0,
+        help=(
+            "probability of training the extension recipe on a step; the remaining steps train the plain objective "
+            "or, when masking is also configured, whichever recipe the shared per-step draw selects. Requires the "
+            "extension flags and is synchronized across distributed ranks"
+        ),
+    )
+    parser.add_argument(
         "--h3_frame_sigma_jitter",
         type=float,
         default=0.0,
@@ -2430,6 +2571,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_mask_audio",
         action="store_true",
         help="also hide a contiguous run of audio latents, training audio inpainting alongside the video mask",
+    )
+    parser.add_argument(
+        "--h3_mask_probability",
+        type=float,
+        default=1.0,
+        help=(
+            "probability of training the masked recipe on a step; the remaining steps train the plain objective "
+            "or, when extension is also configured, whichever recipe the shared per-step draw selects. Requires "
+            "--h3_mask_mode or --h3_mask_audio and is synchronized across distributed ranks"
+        ),
     )
     parser.add_argument(
         "--h3_mask_min_fraction",

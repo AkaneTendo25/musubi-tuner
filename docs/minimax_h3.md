@@ -554,13 +554,26 @@ loss weight is forced to zero; this isolates direct supervision, not H3's shared
 | --- | --- |
 | `--h3_observed_modality {video,audio,random}` | Video-to-audio, audio-to-video, or one adapter covering both plus joint |
 | `--h3_extension_video_frames N` / `--h3_extension_audio_latents N` | Continuation from an observed prefix. Counts are in **latent** units and each must be shorter than its target; the two are independent, so setting one leaves the other generated in full. Under Ref2VA only the `per_row_sigma` route is supported |
+| `--h3_extension_probability P` | Train the extension recipe on a synchronized random fraction of steps; the rest train the plain objective. Requires the extension flags. `1` (default) applies it every step |
 | `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary anchors. FL2VA/`t2va` caches only |
 | `--h3_mask_mode {box,border,segment}` | Inpainting, outpainting, temporal infilling. Also available under Ref2VA |
+| `--h3_mask_probability P` | Train the masked recipe on a synchronized random fraction of steps; the rest train the plain objective. Requires `--h3_mask_mode` or `--h3_mask_audio`. `1` (default) applies it every step |
 | `--h3_frame_sigma_jitter 0.2` | Spreads target-frame noise levels across the schedule in one step. Supported by native T2VA/I2VA/FL2VA/L2VA/Ref2VA caches, including guidance-consistent loss, and skipped for images; cannot be combined with in-target observed-row options or sigma-dependent loss weighting; `0` disables it |
 | `--h3_spatial_density_jitter 0.2` | Perturbs the area normalization of the spatial RoPE grids each step, drawn log-uniformly from `[1/1.2, 1.2]`, so fixed-resolution data still trains a range of token spacings. One factor covers every grid in the packed sequence; `0` disables it |
 | `--h3_caption_dropout_rate 0.1` | Trains the unconditional branch; requires `--cache_guidance_empty` |
 
-Extension, keyframes, and masking all claim the observed rows, so **only one may be enabled at a time**.
+Extension, keyframes, and masking all claim the observed rows, so **only one may be active on a step**.
+
+**Mixing recipes.** `--h3_mask_probability` and `--h3_extension_probability` turn the choice into one categorical draw per
+optimizer step — shared by every item of the batch, by the guidance and preservation branches, and across distributed ranks — so a
+single run can teach masking, extension and the plain objective. Setting both allows masking and extension in the same run,
+provided the two probabilities sum to at most `1`; the draw selects at most one of them per step and the remainder trains the plain
+objective. Without probabilities the two remain mutually exclusive. Keyframes stay exclusive either way. A step that does not
+select a recipe builds exactly the tensors of a run without those flags: unlike guidance distillation and base preservation, no
+loss is rescaled by its probability, because mixing trains different objectives on different steps rather than a sparse estimate
+of one — the same convention as caption dropout and `--h3_observed_modality random`. Validation keeps measuring one fixed recipe
+(the masked one in a mixed run) so its numbers stay comparable. `h3/recipe_mask_active` and `h3/recipe_extension_active` are
+logged only once a probability below `1` is set.
 
 **Observed modality.** The observed side is pinned to the noise level the release already uses for conditioning of that kind, and
 carries no training signal — its loss weight is forced to zero. Datasets must cache both modalities. `random` redraws the task

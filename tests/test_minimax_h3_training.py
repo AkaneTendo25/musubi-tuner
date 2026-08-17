@@ -4714,3 +4714,252 @@ def test_h3_guidance_distillation_probability_is_recorded_in_metadata():
     metadata = MiniMaxH3NetworkTrainer().extra_metadata(args)
 
     assert metadata["ss_h3_guidance_distillation_probability"] == "0.5"
+
+
+class _RecipeRecordingBackend(_FakeBackend):
+    """Record the full conditioning kwargs each forward would have received."""
+
+    def __init__(self):
+        super().__init__()
+        self.conditioning = []
+
+    def predict_training(
+        self, transformer, batch, video_hidden_states, audio_hidden_states, video_timestep, audio_timestep, **kwargs
+    ):
+        self.conditioning.append({key: value for key, value in kwargs.items() if key != "conditioning"})
+        return super().predict_training(
+            transformer,
+            batch,
+            video_hidden_states,
+            audio_hidden_states,
+            video_timestep,
+            audio_timestep,
+            conditioning=kwargs.get("conditioning", "prompt"),
+        )
+
+
+_RECIPE_UNSET = object()
+
+
+def _recipe_args(*, mask=False, extension=False, mask_probability=1.0, extension_probability=1.0):
+    args = create_parser().parse_args(["--sdpa"])
+    args.h3_mask_mode = "box" if mask else "off"
+    args.h3_extension_video_frames = 1 if extension else 0
+    args.h3_mask_probability = mask_probability
+    args.h3_extension_probability = extension_probability
+    return args
+
+
+def _recipe_trainer(args):
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    return trainer
+
+
+def _run_recipe(args, *, forced=_RECIPE_UNSET, seed=0):
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = _RecipeRecordingBackend()
+    trainer.backend = backend
+    trainer._mask_mode = args.h3_mask_mode
+    trainer._extension_video_frames = args.h3_extension_video_frames
+    if forced is not _RECIPE_UNSET:
+        trainer._draw_step_recipe = lambda accelerator, arguments: forced
+    video = torch.zeros(1, 24, 4, 16, 16)
+    batch = {
+        H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 8),
+        H3_AUDIO_LOSS_MASK_KEY: torch.ones(1, 8, dtype=torch.bool),
+        "timesteps": [0.5],
+    }
+    torch.manual_seed(seed)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        _ScaleTransformer(),
+        None,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    return backend, float(loss.detach()), metrics
+
+
+@pytest.mark.parametrize("probability", [-0.1, 1.1, float("nan")])
+@pytest.mark.parametrize("feature", ["mask", "extension"])
+def test_h3_recipe_probabilities_are_range_checked(feature, probability):
+    args = _recipe_args(**{feature: True, f"{feature}_probability": probability})
+
+    with pytest.raises(ValueError, match=f"--h3_{feature}_probability must be finite"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_mask_probability_requires_the_mask_flags():
+    args = _recipe_args(mask_probability=0.5)
+
+    with pytest.raises(ValueError, match="--h3_mask_probability requires"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_extension_probability_requires_the_extension_flags():
+    args = _recipe_args(extension_probability=0.5)
+
+    with pytest.raises(ValueError, match="--h3_extension_probability requires"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_mask_and_extension_share_a_run_only_through_probabilities():
+    both = _recipe_args(mask=True, extension=True)
+    with pytest.raises(ValueError, match="only one"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(both)
+
+    oversubscribed = _recipe_args(mask=True, extension=True, mask_probability=0.7, extension_probability=0.5)
+    with pytest.raises(ValueError, match="must not exceed 1"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(oversubscribed)
+
+    mixed = _recipe_args(mask=True, extension=True, mask_probability=0.5, extension_probability=0.25)
+
+    assert _recipe_trainer(mixed)._configured_recipes() == (True, True)
+
+
+def test_h3_recipe_draw_matches_the_configured_probabilities():
+    args = _recipe_args(mask=True, extension=True, mask_probability=0.5, extension_probability=0.25)
+    trainer = _recipe_trainer(args)
+
+    torch.manual_seed(0)
+    draws = [trainer._draw_step_recipe(_FakeAccelerator(), args) for _ in range(4000)]
+
+    # At most one recipe per step; the residual trains the plain objective.
+    assert set(draws) == {"mask", "extension", "plain"}
+    assert draws.count("mask") / len(draws) == pytest.approx(0.5, abs=0.03)
+    assert draws.count("extension") / len(draws) == pytest.approx(0.25, abs=0.03)
+    assert draws.count("plain") / len(draws) == pytest.approx(0.25, abs=0.03)
+
+
+def test_h3_recipe_draw_is_deterministic_under_a_fixed_seed():
+    args = _recipe_args(mask=True, mask_probability=0.5)
+    runs = []
+    for _ in range(2):
+        trainer = _recipe_trainer(args)
+        torch.manual_seed(1234)
+        runs.append([trainer._draw_step_recipe(_FakeAccelerator(), args) for _ in range(32)])
+
+    assert runs[0] == runs[1]
+    assert set(runs[0]) == {"mask", "plain"}
+
+
+def test_h3_recipe_draw_is_absent_without_probabilities():
+    args = _recipe_args(mask=True)
+    trainer = _recipe_trainer(args)
+
+    # Nothing is drawn and no stream is created: the single configured recipe
+    # applies to every step exactly as it did before mixing existed.
+    assert trainer._draw_step_recipe(_FakeAccelerator(), args) is None
+    assert trainer._recipe_probability_generator is None
+
+
+def test_h3_recipe_draw_is_synchronized_across_ranks_and_off_the_global_stream(monkeypatch):
+    broadcasts = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda value, src: broadcasts.append((value.clone(), src)))
+    args = _recipe_args(mask=True, extension=True, mask_probability=0.5, extension_probability=0.25)
+
+    torch.manual_seed(321)
+    _recipe_trainer(args)._draw_step_recipe(_FakeAccelerator(), args)  # seeds the generator once
+    expected_next = torch.rand(())
+
+    trainer = _recipe_trainer(args)
+    torch.manual_seed(321)
+    for _ in range(6):
+        trainer._draw_step_recipe(_FakeAccelerator(), args)
+    actual_next = torch.rand(())
+
+    # Only the one-time seeding touches the global stream, so recipe mixing shifts
+    # neither caption dropout nor the guidance and preservation draws.
+    assert actual_next == expected_next
+    assert len(broadcasts) == 7 and all(source == 0 for _, source in broadcasts)
+
+
+@pytest.mark.parametrize("feature", ["mask", "extension"])
+def test_h3_inactive_recipe_step_builds_exactly_the_plain_objective(feature):
+    plain_backend, plain_loss, plain_metrics = _run_recipe(_recipe_args())
+    args = _recipe_args(**{feature: True, f"{feature}_probability": 0.5})
+    backend, loss, metrics = _run_recipe(args, forced="plain")
+
+    assert len(backend.conditioning) == len(plain_backend.conditioning) == 1
+    assert backend.conditioning[0] == plain_backend.conditioning[0] == {}
+    assert loss == plain_loss
+    assert metrics[f"h3/recipe_{feature}_active"] == 0.0
+    assert not any(key.startswith("h3/recipe_") for key in plain_metrics)
+
+
+@pytest.mark.parametrize("feature", ["mask", "extension"])
+def test_h3_active_recipe_step_matches_the_always_on_recipe(feature):
+    dense_backend, dense_loss, dense_metrics = _run_recipe(_recipe_args(**{feature: True}))
+    args = _recipe_args(**{feature: True, f"{feature}_probability": 0.5})
+    backend, loss, metrics = _run_recipe(args, forced=feature)
+
+    assert backend.conditioning[0] and backend.conditioning[0].keys() == dense_backend.conditioning[0].keys()
+    assert loss == dense_loss
+    assert metrics[f"h3/recipe_{feature}_active"] == 1.0
+    assert not any(key.startswith("h3/recipe_") for key in dense_metrics)
+
+
+def test_h3_mixed_recipes_never_activate_both_in_one_step():
+    args = _recipe_args(mask=True, extension=True, mask_probability=0.5, extension_probability=0.5)
+    seen = set()
+    for seed in range(12):
+        backend, _, metrics = _run_recipe(args, seed=seed)
+        kwargs = backend.conditioning[0]
+        masked = "observed_video_rows" in kwargs
+        extended = "extension_video_frames" in kwargs
+        assert not (masked and extended)
+        assert masked == (metrics["h3/recipe_mask_active"] == 1.0)
+        assert extended == (metrics["h3/recipe_extension_active"] == 1.0)
+        seen.add((masked, extended))
+
+    assert (True, False) in seen and (False, True) in seen
+
+
+def test_h3_recipe_probabilities_are_recorded_in_metadata():
+    args = _recipe_args(mask=True, mask_probability=0.5)
+
+    metadata = MiniMaxH3NetworkTrainer().extra_metadata(args)
+
+    assert metadata["ss_h3_mask_probability"] == "0.5"
+    assert metadata["ss_h3_extension_probability"] == "1.0"
+
+
+@pytest.mark.parametrize("feature", ["mask", "extension"])
+def test_h3_frame_sigma_jitter_is_still_rejected_for_a_sometimes_active_recipe(feature):
+    args = _recipe_args(**{feature: True, f"{feature}_probability": 0.5})
+    args.h3_frame_sigma_jitter = 0.2
+
+    with pytest.raises(ValueError, match="--h3_frame_sigma_jitter re-noises every frame"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("feature", ["mask", "extension"])
+def test_h3_keyframes_still_reject_a_sometimes_active_recipe(feature):
+    args = _recipe_args(**{feature: True, f"{feature}_probability": 0.5})
+    args.h3_keyframe_anchors = "first,last"
+
+    with pytest.raises(ValueError, match="only one"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_mixed_recipes_under_ref2va_still_require_the_per_row_sigma_route():
+    args = _recipe_args(mask=True, extension=True, mask_probability=0.5, extension_probability=0.5)
+    args.h3_training_mode = "ref2va"
+
+    with pytest.raises(ValueError, match="requires --h3_extension_route per_row_sigma"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    args.h3_extension_route = "per_row_sigma"
+
+    assert _recipe_trainer(args)._configured_recipes() == (True, True)

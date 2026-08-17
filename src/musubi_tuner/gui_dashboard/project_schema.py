@@ -268,12 +268,14 @@ class TrainingConfig(BaseModel):
     h3_extension_video_frames: int = 0
     h3_extension_audio_latents: int = 0
     h3_extension_route: Literal["condition_rows", "per_row_sigma"] = "condition_rows"
+    h3_extension_probability: float = 1.0
     h3_keyframe_anchors: str = ""
     h3_keyframe_random_count: int = 0
     h3_mask_mode: Literal["off", "box", "border", "segment"] = "off"
     h3_mask_audio: bool = False
     h3_mask_min_fraction: float = 0.25
     h3_mask_max_fraction: float = 0.75
+    h3_mask_probability: float = 1.0
     reference_image_short_edge: int = 2048
     reference_image_size_mode: Literal["short_edge", "target_area"] = "short_edge"
     reference_image_max_pixels: int = 0

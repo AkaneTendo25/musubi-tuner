@@ -636,6 +636,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_extension_audio_latents", str(t.h3_extension_audio_latents)]
     if t.h3_extension_route != "condition_rows":
         cmd += ["--h3_extension_route", t.h3_extension_route]
+    if (t.h3_extension_video_frames or t.h3_extension_audio_latents) and t.h3_extension_probability != 1.0:
+        cmd += ["--h3_extension_probability", str(t.h3_extension_probability)]
     if t.h3_keyframe_anchors:
         cmd += ["--h3_keyframe_anchors", t.h3_keyframe_anchors]
     if t.h3_keyframe_random_count:
@@ -655,6 +657,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--h3_mask_mode", t.h3_mask_mode]
         if t.h3_mask_audio:
             cmd.append("--h3_mask_audio")
+        if t.h3_mask_probability != 1.0:
+            cmd += ["--h3_mask_probability", str(t.h3_mask_probability)]
         if t.h3_mask_min_fraction != 0.25:
             cmd += ["--h3_mask_min_fraction", str(t.h3_mask_min_fraction)]
         if t.h3_mask_max_fraction != 0.75:

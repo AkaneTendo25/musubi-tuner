@@ -982,16 +982,59 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
-        if extension and masking:
+        mask_probability = float(t.h3_mask_probability)
+        extension_probability = float(t.h3_extension_probability)
+        for value, field, label in (
+            (mask_probability, "training.h3_mask_probability", "H3 Mask Probability"),
+            (extension_probability, "training.h3_extension_probability", "H3 Extension Probability"),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                errors.append(
+                    _make_issue("error", field, f"{label} must be finite and lie in [0, 1].", label=label, page="training")
+                )
+        if mask_probability < 1.0 and not masking:
             errors.append(
                 _make_issue(
                     "error",
-                    "training.h3_extension_video_frames",
-                    "H3 extension and masked conditioning both claim observed rows; enable only one.",
-                    label="H3 Conditioning",
+                    "training.h3_mask_probability",
+                    "H3 mask probability requires a mask mode or masked audio.",
+                    label="H3 Mask Probability",
                     page="training",
                 )
             )
+        if extension_probability < 1.0 and not extension:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_extension_probability",
+                    "H3 extension probability requires an extension context length.",
+                    label="H3 Extension Probability",
+                    page="training",
+                )
+            )
+        if extension and masking:
+            # They may share a run only when a per-step draw picks at most one.
+            if mask_probability >= 1.0 and extension_probability >= 1.0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_extension_video_frames",
+                        "H3 extension and masked conditioning both claim observed rows; enable only one.",
+                        label="H3 Conditioning",
+                        page="training",
+                    )
+                )
+            elif mask_probability + extension_probability > 1.0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_mask_probability",
+                        "H3 mask and extension probabilities select at most one recipe per step, "
+                        "so together they must not exceed 1.",
+                        label="H3 Conditioning",
+                        page="training",
+                    )
+                )
         if (keyframes or extension or masking) and t.h3_training_mode != "fl2va":
             errors.append(
                 _make_issue(
