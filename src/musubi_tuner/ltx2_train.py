@@ -69,7 +69,12 @@ from musubi_tuner.training.step_control import (
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.async_checkpoint import AsyncCheckpointSaver, validate_async_checkpoint_save_options
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
-from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser, warn_if_h2d_only_ignored
+from musubi_tuner.ltx2_train_network import (
+    LTX2NetworkTrainer,
+    ltx2_setup_parser,
+    validate_ltx2_low_ram_load,
+    warn_if_h2d_only_ignored,
+)
 from musubi_tuner.ltx2_model_parallel import (
     add_ltx2_model_parallel_args,
     clip_grad_norm_model_parallel,
@@ -3869,7 +3874,21 @@ def main() -> None:
     # it saves. The remaining conditions are explicit opt-ins or memory-bounded features that
     # require CPU loading regardless.
     force_cpu_load = ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load or int8_weights_cpu_load
+    # --ltx2_low_ram_load streams each weight onto the device it will be used from, so the swapped
+    # blocks reach main RAM and the resident ones the GPU without the model ever existing whole on
+    # either. It only reaches the loader when the transformer is loaded on the GPU.
+    low_ram_load = bool(getattr(args, "ltx2_low_ram_load", False))
+    if low_ram_load:
+        validate_ltx2_low_ram_load(args)
+        if force_cpu_load:
+            raise ValueError(
+                "--ltx2_low_ram_load is incompatible with model parallel, remote-stage block pruning, "
+                "--qgalore_load_device cpu, and --int8_weights, which stage the transformer on CPU."
+            )
     gpu_load = bool(getattr(args, "ltx2_gpu_load", False))
+    if gpu_load and low_ram_load:
+        logger.info("--ltx2_low_ram_load takes precedence over --ltx2_gpu_load: streaming placement avoids the GPU peak.")
+        gpu_load = False
     if gpu_load and force_cpu_load:
         logger.warning(
             "--ltx2_gpu_load is ignored: model parallel, remote-stage block pruning, --qgalore_load_device cpu, "
@@ -3879,7 +3898,7 @@ def main() -> None:
     if gpu_load and blocks_to_swap > 0:
         logger.info("--ltx2_gpu_load: loading transformer directly onto %s despite --blocks_to_swap", accelerator.device)
         _warn_if_gpu_load_peak_exceeds_free_vram(args.ltx2_checkpoint, accelerator.device)
-    loading_device = "cpu" if (blocks_to_swap > 0 and not gpu_load) or force_cpu_load else accelerator.device
+    loading_device = "cpu" if (blocks_to_swap > 0 and not (gpu_load or low_ram_load)) or force_cpu_load else accelerator.device
     if qgalore_cpu_load:
         logger.info("Q-GaLore CPU load enabled: load/replace/quantize transformer on CPU before moving to %s", accelerator.device)
 
