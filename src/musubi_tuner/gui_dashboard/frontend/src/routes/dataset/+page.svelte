@@ -67,7 +67,8 @@
 				control_modalities: '',
 				control_modality_probability_av: null,
 				control_modality_probability_video: null,
-				control_modality_probability_audio: null
+				control_modality_probability_audio: null,
+				conditioning_mask_directory: ''
 			};
 			const ds = { ...(c.dataset || {}) };
 			if (isValidation) {

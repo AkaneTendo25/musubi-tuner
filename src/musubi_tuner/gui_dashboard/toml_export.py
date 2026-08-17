@@ -279,6 +279,8 @@ def _h3_dataset_entry_to_dict(entry) -> dict:
         if any(value is None for value in probabilities):
             raise ValueError("H3 control modality probabilities require AV, video, and audio values")
         d["control_modality_probabilities"] = [float(value) for value in probabilities]
+    if getattr(entry, "conditioning_mask_directory", ""):
+        d["conditioning_mask_directory"] = entry.conditioning_mask_directory
     return d
 
 

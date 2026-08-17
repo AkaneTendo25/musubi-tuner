@@ -360,6 +360,29 @@ def _validate_h3_dataset_entry(
                 page="dataset",
             )
         )
+    if getattr(entry, "conditioning_mask_directory", ""):
+        if entry.type == "audio" or entry.h3_target_mode == "audio":
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.conditioning_mask_directory",
+                    f"{label}: conditioning masks are video-only and cannot be declared on an audio target.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+        if entry.batch_size > 1:
+            # Observed rows are shared by the whole batch, so one authored region
+            # per step is all the packer can pin.
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.batch_size",
+                    f"{label}: dataset conditioning masks pin one region per step; use batch size 1.",
+                    label=label,
+                    page="dataset",
+                )
+            )
 
 
 def _h3_required_vaes(config: ProjectConfig) -> tuple[bool, bool]:
@@ -1035,6 +1058,36 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         page="training",
                     )
                 )
+        # Dataset-authored masks and the procedural modes are mutually exclusive:
+        # the trainer refuses a config that declares one without the other.
+        mask_rows = list(config.dataset.datasets or []) + list(config.dataset.validation_datasets or [])
+        declared_masks = [e for e in mask_rows if getattr(e, "conditioning_mask_directory", "")]
+        if t.h3_mask_mode == "dataset":
+            uncovered = [
+                e
+                for e in mask_rows
+                if e.type != "audio" and e.h3_target_mode != "audio" and not getattr(e, "conditioning_mask_directory", "")
+            ]
+            if uncovered:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_mask_mode",
+                        "H3 dataset mask mode needs a conditioning mask directory on every video or image dataset.",
+                        label="H3 Mask Mode",
+                        page="training",
+                    )
+                )
+        elif declared_masks:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_mask_mode",
+                    "The dataset declares conditioning masks; select the Dataset mask mode to use them.",
+                    label="H3 Mask Mode",
+                    page="training",
+                )
+            )
         if (keyframes or extension or masking) and t.h3_training_mode != "fl2va":
             errors.append(
                 _make_issue(
@@ -1285,6 +1338,29 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.gradient_checkpointing_cpu_offload_dtype != "none":
+            # Compression lives at the reusable offloader's pack/unpack boundary,
+            # so the plain save-on-CPU path has no hook to apply it.
+            if not (t.gradient_checkpointing and t.gradient_checkpointing_cpu_offload):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.gradient_checkpointing_cpu_offload_dtype",
+                        "Compressed checkpoint offload requires gradient checkpointing with CPU offload.",
+                        label="Checkpoint Offload Dtype",
+                        page="training",
+                    )
+                )
+            elif not t.h3_reusable_activation_offload:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.gradient_checkpointing_cpu_offload_dtype",
+                        "Compressed checkpoint offload requires reusable H3 activation offload.",
+                        label="Checkpoint Offload Dtype",
+                        page="training",
+                    )
+                )
         if t.discrete_flow_shift != 1.0:
             errors.append(
                 _make_issue(

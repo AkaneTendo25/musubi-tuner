@@ -205,49 +205,59 @@
 				{/if}
 				{#if !isAudio}
 					<PathInput
-						label="H3 Reference Directory"
-						value={entry.control_directory || ''}
-						oninput={(e) => updateField('control_directory', e.target.value)}
+						label="Conditioning Mask Directory"
+						value={entry.conditioning_mask_directory || ''}
+						oninput={(e) => updateField('conditioning_mask_directory', e.target.value)}
 						placeholder="Optional"
-						tooltip={sourceDirectoryTooltip}
+						tooltip="Authored observed region for H3 mask mode Dataset. Mask images are matched to targets by basename, white is observed context, and the dataset needs batch size 1."
 					/>
-					<div class="grid grid-cols-2 gap-3">
-						<PathInput
-							label="Paired Reference Video"
-							value={entry.control_video_directory || ''}
-							oninput={(e) => updateField('control_video_directory', e.target.value)}
-							placeholder="Optional"
-							tooltip="Stem-matched reference videos. Set together with Paired Reference Audio to replace each video's soundtrack."
-						/>
-						<PathInput
-							label="Paired Reference Audio"
-							value={entry.control_audio_directory || ''}
-							oninput={(e) => updateField('control_audio_directory', e.target.value)}
-							placeholder="Optional"
-							tooltip="Stem-matched audio paired with the reference video directory. Both paired directories are required."
-						/>
+				{/if}
+				<!-- Ref2VA references apply to audio targets too: an arbitrary
+				     conditioning video (Foley) or a reference voice clip plus a
+				     visual anchor. -->
+				<PathInput
+					label="H3 Reference Directory"
+					value={entry.control_directory || ''}
+					oninput={(e) => updateField('control_directory', e.target.value)}
+					placeholder="Optional"
+					tooltip={sourceDirectoryTooltip}
+				/>
+				<div class="grid grid-cols-2 gap-3">
+					<PathInput
+						label="Paired Reference Video"
+						value={entry.control_video_directory || ''}
+						oninput={(e) => updateField('control_video_directory', e.target.value)}
+						placeholder="Optional"
+						tooltip="Stem-matched reference videos. Set together with Paired Reference Audio to replace each video's soundtrack."
+					/>
+					<PathInput
+						label="Paired Reference Audio"
+						value={entry.control_audio_directory || ''}
+						oninput={(e) => updateField('control_audio_directory', e.target.value)}
+						placeholder="Optional"
+						tooltip="Stem-matched audio paired with the reference video directory. Both paired directories are required."
+					/>
+				</div>
+				<FormSelect
+					label="Reference Modality"
+					value={entry.control_modality || ''}
+					onchange={(e) => updateField('control_modality', e.target.value)}
+					options={[{value:'',label:'Use source modality'},{value:'av',label:'Video + audio'},{value:'video',label:'Visual only'},{value:'audio',label:'Audio only'}]}
+					tooltip="Apply one modality policy to every reference. Use the per-reference list below when references have different roles."
+				/>
+				{#if advanced}
+					<FormField
+						label="Per-Reference Modalities"
+						value={entry.control_modalities || ''}
+						oninput={(e) => updateField('control_modalities', e.target.value)}
+						placeholder="video;av;audio"
+						tooltip="Semicolon-separated role for each ordered reference. Do not combine with a fixed modality or probabilities."
+					/>
+					<div class="grid grid-cols-3 gap-3">
+						<FormField label="Random AV" type="number" value={entry.control_modality_probability_av ?? ''} oninput={(e) => updateNumberField('control_modality_probability_av', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of retaining video and audio from references. Set all three probabilities; they must sum to 1." />
+						<FormField label="Random Video" type="number" value={entry.control_modality_probability_video ?? ''} oninput={(e) => updateNumberField('control_modality_probability_video', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of visual-only reference conditioning." />
+						<FormField label="Random Audio" type="number" value={entry.control_modality_probability_audio ?? ''} oninput={(e) => updateNumberField('control_modality_probability_audio', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of audio-only reference conditioning." />
 					</div>
-					<FormSelect
-						label="Reference Modality"
-						value={entry.control_modality || ''}
-						onchange={(e) => updateField('control_modality', e.target.value)}
-						options={[{value:'',label:'Use source modality'},{value:'av',label:'Video + audio'},{value:'video',label:'Visual only'},{value:'audio',label:'Audio only'}]}
-						tooltip="Apply one modality policy to every reference. Use the per-reference list below when references have different roles."
-					/>
-					{#if advanced}
-						<FormField
-							label="Per-Reference Modalities"
-							value={entry.control_modalities || ''}
-							oninput={(e) => updateField('control_modalities', e.target.value)}
-							placeholder="video;av;audio"
-							tooltip="Semicolon-separated role for each ordered reference. Do not combine with a fixed modality or probabilities."
-						/>
-						<div class="grid grid-cols-3 gap-3">
-							<FormField label="Random AV" type="number" value={entry.control_modality_probability_av ?? ''} oninput={(e) => updateNumberField('control_modality_probability_av', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of retaining video and audio from references. Set all three probabilities; they must sum to 1." />
-							<FormField label="Random Video" type="number" value={entry.control_modality_probability_video ?? ''} oninput={(e) => updateNumberField('control_modality_probability_video', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of visual-only reference conditioning." />
-							<FormField label="Random Audio" type="number" value={entry.control_modality_probability_audio ?? ''} oninput={(e) => updateNumberField('control_modality_probability_audio', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of audio-only reference conditioning." />
-						</div>
-					{/if}
 				{/if}
 			</div>
 		{/if}

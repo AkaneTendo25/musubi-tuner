@@ -771,6 +771,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--h3_gradient_checkpointing_cpu_offload_pin_memory")
     if t.h3_reusable_activation_offload:
         cmd.append("--h3_reusable_activation_offload")
+    if t.gradient_checkpointing_cpu_offload_dtype != "none":
+        cmd += ["--gradient_checkpointing_cpu_offload_dtype", t.gradient_checkpointing_cpu_offload_dtype]
     if t.use_pinned_memory_for_block_swap:
         cmd.append("--use_pinned_memory_for_block_swap")
     if getattr(t, "block_swap_h2d_only", False):
@@ -795,6 +797,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--save_last_n_epochs_state", str(t.save_last_n_epochs_state)]
     if t.save_last_n_steps_state is not None:
         cmd += ["--save_last_n_steps_state", str(t.save_last_n_steps_state)]
+    if t.async_checkpoint_save:
+        cmd.append("--async_checkpoint_save")
     if t.save_state:
         cmd.append("--save_state")
     if t.save_state_on_train_end:

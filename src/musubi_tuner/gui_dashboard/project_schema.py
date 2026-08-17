@@ -126,6 +126,8 @@ class DatasetEntry(BaseModel):
     control_modality_probability_av: Optional[float] = None
     control_modality_probability_video: Optional[float] = None
     control_modality_probability_audio: Optional[float] = None
+    # Authored observed region for --h3_mask_mode dataset. Video/image targets only.
+    conditioning_mask_directory: str = ""
 
 
 class DatasetConfig(BaseModel):
@@ -271,7 +273,7 @@ class TrainingConfig(BaseModel):
     h3_extension_probability: float = 1.0
     h3_keyframe_anchors: str = ""
     h3_keyframe_random_count: int = 0
-    h3_mask_mode: Literal["off", "box", "border", "segment"] = "off"
+    h3_mask_mode: Literal["off", "box", "border", "segment", "dataset"] = "off"
     h3_mask_audio: bool = False
     h3_mask_min_fraction: float = 0.25
     h3_mask_max_fraction: float = 0.75
@@ -525,6 +527,7 @@ class TrainingConfig(BaseModel):
     blocks_to_swap: Optional[int] = None
     gradient_checkpointing: bool = False
     gradient_checkpointing_cpu_offload: bool = False
+    gradient_checkpointing_cpu_offload_dtype: Literal["none", "fp8_e4m3"] = "none"
     split_attn: bool = False
     split_attn_target: Optional[str] = None
     split_attn_mode: Optional[str] = None
@@ -691,6 +694,7 @@ class TrainingConfig(BaseModel):
     save_last_n_steps: Optional[int] = None
     save_last_n_epochs_state: Optional[int] = None
     save_last_n_steps_state: Optional[int] = None
+    async_checkpoint_save: bool = False
     save_state: bool = False
     save_state_mode: Literal["full", "minimal"] = "full"
     save_state_on_train_end: bool = False
@@ -1065,7 +1069,6 @@ class FullFinetuneConfig(TrainingConfig):
     flash_attn: bool = True
     fused_backward_pass: bool = True
     mem_eff_save: bool = True
-    async_checkpoint_save: bool = False
     output_name: str = "ltx2_full_ft"
     save_every_n_steps: Optional[int] = 1000
     network_module: Optional[str] = None
