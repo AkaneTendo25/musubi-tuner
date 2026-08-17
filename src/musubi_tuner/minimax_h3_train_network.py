@@ -1010,6 +1010,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError(
                 "--h3_reusable_activation_offload requires --gradient_checkpointing and --gradient_checkpointing_cpu_offload"
             )
+        if getattr(args, "gradient_checkpointing_cpu_offload_dtype", "none") != "none":
+            if not (args.gradient_checkpointing and args.gradient_checkpointing_cpu_offload):
+                raise ValueError(
+                    "--gradient_checkpointing_cpu_offload_dtype requires "
+                    "--gradient_checkpointing and --gradient_checkpointing_cpu_offload"
+                )
+            if not args.h3_reusable_activation_offload:
+                # Compression lives at the reusable offloader's pack/unpack
+                # boundary; the plain ``save_on_cpu`` path has no hook to apply
+                # it, so silently ignoring the flag there would be worse.
+                raise ValueError("--gradient_checkpointing_cpu_offload_dtype requires --h3_reusable_activation_offload")
         if args.block_swap_h2d_only and not args.use_pinned_memory_for_block_swap:
             logger.warning(
                 "MiniMax H3 H2D-only block swap without pinned host memory uses staged copies and can be substantially slower; "
@@ -1046,6 +1057,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             set_int8_attention_mode(getattr(args, "h3_int8_attention", "off"))
         if args.h3_reusable_activation_offload:
             transformer.enable_reusable_activation_offload()
+            offload_dtype = getattr(args, "gradient_checkpointing_cpu_offload_dtype", "none")
+            if offload_dtype != "none":
+                transformer.reusable_activation_offloader.set_offload_dtype(offload_dtype)
         if args.h3_fused_qk_norm_rope:
             transformer.enable_fused_qk_norm_rope()
             if args.compile:
@@ -2782,6 +2796,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "reuse pinned CPU buffers for checkpoint activations and prefetch them in reverse block order; "
             "requires --gradient_checkpointing --gradient_checkpointing_cpu_offload"
+        ),
+    )
+    parser.add_argument(
+        "--gradient_checkpointing_cpu_offload_dtype",
+        choices=("none", "fp8_e4m3"),
+        default="none",
+        help=(
+            "wire dtype for CPU-offloaded checkpoint activations; 'fp8_e4m3' halves PCIe traffic and pinned host memory "
+            "for bf16/fp16 activations at the cost of a slightly lossy recomputation. Requires "
+            "--gradient_checkpointing --gradient_checkpointing_cpu_offload --h3_reusable_activation_offload"
         ),
     )
     parser.add_argument(
