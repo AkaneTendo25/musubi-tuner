@@ -231,6 +231,8 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 
 The base installation procedure is the same as musubi-tuner — follow the [Installation guide](../README.md#installation) (`pip install -e .` in a virtual environment). The sections below cover LTX-2-specific requirements (CUDA version, model downloads) that go on top of the base install.
 
+LTX-2 additionally requires `torchaudio`, because the audio VAE is imported by the latent caching script even in video-only runs. Install it alongside PyTorch from the same CUDA index, or install the matching extra (`pip install -e ".[cu128]"`). Without it, `ltx2_cache_latents.py` fails at import with `ModuleNotFoundError: No module named 'torchaudio'`.
+
 Windows users can also use [`scripts/install.ps1`](#windows-setup--update-script) as a setup/update helper; that section documents the script's current operations and options.
 
 Command examples assume the repository root and an activated project environment. Ellipses and parenthesized phrases are placeholders for the remaining required arguments.
