@@ -2533,7 +2533,7 @@ class NetworkTrainer:
                         avr_loss=avr_loss,
                         loss_v=loss_metrics.get("loss/video"),
                         loss_a=loss_metrics.get("loss/audio"),
-                        grad_norm=grad_metrics.get("grad_norm"),
+                        grad_norm=grad_metrics.get("grad/norm"),
                         grad_norm_v=grad_metrics.get("grad_norm/video"),
                         grad_norm_a=grad_metrics.get("grad_norm/audio"),
                         lr=current_lr,
