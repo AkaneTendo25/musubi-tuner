@@ -1,9 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 import glob
 import os
 import random
+import re
 import time
-from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from multiprocessing.sharedctypes import Synchronized
@@ -23,6 +25,65 @@ import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+# Tails that get_latent_cache_path / get_text_encoder_output_cache_path append
+# to the source stem: an optional `_00000-039` frame range, and, for latents,
+# the source dimensions.
+FASTER_CACHE_LATENT_TAIL = re.compile(r"^(?:_\d{5}-\d{3})?_\d+x\d+$")
+FASTER_CACHE_TEXT_TAIL = re.compile(r"^(?:_\d{5}-\d{3})?$")
+FASTER_CACHE_PROBE_SAMPLES = 8
+
+
+@dataclass
+class FasterCacheCheckPlan:
+    """Items whose cache can be recognised by name, and the probe that gates it."""
+
+    datasource: "ContentDatasource"
+    matched_paths: set[str] = field(default_factory=set)
+    cached_item_keys: set[str] = field(default_factory=set)
+    probe_item_keys: set[str] = field(default_factory=set)
+
+    def install_probe_filter(self) -> None:
+        """Admit only the probe items, so verification loads nothing else."""
+        self.datasource.set_item_filter(lambda item_key: item_key in self.probe_item_keys)
+
+    def install_skip_filter(self) -> None:
+        self.datasource.set_item_filter(lambda item_key: item_key not in self.cached_item_keys)
+
+    def disable(self) -> None:
+        self.datasource.set_item_filter(None)
+
+
+def verify_faster_cache_plan(
+    plan: FasterCacheCheckPlan,
+    retrieve_batches: Callable[[], Iterable[Any]],
+    cache_path_of: Callable[["ItemInfo"], str],
+    existing_paths: set[str],
+    existing_cache_valid: Optional[Callable[["ItemInfo", str], bool]] = None,
+    unwrap_batch: Optional[Callable[[Any], list]] = None,
+) -> Optional[str]:
+    """Validate a sample of the plan's caches the slow way.
+
+    A cache name records the source stem, the frame range and the dimensions;
+    it records nothing about conditioning identity or a replaced source file.
+    Config drift is uniform across a dataset, so probing a handful of caches
+    with the real validator catches it before any item is skipped by name.
+    Returns None when every probed cache holds, otherwise the reason it did not.
+    """
+    plan.install_probe_filter()
+    try:
+        for batch in retrieve_batches():
+            items = unwrap_batch(batch) if unwrap_batch is not None else batch
+            for item in items:
+                path = os.path.normpath(cache_path_of(item))
+                if path not in existing_paths:
+                    return f"{os.path.basename(path)} does not exist, so the cache names no longer match the dataset"
+                if existing_cache_valid is not None and not existing_cache_valid(item, path):
+                    return f"{os.path.basename(path)} does not match the current configuration"
+    finally:
+        plan.disable()
+    return None
 
 
 def _validate_h3_cache_pair(latent_path: str, text_path: str) -> None:
@@ -190,41 +251,68 @@ class BaseDataset(torch.utils.data.Dataset):
     def get_all_text_encoder_output_cache_files(self):
         return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_te.safetensors"))
 
-    def configure_faster_cache_check(self, cache_paths: Sequence[str], text: bool = False) -> set[str]:
-        """Filter source fetchers using cache names, without opening cache or source files."""
+    def plan_faster_cache_check(
+        self, cache_paths: Sequence[str], text: bool = False, probe_samples: int = FASTER_CACHE_PROBE_SAMPLES
+    ) -> Optional["FasterCacheCheckPlan"]:
+        """Plan name-only cache skipping so source items need not be opened at all.
+
+        Returns None when the dataset cannot be matched by name. The plan is a
+        proposal: it must be probed with ``verify_faster_cache_plan`` before its
+        skip filter is installed, because a cache name carries neither the
+        conditioning identity stored inside the file nor the source dimensions.
+        """
         datasource = getattr(self, "datasource", None)
         is_full_video = isinstance(datasource, VideoDatasource) and getattr(self, "frame_extraction", None) == "full"
         if not isinstance(datasource, ImageDatasource) and not is_full_video:
-            return set()
+            return None
         if not datasource.is_indexable():
-            return set()
+            return None
 
-        normalized_paths = {os.path.normpath(path) for path in cache_paths}
+        # Two source files sharing a stem already collide on one cache path, so
+        # neither can be resolved from a name: never skip those.
+        item_keys_by_stem: dict[str, Optional[str]] = {}
+        for index in range(len(datasource)):
+            item_key = datasource.get_item_key(index)
+            stem = os.path.splitext(os.path.basename(item_key))[0]
+            item_keys_by_stem[stem] = None if stem in item_keys_by_stem else item_key
+
         suffix = f"_{self.architecture}{'_te' if text else ''}.safetensors"
-        source_stems = {os.path.splitext(os.path.basename(datasource.get_item_key(index)))[0] for index in range(len(datasource))}
-        cached_source_stems: set[str] = set()
+        tail_pattern = FASTER_CACHE_TEXT_TAIL if text else FASTER_CACHE_LATENT_TAIL
         matched_paths: set[str] = set()
-        for path in normalized_paths:
+        cached_item_keys: set[str] = set()
+        item_key_by_path: dict[str, str] = {}
+        for path in {os.path.normpath(path) for path in cache_paths}:
             cache_name = os.path.basename(path)
             if not cache_name.endswith(suffix):
                 continue
             cache_stem = cache_name[: -len(suffix)]
-            # Dimensions and frame ranges are underscore-delimited suffixes.
-            # Prefer the longest source stem when source names contain underscores.
+            # Frame range and dimensions are underscore-delimited tails written
+            # by get_*_cache_path. Prefer the longest source stem, and require
+            # the remainder to be exactly such a tail: without that, a cache
+            # left behind by a deleted `foo_1` is read as a cache for `foo`.
             parts = cache_stem.split("_")
             for end in range(len(parts), 0, -1):
                 candidate = "_".join(parts[:end])
-                if candidate in source_stems:
-                    cached_source_stems.add(candidate)
-                    matched_paths.add(path)
+                item_key = item_keys_by_stem.get(candidate)
+                if item_key is None:
+                    continue
+                if not tail_pattern.match(cache_stem[len(candidate) :]):
                     break
+                matched_paths.add(path)
+                cached_item_keys.add(item_key)
+                item_key_by_path[path] = item_key
+                break
 
-        def has_cache_for_item(item_key: str) -> bool:
-            item_stem = os.path.splitext(os.path.basename(item_key))[0]
-            return item_stem in cached_source_stems
+        if not matched_paths:
+            return None
 
-        datasource.set_item_filter(lambda item_key: not has_cache_for_item(item_key))
-        return matched_paths
+        probe_paths = sorted(matched_paths)[: max(1, probe_samples)]
+        return FasterCacheCheckPlan(
+            datasource=datasource,
+            matched_paths=matched_paths,
+            cached_item_keys=cached_item_keys,
+            probe_item_keys={item_key_by_path[path] for path in probe_paths},
+        )
 
     def get_latent_cache_path(self, item_info: ItemInfo) -> str:
         """

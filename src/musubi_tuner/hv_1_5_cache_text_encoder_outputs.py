@@ -130,6 +130,7 @@ def main():
         all_cache_paths_for_dataset,
         encode_for_text_encoders,
         faster_check=args.faster_check,
+        faster_check_samples=args.faster_check_samples,
     )
     del text_encoder_vlm, text_encoder_byt5
 

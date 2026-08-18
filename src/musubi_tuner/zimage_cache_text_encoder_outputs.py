@@ -102,6 +102,7 @@ def main():
         all_cache_paths_for_dataset,
         encode_for_text_encoder,
         faster_check=args.faster_check,
+        faster_check_samples=args.faster_check_samples,
     )
 
     # Clean up

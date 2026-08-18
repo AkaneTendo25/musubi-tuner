@@ -333,6 +333,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         requires_content=encoder.conditioning_requires_content,
         existing_cache_valid=existing_cache_valid,
         faster_check=args.faster_check,
+        faster_check_samples=args.faster_check_samples,
     )
     encoder.close()
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files, all_cache_paths, args.keep_cache)

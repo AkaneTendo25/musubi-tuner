@@ -83,6 +83,7 @@ def main():
         encode_for_text_encoder,
         requires_content=any(getattr(dataset, "has_control", False) for dataset in datasets),
         faster_check=args.faster_check,
+        faster_check_samples=args.faster_check_samples,
     )
 
     cache_text_encoder_outputs.post_process_cache_files(

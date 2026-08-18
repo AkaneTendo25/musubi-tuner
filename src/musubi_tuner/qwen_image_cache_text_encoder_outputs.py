@@ -165,6 +165,7 @@ def main():
         encode_for_text_encoder,
         requires_content=args.is_edit,
         faster_check=args.faster_check,
+        faster_check_samples=args.faster_check_samples,
     )
     del text_encoder
 

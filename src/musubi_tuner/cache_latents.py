@@ -12,7 +12,13 @@ from PIL import Image
 
 import logging
 
-from musubi_tuner.dataset.image_video_dataset import BaseDataset, ItemInfo, save_latent_cache, ARCHITECTURE_HUNYUAN_VIDEO
+from musubi_tuner.dataset.image_video_dataset import (
+    BaseDataset,
+    ItemInfo,
+    save_latent_cache,
+    verify_faster_cache_plan,
+    ARCHITECTURE_HUNYUAN_VIDEO,
+)
 from musubi_tuner.hunyuan_model.vae import load_vae
 from musubi_tuner.hunyuan_model.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from musubi_tuner.utils.model_utils import str_to_dtype
@@ -299,14 +305,36 @@ def encode_datasets(
         existing_latent_cache_paths = None
         if args.skip_existing and getattr(args, "faster_check", False):
             existing_latent_cache_paths = {os.path.normpath(path) for path in dataset.get_all_latent_cache_files()}
-            configure_check = getattr(dataset, "configure_faster_cache_check", None)
-            if configure_check is not None:
-                matched_paths = configure_check(existing_latent_cache_paths)
-                all_latent_cache_paths.extend(matched_paths)
-                logger.info(
-                    "Faster checking matched %d existing latent cache names before loading source items",
-                    len(matched_paths),
+            planner = getattr(dataset, "plan_faster_cache_check", None)
+            plan = (
+                planner(existing_latent_cache_paths, probe_samples=getattr(args, "faster_check_samples", 8))
+                if planner is not None
+                else None
+            )
+            if plan is None:
+                # Nothing recognisable by name: keep the full contract.
+                existing_latent_cache_paths = None
+                logger.info("Faster checking matched no cache names for this dataset; checking every cache")
+            else:
+                rejection = verify_faster_cache_plan(
+                    plan,
+                    lambda: dataset.retrieve_latent_cache_batches(num_workers),
+                    lambda item: item.latent_cache_path,
+                    existing_latent_cache_paths,
+                    existing_cache_valid,
+                    unwrap_batch=lambda batch: batch[1],
                 )
+                if rejection is not None:
+                    existing_latent_cache_paths = None
+                    logger.warning("Faster checking disabled: %s", rejection)
+                else:
+                    plan.install_skip_filter()
+                    all_latent_cache_paths.extend(plan.matched_paths)
+                    logger.info(
+                        "Faster checking matched %d existing latent cache names after probing %d of them",
+                        len(plan.matched_paths),
+                        len(plan.probe_item_keys),
+                    )
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch
             if not supports_alpha:
@@ -422,7 +450,14 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument(
         "--faster_check",
         action="store_true",
-        help="when skipping existing files, compare cache names only without checking cache contents",
+        help="when skipping existing files, recognize caches by name instead of opening every one. A sample of caches is"
+        " still validated in full first, and any mismatch falls back to checking every cache",
+    )
+    parser.add_argument(
+        "--faster_check_samples",
+        type=int,
+        default=8,
+        help="number of existing caches validated in full before --faster_check trusts cache names (default 8)",
     )
     parser.add_argument("--keep_cache", action="store_true", help="keep cache files not in dataset")
     parser.add_argument("--debug_mode", type=str, default=None, choices=["image", "console", "video"], help="debug mode")

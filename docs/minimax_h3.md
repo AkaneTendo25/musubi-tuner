@@ -295,6 +295,11 @@ use caption dropout or the guidance objective.
 `--task` must match how you intend to train: `t2va` (text only), `i2va` (first frame), `fl2va` (first+last), `l2va`
 (last frame), `ref2va`, or `ref2va_omni`. Keyframe tasks take their frames from the target video itself, not from control fields.
 
+`--skip_existing` opens every cache to confirm it was written for the current options, which means loading every source item. On
+datasets of thousands of items, add `--faster_check` to recognize caches by filename instead; it validates
+`--faster_check_samples` caches (default 8) in full first and falls back to checking everything if any of them no longer matches.
+It cannot see a source file replaced in place or a cache truncated by an interrupted write.
+
 For FL2VA conditioned-image training, pass the same `--h3_image_mode first` or `--h3_image_mode first_last` to both cache
 commands and use `--task fl2va` for text caching. `h3_image_frame_count` in the dataset, or the CLI override
 `--h3_image_frame_count`, selects a `17k+5` target grid and defaults to 5. A still target repeats across that grid;

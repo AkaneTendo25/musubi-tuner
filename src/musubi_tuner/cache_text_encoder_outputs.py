@@ -11,9 +11,11 @@ import accelerate
 
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_HUNYUAN_VIDEO,
+    FASTER_CACHE_PROBE_SAMPLES,
     BaseDataset,
     ItemInfo,
     save_text_encoder_output_cache,
+    verify_faster_cache_plan,
 )
 from musubi_tuner.hunyuan_model import text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.text_encoder import TextEncoder
@@ -81,6 +83,7 @@ def process_text_encoder_batches(
     requires_content: Optional[bool] = False,
     existing_cache_valid: Optional[Callable[[ItemInfo, str], bool]] = None,
     faster_check: bool = False,
+    faster_check_samples: int = FASTER_CACHE_PROBE_SAMPLES,
 ):
     """
     Architecture independent processing of text encoder batches.
@@ -92,30 +95,54 @@ def process_text_encoder_batches(
         all_cache_files = all_cache_files_for_dataset[i]
         all_cache_paths = all_cache_paths_for_dataset[i]
         existing_text_cache_paths = set(all_cache_files) if skip_existing and faster_check else None
-        if existing_text_cache_paths is not None:
-            configure_check = getattr(dataset, "configure_faster_cache_check", None)
-            if configure_check is not None:
-                matched_paths = configure_check(existing_text_cache_paths, text=True)
-                all_cache_paths.update(matched_paths)
-                logger.info(
-                    "Faster checking matched %d existing text cache names before loading source items",
-                    len(matched_paths),
-                )
 
-        if not requires_content:
-            batches = dataset.retrieve_text_encoder_output_cache_batches(num_workers)  # return captions only
-        else:
-            batches = dataset.retrieve_latent_cache_batches(num_workers)  # return captions and images/videos
+        def retrieve_batches():
+            if not requires_content:
+                return dataset.retrieve_text_encoder_output_cache_batches(num_workers)  # return captions only
+            return dataset.retrieve_latent_cache_batches(num_workers)  # return captions and images/videos
+
+        def unwrap_batch(batch):
+            # Content batches are (key, items); caption-only batches are items.
+            items = batch[1] if requires_content else batch
+            for item in items:
+                if item.text_encoder_output_cache_path is None:
+                    item.text_encoder_output_cache_path = dataset.get_text_encoder_output_cache_path(item)
+            return items
+
+        if existing_text_cache_paths is not None:
+            planner = getattr(dataset, "plan_faster_cache_check", None)
+            plan = planner(existing_text_cache_paths, text=True, probe_samples=faster_check_samples) if planner else None
+            if plan is None:
+                existing_text_cache_paths = None
+                logger.info("Faster checking matched no cache names for this dataset; checking every cache")
+            else:
+                rejection = verify_faster_cache_plan(
+                    plan,
+                    retrieve_batches,
+                    lambda item: item.text_encoder_output_cache_path,
+                    existing_text_cache_paths,
+                    existing_cache_valid,
+                    unwrap_batch=unwrap_batch,
+                )
+                if rejection is not None:
+                    existing_text_cache_paths = None
+                    logger.warning("Faster checking disabled: %s", rejection)
+                else:
+                    plan.install_skip_filter()
+                    all_cache_paths.update(plan.matched_paths)
+                    logger.info(
+                        "Faster checking matched %d existing text cache names after probing %d of them",
+                        len(plan.matched_paths),
+                        len(plan.probe_item_keys),
+                    )
+
+        batches = retrieve_batches()
 
         for batch in tqdm(batches):
             # update cache files (it's ok if we update it multiple times)
-            if requires_content:
-                batch = batch[1]  # batch is (key, items), so use items
-                # Video latent-cache batches do not populate this path, unlike
-                # caption-only batches and image content batches.
-                for item in batch:
-                    if item.text_encoder_output_cache_path is None:
-                        item.text_encoder_output_cache_path = dataset.get_text_encoder_output_cache_path(item)
+            # Video latent-cache batches do not populate the cache path, unlike
+            # caption-only batches and image content batches.
+            batch = unwrap_batch(batch)
             all_cache_paths.update([os.path.normpath(item.text_encoder_output_cache_path) for item in batch])
 
             # skip existing cache files
@@ -255,7 +282,14 @@ def setup_parser_common():
     parser.add_argument(
         "--faster_check",
         action="store_true",
-        help="when skipping existing files, compare cache names only without checking cache contents",
+        help="when skipping existing files, recognize caches by name instead of opening every one. A sample of caches is"
+        " still validated in full first, and any mismatch falls back to checking every cache",
+    )
+    parser.add_argument(
+        "--faster_check_samples",
+        type=int,
+        default=8,
+        help="number of existing caches validated in full before --faster_check trusts cache names (default 8)",
     )
     parser.add_argument("--keep_cache", action="store_true", help="keep cache files not in dataset")
     return parser
