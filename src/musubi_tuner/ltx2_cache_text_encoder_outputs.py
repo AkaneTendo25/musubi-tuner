@@ -508,8 +508,6 @@ def main() -> None:
         gemma_safetensors = text_encoder_checkpoint
     if args.gemma_root is None and not gemma_safetensors:
         raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 Gemma text caching")
-    if gemma_safetensors and (getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False)):
-        raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
     if args.ltx2_checkpoint is None and getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
         raise ValueError("--ltx2_checkpoint is required for LTX-2 Gemma text caching")
     from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder

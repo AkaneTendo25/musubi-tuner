@@ -295,7 +295,7 @@ For official two-stage LTX-2.5 inference, also download the [LTX-2.3 x2 spatial 
 
 Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested.
 
-LTX-2.5 accepts its Gemma 4 text encoder in either form. Split packs publish it as the packed file above, passed with `--ltx2_text_encoder_checkpoint`. Checkpoints that publish it as a Transformers directory are passed with `--gemma_root` instead; the directory needs `config.json`, `tokenizer.json`, and the `model*.safetensors` weights, and sharded weight files are read as one. `--gemma_load_in_4bit` / `--gemma_load_in_8bit` work with either Gemma generation when the text encoder is a directory; they are not available for a packed text-encoder file.
+LTX-2.5 accepts its Gemma 4 text encoder in either form. Split packs publish it as the packed file above, passed with `--ltx2_text_encoder_checkpoint`. Checkpoints that publish it as a Transformers directory are passed with `--gemma_root` instead; the directory needs `config.json`, `tokenizer.json`, and the `model*.safetensors` weights, and sharded weight files are read as one. `--gemma_load_in_4bit` / `--gemma_load_in_8bit` work with either Gemma generation and with either form, directory or packed file. A packed file streams in first and is converted afterwards, so its dense copy passes through main RAM rather than VRAM.
 
 ---
 

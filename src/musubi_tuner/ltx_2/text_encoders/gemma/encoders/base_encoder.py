@@ -148,6 +148,64 @@ def _open_weight_shards(paths: list[str]):
     return _ShardedSafeOpen(paths)
 
 
+def _quantize_linear_modules(
+    model: torch.nn.Module,
+    quantization_config,
+    *,
+    skip: tuple[str, ...] = ("lm_head",),
+) -> int:
+    """Swap `nn.Linear` for its bitsandbytes counterpart, carrying the loaded weights over.
+
+    Transformers' own helper builds the replacement modules on the meta device because it runs
+    before the checkpoint is read. Weights that are already materialized need the opposite
+    order, so the tensors are handed to the bnb parameter types here and quantized when the
+    module is moved to the accelerator.
+    """
+
+    import bitsandbytes as bnb
+
+    eight_bit = quantization_config.quantization_method() == "llm_int8"
+    replaced = 0
+    for parent_name, parent in list(model.named_modules()):
+        for child_name, child in list(parent.named_children()):
+            full_name = f"{parent_name}.{child_name}" if parent_name else child_name
+            if type(child) is not torch.nn.Linear or any(part in full_name.split(".") for part in skip):
+                continue
+            if eight_bit:
+                replacement = bnb.nn.Linear8bitLt(
+                    child.in_features,
+                    child.out_features,
+                    child.bias is not None,
+                    has_fp16_weights=quantization_config.llm_int8_has_fp16_weight,
+                    threshold=quantization_config.llm_int8_threshold,
+                )
+                replacement.weight = bnb.nn.Int8Params(
+                    child.weight.data,
+                    requires_grad=False,
+                    has_fp16_weights=quantization_config.llm_int8_has_fp16_weight,
+                )
+            else:
+                replacement = bnb.nn.Linear4bit(
+                    child.in_features,
+                    child.out_features,
+                    child.bias is not None,
+                    compute_dtype=quantization_config.bnb_4bit_compute_dtype,
+                    compress_statistics=quantization_config.bnb_4bit_use_double_quant,
+                    quant_type=quantization_config.bnb_4bit_quant_type,
+                )
+                replacement.weight = bnb.nn.Params4bit(
+                    child.weight.data,
+                    requires_grad=False,
+                    compress_statistics=quantization_config.bnb_4bit_use_double_quant,
+                    quant_type=quantization_config.bnb_4bit_quant_type,
+                )
+            if child.bias is not None:
+                replacement.bias = torch.nn.Parameter(child.bias.data, requires_grad=False)
+            setattr(parent, child_name, replacement)
+            replaced += 1
+    return replaced
+
+
 def _is_non_weight_key(key: str) -> bool:
     """Report whether a checkpoint key carries packed assets rather than weights."""
 
@@ -696,8 +754,6 @@ def module_ops_from_gemma_root(
     packed_config = None
     packed_tokenizer = None
     if gemma_safetensors:
-        if load_in_8bit or load_in_4bit:
-            raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
         sf_path = Path(gemma_safetensors)
         if not sf_path.exists():
             raise FileNotFoundError(f"Gemma safetensors not found: {gemma_safetensors}")
@@ -774,24 +830,29 @@ def module_ops_from_gemma_root(
         if load_in_8bit and load_in_4bit:
             raise ValueError("Only one of load_in_8bit or load_in_4bit can be enabled")
 
-        if load_in_8bit or load_in_4bit:
-            if not torch.cuda.is_available():
-                raise ValueError("8-bit/4-bit Gemma loading requires CUDA")
-            if gemma_weights_path is not None:
-                raise ValueError("gemma_weights_path is not supported with 8-bit/4-bit loading")
+        quantize = load_in_8bit or load_in_4bit
+        if quantize and not torch.cuda.is_available():
+            raise ValueError("8-bit/4-bit Gemma loading requires CUDA")
+        if quantize and keep_fp8:
+            raise ValueError("8-bit/4-bit loading cannot be combined with float8 Gemma weights.")
 
+        def _quantization_config():
             from transformers import BitsAndBytesConfig
 
             if load_in_8bit:
-                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-            else:
-                compute_dtype = bnb_4bit_compute_dtype if bnb_4bit_compute_dtype is not None else torch_dtype
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type=bnb_4bit_quant_type,
-                    bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
-                    bnb_4bit_compute_dtype=compute_dtype,
-                )
+                return BitsAndBytesConfig(load_in_8bit=True)
+            compute_dtype = bnb_4bit_compute_dtype if bnb_4bit_compute_dtype is not None else torch_dtype
+            return BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=bnb_4bit_quant_type,
+                bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+
+        # A model directory is quantized by Transformers while it reads the checkpoint. Weight
+        # files have no such entry point, so they stream in first and are converted afterwards.
+        if quantize and gemma_weights_path is None:
+            quantization_config = _quantization_config()
 
             module.model = directory_model_class.from_pretrained(
                 gemma_path,
@@ -803,6 +864,15 @@ def module_ops_from_gemma_root(
         else:
             if gemma_weights_path is not None:
                 load_device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+                quantized_target_device = None
+                if quantize:
+                    # Stage on CPU: bitsandbytes quantizes on the move to CUDA, so the dense copy
+                    # never has to be resident there.
+                    quantized_target_device = torch.device("cuda") if load_device.type != "cuda" else load_device
+                    quantized_target_device = (
+                        bnb_device_map.get("", quantized_target_device) if bnb_device_map else quantized_target_device
+                    )
+                    load_device = torch.device("cpu")
                 if keep_fp8 and load_device.type != "cuda":
                     raise ValueError("Float8 Gemma weights require CUDA; provide a GPU or use non-fp8 weights.")
                 elif gemma_weights_dtype is not None and gemma_weights_dtype.itemsize == 1 and load_device.type != "cuda":
@@ -1054,6 +1124,18 @@ def module_ops_from_gemma_root(
                     if offload_fp8_weights and load_device.type == "cuda":
                         torch.cuda.empty_cache()
                     module._has_fp8_model = True
+
+                if quantize:
+                    quantization_config = _quantization_config()
+                    replaced = _quantize_linear_modules(module.model, quantization_config)
+                    module.model = module.model.to(quantized_target_device)
+                    module.model.config.quantization_config = quantization_config
+                    logger.info(
+                        "Converted %d Linear modules to %s on %s",
+                        replaced,
+                        "8-bit" if load_in_8bit else "4-bit",
+                        quantized_target_device,
+                    )
 
                 logger.info("Custom Gemma weights loaded.")
 

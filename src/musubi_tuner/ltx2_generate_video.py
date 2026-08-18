@@ -802,8 +802,6 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--gemma_root or --gemma_safetensors is required (unless using --use_precached_sample_prompts)")
     if args.gemma_load_in_8bit and args.gemma_load_in_4bit:
         raise ValueError("--gemma_load_in_8bit and --gemma_load_in_4bit cannot be enabled together")
-    if args.gemma_safetensors and (args.gemma_load_in_8bit or args.gemma_load_in_4bit):
-        raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
     if (args.int4_convrot_base or args.int4_convrot_dynamic) and (args.fp8_base or args.fp8_scaled or args.nf4_base):
         raise ValueError("INT4 ConvRot inference is mutually exclusive with FP8 and NF4 base modes")
     from musubi_tuner.modules.int4_convrot_utils import validate_int4_convrot_scale_group_size
