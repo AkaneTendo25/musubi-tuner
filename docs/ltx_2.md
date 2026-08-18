@@ -276,6 +276,7 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 - LTX-2.3 (22B): [ltx-2.3-22b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
 - LTX-2.5 (22B): [ltx-2.5-22b-dev-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors)
 - LTX-2.5 distilled inference: [ltx-2.5-22b-distilled-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors)
+- LTX-2.5 Pre-Trained (22B): [ltx-2.5-22b-pt-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5-Pre-Trained/resolve/main/ltx-2.5-22b-pt-bf16.safetensors) — a unified checkpoint holding the transformer, both VAEs, and the text projections; its Gemma 4 text encoder ships as the `ltx-2.5-22b-gemma4-12b/` directory in the same repository. This is the base checkpoint from before supervised fine-tuning, so it needs more data and steps than the released model, and the `ltx25` sampling preset does not apply to it.
 
 **Gemma Text Encoder**:
 - LTX-2 / LTX-2.3, HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
@@ -534,7 +535,7 @@ python ltx2_cache_latents.py ^
   --ltx2_audio_source video
 ```
 
-For LTX-2.5, point `--ltx2_checkpoint` to its transformer, add `--vae /path/to/ltx-2.5-video-vae-bf16.safetensors`, add `--ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors` for audio or AV caching, and set `--ltx_version 2.5`.
+For LTX-2.5, point `--ltx2_checkpoint` to its transformer, add `--vae /path/to/ltx-2.5-video-vae-bf16.safetensors`, add `--ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors` for audio or AV caching, and set `--ltx_version 2.5`. A unified LTX-2.5 checkpoint carries the VAEs itself, so point `--vae` (and `--ltx2_audio_vae`) at that same file.
 
 ### Latent Caching Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
