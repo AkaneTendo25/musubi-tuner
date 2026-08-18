@@ -53,6 +53,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Training Your First LoRA](#training-your-first-lora)
     - [Choosing Model Version for Training (2.0 vs 2.3)](#choosing-model-version-for-training-20-vs-23)
     - [Standard LoRA Training](#standard-lora-training)
+      - [Training on a Unified LTX-2.5 Checkpoint](#training-on-a-unified-ltx-25-checkpoint)
     - [Audio-Only Training](#audio-only-training)
 - [Part II — Core Workflows](#part-ii--core-workflows)
   - [Sampling, Checkpoints & Resuming](#sampling-checkpoints--resuming)
@@ -278,7 +279,7 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 - LTX-2.3 (22B): [ltx-2.3-22b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
 - LTX-2.5 (22B): [ltx-2.5-22b-dev-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors)
 - LTX-2.5 distilled inference: [ltx-2.5-22b-distilled-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors)
-- LTX-2.5 Pre-Trained (22B): [ltx-2.5-22b-pt-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5-Pre-Trained/resolve/main/ltx-2.5-22b-pt-bf16.safetensors) — a unified checkpoint holding the transformer, both VAEs, and the text projections; its Gemma 4 text encoder ships as the `ltx-2.5-22b-gemma4-12b/` directory in the same repository. This is the base checkpoint from before supervised fine-tuning, so it needs more data and steps than the released model, and the `ltx25` sampling preset does not apply to it.
+- LTX-2.5 Pre-Trained (22B): [ltx-2.5-22b-pt-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5-Pre-Trained/resolve/main/ltx-2.5-22b-pt-bf16.safetensors) — the pre-training base checkpoint, before supervised fine-tuning. One unified file holds the transformer, both VAEs, and the text projections; the Gemma 4 text encoder is the `ltx-2.5-22b-gemma4-12b/` directory in the same repository. See [Training on a Unified LTX-2.5 Checkpoint](#training-on-a-unified-ltx-25-checkpoint).
 
 **Gemma Text Encoder**:
 - LTX-2 / LTX-2.3, HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
@@ -819,6 +820,17 @@ For LTX-2 checkpoints, replace:
 - `--ltx_version 2.3` -> `--ltx_version 2.0`
 
 For LTX-2.5, use the transformer with `--ltx2_checkpoint`, set `--ltx_version 2.5`, and provide the split text encoder and VAEs listed under [Downloading Required Models](#downloading-required-models). Existing LoRA, optimization, and block-swap options remain unchanged; use `--int8_base_dynamic` to quantize the official BF16 transformer at load time.
+
+#### Training on a Unified LTX-2.5 Checkpoint
+<sub>[↑ contents](#table-of-contents)</sub>
+
+A unified checkpoint, such as LTX-2.5 Pre-Trained, holds the transformer, both VAEs, and the text projections in one file, and ships its Gemma 4 text encoder as a directory. Three flags differ from the split-pack commands:
+
+- `--gemma_root /path/to/ltx-2.5-22b-gemma4-12b` instead of `--ltx2_text_encoder_checkpoint`, and no `--gemma_load_in_8bit`.
+- `--vae` (and `--ltx2_audio_vae` for audio or AV) pointing at the unified checkpoint itself during latent caching.
+- `--sample_sampling_preset ltx25_full`, because the `ltx25` default is the distilled two-stage recipe and does not fit a non-distilled checkpoint.
+
+Everything else — caching, LoRA and full fine-tuning, `video` / `av` / `audio` modes, block swap, quantization, multi-GPU — is unchanged.
 
 > For DoRA, LyCORIS, quantization, optimizers, per-module settings, regularizers, conditioning (IC-LoRA / latent guides), and every other option, see [Part III — Advanced](#part-iii--advanced).
 
