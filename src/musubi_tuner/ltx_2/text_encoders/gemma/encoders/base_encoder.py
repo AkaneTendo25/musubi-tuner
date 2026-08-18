@@ -36,16 +36,102 @@ def validate_gemma_checkpoint_compatibility(transformer_checkpoint: str, gemma_c
         raise ValueError(f"LTX {model_version} checkpoint has no gemma_source_checkpoint marker; cannot verify its text encoder.")
     expected = json.loads(raw_source).get("gemma_version")
 
-    with safe_open(gemma_checkpoint, framework="pt", device="cpu") as handle:
-        gemma_metadata = handle.metadata() or {}
-    raw_config = gemma_metadata.get("gemma_config")
-    actual = json.loads(raw_config).get("gemma_version") if raw_config else None
+    gemma_path = Path(gemma_checkpoint)
+    if gemma_path.is_dir():
+        # A Gemma model directory keeps the marker in config.json instead of safetensors metadata.
+        config_file = gemma_path / "config.json"
+        if not config_file.exists():
+            raise ValueError(f"Gemma directory {gemma_checkpoint} has no config.json; cannot verify its version.")
+        actual = json.loads(config_file.read_text(encoding="utf-8")).get("gemma_version")
+    else:
+        with safe_open(gemma_checkpoint, framework="pt", device="cpu") as handle:
+            gemma_metadata = handle.metadata() or {}
+        raw_config = gemma_metadata.get("gemma_config")
+        actual = json.loads(raw_config).get("gemma_version") if raw_config else None
     if not expected or not actual:
-        raise ValueError(f"LTX {model_version} requires a packed Gemma checkpoint with a gemma_version marker.")
+        raise ValueError(
+            f"LTX {model_version} requires a packed Gemma checkpoint or a model directory with a gemma_version marker."
+        )
     if actual != expected:
         raise ValueError(
             f"Incompatible LTX/Gemma checkpoints: transformer expects {expected!r}, but the text encoder provides {actual!r}."
         )
+
+
+def _is_gemma3_config(config: object) -> bool:
+    """Report whether a Gemma config describes the Gemma 3 family."""
+
+    return str(getattr(config, "model_type", "") or "").startswith("gemma3")
+
+
+# Gemma 4 exports disagree on the vision-branch names across Transformers releases:
+# 5.10 wrote ``model.vision_embedder.*`` and a bare ``embedding_projection``, while
+# 5.14 expects ``model.embed_vision.*`` with a ``multimodal_embedder`` level. Checkpoints
+# are therefore matched against the live module tree, trying each spelling in turn.
+_GEMMA_KEY_ALIASES: tuple[tuple[str, str], ...] = (
+    ("model.embed_vision.embedding_projection.", "model.embed_vision.multimodal_embedder.embedding_projection."),
+    ("model.embed_vision.multimodal_embedder.embedding_projection.", "model.embed_vision.embedding_projection."),
+    ("model.vision_embedder.", "model.embed_vision."),
+    ("model.embed_vision.", "model.vision_embedder."),
+)
+
+
+def _key_alias_candidates(key: str) -> list[str]:
+    """Return alternative spellings for a checkpoint key, most specific first."""
+
+    candidates = []
+    for source, target in _GEMMA_KEY_ALIASES:
+        if key.startswith(source):
+            candidate = target + key[len(source) :]
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+class _ShardedSafeOpen:
+    """Present several safetensors shards as one ``safe_open``-style handle."""
+
+    def __init__(self, paths: list[str]) -> None:
+        self._paths = paths
+        self._handles = []
+        self._owner: dict[str, object] = {}
+
+    def __enter__(self) -> "_ShardedSafeOpen":
+        from safetensors import safe_open
+
+        for path in self._paths:
+            handle = safe_open(path, framework="pt", device="cpu").__enter__()
+            self._handles.append(handle)
+            for key in handle.keys():
+                self._owner.setdefault(key, handle)
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        for handle in reversed(self._handles):
+            handle.__exit__(*exc_info)
+        self._handles.clear()
+
+    def keys(self):
+        return list(self._owner.keys())
+
+    def get_tensor(self, key: str):
+        return self._owner[key].get_tensor(key)
+
+
+def _open_weight_shards(paths: list[str]):
+    """Open one or many Gemma weight files with a single context manager."""
+
+    from safetensors import safe_open
+
+    if len(paths) == 1:
+        return safe_open(paths[0], framework="pt", device="cpu")
+    return _ShardedSafeOpen(paths)
+
+
+def _is_non_weight_key(key: str) -> bool:
+    """Report whether a checkpoint key carries packed assets rather than weights."""
+
+    return key == "tokenizer_json" or key.startswith("hf_asset__")
 
 
 def _packed_ltx25_assets(path: str) -> tuple[object | None, PackedTokenizerAssets | None]:
@@ -623,9 +709,39 @@ def module_ops_from_gemma_root(
     else:
         raise ValueError("Either gemma_root, gemma_weights_path, or gemma_safetensors must be provided")
 
+    # A Gemma 4 directory (LTX-2.5 and newer) cannot go through the Gemma 3 `from_pretrained`
+    # branch below, so route it into the streaming loader that builds from config and maps keys.
+    directory_weights = False
+    if gemma_root is not None and gemma_weights_path is None and not gemma_safetensors:
+        from transformers import AutoConfig
+
+        directory_config = AutoConfig.from_pretrained(gemma_root, local_files_only=True)
+        if not _is_gemma3_config(directory_config):
+            if load_in_8bit or load_in_4bit:
+                raise ValueError(
+                    f"--gemma_load_in_4bit/8bit only supports Gemma 3 directories; {gemma_root} is "
+                    f"model_type={getattr(directory_config, 'model_type', '?')}."
+                )
+            weight_files = sorted(Path(gemma_path).glob("model*.safetensors"))
+            if not weight_files:
+                raise FileNotFoundError(f"No model*.safetensors found under {gemma_path}")
+            gemma_weights_path = [str(p) for p in weight_files]
+            gemma_weights_dtype = _infer_safetensors_dtype(gemma_weights_path[0])
+            directory_weights = True
+            logger.info(
+                "Gemma directory %s is model_type=%s; loading %d weight file(s) through the streaming loader.",
+                gemma_root,
+                getattr(directory_config, "model_type", "?"),
+                len(weight_files),
+            )
+
     # Resolve tokenizer: from gemma_root directory or extracted from safetensors
     if gemma_root is not None:
-        tokenizer_path: str | bytes = _find_matching_dir(gemma_root, "tokenizer.model")
+        # Gemma 3 ships a SentencePiece `tokenizer.model`; Gemma 4 ships only `tokenizer.json`.
+        try:
+            tokenizer_path: str | bytes = _find_matching_dir(gemma_root, "tokenizer.model")
+        except FileNotFoundError:
+            tokenizer_path = _find_matching_dir(gemma_root, "tokenizer.json")
     elif packed_tokenizer is not None:
         tokenizer_path = packed_tokenizer
     elif gemma_safetensors:
@@ -666,8 +782,6 @@ def module_ops_from_gemma_root(
             )
         else:
             if gemma_weights_path is not None:
-                from safetensors import safe_open
-
                 load_device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
                 if keep_fp8 and load_device.type != "cuda":
                     raise ValueError("Float8 Gemma weights require CUDA; provide a GPU or use non-fp8 weights.")
@@ -689,17 +803,21 @@ def module_ops_from_gemma_root(
                         config_class = Gemma3ForConditionalGeneration.config_class
                         config = config_class(**inferred)
 
+                # Gemma 3 keeps its dedicated class; every newer family is built through Auto.
+                build_with_auto_model = not _is_gemma3_config(config)
+
                 # Initialize on meta device to avoid immediate allocation
                 with torch.device("meta"):
-                    if packed_config is not None:
+                    if build_with_auto_model:
                         module.model = AutoModelForImageTextToText.from_config(config).to(dtype=torch_dtype)
                     else:
                         module.model = Gemma3ForConditionalGeneration(config).to(dtype=torch_dtype)
 
+                weight_shards = gemma_weights_path if isinstance(gemma_weights_path, list) else [gemma_weights_path]
                 logger.info(f"Loading custom Gemma weights from {gemma_weights_path}...")
 
                 # Memory-efficient loading: stream tensors directly to model
-                with safe_open(gemma_weights_path, framework="pt", device="cpu") as f:
+                with _open_weight_shards(weight_shards) as f:
                     keys = list(f.keys())
                     total_keys = len(keys)
                     logger.info(f"Found {total_keys} tensors in safetensors file")
@@ -733,12 +851,12 @@ def module_ops_from_gemma_root(
                         elif key.startswith("model.norm."):
                             new_key = key.replace("model.norm.", "model.language_model.norm.", 1)
                         elif key.startswith("vision_model."):
-                            if packed_config is not None:
+                            if build_with_auto_model:
                                 new_key = key.replace("vision_model.", "model.embed_vision.", 1)
                             else:
                                 new_key = f"model.vision_tower.{key}"
                         elif key.startswith("multi_modal_projector."):
-                            if packed_config is not None:
+                            if build_with_auto_model:
                                 new_key = key.replace(
                                     "multi_modal_projector.",
                                     "model.embed_vision.multimodal_embedder.",
@@ -754,7 +872,19 @@ def module_ops_from_gemma_root(
 
                         try:
                             # Iterate to find the submodule and parameter
-                            sub_mod, param_name = _resolve_module_and_attr(module.model, new_key)
+                            try:
+                                sub_mod, param_name = _resolve_module_and_attr(module.model, new_key)
+                            except AttributeError:
+                                # Fall back to the other spellings this Transformers release may use.
+                                for alias in _key_alias_candidates(new_key):
+                                    try:
+                                        sub_mod, param_name = _resolve_module_and_attr(module.model, alias)
+                                    except AttributeError:
+                                        continue
+                                    new_key = alias
+                                    break
+                                else:
+                                    raise
                             param = getattr(sub_mod, param_name)
 
                             # Skip if already loaded (unlikely in this loop but good safety)
@@ -797,17 +927,27 @@ def module_ops_from_gemma_root(
                                 setattr(sub_mod, param_name, new_param)
 
                         except AttributeError:
-                            # Missing in model (unexpected key) - track for debugging
-                            if i < 20:  # Only log first 20 unmatched
-                                unmatched_keys.append((key, new_key))
+                            # Missing in model (unexpected key) - track for reporting
+                            unmatched_keys.append((key, new_key))
                             pass
                         except Exception as e:
                             logger.warning(f"Error loading {new_key}: {e}")
                 # Log unmatched keys for debugging
                 if unmatched_keys:
-                    logger.info(f"First {len(unmatched_keys)} unmatched safetensors keys (original -> attempted):")
-                    for orig, attempted in unmatched_keys:
+                    logger.info(f"{len(unmatched_keys)} unmatched safetensors keys (original -> attempted), first 20:")
+                    for orig, attempted in unmatched_keys[:20]:
                         logger.info(f"  {orig} -> {attempted}")
+
+                # A model directory must map completely: an unmatched weight would otherwise be
+                # left randomly initialized, which is silent and very hard to notice downstream.
+                if directory_weights:
+                    unmapped_weights = [orig for orig, _ in unmatched_keys if not _is_non_weight_key(orig)]
+                    if unmapped_weights:
+                        raise ValueError(
+                            f"{len(unmapped_weights)} Gemma tensor(s) from {gemma_root} have no counterpart in the "
+                            f"{type(module.model).__name__} built by transformers "
+                            f"{__import__('transformers').__version__}. First 10: {unmapped_weights[:10]}"
+                        )
 
                 # Some text-encoder exports omit lm_head; tie it to input embeddings before meta checks.
                 if hasattr(module.model, "tie_weights"):
@@ -816,7 +956,7 @@ def module_ops_from_gemma_root(
                     except Exception as e:
                         logger.warning("Failed to tie Gemma lm_head weights: %s", e)
 
-                if packed_config is not None:
+                if build_with_auto_model:
                     _initialize_packed_gemma_runtime_buffers(module.model)
 
                 meta_params = [(name, p) for name, p in module.model.named_parameters() if p.device.type == "meta"]
