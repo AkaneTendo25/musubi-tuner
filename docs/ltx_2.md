@@ -281,6 +281,7 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 - LTX-2 / LTX-2.3, HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
 - LTX-2 / LTX-2.3, single file (`--gemma_safetensors`): [gemma_3_12B_it_fp8_e4m3fn.safetensors](https://huggingface.co/GitMylo/LTX-2-comfy_gemma_fp8_e4m3fn/resolve/main/gemma_3_12B_it_fp8_e4m3fn.safetensors)
 - LTX-2.5, packed Gemma 4 and connector (`--ltx2_text_encoder_checkpoint`): [gemma4-12b-with-proj-ltx-2.5-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors)
+- LTX-2.5, Gemma 4 model directory (`--gemma_root`): used by checkpoints that ship the text encoder as a Transformers directory instead of a packed file
 
 **LTX-2.5 VAEs**:
 - Video (`--ltx2_video_vae`, or `--vae` during latent caching): [ltx-2.5-video-vae-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors)
@@ -288,7 +289,9 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 
 For official two-stage LTX-2.5 inference, also download the [LTX-2.3 x2 spatial upscaler](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors). The optional [LTX-2.5 distilled LoRA](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors) is for applying the distilled recipe to the development transformer.
 
-Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested. Use the packed Gemma 4 file for LTX-2.5.
+Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested.
+
+LTX-2.5 accepts its Gemma 4 text encoder in either form. Split packs publish it as the packed file above, passed with `--ltx2_text_encoder_checkpoint`. Checkpoints that publish it as a Transformers directory are passed with `--gemma_root` instead; the directory needs `config.json`, `tokenizer.json`, and the `model*.safetensors` weights, and sharded weight files are read as one. `--gemma_load_in_4bit` / `--gemma_load_in_8bit` apply to Gemma 3 directories only.
 
 ---
 
@@ -652,7 +655,7 @@ python ltx2_cache_text_encoder_outputs.py ^
   --batch_size 1
 ```
 
-For LTX-2.5, replace `--gemma_root` and `--gemma_load_in_8bit` with `--ltx2_text_encoder_checkpoint /path/to/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, point `--ltx2_checkpoint` to the 2.5 transformer, and set `--ltx_version 2.5`.
+For LTX-2.5 with a split pack, replace `--gemma_root` and `--gemma_load_in_8bit` with `--ltx2_text_encoder_checkpoint /path/to/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, point `--ltx2_checkpoint` to the 2.5 transformer, and set `--ltx_version 2.5`. When the text encoder is a Gemma 4 directory, keep `--gemma_root /path/to/gemma4-dir`, drop `--gemma_load_in_8bit`, and leave `--ltx2_text_encoder_checkpoint` unset so the connector weights are read from `--ltx2_checkpoint`.
 
 ### Text Encoder Caching Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
