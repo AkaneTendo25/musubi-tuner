@@ -90,6 +90,7 @@ def main():
         all_cache_files_for_dataset,
         all_cache_paths_for_dataset,
         encode_for_text_encoder,
+        faster_check=args.faster_check,
     )
 
     # remove cache files not in dataset

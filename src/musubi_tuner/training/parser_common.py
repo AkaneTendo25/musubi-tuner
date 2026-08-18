@@ -345,7 +345,7 @@ def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, Automagic3. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(

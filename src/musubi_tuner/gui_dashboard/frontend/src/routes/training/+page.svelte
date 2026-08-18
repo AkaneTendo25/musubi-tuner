@@ -70,6 +70,7 @@
 
 	// Common optimizer presets
 	const optimizerOptions = [
+		'Automagic3',
 		'adamw8bit',
 		'adamw',
 		'adafactor',
@@ -410,8 +411,21 @@
 		return alias === 'pplus' || alias === 'prodigyplus' || alias === 'prodigyplusschedulefree';
 	}
 
+	function isAutomagic3Optimizer(value) {
+		const alias = optimizerAlias(value);
+		return alias === 'automagic3' || alias === 'automagicv3';
+	}
+
 	function applyRecommendedOptimizerArgs() {
-		if (isProdigyPlusOptimizer(t.optimizer_type)) {
+		if (isAutomagic3Optimizer(t.optimizer_type)) {
+			update('optimizer_type', 'Automagic3');
+			update('optimizer_args', 'fused=False weight_decay=0.0001');
+			update('learning_rate', 1e-4);
+			update('lr_scheduler', 'constant');
+			update('lr_warmup_steps', 0);
+			update('lr_decay_steps', 0);
+			update('max_grad_norm', 0.0);
+		} else if (isProdigyPlusOptimizer(t.optimizer_type)) {
 			update('optimizer_type', 'ProdigyPlusScheduleFree');
 			update('optimizer_args', prodigyPlusOptimizerArgs);
 			update('learning_rate', 1.0);
@@ -866,7 +880,7 @@
 							<button
 								type="button"
 								onclick={applyRecommendedOptimizerArgs}
-								disabled={!isProdigyPlusOptimizer(t.optimizer_type)}
+								disabled={!isProdigyPlusOptimizer(t.optimizer_type) && !isAutomagic3Optimizer(t.optimizer_type)}
 								data-tooltip="Set recommended settings for the selected optimizer"
 								class="text-sm font-medium disabled:opacity-40 flex-shrink-0"
 								style="height: 38px; min-width: 36px; padding: 0 10px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);"

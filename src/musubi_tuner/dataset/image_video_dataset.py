@@ -190,6 +190,42 @@ class BaseDataset(torch.utils.data.Dataset):
     def get_all_text_encoder_output_cache_files(self):
         return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_te.safetensors"))
 
+    def configure_faster_cache_check(self, cache_paths: Sequence[str], text: bool = False) -> set[str]:
+        """Filter source fetchers using cache names, without opening cache or source files."""
+        datasource = getattr(self, "datasource", None)
+        is_full_video = isinstance(datasource, VideoDatasource) and getattr(self, "frame_extraction", None) == "full"
+        if not isinstance(datasource, ImageDatasource) and not is_full_video:
+            return set()
+        if not datasource.is_indexable():
+            return set()
+
+        normalized_paths = {os.path.normpath(path) for path in cache_paths}
+        suffix = f"_{self.architecture}{'_te' if text else ''}.safetensors"
+        source_stems = {os.path.splitext(os.path.basename(datasource.get_item_key(index)))[0] for index in range(len(datasource))}
+        cached_source_stems: set[str] = set()
+        matched_paths: set[str] = set()
+        for path in normalized_paths:
+            cache_name = os.path.basename(path)
+            if not cache_name.endswith(suffix):
+                continue
+            cache_stem = cache_name[: -len(suffix)]
+            # Dimensions and frame ranges are underscore-delimited suffixes.
+            # Prefer the longest source stem when source names contain underscores.
+            parts = cache_stem.split("_")
+            for end in range(len(parts), 0, -1):
+                candidate = "_".join(parts[:end])
+                if candidate in source_stems:
+                    cached_source_stems.add(candidate)
+                    matched_paths.add(path)
+                    break
+
+        def has_cache_for_item(item_key: str) -> bool:
+            item_stem = os.path.splitext(os.path.basename(item_key))[0]
+            return item_stem in cached_source_stems
+
+        datasource.set_item_filter(lambda item_key: not has_cache_for_item(item_key))
+        return matched_paths
+
     def get_latent_cache_path(self, item_info: ItemInfo) -> str:
         """
         Returns the cache path for the latent tensor.

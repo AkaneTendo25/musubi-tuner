@@ -296,6 +296,17 @@ def encode_datasets(
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_latent_cache_paths = []
+        existing_latent_cache_paths = None
+        if args.skip_existing and getattr(args, "faster_check", False):
+            existing_latent_cache_paths = {os.path.normpath(path) for path in dataset.get_all_latent_cache_files()}
+            configure_check = getattr(dataset, "configure_faster_cache_check", None)
+            if configure_check is not None:
+                matched_paths = configure_check(existing_latent_cache_paths)
+                all_latent_cache_paths.extend(matched_paths)
+                logger.info(
+                    "Faster checking matched %d existing latent cache names before loading source items",
+                    len(matched_paths),
+                )
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch
             if not supports_alpha:
@@ -312,19 +323,27 @@ def encode_datasets(
             all_latent_cache_paths.extend([item.latent_cache_path for item in batch])
 
             if args.skip_existing:
-                filtered_batch = [
-                    item
-                    for item in batch
-                    if not os.path.exists(item.latent_cache_path)
-                    or (existing_cache_valid is not None and not existing_cache_valid(item, item.latent_cache_path))
-                ]
+                if existing_latent_cache_paths is not None:
+                    filtered_batch = [
+                        item for item in batch if os.path.normpath(item.latent_cache_path) not in existing_latent_cache_paths
+                    ]
+                else:
+                    filtered_batch = [
+                        item
+                        for item in batch
+                        if not os.path.exists(item.latent_cache_path)
+                        or (existing_cache_valid is not None and not existing_cache_valid(item, item.latent_cache_path))
+                    ]
                 if len(filtered_batch) == 0:
                     continue
                 batch = filtered_batch
 
             bs = args.batch_size if args.batch_size is not None else len(batch)
             for i in range(0, len(batch), bs):
-                encode(batch[i : i + bs])
+                encode_batch = batch[i : i + bs]
+                encode(encode_batch)
+                if existing_latent_cache_paths is not None:
+                    existing_latent_cache_paths.update(os.path.normpath(item.latent_cache_path) for item in encode_batch)
 
         # normalize paths
         all_latent_cache_paths = [os.path.normpath(p) for p in all_latent_cache_paths]
@@ -400,6 +419,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num_workers", type=int, default=None, help="number of workers for dataset. default is cpu count-1")
     parser.add_argument("--skip_existing", action="store_true", help="skip existing cache files")
+    parser.add_argument(
+        "--faster_check",
+        action="store_true",
+        help="when skipping existing files, compare cache names only without checking cache contents",
+    )
     parser.add_argument("--keep_cache", action="store_true", help="keep cache files not in dataset")
     parser.add_argument("--debug_mode", type=str, default=None, choices=["image", "console", "video"], help="debug mode")
     parser.add_argument("--console_width", type=int, default=80, help="debug mode: console width")

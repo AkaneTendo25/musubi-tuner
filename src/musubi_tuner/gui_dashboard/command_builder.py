@@ -346,6 +346,8 @@ def _h3_cache_common_args(cmd: list[str], section) -> None:
         cmd += ["--device", section.device]
     if section.skip_existing:
         cmd.append("--skip_existing")
+    if getattr(section, "faster_check", False):
+        cmd.append("--faster_check")
     if section.keep_cache:
         cmd.append("--keep_cache")
     if section.num_workers is not None:
@@ -1100,6 +1102,8 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--device", c.device]
     if c.skip_existing:
         cmd.append("--skip_existing")
+    if getattr(c, "faster_check", False):
+        cmd.append("--faster_check")
     if c.atomic_cache_writes:
         cmd.append("--atomic_cache_writes")
     if c.keep_cache:
@@ -1208,6 +1212,8 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--mixed_precision", c.mixed_precision]
     if c.skip_existing:
         cmd.append("--skip_existing")
+    if getattr(c, "faster_check", False):
+        cmd.append("--faster_check")
     if c.atomic_cache_writes:
         cmd.append("--atomic_cache_writes")
     if c.keep_cache:

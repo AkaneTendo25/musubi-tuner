@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
@@ -83,9 +83,17 @@ class ContentDatasource:
     def __init__(self):
         self.caption_only = False  # set to True to only fetch caption for Text Encoder caching
         self.has_control = False
+        self._item_filter: Optional[Callable[[str], bool]] = None
 
     def set_caption_only(self, caption_only: bool):
         self.caption_only = caption_only
+
+    def set_item_filter(self, item_filter: Optional[Callable[[str], bool]]):
+        """Filter source items before a fetcher can open media or captions."""
+        self._item_filter = item_filter
+
+    def should_include_item(self, item_key: str) -> bool:
+        return self._item_filter is None or self._item_filter(item_key)
 
     def is_indexable(self):
         return False
@@ -97,6 +105,9 @@ class ContentDatasource:
         raise NotImplementedError
 
     def __len__(self):
+        raise NotImplementedError
+
+    def get_item_key(self, idx: int) -> str:
         raise NotImplementedError
 
     def __iter__(self):
@@ -367,24 +378,29 @@ class ImageDirectoryDatasource(ImageDatasource):
         """
         Returns a fetcher function that returns image data.
         """
-        if self.current_idx >= len(self.image_paths):
-            raise StopIteration
+        while self.current_idx < len(self.image_paths):
+            index = self.current_idx
+            self.current_idx += 1
+            image_path = self.image_paths[index]
+            if not self.should_include_item(image_path):
+                continue
 
-        if self.caption_only:
+            if self.caption_only:
 
-            def create_caption_fetcher(index):
-                return lambda: self.get_caption(index)
+                def create_caption_fetcher(index):
+                    return lambda: self.get_caption(index)
 
-            fetcher = create_caption_fetcher(self.current_idx)
-        else:
+                return create_caption_fetcher(index)
 
             def create_image_fetcher(index):
                 return lambda: self.get_image_data(index)
 
-            fetcher = create_image_fetcher(self.current_idx)
+            return create_image_fetcher(index)
 
-        self.current_idx += 1
-        return fetcher
+        raise StopIteration
+
+    def get_item_key(self, idx: int) -> str:
+        return self.image_paths[idx]
 
 
 class ImageJsonlDatasource(ImageDatasource):
@@ -547,25 +563,29 @@ class ImageJsonlDatasource(ImageDatasource):
         return self
 
     def __next__(self) -> callable:
-        if self.current_idx >= len(self.data):
-            raise StopIteration
+        while self.current_idx < len(self.data):
+            index = self.current_idx
+            self.current_idx += 1
+            image_path = self.data[index].get("image_path", self.data[index].get("image_path_0"))
+            if not self.should_include_item(image_path):
+                continue
 
-        if self.caption_only:
+            if self.caption_only:
 
-            def create_caption_fetcher(index):
-                return lambda: self.get_caption(index)
+                def create_caption_fetcher(index):
+                    return lambda: self.get_caption(index)
 
-            fetcher = create_caption_fetcher(self.current_idx)
-
-        else:
+                return create_caption_fetcher(index)
 
             def create_fetcher(index):
                 return lambda: self.get_image_data(index)
 
-            fetcher = create_fetcher(self.current_idx)
+            return create_fetcher(index)
 
-        self.current_idx += 1
-        return fetcher
+        raise StopIteration
+
+    def get_item_key(self, idx: int) -> str:
+        return self.data[idx].get("image_path", self.data[idx].get("image_path_0"))
 
 
 class VideoDatasource(ContentDatasource):
@@ -753,25 +773,29 @@ class VideoDirectoryDatasource(VideoDatasource):
         return self
 
     def __next__(self):
-        if self.current_idx >= len(self.video_paths):
-            raise StopIteration
+        while self.current_idx < len(self.video_paths):
+            index = self.current_idx
+            self.current_idx += 1
+            video_path = self.video_paths[index]
+            if not self.should_include_item(video_path):
+                continue
 
-        if self.caption_only:
+            if self.caption_only:
 
-            def create_caption_fetcher(index):
-                return lambda: self.get_caption(index)
+                def create_caption_fetcher(index):
+                    return lambda: self.get_caption(index)
 
-            fetcher = create_caption_fetcher(self.current_idx)
-
-        else:
+                return create_caption_fetcher(index)
 
             def create_fetcher(index):
                 return lambda: self.get_video_data(index)
 
-            fetcher = create_fetcher(self.current_idx)
+            return create_fetcher(index)
 
-        self.current_idx += 1
-        return fetcher
+        raise StopIteration
+
+    def get_item_key(self, idx: int) -> str:
+        return self.video_paths[idx]
 
 
 class VideoJsonlDatasource(VideoDatasource):
@@ -862,22 +886,26 @@ class VideoJsonlDatasource(VideoDatasource):
         return self
 
     def __next__(self):
-        if self.current_idx >= len(self.data):
-            raise StopIteration
+        while self.current_idx < len(self.data):
+            index = self.current_idx
+            self.current_idx += 1
+            video_path = self.data[index]["video_path"]
+            if not self.should_include_item(video_path):
+                continue
 
-        if self.caption_only:
+            if self.caption_only:
 
-            def create_caption_fetcher(index):
-                return lambda: self.get_caption(index)
+                def create_caption_fetcher(index):
+                    return lambda: self.get_caption(index)
 
-            fetcher = create_caption_fetcher(self.current_idx)
-
-        else:
+                return create_caption_fetcher(index)
 
             def create_fetcher(index):
                 return lambda: self.get_video_data(index)
 
-            fetcher = create_fetcher(self.current_idx)
+            return create_fetcher(index)
 
-        self.current_idx += 1
-        return fetcher
+        raise StopIteration
+
+    def get_item_key(self, idx: int) -> str:
+        return self.data[idx]["video_path"]

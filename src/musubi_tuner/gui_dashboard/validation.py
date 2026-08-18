@@ -1697,7 +1697,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
         optimizer_type = str(t.optimizer_type or "").lower()
-        if optimizer_type.endswith("schedulefree") or optimizer_type == "automagic":
+        if optimizer_type.endswith("schedulefree") or optimizer_type in {"automagic", "automagic3", "automagicv3"}:
             errors.append(
                 _make_issue(
                     "error",

@@ -368,6 +368,21 @@ accelerate launch minimax_h3_train_network.py \
 
 For Ref2VA, swap the checkpoint and add `--h3_training_mode ref2va` (or `ref2va_omni`).
 
+### Automagic v3
+
+Musubi includes AI Toolkit's experimental Automagic v3 optimizer under the `Automagic3` alias:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... \
+  --optimizer_type Automagic3 \
+  --optimizer_args fused=False weight_decay=0.0001 \
+  --learning_rate 1e-4 --lr_scheduler constant --max_grad_norm 0
+```
+
+The dashboard's optimizer **Set** button applies these values. Automagic3 adapts one learning rate per optimizer group, so it
+uses a constant external scheduler. The alias forces normal step-time updates (`fused=False`) so gradient accumulation,
+distributed reduction, and gradient clipping keep their usual semantics.
+
 Adapters target attention and feed-forward projections; norms and timestep/modality calibration stay frozen. LoHa/LoKr are
 unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally
 `--compile_auto_cache_size_limit`, `--compile_fallback_to_eager`, or `--inductor_config KEY=VALUE ...`. GPU compilation requires

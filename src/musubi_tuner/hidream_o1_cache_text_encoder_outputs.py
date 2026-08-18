@@ -82,6 +82,7 @@ def main():
         all_cache_paths_for_dataset,
         encode_for_text_encoder,
         requires_content=any(getattr(dataset, "has_control", False) for dataset in datasets),
+        faster_check=args.faster_check,
     )
 
     cache_text_encoder_outputs.post_process_cache_files(

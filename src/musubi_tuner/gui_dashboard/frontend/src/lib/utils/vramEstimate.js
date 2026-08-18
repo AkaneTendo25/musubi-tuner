@@ -204,9 +204,10 @@ export function estimateTraining(cfg) {
 
 	const loraParamCount = loraParamsGB * (1024 ** 3) / 2;
 	const optType = String(t.optimizer_type || 'adamw8bit').toLowerCase();
+	const isAutomagic3 = optType === 'automagic3' || optType === 'automagicv3';
 	const is8bitOpt = optType.includes('8bit');
 	const isScheduleFree = optType.includes('schedulefree') || optType === 'automagic';
-	const optBytesPerParam = is8bitOpt ? 6 : (isScheduleFree ? 14 : 12);
+	const optBytesPerParam = isAutomagic3 ? 1 : (is8bitOpt ? 6 : (isScheduleFree ? 14 : 12));
 	const optimStates = (loraParamCount * optBytesPerParam) / (1024 ** 3);
 	const loraGrads = loraParamsGB;
 

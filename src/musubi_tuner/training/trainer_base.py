@@ -298,6 +298,22 @@ class NetworkTrainer:
             optimizer_class = torch.optim.AdamW
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type in {"automagic3", "automagicv3"}:
+            from musubi_tuner.optimizers import Automagic3
+
+            # Fused backward hooks update before musubi can accumulate,
+            # all-reduce, or clip gradients, so use normal step-time updates.
+            optimizer_kwargs.setdefault("fused", False)
+            optimizer_kwargs.setdefault("stochastic_grad_accumulation", False)
+            if optimizer_kwargs["fused"]:
+                raise ValueError(
+                    "Automagic3 fused=True is incompatible with musubi-tuner's gradient accumulation, "
+                    "distributed reduction, and clipping; use fused=False"
+                )
+            logger.info(f"use Automagic3 optimizer | {optimizer_kwargs}")
+            optimizer_class = Automagic3
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         if optimizer is None:
             # 任意のoptimizerを使う
             case_sensitive_optimizer_type = args.optimizer_type  # not lower
@@ -328,7 +344,8 @@ class NetworkTrainer:
         return optimizer_name, optimizer_args, optimizer, train_fn, eval_fn
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-        return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
+        optimizer_type = args.optimizer_type.lower()
+        return optimizer_type.endswith("schedulefree") or optimizer_type in {"automagic3", "automagicv3"}
 
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
@@ -342,6 +359,8 @@ class NetworkTrainer:
                 pass
 
             def get_last_lr(self):
+                if hasattr(self.optimizer, "get_learning_rates"):
+                    return self.optimizer.get_learning_rates()
                 return [group["lr"] for group in self.optimizer.param_groups]
 
         return DummyScheduler(optimizer)

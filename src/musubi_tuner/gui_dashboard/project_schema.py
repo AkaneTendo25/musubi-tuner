@@ -166,6 +166,7 @@ class CachingConfig(BaseModel):
     vae_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
     device: Optional[str] = None
     skip_existing: bool = False
+    faster_check: bool = False
     atomic_cache_writes: bool = False
     keep_cache: bool = False
     num_workers: Optional[int] = None

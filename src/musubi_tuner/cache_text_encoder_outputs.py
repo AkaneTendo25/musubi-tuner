@@ -80,6 +80,7 @@ def process_text_encoder_batches(
     encode: callable,
     requires_content: Optional[bool] = False,
     existing_cache_valid: Optional[Callable[[ItemInfo, str], bool]] = None,
+    faster_check: bool = False,
 ):
     """
     Architecture independent processing of text encoder batches.
@@ -90,6 +91,16 @@ def process_text_encoder_batches(
         logger.info(f"Encoding dataset [{i}]")
         all_cache_files = all_cache_files_for_dataset[i]
         all_cache_paths = all_cache_paths_for_dataset[i]
+        existing_text_cache_paths = set(all_cache_files) if skip_existing and faster_check else None
+        if existing_text_cache_paths is not None:
+            configure_check = getattr(dataset, "configure_faster_cache_check", None)
+            if configure_check is not None:
+                matched_paths = configure_check(existing_text_cache_paths, text=True)
+                all_cache_paths.update(matched_paths)
+                logger.info(
+                    "Faster checking matched %d existing text cache names before loading source items",
+                    len(matched_paths),
+                )
 
         if not requires_content:
             batches = dataset.retrieve_text_encoder_output_cache_batches(num_workers)  # return captions only
@@ -109,12 +120,21 @@ def process_text_encoder_batches(
 
             # skip existing cache files
             if skip_existing:
-                filtered_batch = [
-                    item
-                    for item in batch
-                    if os.path.normpath(item.text_encoder_output_cache_path) not in all_cache_files
-                    or (existing_cache_valid is not None and not existing_cache_valid(item, item.text_encoder_output_cache_path))
-                ]
+                if existing_text_cache_paths is not None:
+                    filtered_batch = [
+                        item
+                        for item in batch
+                        if os.path.normpath(item.text_encoder_output_cache_path) not in existing_text_cache_paths
+                    ]
+                else:
+                    filtered_batch = [
+                        item
+                        for item in batch
+                        if os.path.normpath(item.text_encoder_output_cache_path) not in all_cache_files
+                        or (
+                            existing_cache_valid is not None and not existing_cache_valid(item, item.text_encoder_output_cache_path)
+                        )
+                    ]
                 # print(f"Filtered {len(batch) - len(filtered_batch)} existing cache files")
                 if len(filtered_batch) == 0:
                     continue
@@ -122,7 +142,10 @@ def process_text_encoder_batches(
 
             bs = batch_size if batch_size is not None else len(batch)
             for i in range(0, len(batch), bs):
-                encode(batch[i : i + bs])
+                encode_batch = batch[i : i + bs]
+                encode(encode_batch)
+                if existing_text_cache_paths is not None:
+                    existing_text_cache_paths.update(os.path.normpath(item.text_encoder_output_cache_path) for item in encode_batch)
 
 
 def post_process_cache_files(
@@ -187,6 +210,7 @@ def main():
         all_cache_files_for_dataset,
         all_cache_paths_for_dataset,
         encode_for_text_encoder_1,
+        faster_check=args.faster_check,
     )
     del text_encoder_1
 
@@ -210,6 +234,7 @@ def main():
         all_cache_files_for_dataset,
         all_cache_paths_for_dataset,
         encode_for_text_encoder_2,
+        faster_check=args.faster_check,
     )
     del text_encoder_2
 
@@ -227,6 +252,11 @@ def setup_parser_common():
     )
     parser.add_argument("--num_workers", type=int, default=None, help="number of workers for dataset. default is cpu count-1")
     parser.add_argument("--skip_existing", action="store_true", help="skip existing cache files")
+    parser.add_argument(
+        "--faster_check",
+        action="store_true",
+        help="when skipping existing files, compare cache names only without checking cache contents",
+    )
     parser.add_argument("--keep_cache", action="store_true", help="keep cache files not in dataset")
     return parser
 

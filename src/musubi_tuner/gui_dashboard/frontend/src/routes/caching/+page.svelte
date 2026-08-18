@@ -467,8 +467,9 @@
 				<FormSelect fieldPath="caching.mixed_precision" value={caching.mixed_precision || 'no'} options={['no', 'fp16', 'bf16']} onchange={(e) => updateCaching('mixed_precision', e.target.value)} tooltip="Mixed precision mode for text encoder caching." />
 				<FormField type="number" fieldPath="caching.num_workers" value={caching.num_workers ?? ''} oninput={(e) => updateCaching('num_workers', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" tooltip="Number of data loader workers" />
 			</div>
-			<div class="grid grid-cols-2 xl:grid-cols-4 gap-x-4 gap-y-1">
+			<div class="grid grid-cols-2 xl:grid-cols-5 gap-x-4 gap-y-1">
 				<FormToggle fieldPath="caching.skip_existing" checked={caching.skip_existing ?? false} onchange={(e) => updateCaching('skip_existing', e.target.checked)} tooltip="Skip files that already have cached outputs" />
+				<FormToggle label="Faster checking" fieldPath="caching.faster_check" checked={caching.faster_check ?? false} onchange={(e) => updateCaching('faster_check', e.target.checked)} tooltip="When Skip Existing is enabled, compare cache names only and do not inspect each cache file for validity." />
 				<FormToggle fieldPath="caching.atomic_cache_writes" checked={caching.atomic_cache_writes ?? false} onchange={(e) => updateCaching('atomic_cache_writes', e.target.checked)} tooltip="Write cache files through a temporary sibling file, then atomically replace the final cache path after a successful save." />
 				<FormToggle fieldPath="caching.cache_distributed" checked={caching.cache_distributed ?? false} onchange={(e) => updateCaching('cache_distributed', e.target.checked)} tooltip="Shard caching work across multiple processes (opt-in multi-process cache sharding)." />
 				<FormToggle fieldPath="caching.cpu_staged_checkpoint_loading" checked={caching.cpu_staged_checkpoint_loading ?? false} onchange={(e) => updateCaching('cpu_staged_checkpoint_loading', e.target.checked)} tooltip="Stage checkpoint tensors through CPU before moving them to the selected device." />

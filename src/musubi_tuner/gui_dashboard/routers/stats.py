@@ -760,12 +760,15 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         # ── Optimizer states ──
         lora_param_count = lora_size_gb * (1024**3) / 2  # bf16 -> count
         opt_type = str(training.get("optimizer_type", "adamw8bit")).lower()
+        is_automagic3 = opt_type in {"automagic3", "automagicv3"}
         is_8bit = "8bit" in opt_type
         is_4bit = "4bit" in opt_type
         is_fp8_optim = "fp8" in opt_type
         is_kahan = opt_type.startswith("optimi_") or opt_type.startswith("torchoptimi_") or opt_type.startswith("optimi.")
         is_sf = "schedulefree" in opt_type or opt_type == "automagic"
-        if is_4bit:
+        if is_automagic3:
+            opt_bytes = 1
+        elif is_4bit:
             opt_bytes = 5
         elif is_8bit or is_fp8_optim:
             opt_bytes = 6
@@ -906,7 +909,9 @@ def _calculate_h3_vram_stats(training: dict, caching: dict, dataset: dict) -> VR
     lora_size_gb = _h3_lora_size_gb(training)
     lora_param_count = lora_size_gb * (1024**3) / 2
     opt_type = str(training.get("optimizer_type", "adamw8bit")).lower()
-    if "4bit" in opt_type:
+    if opt_type in {"automagic3", "automagicv3"}:
+        opt_bytes = 1
+    elif "4bit" in opt_type:
         opt_bytes = 5
     elif "8bit" in opt_type or "fp8" in opt_type:
         opt_bytes = 6

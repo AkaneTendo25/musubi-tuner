@@ -164,6 +164,7 @@ def main():
         all_cache_paths_for_dataset,
         encode_for_text_encoder,
         requires_content=args.is_edit,
+        faster_check=args.faster_check,
     )
     del text_encoder
 
