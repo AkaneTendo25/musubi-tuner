@@ -2057,7 +2057,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sampling_preset",
         type=str,
         default="defaults",
-        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "ltx25", "ltx25_full", "distilled_two_stage"],
         help="Sampling preset used to resolve fallback geometry when sample prompts omit --w/--h.",
     )
     parser.add_argument(

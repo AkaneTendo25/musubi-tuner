@@ -865,7 +865,7 @@ The LTX-2.5 DiffVAE has a wider receptive field than the convolutional VAE. For 
 | `--sample_audio_subprocess` | on | Decode audio in a subprocess to avoid OOM crashes. Use `--no-sample_audio_subprocess` to decode in-process |
 | `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
-| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Named values: `defaults` (resolves per `--ltx_version`), `legacy` (bypass preset defaults), `ltx20`, `ltx23`, `ltx23_hq`, `ltx25`, and `distilled_two_stage`; see [Two-Stage Sampling](#two-stage-sampling). LTX-2.5 defaults to its official distilled two-stage settings. |
+| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Named values: `defaults` (resolves per `--ltx_version`), `legacy` (bypass preset defaults), `ltx20`, `ltx23`, `ltx23_hq`, `ltx25`, `ltx25_full`, and `distilled_two_stage`; see [Two-Stage Sampling](#two-stage-sampling). LTX-2.5 defaults to its official distilled two-stage settings; use `ltx25_full` when training on a non-distilled 2.5 checkpoint, which needs the full 30-step schedule with CFG and STG instead. |
 | `--sample_sampler` | `auto` | Denoising sampler. The LTX-2.5 preset follows the official pipeline: Euler ancestral in stage 1 and deterministic Euler in stage 2. Other full LTX presets use `res_2s`; `distilled_two_stage` uses Euler. |
 | `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
 

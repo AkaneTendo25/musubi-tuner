@@ -385,7 +385,7 @@ def parse_args() -> argparse.Namespace:
         "--sample_sampling_preset",
         type=str,
         default="defaults",
-        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "ltx25", "distilled_two_stage"],
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "ltx25", "ltx25_full", "distilled_two_stage"],
         help="Generation defaults. Use 'legacy' for the old 512x768/20-step/no-guidance defaults.",
     )
     parser.add_argument(
