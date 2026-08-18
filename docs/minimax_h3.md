@@ -21,6 +21,7 @@ Two released transformers, with different conditioning contracts:
   - [Qwen control visuals](#qwen-control-visuals)
 - [Pre-caching](#pre-caching)
 - [Training](#training)
+  - [Optimizers](#optimizers)
   - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
   - [Full-parameter BF16 training](#full-parameter-bf16-training)
   - [Saving and resuming](#saving-and-resuming)
@@ -368,20 +369,19 @@ accelerate launch minimax_h3_train_network.py \
 
 For Ref2VA, swap the checkpoint and add `--h3_training_mode ref2va` (or `ref2va_omni`).
 
-### Automagic v3
+### Optimizers
 
-Musubi includes AI Toolkit's experimental Automagic v3 optimizer under the `Automagic3` alias:
+`--optimizer_type` takes any musubi optimizer. AI Toolkit's Automagic v3 (**experimental**) is bundled as `Automagic3`:
 
 ```shell
 accelerate launch minimax_h3_train_network.py ... \
-  --optimizer_type Automagic3 \
-  --optimizer_args fused=False weight_decay=0.0001 \
+  --optimizer_type Automagic3 --optimizer_args weight_decay=0.0001 \
   --learning_rate 1e-4 --lr_scheduler constant --max_grad_norm 0
 ```
 
-The dashboard's optimizer **Set** button applies these values. Automagic3 adapts one learning rate per optimizer group, so it
-uses a constant external scheduler. The alias forces normal step-time updates (`fused=False`) so gradient accumulation,
-distributed reduction, and gradient clipping keep their usual semantics.
+The dashboard's optimizer **Set** button applies these values. It adapts the rate itself, so `--learning_rate` is a starting
+point and schedulers, warmup and decay are ignored; the adapted rate stays within two decades of it unless `min_lr`/`max_lr` are
+passed in `--optimizer_args`. State costs about one byte per parameter.
 
 Adapters target attention and feed-forward projections; norms and timestep/modality calibration stay frozen. LoHa/LoKr are
 unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally

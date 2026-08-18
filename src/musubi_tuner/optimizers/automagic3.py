@@ -7,8 +7,12 @@ Copyright (c) 2024 Ostris, LLC. Licensed under the MIT License; see
 This optimizer is experimental and under active upstream development.
 """
 
+import logging
 from typing import List
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class Automagic3(torch.optim.Optimizer):
@@ -24,7 +28,7 @@ class Automagic3(torch.optim.Optimizer):
     everything in between, which is treated as noise.
 
     Each element keeps a window of its last H (= ``polarity_history``,
-    default 4) update sign bits ("is the update positive", 1-bit packed) --
+    default 8) update sign bits ("is the update positive", 1-bit packed) --
     H/8 bytes per element (half a byte at the default), the only
     per-element optimizer state. A short window suffices because verdicts
     are pooled across the whole group: millions of voters make weak
@@ -100,7 +104,7 @@ class Automagic3(torch.optim.Optimizer):
         from this in whichever direction the pooled vote points, so it is a
         launch point, not a tuned target.
     min_lr : float
-        Lower bound on the adapted lr (default 1e-30). At the default this is
+        Lower bound on the adapted lr (default 1e-8). At the default this is
         purely a numerical overflow guard far outside the usable range; set it
         higher to put a hard floor under the controller.
     max_lr : float
@@ -118,7 +122,7 @@ class Automagic3(torch.optim.Optimizer):
     weight_decay : float
         Decoupled (AdamW-style) weight decay; 0 disables it.
     polarity_history : int
-        Sign-history window length H (2 to 64, default 4); H/8 bytes of
+        Sign-history window length H (2 to 64, default 8); H/8 bytes of
         state per element. Longer windows make the two vote events rarer
         and more decisive (probability 2^(1-H) each under noise -- a real
         trend's excess grows ~(1+rho)^H), so detection sharpens, at the
@@ -199,7 +203,7 @@ class Automagic3(torch.optim.Optimizer):
         if lr > 1e-3:
             # No clamping: a too-high start just oscillates immediately and
             # the controller drives it down.
-            print(f"Note: start lr {lr} is high; the controller will correct it (the pooled vote will walk it down).")
+            logger.warning(f"Automagic3: start lr {lr} is high; the pooled vote will walk it down.")
         defaults = dict(
             lr=lr,
             min_lr=min_lr,
@@ -235,7 +239,7 @@ class Automagic3(torch.optim.Optimizer):
                     self._hook_handles.append(handle)
 
         total = sum(p.numel() for g in self.param_groups for p in g["params"])
-        print(f"Total training paramiters: {total:,}")
+        logger.info(f"Automagic3: {total:,} trainable parameters")
 
     # ------------------------------------------------------------------ utils
 

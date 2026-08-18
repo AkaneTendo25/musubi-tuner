@@ -301,14 +301,37 @@ class NetworkTrainer:
         elif optimizer_type in {"automagic3", "automagicv3"}:
             from musubi_tuner.optimizers import Automagic3
 
-            # Fused backward hooks update before musubi can accumulate,
-            # all-reduce, or clip gradients, so use normal step-time updates.
+            # Both of these install post_accumulate_grad hooks that consume and
+            # clear p.grad during backward, before musubi accumulates, reduces
+            # and clips it, so both must stay off: fused also applies the update
+            # there, and stochastic_grad_accumulation moves the running sum into
+            # a private buffer that clip_grad_norm_ and the nan-skip never see.
             optimizer_kwargs.setdefault("fused", False)
             optimizer_kwargs.setdefault("stochastic_grad_accumulation", False)
-            if optimizer_kwargs["fused"]:
-                raise ValueError(
-                    "Automagic3 fused=True is incompatible with musubi-tuner's gradient accumulation, "
-                    "distributed reduction, and clipping; use fused=False"
+            for hook_arg in ("fused", "stochastic_grad_accumulation"):
+                if optimizer_kwargs[hook_arg]:
+                    raise ValueError(
+                        f"Automagic3 {hook_arg}=True is incompatible with musubi-tuner's gradient accumulation, "
+                        f"distributed reduction, and clipping; use {hook_arg}=False"
+                    )
+            # The controller multiplies the lr by up to e per step and its own
+            # bounds (1e-8 to 1e3) are numerical guards, decades outside any
+            # usable range. Rail it to two decades around the requested lr
+            # unless the user set explicit bounds.
+            if lr:
+                optimizer_kwargs.setdefault("min_lr", lr / 100.0)
+                optimizer_kwargs.setdefault("max_lr", lr * 100.0)
+            # The adapted lr lives in optimizer state, not in param_groups, so
+            # get_lr_scheduler hands out a dummy scheduler and every external
+            # schedule is inert.
+            if (
+                getattr(args, "lr_scheduler", "constant") != "constant"
+                or getattr(args, "lr_warmup_steps", 0)
+                or getattr(args, "lr_decay_steps", 0)
+            ):
+                logger.warning(
+                    "Automagic3 adapts the learning rate itself; --lr_scheduler, --lr_warmup_steps and "
+                    "--lr_decay_steps have no effect"
                 )
             logger.info(f"use Automagic3 optimizer | {optimizer_kwargs}")
             optimizer_class = Automagic3

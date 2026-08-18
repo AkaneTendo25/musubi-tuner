@@ -933,3 +933,23 @@ def test_h3_dashboard_training_page_exposes_the_null_field_controls() -> None:
 
     assert "training.h3_guidance_null_source" in page
     assert "training.h3_guidance_cfg_zero" in page
+
+
+def test_dashboard_warns_that_automagic3_ignores_the_lr_schedule(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.optimizer_type = "Automagic3"
+    config.training.lr_scheduler = "cosine"
+
+    report = validate_training_config(config)
+
+    assert "training.lr_scheduler" in report["field_warnings"]
+
+
+def test_dashboard_accepts_automagic3_with_a_constant_schedule(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.optimizer_type = "Automagic3"
+    config.training.lr_scheduler = "constant"
+
+    report = validate_training_config(config)
+
+    assert "training.lr_scheduler" not in report["field_warnings"]

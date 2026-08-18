@@ -687,6 +687,19 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+    if str(t.optimizer_type or "").lower() in {"automagic3", "automagicv3"}:
+        # The adapted rate lives in optimizer state, so the trainer hands out a
+        # dummy scheduler and every external schedule is silently inert.
+        if (t.lr_scheduler or "constant") != "constant" or t.lr_warmup_steps or t.lr_decay_steps:
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "training.lr_scheduler",
+                    "Automagic3 adapts the learning rate itself; the scheduler, warmup and decay steps have no effect.",
+                    label="LR Scheduler",
+                    page="training",
+                )
+            )
     if t.model_type == "minimax_h3":
         allowed_h3_timestep_sampling = {"uniform", "sigmoid", "shift", "logsnr", "sigma"}
         if t.h3_timestep_sampling not in allowed_h3_timestep_sampling:
