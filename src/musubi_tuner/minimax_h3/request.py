@@ -64,6 +64,23 @@ class H3GenerationRequest:
         object.__setattr__(self, "references", tuple(self.references))
         self.validate()
 
+    def canvas_reference(self) -> Path | None:
+        """Image whose proportions govern the canvas under ``adaptive``.
+
+        Precedence follows what the viewer sees first and longest: the opening
+        frame, then the closing one, then the ordinary reference images in the
+        order they were given. Video and audio references are ignored -- a video
+        reference is resampled to its own geometry and never dictates the
+        output canvas.
+
+        Returns ``None`` for a text-only request, which has nothing to adapt to.
+        """
+        for role in (ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME, ReferenceRole.KEYFRAME, ReferenceRole.REFERENCE):
+            for reference in self._with_role(role):
+                if reference.kind is ReferenceKind.IMAGE:
+                    return reference.path
+        return None
+
     def validate(self, *, check_files: bool = False) -> None:
         if not self.prompt.strip():
             raise ValueError("prompt must not be empty")

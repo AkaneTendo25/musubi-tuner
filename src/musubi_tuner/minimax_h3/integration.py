@@ -611,7 +611,9 @@ class _NativeGenerator:
     def generate(self, request: H3GenerationRequest) -> None:
         metrics: dict[str, dict] = {}
         total_started = time.perf_counter()
-        height, width = (self.height, self.width) if self.height is not None else resolve_canvas_size(request.ratio)
+        height, width = (
+            (self.height, self.width) if self.height is not None else resolve_canvas_size(request.ratio, request.canvas_reference())
+        )
         shape = request.temporal_shape
         references = None
         prepared_references = ()

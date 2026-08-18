@@ -51,7 +51,6 @@ from musubi_tuner.minimax_h3.references import H3PreparedReference, H3ReferenceK
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 _SHORT_EDGE = 768
-_MAX_PIXELS = 768 * 1344
 
 
 @dataclass(frozen=True)
@@ -69,26 +68,57 @@ class H3EncodedReferences:
     audio_rows: torch.Tensor
 
 
-def resolve_canvas_size(ratio: str) -> tuple[int, int]:
-    """Resolve an H3 ratio to its released 768-short-edge canvas."""
+def _aspect_from_image(path: Path) -> float:
+    """Proportions of a reference image, read without decoding its pixels."""
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image)
+        width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"reference image has no extent: {path}")
+    return width / height
+
+
+def resolve_canvas_size(ratio: str, reference: Path | None = None) -> tuple[int, int]:
+    """Resolve an H3 ratio to its released 768-short-edge canvas.
+
+    The short edge is the quantity the authors hold fixed: their own request to
+    a local H3 deployment carries ``"short_edge": 768`` together with
+    ``"aspect_ratio": "auto"``, and neither the request schema nor the model
+    card states any budget on total pixels.
+
+    Capping the area instead would silently shrink the short edge on wide
+    ratios -- under a 768x1344 budget a 21:9 canvas comes out at 1536x672, so
+    the widest scenes of a run would be rendered at a lower resolution than
+    every other scene in the same run, and nothing in the output says so.
+
+    ``adaptive`` takes the proportions from ``reference`` rather than from a
+    fixed list, which is what the authors' own request means by
+    ``"aspect_ratio": "auto"``. Rounding to the canvas multiple is the only
+    departure from the reference, so the result is the closest canvas the model
+    can render; snapping to a named ratio first would throw away that accuracy.
+    """
     if ratio == "adaptive":
-        ratio = "16:9"
-    try:
-        aspect_width, aspect_height = (float(value) for value in ratio.split(":"))
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"invalid MiniMax H3 aspect ratio: {ratio!r}") from error
-    if aspect_width <= 0 or aspect_height <= 0:
-        raise ValueError("MiniMax H3 aspect-ratio values must be positive")
-    value = aspect_width / aspect_height
+        if reference is None:
+            # Nothing to adapt to: a text-only request carries no image.
+            value = 16 / 9
+        else:
+            value = _aspect_from_image(reference)
+    else:
+        try:
+            aspect_width, aspect_height = (float(item) for item in ratio.split(":"))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid MiniMax H3 aspect ratio: {ratio!r}") from error
+        if aspect_width <= 0 or aspect_height <= 0:
+            raise ValueError("MiniMax H3 aspect-ratio values must be positive")
+        value = aspect_width / aspect_height
     if not 0.25 <= value <= 4.0:
         raise ValueError("MiniMax H3 supports aspect ratios from 1:4 through 4:1")
     if value >= 1.0:
         width, height = _SHORT_EDGE * value, float(_SHORT_EDGE)
     else:
         width, height = float(_SHORT_EDGE), _SHORT_EDGE / value
-    if width * height > _MAX_PIXELS:
-        scale = (_MAX_PIXELS / (width * height)) ** 0.5
-        width, height = width * scale, height * scale
     return (
         max(CANVAS_MULTIPLE, round(height / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
         max(CANVAS_MULTIPLE, round(width / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
