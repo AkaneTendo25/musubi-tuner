@@ -732,16 +732,16 @@ def module_ops_from_gemma_root(
     # A Gemma 4 directory (LTX-2.5 and newer) cannot go through the Gemma 3 `from_pretrained`
     # branch below, so route it into the streaming loader that builds from config and maps keys.
     directory_weights = False
+    # Gemma 3 has a dedicated model class; a newer family is built through Auto. bitsandbytes
+    # quantizes at `from_pretrained` time, so those loads stay on the Transformers path.
+    directory_model_class = Gemma3ForConditionalGeneration
     if gemma_root is not None and gemma_weights_path is None and not gemma_safetensors:
         from transformers import AutoConfig
 
         directory_config = AutoConfig.from_pretrained(gemma_root, local_files_only=True)
         if not _is_gemma3_config(directory_config):
-            if load_in_8bit or load_in_4bit:
-                raise ValueError(
-                    f"--gemma_load_in_4bit/8bit only supports Gemma 3 directories; {gemma_root} is "
-                    f"model_type={getattr(directory_config, 'model_type', '?')}."
-                )
+            directory_model_class = AutoModelForImageTextToText
+        if not _is_gemma3_config(directory_config) and not (load_in_8bit or load_in_4bit):
             weight_files = sorted(Path(gemma_path).glob("model*.safetensors"))
             if not weight_files:
                 raise FileNotFoundError(f"No model*.safetensors found under {gemma_path}")
@@ -793,7 +793,7 @@ def module_ops_from_gemma_root(
                     bnb_4bit_compute_dtype=compute_dtype,
                 )
 
-            module.model = Gemma3ForConditionalGeneration.from_pretrained(
+            module.model = directory_model_class.from_pretrained(
                 gemma_path,
                 local_files_only=True,
                 torch_dtype=torch_dtype,
@@ -1060,7 +1060,7 @@ def module_ops_from_gemma_root(
                 # DO NOT cast to torch_dtype here - that would upcast quantized weights to full precision!
                 # module.model = module.model.to(dtype=torch_dtype)
             else:
-                module.model = Gemma3ForConditionalGeneration.from_pretrained(
+                module.model = directory_model_class.from_pretrained(
                     gemma_path,
                     local_files_only=True,
                     torch_dtype=torch_dtype,

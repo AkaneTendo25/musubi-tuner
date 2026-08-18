@@ -295,7 +295,7 @@ For official two-stage LTX-2.5 inference, also download the [LTX-2.3 x2 spatial 
 
 Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested.
 
-LTX-2.5 accepts its Gemma 4 text encoder in either form. Split packs publish it as the packed file above, passed with `--ltx2_text_encoder_checkpoint`. Checkpoints that publish it as a Transformers directory are passed with `--gemma_root` instead; the directory needs `config.json`, `tokenizer.json`, and the `model*.safetensors` weights, and sharded weight files are read as one. `--gemma_load_in_4bit` / `--gemma_load_in_8bit` apply to Gemma 3 directories only.
+LTX-2.5 accepts its Gemma 4 text encoder in either form. Split packs publish it as the packed file above, passed with `--ltx2_text_encoder_checkpoint`. Checkpoints that publish it as a Transformers directory are passed with `--gemma_root` instead; the directory needs `config.json`, `tokenizer.json`, and the `model*.safetensors` weights, and sharded weight files are read as one. `--gemma_load_in_4bit` / `--gemma_load_in_8bit` work with either Gemma generation when the text encoder is a directory; they are not available for a packed text-encoder file.
 
 ---
 
@@ -826,7 +826,7 @@ For LTX-2.5, use the transformer with `--ltx2_checkpoint`, set `--ltx_version 2.
 
 A unified checkpoint, such as LTX-2.5 Pre-Trained, holds the transformer, both VAEs, and the text projections in one file, and ships its Gemma 4 text encoder as a directory. Three flags differ from the split-pack commands:
 
-- `--gemma_root /path/to/ltx-2.5-22b-gemma4-12b` instead of `--ltx2_text_encoder_checkpoint`, and no `--gemma_load_in_8bit`.
+- `--gemma_root /path/to/ltx-2.5-22b-gemma4-12b` instead of `--ltx2_text_encoder_checkpoint`. `--gemma_load_in_8bit` / `--gemma_load_in_4bit` remain available and roughly halve the text encoder's memory during caching.
 - `--vae` (and `--ltx2_audio_vae` for audio or AV) pointing at the unified checkpoint itself during latent caching.
 - `--sample_sampling_preset ltx25_full`, because the `ltx25` default is the distilled two-stage recipe and does not fit a non-distilled checkpoint.
 
