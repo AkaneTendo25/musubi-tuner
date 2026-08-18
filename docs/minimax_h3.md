@@ -380,13 +380,12 @@ For Ref2VA, swap the checkpoint and add `--h3_training_mode ref2va` (or `ref2va_
 
 ```shell
 accelerate launch minimax_h3_train_network.py ... \
-  --optimizer_type Automagic3 --optimizer_args weight_decay=0.0001 \
-  --learning_rate 1e-4 --lr_scheduler constant --max_grad_norm 0
+  --optimizer_type Automagic3 --learning_rate 1e-4 --lr_scheduler constant --max_grad_norm 0
 ```
 
 The dashboard's optimizer **Set** button applies these values. It adapts the rate itself, so `--learning_rate` is a starting
 point and schedulers, warmup and decay are ignored; the adapted rate stays within two decades of it unless `min_lr`/`max_lr` are
-passed in `--optimizer_args`. State costs about one byte per parameter.
+passed in `--optimizer_args`. Weight decay defaults to `1e-4`. State costs about one byte per parameter.
 
 Adapters target attention and feed-forward projections; norms and timestep/modality calibration stay frozen. LoHa/LoKr are
 unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally

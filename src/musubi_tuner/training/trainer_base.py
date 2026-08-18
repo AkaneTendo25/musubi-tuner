@@ -301,11 +301,8 @@ class NetworkTrainer:
         elif optimizer_type in {"automagic3", "automagicv3"}:
             from musubi_tuner.optimizers import Automagic3
 
-            # Both of these install post_accumulate_grad hooks that consume and
-            # clear p.grad during backward, before musubi accumulates, reduces
-            # and clips it, so both must stay off: fused also applies the update
-            # there, and stochastic_grad_accumulation moves the running sum into
-            # a private buffer that clip_grad_norm_ and the nan-skip never see.
+            # Both install post_accumulate_grad hooks that consume p.grad during
+            # backward, before musubi accumulates, reduces and clips it.
             optimizer_kwargs.setdefault("fused", False)
             optimizer_kwargs.setdefault("stochastic_grad_accumulation", False)
             for hook_arg in ("fused", "stochastic_grad_accumulation"):
@@ -314,16 +311,15 @@ class NetworkTrainer:
                         f"Automagic3 {hook_arg}=True is incompatible with musubi-tuner's gradient accumulation, "
                         f"distributed reduction, and clipping; use {hook_arg}=False"
                     )
-            # The controller multiplies the lr by up to e per step and its own
-            # bounds (1e-8 to 1e3) are numerical guards, decades outside any
-            # usable range. Rail it to two decades around the requested lr
-            # unless the user set explicit bounds.
+            # Upstream applies no decay; 1e-4 is the recommended setting here.
+            optimizer_kwargs.setdefault("weight_decay", 1e-4)
+            # The controller can multiply the lr by e per step and its own bounds
+            # are numerical guards, so rail it to two decades around the request.
             if lr:
                 optimizer_kwargs.setdefault("min_lr", lr / 100.0)
                 optimizer_kwargs.setdefault("max_lr", lr * 100.0)
-            # The adapted lr lives in optimizer state, not in param_groups, so
-            # get_lr_scheduler hands out a dummy scheduler and every external
-            # schedule is inert.
+            # The adapted lr lives in optimizer state, so get_lr_scheduler returns
+            # a dummy scheduler and external schedules never apply.
             if (
                 getattr(args, "lr_scheduler", "constant") != "constant"
                 or getattr(args, "lr_warmup_steps", 0)

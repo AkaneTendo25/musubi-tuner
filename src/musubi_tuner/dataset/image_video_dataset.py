@@ -27,9 +27,8 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-# Tails that get_latent_cache_path / get_text_encoder_output_cache_path append
-# to the source stem: an optional `_00000-039` frame range, and, for latents,
-# the source dimensions.
+# Tails appended to the source stem by get_*_cache_path: an optional frame
+# range, plus the dimensions for latents.
 FASTER_CACHE_LATENT_TAIL = re.compile(r"^(?:_\d{5}-\d{3})?_\d+x\d+$")
 FASTER_CACHE_TEXT_TAIL = re.compile(r"^(?:_\d{5}-\d{3})?$")
 FASTER_CACHE_PROBE_SAMPLES = 8
@@ -37,7 +36,7 @@ FASTER_CACHE_PROBE_SAMPLES = 8
 
 @dataclass
 class FasterCacheCheckPlan:
-    """Items whose cache can be recognised by name, and the probe that gates it."""
+    """Items whose cache is recognisable by name, and the probe that gates them."""
 
     datasource: "ContentDatasource"
     matched_paths: set[str] = field(default_factory=set)
@@ -63,13 +62,12 @@ def verify_faster_cache_plan(
     existing_cache_valid: Optional[Callable[["ItemInfo", str], bool]] = None,
     unwrap_batch: Optional[Callable[[Any], list]] = None,
 ) -> Optional[str]:
-    """Validate a sample of the plan's caches the slow way.
+    """Validate a sample of the plan's caches in full.
 
-    A cache name records the source stem, the frame range and the dimensions;
-    it records nothing about conditioning identity or a replaced source file.
-    Config drift is uniform across a dataset, so probing a handful of caches
-    with the real validator catches it before any item is skipped by name.
-    Returns None when every probed cache holds, otherwise the reason it did not.
+    A cache name records the source stem, frame range and dimensions, but not
+    conditioning identity. Config drift is uniform across a dataset, so probing
+    a few caches catches it before any item is skipped by name. Returns None
+    when every probed cache holds, otherwise the reason it did not.
     """
     plan.install_probe_filter()
     try:
@@ -254,12 +252,11 @@ class BaseDataset(torch.utils.data.Dataset):
     def plan_faster_cache_check(
         self, cache_paths: Sequence[str], text: bool = False, probe_samples: int = FASTER_CACHE_PROBE_SAMPLES
     ) -> Optional["FasterCacheCheckPlan"]:
-        """Plan name-only cache skipping so source items need not be opened at all.
+        """Plan name-only cache skipping, so source items need not be opened.
 
-        Returns None when the dataset cannot be matched by name. The plan is a
-        proposal: it must be probed with ``verify_faster_cache_plan`` before its
-        skip filter is installed, because a cache name carries neither the
-        conditioning identity stored inside the file nor the source dimensions.
+        Returns None when the dataset cannot be matched by name. The plan must
+        be probed with ``verify_faster_cache_plan`` before its skip filter is
+        installed: a cache name carries no conditioning identity.
         """
         datasource = getattr(self, "datasource", None)
         is_full_video = isinstance(datasource, VideoDatasource) and getattr(self, "frame_extraction", None) == "full"
@@ -268,8 +265,8 @@ class BaseDataset(torch.utils.data.Dataset):
         if not datasource.is_indexable():
             return None
 
-        # Two source files sharing a stem already collide on one cache path, so
-        # neither can be resolved from a name: never skip those.
+        # Two sources sharing a stem already collide on one cache path, so
+        # neither is resolvable by name.
         item_keys_by_stem: dict[str, Optional[str]] = {}
         for index in range(len(datasource)):
             item_key = datasource.get_item_key(index)
@@ -286,10 +283,8 @@ class BaseDataset(torch.utils.data.Dataset):
             if not cache_name.endswith(suffix):
                 continue
             cache_stem = cache_name[: -len(suffix)]
-            # Frame range and dimensions are underscore-delimited tails written
-            # by get_*_cache_path. Prefer the longest source stem, and require
-            # the remainder to be exactly such a tail: without that, a cache
-            # left behind by a deleted `foo_1` is read as a cache for `foo`.
+            # Prefer the longest source stem and require the remainder to be a
+            # generated tail, or a cache left by a deleted `foo_1` matches `foo`.
             parts = cache_stem.split("_")
             for end in range(len(parts), 0, -1):
                 candidate = "_".join(parts[:end])

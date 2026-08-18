@@ -122,6 +122,14 @@ def test_trainer_selects_automagic3_and_rails_the_rate():
     group = optimizer.param_groups[0]
     assert group["min_lr"] == pytest.approx(1e-6)
     assert group["max_lr"] == pytest.approx(1e-2)
+    assert group["weight_decay"] == pytest.approx(1e-4)
+
+
+def test_trainer_keeps_user_supplied_weight_decay():
+    trainer = NetworkTrainer()
+    params = list(_model().parameters())
+    _, _, optimizer, _, _ = trainer.get_optimizer(_args(optimizer_args=["weight_decay=0.0"]), params)
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.0)
 
 
 def test_trainer_keeps_user_supplied_rails():
