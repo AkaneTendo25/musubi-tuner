@@ -497,7 +497,14 @@ def main() -> None:
         else args.ltx2_checkpoint
     )
     gemma_safetensors = getattr(args, "gemma_safetensors", None)
-    if not gemma_safetensors and str(getattr(args, "ltx_version", "")) == "2.5":
+    # LTX-2.5 split packs keep Gemma inside the text-encoder safetensors; a Gemma 4 model
+    # directory supplies it instead, and then the connectors come from --ltx2_checkpoint.
+    gemma4_directory = None
+    if getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
+        from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import resolve_gemma4_directory
+
+        gemma4_directory = resolve_gemma4_directory(args.gemma_root)
+    if not gemma_safetensors and gemma4_directory is None and str(getattr(args, "ltx_version", "")) == "2.5":
         gemma_safetensors = text_encoder_checkpoint
     if args.gemma_root is None and not gemma_safetensors:
         raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 Gemma text caching")
@@ -529,7 +536,9 @@ def main() -> None:
         else str(text_encoder_checkpoint)
     )
     if args.ltx2_checkpoint is not None:
-        validate_gemma_checkpoint_compatibility(str(args.ltx2_checkpoint), str(text_encoder_checkpoint))
+        # With a Gemma 4 directory the version marker lives there, not in the transformer file.
+        gemma_version_source = gemma4_directory or text_encoder_checkpoint
+        validate_gemma_checkpoint_compatibility(str(args.ltx2_checkpoint), str(gemma_version_source))
 
     configurator = AVGemmaTextEncoderModelConfigurator if audio_video else VideoGemmaTextEncoderModelConfigurator
     key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS
@@ -743,7 +752,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sampling_preset",
         type=str,
         default="defaults",
-        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "ltx25", "ltx25_full", "distilled_two_stage"],
         help="Sampling preset used to resolve default negative prompts for sample prompt caching.",
     )
     parser.add_argument(

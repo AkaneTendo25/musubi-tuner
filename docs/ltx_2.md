@@ -53,6 +53,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Training Your First LoRA](#training-your-first-lora)
     - [Choosing Model Version for Training (2.0 vs 2.3)](#choosing-model-version-for-training-20-vs-23)
     - [Standard LoRA Training](#standard-lora-training)
+      - [Training on a Unified LTX-2.5 Checkpoint](#training-on-a-unified-ltx-25-checkpoint)
     - [Audio-Only Training](#audio-only-training)
 - [Part II — Core Workflows](#part-ii--core-workflows)
   - [Sampling, Checkpoints & Resuming](#sampling-checkpoints--resuming)
@@ -231,6 +232,8 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 
 The base installation procedure is the same as musubi-tuner — follow the [Installation guide](../README.md#installation) (`pip install -e .` in a virtual environment). The sections below cover LTX-2-specific requirements (CUDA version, model downloads) that go on top of the base install.
 
+LTX-2 additionally requires `torchaudio`, because the audio VAE is imported by the latent caching script even in video-only runs. Install it alongside PyTorch from the same CUDA index, or install the matching extra (`pip install -e ".[cu128]"`). Without it, `ltx2_cache_latents.py` fails at import with `ModuleNotFoundError: No module named 'torchaudio'`.
+
 Windows users can also use [`scripts/install.ps1`](#windows-setup--update-script) as a setup/update helper; that section documents the script's current operations and options.
 
 Command examples assume the repository root and an activated project environment. Ellipses and parenthesized phrases are placeholders for the remaining required arguments.
@@ -276,11 +279,13 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 - LTX-2.3 (22B): [ltx-2.3-22b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
 - LTX-2.5 (22B): [ltx-2.5-22b-dev-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors)
 - LTX-2.5 distilled inference: [ltx-2.5-22b-distilled-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors)
+- LTX-2.5 Pre-Trained (22B): [ltx-2.5-22b-pt-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5-Pre-Trained/resolve/main/ltx-2.5-22b-pt-bf16.safetensors) — the pre-training base checkpoint, before supervised fine-tuning. One unified file holds the transformer, both VAEs, and the text projections; the Gemma 4 text encoder is the `ltx-2.5-22b-gemma4-12b/` directory in the same repository. See [Training on a Unified LTX-2.5 Checkpoint](#training-on-a-unified-ltx-25-checkpoint).
 
 **Gemma Text Encoder**:
 - LTX-2 / LTX-2.3, HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
 - LTX-2 / LTX-2.3, single file (`--gemma_safetensors`): [gemma_3_12B_it_fp8_e4m3fn.safetensors](https://huggingface.co/GitMylo/LTX-2-comfy_gemma_fp8_e4m3fn/resolve/main/gemma_3_12B_it_fp8_e4m3fn.safetensors)
 - LTX-2.5, packed Gemma 4 and connector (`--ltx2_text_encoder_checkpoint`): [gemma4-12b-with-proj-ltx-2.5-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors)
+- LTX-2.5, Gemma 4 model directory (`--gemma_root`): used by checkpoints that ship the text encoder as a Transformers directory instead of a packed file
 
 **LTX-2.5 VAEs**:
 - Video (`--ltx2_video_vae`, or `--vae` during latent caching): [ltx-2.5-video-vae-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors)
@@ -288,7 +293,9 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 
 For official two-stage LTX-2.5 inference, also download the [LTX-2.3 x2 spatial upscaler](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors). The optional [LTX-2.5 distilled LoRA](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors) is for applying the distilled recipe to the development transformer.
 
-Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested. Use the packed Gemma 4 file for LTX-2.5.
+Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested.
+
+LTX-2.5 accepts its Gemma 4 text encoder in either form. Split packs publish it as the packed file above, passed with `--ltx2_text_encoder_checkpoint`. Checkpoints that publish it as a Transformers directory are passed with `--gemma_root` instead; the directory needs `config.json`, `tokenizer.json`, and the `model*.safetensors` weights, and sharded weight files are read as one. `--gemma_load_in_4bit` / `--gemma_load_in_8bit` apply to Gemma 3 directories only.
 
 ---
 
@@ -531,7 +538,7 @@ python ltx2_cache_latents.py ^
   --ltx2_audio_source video
 ```
 
-For LTX-2.5, point `--ltx2_checkpoint` to its transformer, add `--vae /path/to/ltx-2.5-video-vae-bf16.safetensors`, add `--ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors` for audio or AV caching, and set `--ltx_version 2.5`.
+For LTX-2.5, point `--ltx2_checkpoint` to its transformer, add `--vae /path/to/ltx-2.5-video-vae-bf16.safetensors`, add `--ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors` for audio or AV caching, and set `--ltx_version 2.5`. A unified LTX-2.5 checkpoint carries the VAEs itself, so point `--vae` (and `--ltx2_audio_vae`) at that same file.
 
 ### Latent Caching Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -652,7 +659,7 @@ python ltx2_cache_text_encoder_outputs.py ^
   --batch_size 1
 ```
 
-For LTX-2.5, replace `--gemma_root` and `--gemma_load_in_8bit` with `--ltx2_text_encoder_checkpoint /path/to/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, point `--ltx2_checkpoint` to the 2.5 transformer, and set `--ltx_version 2.5`.
+For LTX-2.5 with a split pack, replace `--gemma_root` and `--gemma_load_in_8bit` with `--ltx2_text_encoder_checkpoint /path/to/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, point `--ltx2_checkpoint` to the 2.5 transformer, and set `--ltx_version 2.5`. When the text encoder is a Gemma 4 directory, keep `--gemma_root /path/to/gemma4-dir`, drop `--gemma_load_in_8bit`, and leave `--ltx2_text_encoder_checkpoint` unset so the connector weights are read from `--ltx2_checkpoint`.
 
 ### Text Encoder Caching Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -814,6 +821,17 @@ For LTX-2 checkpoints, replace:
 
 For LTX-2.5, use the transformer with `--ltx2_checkpoint`, set `--ltx_version 2.5`, and provide the split text encoder and VAEs listed under [Downloading Required Models](#downloading-required-models). Existing LoRA, optimization, and block-swap options remain unchanged; use `--int8_base_dynamic` to quantize the official BF16 transformer at load time.
 
+#### Training on a Unified LTX-2.5 Checkpoint
+<sub>[↑ contents](#table-of-contents)</sub>
+
+A unified checkpoint, such as LTX-2.5 Pre-Trained, holds the transformer, both VAEs, and the text projections in one file, and ships its Gemma 4 text encoder as a directory. Three flags differ from the split-pack commands:
+
+- `--gemma_root /path/to/ltx-2.5-22b-gemma4-12b` instead of `--ltx2_text_encoder_checkpoint`, and no `--gemma_load_in_8bit`.
+- `--vae` (and `--ltx2_audio_vae` for audio or AV) pointing at the unified checkpoint itself during latent caching.
+- `--sample_sampling_preset ltx25_full`, because the `ltx25` default is the distilled two-stage recipe and does not fit a non-distilled checkpoint.
+
+Everything else — caching, LoRA and full fine-tuning, `video` / `av` / `audio` modes, block swap, quantization, multi-GPU — is unchanged.
+
 > For DoRA, LyCORIS, quantization, optimizers, per-module settings, regularizers, conditioning (IC-LoRA / latent guides), and every other option, see [Part III — Advanced](#part-iii--advanced).
 
 ### Audio-Only Training
@@ -859,7 +877,7 @@ The LTX-2.5 DiffVAE has a wider receptive field than the convolutional VAE. For 
 | `--sample_audio_subprocess` | on | Decode audio in a subprocess to avoid OOM crashes. Use `--no-sample_audio_subprocess` to decode in-process |
 | `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
-| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Named values: `defaults` (resolves per `--ltx_version`), `legacy` (bypass preset defaults), `ltx20`, `ltx23`, `ltx23_hq`, `ltx25`, and `distilled_two_stage`; see [Two-Stage Sampling](#two-stage-sampling). LTX-2.5 defaults to its official distilled two-stage settings. |
+| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Named values: `defaults` (resolves per `--ltx_version`), `legacy` (bypass preset defaults), `ltx20`, `ltx23`, `ltx23_hq`, `ltx25`, `ltx25_full`, and `distilled_two_stage`; see [Two-Stage Sampling](#two-stage-sampling). LTX-2.5 defaults to its official distilled two-stage settings; use `ltx25_full` when training on a non-distilled 2.5 checkpoint, which needs the full 30-step schedule with CFG and STG instead. |
 | `--sample_sampler` | `auto` | Denoising sampler. The LTX-2.5 preset follows the official pipeline: Euler ancestral in stage 1 and deterministic Euler in stage 2. Other full LTX presets use `res_2s`; `distilled_two_stage` uses Euler. |
 | `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
 
@@ -1258,7 +1276,7 @@ reference_cache_directory/                  # IC-LoRA only
 | No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | Expected behavior. Train in AV mode (`--ltx2_mode av` or `audio`) to generate audio during sampling |
 | Cannot resume training from checkpoint | Using a `*.comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `.comfy` extension. If you used `--no_save_original_lora`, you must retrain from scratch. |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
-| `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | The installed Transformers version is incompatible with the packed Gemma loader. The safetensors file is normally correct; rotary buffers are computed from config. | Reinstall the declared dependencies with `pip install -e .` (LTX-2.5 requires `transformers>=5.8.0,<5.15`). |
+| `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | The installed Transformers version is incompatible with the packed Gemma loader. The safetensors file is normally correct; rotary buffers are computed from config. | Reinstall the declared dependencies with `pip install -e .` (LTX-2.5 requires `transformers>=5.15,<5.16`). |
 | A nominally video-only LoRA contains audio or AV cross-modal adapter keys | `--ltx2_mode av` constructs the audio/cross-modal modules, and a broad target preset can select them. In `--ltx2_mode v`/`video`, those modules are not constructed. | Use `--ltx2_mode v` when no audio path is needed. If AV mode is required, use a `video_*` preset (`video_sa`, `video_sa_ff`, or `video_sa_ca_ff`) to restrict adapter targets to the video branch. See [LoRA Targets](#lora-targets). |
 | `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Reduce audio learning rate with `--audio_lr 1e-6` or fine-grained `--lr_args audio_attn=1e-6 audio_ff=1e-6`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
 | `loss_a` absent or not dropping in mixed dataset (audio starvation) | Audio batches too rare — non-audio steps outnumber audio steps, audio branch gets insufficient supervision | Increase `num_repeats` on audio datasets (target 30-50% audio steps). Add `--audio_loss_balance_mode inv_freq` to auto-boost audio weight. Use `--audio_dop` or `--audio_silence_regularizer` to provide audio signal on non-audio steps. Check caching summary for `failed > 0`. |

@@ -539,7 +539,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sampling_preset",
         type=str,
         default="defaults",
-        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "ltx25", "distilled_two_stage"],
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "ltx25", "ltx25_full", "distilled_two_stage"],
         help=(
             "Sampling defaults for validation previews. 'defaults' selects the preset for --ltx_version; "
             "use 'legacy' to bypass version preset defaults."

@@ -88,6 +88,25 @@ LTX2_SAMPLING_PRESETS: dict[str, LTX2SamplingPreset] = {
         video_modality_scale=3.0,
         audio_modality_scale=3.0,
     ),
+    # Non-distilled LTX-2.5. The official pipeline maps every checkpoint at or above
+    # model_version 2.4 onto the 2.3 knobs, so the sampling values match "ltx23"; the
+    # separate name keeps a 2.5 checkpoint from having to be sampled under a 2.3 preset.
+    "ltx25_full": LTX2SamplingPreset(
+        sample_steps=30,
+        width=768,
+        height=512,
+        frame_count=121,
+        frame_rate=24.0,
+        video_cfg_scale=3.0,
+        audio_cfg_scale=7.0,
+        stg_scale=1.0,
+        stg_blocks=[28],
+        stg_mode="both",
+        video_rescale_scale=0.7,
+        audio_rescale_scale=0.7,
+        video_modality_scale=3.0,
+        audio_modality_scale=3.0,
+    ),
     # Official LTX-2.5 distilled two-stage recipe. The two-stage inferencer
     # halves this requested final size for its 768x512 first stage.
     "ltx25": LTX2SamplingPreset(
