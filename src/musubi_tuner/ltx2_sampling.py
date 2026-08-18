@@ -910,10 +910,12 @@ class LTX2SamplingMixin:
         if text_encoder_checkpoint is None and str(getattr(args, "ltx_version", "")) == "2.5":
             text_encoder_checkpoint = gemma_safetensors
         text_encoder_checkpoint = text_encoder_checkpoint or args.ltx2_checkpoint
-        # With a Gemma directory the version marker lives there, not in the transformer file.
-        gemma_version_source = (
-            args.gemma_root if not gemma_safetensors and getattr(args, "gemma_root", None) else text_encoder_checkpoint
-        )
+        # With a Gemma 4 directory the version marker lives there, not in the transformer file.
+        from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import resolve_gemma4_directory
+
+        gemma_version_source = text_encoder_checkpoint
+        if not gemma_safetensors:
+            gemma_version_source = resolve_gemma4_directory(getattr(args, "gemma_root", None)) or text_encoder_checkpoint
         validate_gemma_checkpoint_compatibility(str(args.ltx2_checkpoint), str(gemma_version_source))
         builder_model_paths = (
             (str(args.ltx2_checkpoint), str(text_encoder_checkpoint))

@@ -497,9 +497,14 @@ def main() -> None:
         else args.ltx2_checkpoint
     )
     gemma_safetensors = getattr(args, "gemma_safetensors", None)
-    # LTX-2.5 split packs keep Gemma inside the text-encoder safetensors. A --gemma_root
-    # directory (unified LTX-2.5 checkpoints) supplies it instead, so leave it alone there.
-    if not gemma_safetensors and args.gemma_root is None and str(getattr(args, "ltx_version", "")) == "2.5":
+    # LTX-2.5 split packs keep Gemma inside the text-encoder safetensors; a Gemma 4 model
+    # directory supplies it instead, and then the connectors come from --ltx2_checkpoint.
+    gemma4_directory = None
+    if getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
+        from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import resolve_gemma4_directory
+
+        gemma4_directory = resolve_gemma4_directory(args.gemma_root)
+    if not gemma_safetensors and gemma4_directory is None and str(getattr(args, "ltx_version", "")) == "2.5":
         gemma_safetensors = text_encoder_checkpoint
     if args.gemma_root is None and not gemma_safetensors:
         raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 Gemma text caching")
@@ -531,8 +536,8 @@ def main() -> None:
         else str(text_encoder_checkpoint)
     )
     if args.ltx2_checkpoint is not None:
-        # With a Gemma directory the version marker lives there, not in the transformer file.
-        gemma_version_source = args.gemma_root if gemma_safetensors is None and args.gemma_root else text_encoder_checkpoint
+        # With a Gemma 4 directory the version marker lives there, not in the transformer file.
+        gemma_version_source = gemma4_directory or text_encoder_checkpoint
         validate_gemma_checkpoint_compatibility(str(args.ltx2_checkpoint), str(gemma_version_source))
 
     configurator = AVGemmaTextEncoderModelConfigurator if audio_video else VideoGemmaTextEncoderModelConfigurator

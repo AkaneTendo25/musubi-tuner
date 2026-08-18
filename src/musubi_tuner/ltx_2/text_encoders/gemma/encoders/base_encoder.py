@@ -58,6 +58,26 @@ def validate_gemma_checkpoint_compatibility(transformer_checkpoint: str, gemma_c
         )
 
 
+def resolve_gemma4_directory(gemma_root: str | None) -> str | None:
+    """Return `gemma_root` when it is a usable Gemma 4 model directory, else None.
+
+    `--gemma_root` carries a Gemma 3 default path that may not exist, so presence of the
+    argument alone says nothing about which text encoder the user actually supplied.
+    """
+
+    if not gemma_root:
+        return None
+    root = Path(gemma_root)
+    config_file = root / "config.json"
+    if not root.is_dir() or not config_file.exists():
+        return None
+    try:
+        model_type = json.loads(config_file.read_text(encoding="utf-8")).get("model_type", "")
+    except (OSError, ValueError):
+        return None
+    return None if str(model_type).startswith("gemma3") else gemma_root
+
+
 def _is_gemma3_config(config: object) -> bool:
     """Report whether a Gemma config describes the Gemma 3 family."""
 
