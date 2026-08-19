@@ -757,7 +757,9 @@ python minimax_h3_cache_dino_features.py \
 
 DINOv2 is fetched through Torch Hub by default; use `--dino_repo` for a local checkout and `--torch_hub_dir` for a persistent
 model cache. `validation_datasets` entries are cached in the same invocation, and the cached `dino_model` must match the one
-training requests.
+training requests. Frames follow the upstream DINOv2 transform — bicubic short-edge resize to 518 with antialiasing, then a
+center crop — so rectangular bucket frames keep their aspect ratio. Each cache records the preprocessing version it was
+written with; `--skip_existing` rebuilds any cache written by an older pipeline instead of mixing conventions.
 
 CREPA's projection head is training state, not part of the inference LoRA; it is saved separately as `h3_crepa.safetensors`.
 

@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 _INPUT_SIZE = 518
 _MEAN = (0.485, 0.456, 0.406)
 _STD = (0.229, 0.224, 0.225)
+# Bump whenever the pixel pipeline in ``_resize_and_center_crop`` changes. Cached
+# features are a frozen CREPA target, so a preprocessing change has to invalidate
+# existing caches instead of letting two conventions mix inside one run.
+_PREPROCESS_VERSION = "2"
 
 
 def dino_cache_path(latent_cache_path: str | Path) -> Path:
@@ -42,7 +46,11 @@ def _dino_cache_is_current(path: Path, latent_cache_path: str | Path, dino_model
     try:
         with safe_open(path, framework="pt") as handle:
             metadata = handle.metadata() or {}
-        expected = {"dino_model": dino_model, **_latent_cache_identity(latent_cache_path)}
+        expected = {
+            "dino_model": dino_model,
+            "preprocess_version": _PREPROCESS_VERSION,
+            **_latent_cache_identity(latent_cache_path),
+        }
         return all(metadata.get(key) == value for key, value in expected.items())
     except (OSError, ValueError):
         return False
@@ -59,10 +67,31 @@ def _load_model(name: str, repo: Path | None, hub_dir: Path | None) -> torch.nn.
     return torch.hub.load("facebookresearch/dinov2", name)
 
 
+def _resize_and_center_crop(images: torch.Tensor) -> torch.Tensor:
+    # Upstream DINOv2 evaluates on a bicubic short-edge resize followed by a
+    # center crop. Bucket frames are rectangular, so resizing straight to a
+    # square would shear the aspect ratio the teacher was trained on.
+    height, width = images.shape[-2:]
+    scale = _INPUT_SIZE / min(height, width)
+    resized = F.interpolate(
+        images,
+        size=(max(_INPUT_SIZE, round(height * scale)), max(_INPUT_SIZE, round(width * scale))),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    )
+    # Bicubic weights are signed and overshoot outside the source range; the
+    # upstream PIL path cannot leave values beyond the 8-bit gamut.
+    resized = resized.clamp_(0, 1)
+    top = (resized.shape[-2] - _INPUT_SIZE) // 2
+    left = (resized.shape[-1] - _INPUT_SIZE) // 2
+    return resized[..., top : top + _INPUT_SIZE, left : left + _INPUT_SIZE]
+
+
 @torch.inference_mode()
 def extract_features(model: torch.nn.Module, frames: np.ndarray, device: torch.device, batch_size: int) -> torch.Tensor:
     images = torch.from_numpy(frames).permute(0, 3, 1, 2).float().div_(255)
-    images = F.interpolate(images, size=(_INPUT_SIZE, _INPUT_SIZE), mode="bilinear", align_corners=False)
+    images = _resize_and_center_crop(images)
     mean = images.new_tensor(_MEAN).view(1, 3, 1, 1)
     std = images.new_tensor(_STD).view(1, 3, 1, 1)
     images = (images - mean) / std
@@ -138,6 +167,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 features = extract_features(model, item.content, device, args.dino_batch_size)
                 metadata = {
                     "dino_model": args.dino_model,
+                    "preprocess_version": _PREPROCESS_VERSION,
                     "frames": str(features.shape[0]),
                     "patches": str(features.shape[1]),
                     "channels": str(features.shape[2]),

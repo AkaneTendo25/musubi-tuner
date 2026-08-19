@@ -28,10 +28,13 @@ from tqdm import tqdm
 
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
+    AUDIO_LATENT_CHANNELS,
     AUDIO_SAMPLE_RATE,
     CANVAS_MULTIPLE,
+    VIDEO_DIT_PATCH_SIZE,
     VIDEO_FLOW_SHIFT,
     VIDEO_FPS,
+    VIDEO_LATENT_CHANNELS,
     VIDEO_SPATIAL_COMPRESSION,
     temporal_shape,
 )
@@ -203,7 +206,7 @@ def encode_keyframe_images(
         mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
         std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
         latent = video_encoder.encode_reference(((pixels - mean) / std).to(weight_dtype), image=True)[0]
-        rows.append(patchify_video_latents(latent[None], (1, 2, 2))[0].cpu())
+        rows.append(patchify_video_latents(latent[None], VIDEO_DIT_PATCH_SIZE)[0].cpu())
     del video_encoder
     clean_memory_on_device(device)
     return tuple(rows)
@@ -253,7 +256,7 @@ def encode_reference_media(
             pixels.sub_(mean).div_(std)
             latent = video_encoder.encode_reference(pixels.to(weight_dtype), image=image)[0]
             video_shapes[index] = tuple(int(value) for value in latent.shape[-3:])
-            video_rows_by_reference[index] = patchify_video_latents(latent[None], (1, 2, 2))[0].float().cpu()
+            video_rows_by_reference[index] = patchify_video_latents(latent[None], VIDEO_DIT_PATCH_SIZE)[0].float().cpu()
             del pixels, latent
         del video_encoder
         gc.collect()
@@ -302,8 +305,12 @@ def encode_reference_media(
         )
     return H3EncodedReferences(
         geometries=tuple(geometries),
-        video_rows=torch.cat(video_rows) if video_rows else torch.empty((0, 96), dtype=torch.float32),
-        audio_rows=torch.cat(audio_rows) if audio_rows else torch.empty((0, 32), dtype=torch.float32),
+        video_rows=(
+            torch.cat(video_rows)
+            if video_rows
+            else torch.empty((0, VIDEO_LATENT_CHANNELS * int(np.prod(VIDEO_DIT_PATCH_SIZE))), dtype=torch.float32)
+        ),
+        audio_rows=torch.cat(audio_rows) if audio_rows else torch.empty((0, AUDIO_LATENT_CHANNELS), dtype=torch.float32),
     )
 
 

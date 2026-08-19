@@ -13,7 +13,13 @@ import torch.nn.functional as F
 from PIL import Image
 from safetensors import safe_open
 
-from musubi_tuner.minimax_h3.architecture import IMAGE_FRAME_COUNT, temporal_shape
+from musubi_tuner.minimax_h3.architecture import (
+    AUDIO_LATENT_CHANNELS,
+    IMAGE_FRAME_COUNT,
+    VIDEO_DIT_PATCH_SIZE,
+    VIDEO_LATENT_CHANNELS,
+    temporal_shape,
+)
 from musubi_tuner.minimax_h3.audio import (
     audio_valid_mask_to_latent_mask,
     load_audio_asset,
@@ -1860,7 +1866,7 @@ class _NativeLatentEncoder:
                 video_shapes.append((0, 0, 0))
             else:
                 video_shapes.append(tuple(int(value) for value in latent.shape[-3:]))
-                video_rows.append(patchify_video_latents(latent[None], (1, 2, 2))[0])
+                video_rows.append(patchify_video_latents(latent[None], VIDEO_DIT_PATCH_SIZE)[0])
 
             if reference.waveform is None:
                 audio_lengths.append(0)
@@ -1883,10 +1889,12 @@ class _NativeLatentEncoder:
             f"varlen_{H3_REFERENCE_VIDEO_SHAPES_KEY}{suffix}_int64": torch.tensor(video_shapes, dtype=torch.long),
             f"varlen_{H3_REFERENCE_AUDIO_LENGTHS_KEY}{suffix}_int64": torch.tensor(audio_lengths, dtype=torch.long),
             f"varlen_{H3_REFERENCE_VIDEO_ROWS_KEY}{suffix}_{dtype_name}": (
-                torch.cat(video_rows) if video_rows else torch.empty((0, 96), dtype=self.output_dtype)
+                torch.cat(video_rows)
+                if video_rows
+                else torch.empty((0, VIDEO_LATENT_CHANNELS * int(np.prod(VIDEO_DIT_PATCH_SIZE))), dtype=self.output_dtype)
             ),
             f"varlen_{H3_REFERENCE_AUDIO_ROWS_KEY}{suffix}_{dtype_name}": (
-                torch.cat(audio_rows) if audio_rows else torch.empty((0, 32), dtype=self.output_dtype)
+                torch.cat(audio_rows) if audio_rows else torch.empty((0, AUDIO_LATENT_CHANNELS), dtype=self.output_dtype)
             ),
         }
         if any(reference.kind is H3ReferenceKind.VIDEO for reference in references):
@@ -1977,8 +1985,8 @@ class _NativeLatentEncoder:
                 last = self._encode_reference_video(last_content, image=True)
                 keyframe_rows = torch.cat(
                     (
-                        patchify_video_latents(first[None], (1, 2, 2))[0],
-                        patchify_video_latents(last[None], (1, 2, 2))[0],
+                        patchify_video_latents(first[None], VIDEO_DIT_PATCH_SIZE)[0],
+                        patchify_video_latents(last[None], VIDEO_DIT_PATCH_SIZE)[0],
                     )
                 )
                 tensors[f"varlen_{H3_KEYFRAME_VIDEO_ROWS_KEY}_{dtype_name}"] = keyframe_rows

@@ -79,8 +79,11 @@ from musubi_tuner.minimax_h3.training import (
 )
 from musubi_tuner.minimax_h3.validation import masked_squared_error_sum
 from musubi_tuner.minimax_h3_cache_dino_features import (
+    _INPUT_SIZE,
+    _PREPROCESS_VERSION,
     _dino_cache_is_current,
     _latent_cache_identity,
+    _resize_and_center_crop,
     _save_features,
     dino_cache_path,
 )
@@ -210,11 +213,56 @@ def test_h3_dino_cache_identity_detects_rebuilt_latents(tmp_path):
     latent = tmp_path / "clip_mmh3.safetensors"
     dino = dino_cache_path(latent)
     save_file({"latents": torch.zeros(1)}, latent)
-    _save_features(dino, torch.zeros(1, 1, 1), {"dino_model": "probe", **_latent_cache_identity(latent)}, atomic=False)
+    metadata = {"dino_model": "probe", "preprocess_version": _PREPROCESS_VERSION, **_latent_cache_identity(latent)}
+    _save_features(dino, torch.zeros(1, 1, 1), metadata, atomic=False)
     assert _dino_cache_is_current(dino, latent, "probe")
 
     save_file({"latents": torch.zeros(2)}, latent)
     assert not _dino_cache_is_current(dino, latent, "probe")
+
+
+def test_h3_dino_cache_identity_rejects_a_foreign_preprocessing_version(tmp_path):
+    latent = tmp_path / "clip_mmh3.safetensors"
+    dino = dino_cache_path(latent)
+    save_file({"latents": torch.zeros(1)}, latent)
+    identity = {"dino_model": "probe", **_latent_cache_identity(latent)}
+
+    # Caches predating the preprocessing contract carry no version at all; they
+    # hold features from a different pixel pipeline and must be rebuilt.
+    _save_features(dino, torch.zeros(1, 1, 1), dict(identity), atomic=False)
+    assert not _dino_cache_is_current(dino, latent, "probe")
+
+    _save_features(dino, torch.zeros(1, 1, 1), {**identity, "preprocess_version": "0"}, atomic=False)
+    assert not _dino_cache_is_current(dino, latent, "probe")
+
+    _save_features(dino, torch.zeros(1, 1, 1), {**identity, "preprocess_version": _PREPROCESS_VERSION}, atomic=False)
+    assert _dino_cache_is_current(dino, latent, "probe")
+
+
+def _marker_extent(images: torch.Tensor) -> tuple[int, int]:
+    mask = images[0].mean(dim=0) > 0.5
+    rows = mask.any(dim=1).nonzero()
+    columns = mask.any(dim=0).nonzero()
+    return int(rows[-1] - rows[0]) + 1, int(columns[-1] - columns[0]) + 1
+
+
+@pytest.mark.parametrize("shape", [(544, 960), (960, 544)])
+def test_h3_dino_preprocessing_center_crops_instead_of_squashing_the_aspect(shape):
+    # A centred square marker stays square only if the short edge is scaled and
+    # the long edge is cropped; resizing a rectangular bucket frame straight to
+    # 518x518 would stretch the marker along whichever edge was compressed.
+    height, width = shape
+    side = 200
+    frame = torch.zeros(1, 3, height, width)
+    frame[:, :, (height - side) // 2 : (height + side) // 2, (width - side) // 2 : (width + side) // 2] = 1.0
+
+    cropped = _resize_and_center_crop(frame)
+    assert cropped.shape == (1, 3, _INPUT_SIZE, _INPUT_SIZE)
+
+    marker_height, marker_width = _marker_extent(cropped)
+    expected = round(side * _INPUT_SIZE / min(height, width))
+    assert abs(marker_height - marker_width) <= 2
+    assert abs(marker_height - expected) <= 2 and abs(marker_width - expected) <= 2
 
 
 @pytest.mark.parametrize(
