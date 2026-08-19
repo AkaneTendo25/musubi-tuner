@@ -114,6 +114,11 @@ def _merge_base_loras_into_int8_state_dict(
     """
     matched_counts = _validate_base_lora_matches(set(state_dict), lora_weights_list)
     multipliers = list(lora_multipliers or [])
+    if len(multipliers) > len(lora_weights_list):
+        logger.warning(
+            f"--base_weights_multiplier lists {len(multipliers)} values for {len(lora_weights_list)} "
+            "--base_weights; the extra ones are ignored"
+        )
     multipliers.extend([1.0] * (len(lora_weights_list) - len(multipliers)))
     multipliers = multipliers[: len(lora_weights_list)]
     remaining_keys = [set(weights) for weights in lora_weights_list]

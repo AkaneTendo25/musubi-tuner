@@ -570,6 +570,10 @@ class H3DatasetAdapter:
                     raise ValueError(
                         f"{CONDITIONING_MASK_DIRECTORY_KEY} masks video latents, so it cannot be used on an audio dataset"
                     )
+                if self.image_mode != "none":
+                    # The image-mode check further down is only reached by video/image
+                    # datasets; without this one the run fails much later, inside caching.
+                    raise ValueError("MiniMax H3 conditioned-image mode accepts image datasets only, not an audio dataset")
                 audio_dataset = H3AudioDataset(source, general)
                 self.audio_datasets.append(audio_dataset)
                 self.dataset_kinds.append("audio")
@@ -838,12 +842,21 @@ class H3DatasetAdapter:
         do not run image mode, the frame-ranged one for those that do.
         """
         masks: dict[str, str] = {}
+
+        def register(key: str, mask_path: str) -> None:
+            # Two targets with the same stem in different folders collapse onto one key
+            # here, and the collator would silently apply one target's mask to the other.
+            existing = masks.get(key)
+            if existing is not None and existing != mask_path:
+                raise ValueError(f"ambiguous H3 conditioning masks for {key!r}: {existing} and {mask_path}")
+            masks[key] = mask_path
+
         for normal, mask_path in self.conditioning_masks.items():
             stem = Path(self._targets[normal].path).stem
-            masks[stem] = str(mask_path)
+            register(stem, str(mask_path))
             frame_count = self._image_frame_counts.get(normal)
             if frame_count is not None:
-                masks[f"{stem}_00000-{int(frame_count):03d}"] = str(mask_path)
+                register(f"{stem}_00000-{int(frame_count):03d}", str(mask_path))
         return masks
 
     def adapt_dataset_group(self, dataset_group: DatasetGroup) -> None:

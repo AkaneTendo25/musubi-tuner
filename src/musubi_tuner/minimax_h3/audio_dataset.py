@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import random
 from pathlib import Path
@@ -11,6 +12,8 @@ from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
 from musubi_tuner.dataset.bucket import BucketBatchManager
 from musubi_tuner.dataset.image_video_dataset import BaseDataset, ItemInfo
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
+
+logger = logging.getLogger(__name__)
 
 
 class H3AudioDataset(BaseDataset):
@@ -24,7 +27,12 @@ class H3AudioDataset(BaseDataset):
         if not frames or len(frames) != 1 or not is_valid_frame_count(int(frames[0])):
             raise ValueError("H3 audio datasets require one target_frames value satisfying frame_count % 17 == 5")
         self.target_frames = int(frames[0])
-        resolution = tuple(value("resolution", (768, 768)))
+        configured_resolution = value("resolution", (768, 768))
+        # The Musubi schema accepts a scalar resolution as a square one, but this dataset
+        # is built from the raw config, before that conversion runs.
+        if isinstance(configured_resolution, int):
+            configured_resolution = (configured_resolution, configured_resolution)
+        resolution = tuple(configured_resolution)
         super().__init__(
             resolution=resolution,
             caption_extension=value("caption_extension", ".txt"),
@@ -108,11 +116,17 @@ class H3AudioDataset(BaseDataset):
 
     def prepare_for_training(self, num_timestep_buckets: int | None = None):
         bucket = []
+        skipped: list[str] = []
         for path, caption in self.records:
             item = self._item(path, caption)
             if not Path(item.latent_cache_path).is_file() or not Path(item.text_encoder_output_cache_path).is_file():
+                skipped.append(item.latent_cache_path)
                 continue
             bucket.extend([item] * self.num_repeats)
+        if skipped:
+            logger.warning(
+                f"H3 audio dataset skips {len(skipped)} of {len(self.records)} items without both caches, e.g. {skipped[0]}"
+            )
         bucket_key = (*self.resolution, self.target_frames)
         self.batch_manager = BucketBatchManager({bucket_key: bucket}, self.batch_size, num_timestep_buckets)
         self.num_train_items = len(bucket)

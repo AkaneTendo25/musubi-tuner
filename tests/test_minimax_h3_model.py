@@ -105,6 +105,29 @@ def test_h3_base_lora_merge_requantizes_each_int8_layer_once(monkeypatch):
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.04)
 
 
+def test_h3_base_lora_merge_warns_about_surplus_multipliers(caplog):
+    # Stock musubi truncates silently; the merge stays compatible but says so.
+    model_key = "final_layer.video_out.weight"
+    lora_name = "lora_unet_final_layer_video_out"
+    state_dict = {model_key: torch.randn(6, 8, dtype=torch.bfloat16)}
+    lora = {
+        f"{lora_name}.lora_down.weight": torch.randn(2, 8),
+        f"{lora_name}.lora_up.weight": torch.randn(6, 2),
+        f"{lora_name}.alpha": torch.tensor(1.0),
+    }
+
+    with caplog.at_level("WARNING"):
+        matched, _ = _merge_base_loras_into_int8_state_dict(
+            state_dict,
+            [lora],
+            [0.5, 1.5, 2.0],
+            calc_device=torch.device("cpu"),
+        )
+
+    assert matched == [1]
+    assert any("3 values for 1" in record.message for record in caplog.records)
+
+
 def test_h3_base_lora_merge_preserves_floating_targets_in_mixed_checkpoint():
     torch.manual_seed(11)
     model_key = "final_layer.video_out.weight"

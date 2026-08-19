@@ -3629,6 +3629,96 @@ def test_h3_conditioning_mask_directory_is_rejected_on_an_audio_dataset(tmp_path
         h3_dataset.H3DatasetAdapter(config, Namespace(h3_mask_mode="dataset"))
 
 
+def test_h3_image_mode_is_rejected_on_an_audio_dataset(tmp_path):
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    (audio / "tone.wav").write_bytes(b"target")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "audio_directory": str(audio),
+                "h3_target_mode": "audio",
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [124],
+            }
+        ],
+    }
+    args = Namespace(debug_dataset=False, h3_image_mode="first", h3_image_frame_count=5)
+
+    with pytest.raises(ValueError, match="image datasets only"):
+        h3_dataset.H3DatasetAdapter(config, args)
+
+
+def test_h3_conditioning_masks_reject_two_targets_sharing_a_stem(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    masks = tmp_path / "masks"
+    for directory in (first, second, masks):
+        directory.mkdir()
+    (first / "clip.mp4").write_bytes(b"video")
+    (second / "clip.mp4").write_bytes(b"video")
+    _write_mask(masks / "clip.png", observed_box=(0, 0, 32, 64))
+    _write_mask(tmp_path / "other.png", observed_box=(0, 0, 16, 64))
+    (masks / "other").mkdir()
+    _write_mask(masks / "other" / "clip.png", observed_box=(0, 0, 16, 64))
+    config = {
+        "general": {"resolution": [512, 512], "target_frames": [22]},
+        "datasets": [
+            {
+                "video_directory": str(first),
+                "cache_directory": str(tmp_path / "cache_first"),
+                "conditioning_mask_directory": str(masks),
+            },
+            {
+                "video_directory": str(second),
+                "cache_directory": str(tmp_path / "cache_second"),
+                "conditioning_mask_directory": str(masks / "other"),
+            },
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(h3_mask_mode="dataset"))
+
+    with pytest.raises(ValueError, match="ambiguous H3 conditioning masks for 'clip'"):
+        adapter.conditioning_mask_paths_by_item_key()
+
+
+def test_h3_audio_dataset_accepts_a_scalar_resolution(tmp_path):
+    (tmp_path / "tone.wav").write_bytes(b"fixture")
+
+    dataset = H3AudioDataset(
+        {
+            "audio_directory": str(tmp_path),
+            "cache_directory": str(tmp_path),
+            "target_frames": [124],
+            "resolution": 1024,
+        },
+        {},
+    )
+
+    assert tuple(dataset.resolution) == (1024, 1024)
+
+
+def test_h3_audio_dataset_warns_about_items_without_caches(tmp_path, caplog):
+    (tmp_path / "tone.wav").write_bytes(b"fixture")
+    dataset = H3AudioDataset(
+        {
+            "audio_directory": str(tmp_path),
+            "cache_directory": str(tmp_path),
+            "target_frames": [124],
+            "resolution": [832, 480],
+        },
+        {},
+    )
+
+    with caplog.at_level("WARNING"):
+        dataset.prepare_for_training()
+
+    assert dataset.num_train_items == 0
+    assert any("skips 1 of 1 items" in record.message for record in caplog.records)
+
+
 def test_h3_conditioning_mask_loads_with_white_as_observed(tmp_path):
     from musubi_tuner.minimax_h3.masking import load_conditioning_mask
 

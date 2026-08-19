@@ -1537,6 +1537,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         base_weight_paths = list(getattr(args, "base_weights", None) or [])
         base_lora_weights = [self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3") for path in base_weight_paths]
         base_lora_multipliers = list(getattr(args, "base_weights_multiplier", None) or [])
+        if len(base_lora_multipliers) > len(base_lora_weights):
+            logger.warning(
+                f"--base_weights_multiplier lists {len(base_lora_multipliers)} values for {len(base_lora_weights)} "
+                "--base_weights; the extra ones are ignored"
+            )
         base_lora_multipliers.extend([1.0] * (len(base_lora_weights) - len(base_lora_multipliers)))
         base_lora_multipliers = base_lora_multipliers[: len(base_lora_weights)]
         backend_kwargs = dict(
