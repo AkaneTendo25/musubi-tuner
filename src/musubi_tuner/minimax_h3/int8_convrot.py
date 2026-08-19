@@ -156,8 +156,11 @@ class _Int8ConvRotFunction(torch.autograd.Function):
         if ctx.fwd_mode == "bf16":
             # The un-rotated weight is the ordinary W, so the gradient needs no rotation
             # of its own: the saving applies to both directions.
-            dense_weight = _unrotated_weight(weight, scale, ctx.group_size, torch.float32)
-            grad_input = folded.float() @ dense_weight
+            # The dequantization stays in the gradient dtype, like the quantized branch
+            # below: an fp32 weight is twice the peak memory of the stored INT8 one and
+            # its matmul misses the tensor cores.
+            dense_weight = _unrotated_weight(weight, scale, ctx.group_size, folded.dtype)
+            grad_input = folded @ dense_weight
             return grad_input.to(ctx.input_dtype).reshape(ctx.input_shape), None, None, None, None, None, None
         if ctx.bwd_mode == "int8" and _int8_available(folded):
             # Copy before the in-place fold: ``folded`` is a view of the caller's gradient,

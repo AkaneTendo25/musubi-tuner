@@ -3251,6 +3251,26 @@ def test_h3_prequantized_convrot_bf16_backward_matches_the_fp32_gradient():
     assert (x.grad.float() - expected).norm() / expected.norm() < 2e-2
 
 
+def test_h3_prequantized_convrot_bf16_forward_backward_matches_the_fp32_gradient():
+    # The BF16 *forward* takes its own early return in the backward, and it used to
+    # dequantize into fp32 there as well; the gradient must not move.
+    import torch
+
+    from musubi_tuner.minimax_h3.int8_convrot import rotate_activation
+
+    _, layer, _ = _prequantized_convrot_linear(fwd_mode="bf16")
+    x = torch.randn(6, 16, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn(6, 8, dtype=torch.bfloat16)
+
+    layer(x).backward(grad_output)
+
+    dense_weight = layer.weight.float() * layer.scale_weight.reshape(-1, 1).float()
+    # The BF16 forward runs on the un-rotated weight, so its backward carries no
+    # rotation of its own.
+    expected = grad_output.float() @ rotate_activation(dense_weight, 4)
+    assert (x.grad.float() - expected).norm() / expected.norm() < 2e-2
+
+
 def test_h3_prequantized_convrot_backward_skips_a_non_differentiable_input(monkeypatch):
     import torch
 

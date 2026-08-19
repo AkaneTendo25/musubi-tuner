@@ -47,6 +47,16 @@ def test_rows_not_multiple_of_block():
     assert torch.allclose(dense, out, atol=2e-3, rtol=2e-3)
 
 
+def test_one_row_past_a_block_boundary_matches_dense():
+    # The largest possible padding: the straddling block is a single real row and
+    # 127 padded ones, all of which only the mask function can cut.
+    q, k, v = _qkv(rows=129)
+    out = block_sparse_attention(q, k, v, BlockSparseConfig(block=128, kv_fraction=1.0))
+    assert out.shape == q.shape
+    dense = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    assert torch.allclose(dense, out, atol=2e-3, rtol=2e-3), (dense - out).abs().max().item()
+
+
 def test_own_block_always_retained():
     q, k, v = _qkv(rows=1024)
     mask = select_blocks(q, k, BlockSparseConfig(block=128, kv_fraction=0.01, min_blocks=1))
@@ -84,3 +94,34 @@ def test_threshold_adapts_per_query_block():
     mask = select_blocks(q, k, BlockSparseConfig(block=128, threshold=0.5))
     per_block = mask.sum(-1).flatten()
     assert per_block.min() != per_block.max(), per_block.unique()
+
+
+def test_varying_lengths_keep_the_sparse_kernel():
+    """Sequence length varies per sample; the kernel must survive that.
+
+    ``flex_attention`` falls back to a dense math path that materializes the
+    whole score matrix, and the fallback is silent: the result is correct while
+    the memory and time are those of dense attention. Recompiling per length
+    exhausts the compile budget and triggers exactly that, so the guard here is
+    a run over many lengths, not a single call.
+    """
+    import importlib
+
+    hop = importlib.import_module("torch._higher_order_ops.flex_attention")
+    original = hop.math_attention
+    fell_back = []
+
+    def spy(*args, **kwargs):
+        fell_back.append(True)
+        return original(*args, **kwargs)
+
+    hop.math_attention = spy
+    try:
+        cfg = BlockSparseConfig(block=128, kv_fraction=0.25)
+        for rows in (1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048, 2176, 2304, 2432):
+            q, k, v = _qkv(rows=rows)
+            block_sparse_attention(q, k, v, cfg)
+    finally:
+        hop.math_attention = original
+
+    assert not fell_back, "attention fell back to the dense math path"

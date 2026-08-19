@@ -119,13 +119,16 @@ if HAS_TRITON:
         block_weights,
         output,
         sequence: tl.constexpr,
-        heads: tl.constexpr,
         selected_blocks: tl.constexpr,
         head_dim: tl.constexpr,
         block_rows: tl.constexpr,
         scale_log2: tl.constexpr,
     ):
-        """Flash-style reference attention with runtime block indices/weights."""
+        """Flash-style reference attention with runtime block indices/weights.
+
+        Unreachable from the trained paths and therefore untested on CPU: the
+        online-softmax algebra below can only be exercised on a GPU.
+        """
         query_block = tl.program_id(0)
         head = tl.program_id(1)
         row_offsets = query_block * block_rows + tl.arange(0, block_rows)
@@ -157,8 +160,13 @@ if HAS_TRITON:
             logits = tl.where(row_mask[:, None] & key_mask[None, :], logits, -float("inf"))
             block_max = tl.max(logits, axis=1)
             next_max = tl.maximum(running_max, block_max)
-            old_scale = tl.exp2(running_max - next_max)
-            probabilities = tl.exp2(logits - next_max[:, None])
+            # A padded route slot (key_block == -1) masks the whole block, so on
+            # the leading slot next_max is still -inf and both exponents would be
+            # -inf - -inf = NaN. Pin them: the rescale is a no-op (1.0) and a
+            # fully masked block contributes nothing (0.0).
+            empty = next_max == float("-inf")
+            old_scale = tl.where(empty, 1.0, tl.exp2(running_max - next_max))
+            probabilities = tl.where(empty[:, None], 0.0, tl.exp2(logits - next_max[:, None]))
             block_sum = tl.sum(probabilities, axis=1)
             v = tl.load(
                 value + head_base + key_rows[:, None] * head_dim + dim_offsets[None, :],
@@ -716,7 +724,6 @@ def reference_block_sparse_forward(
         block_weights.contiguous(),
         output,
         sequence=sequence,
-        heads=heads,
         selected_blocks=selected_blocks,
         head_dim=head_dim,
         block_rows=block_rows,

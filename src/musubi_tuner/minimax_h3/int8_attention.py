@@ -24,9 +24,10 @@ except ImportError:  # pragma: no cover - runtime dependent
 
 
 if HAS_TRITON:
-
+    # The row count is the grid, never a constexpr: baking it into the signature
+    # would key the specialization on sequence length and recompile per shape.
     @triton.jit
-    def _quantize_rows_kernel(x, quantized, scales, rows: tl.constexpr, dim: tl.constexpr, block: tl.constexpr):
+    def _quantize_rows_kernel(x, quantized, scales, dim: tl.constexpr, block: tl.constexpr):
         row = tl.program_id(0)
         offsets = tl.arange(0, block)
         mask = offsets < dim
@@ -234,7 +235,7 @@ def _quantize_rows(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     rows = value.numel() // value.shape[-1]
     quantized = torch.empty_like(value, dtype=torch.int8)
     scales = torch.empty(value.shape[:-1], device=value.device, dtype=torch.float32)
-    _quantize_rows_kernel[(rows,)](value, quantized, scales, rows, value.shape[-1], triton.next_power_of_2(value.shape[-1]))
+    _quantize_rows_kernel[(rows,)](value, quantized, scales, value.shape[-1], triton.next_power_of_2(value.shape[-1]))
     return quantized, scales
 
 

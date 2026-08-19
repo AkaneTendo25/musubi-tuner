@@ -136,7 +136,8 @@ class ReusableActivationOffloader:
                 "reusable H3 activation offload is discarding %d saved activation handle(s) from a previous "
                 "grad-enabled forward whose backward never ran (skipped step, caught OOM, or partial autograd.grad); "
                 "if you did not expect an aborted backward, a second forward was started before the first was "
-                "backpropagated and its recomputation will fail",
+                "backpropagated and its gradients will be silently wrong: the pooled buffers are reused, so the "
+                "recomputation succeeds on the second forward's data",
                 unconsumed,
             )
         self.reset()

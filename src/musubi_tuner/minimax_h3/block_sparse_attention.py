@@ -27,7 +27,11 @@ def _compiled_flex():
     compiled path fuses the mask and skips excluded blocks.
     """
     if "fn" not in _COMPILED:
-        _COMPILED["fn"] = torch.compile(flex_attention, dynamic=False)
+        # Dynamic shapes on purpose: sequence length varies per sample, and a
+        # static compile would rebuild the kernel for every new length until
+        # the recompile limit is hit and the call silently falls back to the
+        # dense math path.
+        _COMPILED["fn"] = torch.compile(flex_attention, dynamic=True)
     return _COMPILED["fn"]
 
 
@@ -127,11 +131,11 @@ def block_sparse_attention(
     padded = query.shape[-2]
 
     # A zero score is a full weight after the softmax, so padded rows must be
-    # excluded. Drop fully padded blocks here; the straddling block holds real
-    # rows and is cut per row by the mask below.
-    if pad:
-        keep = keep.clone()
-        keep[..., -(-rows // cfg.block) :] = False
+    # excluded. The straddling block holds real rows, so the cut is per row and
+    # comes from a tensor rather than a captured length: a captured int is a
+    # guard on its value, so every new sequence length would recompile the
+    # kernel until the limit is reached and the call falls back to dense math.
+    valid = torch.arange(padded, device=query.device) < rows
 
     # Built from the selected indices: evaluating a mask function over every
     # row pair would materialize a grid the size of the attention matrix.
@@ -139,7 +143,7 @@ def block_sparse_attention(
     indices = torch.argsort(keep.to(torch.int8), dim=-1, descending=True, stable=True).to(torch.int32)
 
     def mask_mod(batch, head, q_row, k_row):
-        return (k_row < rows) & keep[batch, head, q_row // cfg.block, k_row // cfg.block]
+        return valid[k_row] & keep[batch, head, q_row // cfg.block, k_row // cfg.block]
 
     block_mask = BlockMask.from_kv_blocks(
         counts,
