@@ -832,11 +832,18 @@ class H3DatasetAdapter:
         """Map the cached item key -- the target's basename -- to its mask file.
 
         Training rebuilds items from cache filenames, which keep only the stem,
-        so that is the only handle the collator has on the source media.
+        so that is the only handle the collator has on the source media. An
+        image-mode dataset caches its latents under ``{stem}_00000-{frames:03d}``,
+        so both spellings are registered: the bare stem for image datasets that
+        do not run image mode, the frame-ranged one for those that do.
         """
         masks: dict[str, str] = {}
         for normal, mask_path in self.conditioning_masks.items():
-            masks[Path(self._targets[normal].path).stem] = str(mask_path)
+            stem = Path(self._targets[normal].path).stem
+            masks[stem] = str(mask_path)
+            frame_count = self._image_frame_counts.get(normal)
+            if frame_count is not None:
+                masks[f"{stem}_00000-{int(frame_count):03d}"] = str(mask_path)
         return masks
 
     def adapt_dataset_group(self, dataset_group: DatasetGroup) -> None:

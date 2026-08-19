@@ -3420,6 +3420,39 @@ def test_h3_conditioning_mask_directory_matches_targets_by_basename(tmp_path):
     assert "conditioning_mask_directory" not in adapter.musubi_config["datasets"][0]
 
 
+def test_h3_conditioning_masks_key_by_the_image_mode_item_key(tmp_path):
+    images = tmp_path / "images"
+    controls = tmp_path / "controls"
+    masks = tmp_path / "masks"
+    images.mkdir()
+    controls.mkdir()
+    masks.mkdir()
+    (images / "portrait.png").write_bytes(b"target")
+    (controls / "portrait.png").write_bytes(b"control")
+    _write_mask(masks / "portrait.png", observed_box=(0, 0, 32, 64))
+    config = {
+        "general": {"resolution": [64, 64]},
+        "datasets": [
+            {
+                "image_directory": str(images),
+                "control_directory": str(controls),
+                "cache_directory": str(tmp_path / "cache"),
+                "conditioning_mask_directory": str(masks),
+            }
+        ],
+    }
+    args = Namespace(debug_dataset=False, h3_mask_mode="dataset", h3_image_mode="first", h3_image_frame_count=5)
+
+    adapter = h3_dataset.H3DatasetAdapter(config, args)
+
+    # Image mode caches latents as ``{stem}_00000-{frames:03d}_{size}``, and training
+    # rebuilds the item key from that filename, so the map must carry both spellings.
+    assert adapter.conditioning_mask_paths_by_item_key() == {
+        "portrait": str(masks / "portrait.png"),
+        "portrait_00000-005": str(masks / "portrait.png"),
+    }
+
+
 def test_h3_conditioning_mask_jsonl_path_resolves_against_the_manifest(tmp_path):
     manifest = tmp_path / "videos.jsonl"
     manifest.write_text(
