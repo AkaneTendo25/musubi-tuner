@@ -34,6 +34,7 @@ from torch.utils.checkpoint import checkpoint
 
 from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffloader
 from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
+from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig, block_sparse_attention
 from musubi_tuner.minimax_h3.triton_kernels import (
     try_fused_indexed_adaln_rmsnorm,
     try_fused_qk_norm_rope,
@@ -198,6 +199,7 @@ class MiniMaxH3Attention(nn.Module):
         self.attention_mode = attention_mode
         self.auto_dispatch = False
         self.int8_attention = False
+        self.block_sparse_config: BlockSparseConfig | None = None
         self.fused_qk_norm_rope = False
         self.inner_dim = heads * head_dim
         self.qkv_proj = nn.Linear(hidden_size, 3 * self.inner_dim, bias=False)
@@ -236,7 +238,14 @@ class MiniMaxH3Attention(nn.Module):
                 query = _apply_rotary_emb(query, *rotary_emb)
                 key = _apply_rotary_emb(key, *rotary_emb)
 
-        if self.int8_attention and attention_mask is None:
+        if self.block_sparse_config is not None and attention_mask is None:
+            # A padding mask is a pairwise condition block selection cannot
+            # express, so masked calls fall through to the dense path.
+            hidden_states = block_sparse_attention(
+                query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), self.block_sparse_config
+            )
+            hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        elif self.int8_attention and attention_mask is None:
             query = query.transpose(1, 2)
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
@@ -540,6 +549,19 @@ class MiniMaxH3Transformer(nn.Module):
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
                 module.int8_attention = enabled
+
+    def set_block_sparse_attention(self, config: BlockSparseConfig | None, *, start_block: int = 0) -> None:
+        """Enable block-sparse attention from ``start_block`` onwards.
+
+        Early blocks run on short sequences where selection costs more than the
+        attention it replaces, so they are left dense.
+        """
+        if config is not None:
+            config.validate()
+        for index, block in enumerate(self.blocks):
+            for module in block.modules():
+                if isinstance(module, MiniMaxH3Attention):
+                    module.block_sparse_config = config if index >= start_block else None
 
     @contextmanager
     def int8_attention_context(self, *, auxiliary: bool):
