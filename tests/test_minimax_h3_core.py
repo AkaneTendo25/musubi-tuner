@@ -1574,6 +1574,21 @@ def test_reference_video_presentation_labels_frames_with_source_time():
     assert blocks == (0.5, 2.5)
 
 
+def test_reference_video_presentation_pads_a_single_frame_for_qwen():
+    # Qwen3-VL sizes the clip before padding its tail to temporal_patch_size, so
+    # a one-frame presentation must already carry two frames and two timestamps.
+    sampled, blocks = sample_reference_video_frames(_reference_frame_stack(1))
+    assert [int(frame[0, 0, 0]) for frame in sampled] == [0, 0]
+    assert blocks == (0.0,)
+
+
+def test_reference_video_presentation_rounds_frame_indices_half_up():
+    # A 3 fps stack presents at 2 fps with a stride of 1.5, so every other cursor
+    # lands on a half frame: banker's rounding would pick 4 instead of 5.
+    sampled, _ = sample_reference_video_frames(_reference_frame_stack(6), 3.0)
+    assert [int(frame[0, 0, 0]) for frame in sampled] == [0, 2, 3, 5]
+
+
 def test_reference_video_fps_names_the_cache_only_when_enabled():
     assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, video_sample_fps=REFERENCE_VIDEO_FPS) == ""
     assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE, video_sample_fps=2) == "_vfps2"

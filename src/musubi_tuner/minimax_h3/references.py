@@ -400,16 +400,28 @@ def sample_reference_video_frames(
     24 fps grid, or the opt-in subsampling rate. Timestamps come from the chosen
     source frame rather than its position, so a clip already below 2 fps keeps
     every frame and is still labelled with the seconds it actually spans.
+
+    A single presented frame is duplicated: Qwen3-VL's video processor sizes the
+    clip before it pads the tail to ``temporal_patch_size``, so a one-frame stack
+    trips its ``num_frames < temporal_factor`` guard. The duplicate is exactly
+    what the processor would have appended, and only the presentation sees it --
+    the VAE path accepts a single reference frame unchanged.
     """
     if frames_fps <= 0:
         raise ValueError("H3 reference video presentation requires a positive frame rate")
     stride = frames_fps / REFERENCE_VIDEO_SAMPLE_FPS
     indices: list[int] = []
     cursor = 0.0
-    while round(cursor) < frames.shape[0]:
-        if not indices or round(cursor) > indices[-1]:
-            indices.append(round(cursor))
+    # Explicit half-up, like every other frame grid in this module: ``round`` is
+    # banker's, so a stride landing exactly between two frames would alternate
+    # between them by parity.
+    while math.floor(cursor + 0.5) < frames.shape[0]:
+        index = math.floor(cursor + 0.5)
+        if not indices or index > indices[-1]:
+            indices.append(index)
         cursor += stride
+    if len(indices) == 1:
+        indices.append(indices[-1])
     timestamps = [index / frames_fps for index in indices]
     timestamps += [timestamps[-1]] * (-len(timestamps) % REFERENCE_VIDEO_TEMPORAL_PATCH)
     blocks = tuple(
