@@ -1164,6 +1164,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
         transformer.set_gradient_checkpointing_blocks(args.h3_gradient_checkpointing_blocks)
         transformer.set_activation_cpu_offload_pin_memory(args.h3_gradient_checkpointing_cpu_offload_pin_memory)
+        fraction = getattr(args, "h3_block_sparse_kv_fraction", 0.0)
+        threshold = getattr(args, "h3_block_sparse_threshold", 0.0)
+        set_block_sparse = getattr(transformer, "set_block_sparse_attention", None)
+        if (fraction > 0 or threshold > 0) and callable(set_block_sparse):
+            from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig
+
+            set_block_sparse(
+                BlockSparseConfig(
+                    kv_fraction=fraction if fraction > 0 else 1.0,
+                    threshold=threshold if threshold > 0 else None,
+                ),
+                start_block=getattr(args, "h3_block_sparse_start_block", 0),
+            )
         set_int8_attention_mode = getattr(transformer, "set_int8_attention_mode", None)
         if callable(set_int8_attention_mode):
             set_int8_attention_mode(getattr(args, "h3_int8_attention", "off"))
@@ -3197,6 +3210,30 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "for bf16/fp16 activations at the cost of a slightly lossy recomputation. Requires "
             "--gradient_checkpointing --gradient_checkpointing_cpu_offload --h3_reusable_activation_offload"
         ),
+    )
+    parser.add_argument(
+        "--h3_block_sparse_kv_fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "share of key blocks each query block attends to; 0 disables block-sparse attention "
+            "and 1.0 keeps every block, which reproduces dense attention"
+        ),
+    )
+    parser.add_argument(
+        "--h3_block_sparse_threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "keep the highest scoring key blocks until they hold this share of the score mass, "
+            "instead of a fixed count; takes precedence over --h3_block_sparse_kv_fraction"
+        ),
+    )
+    parser.add_argument(
+        "--h3_block_sparse_start_block",
+        type=int,
+        default=0,
+        help="index of the first transformer block to run block-sparse; earlier blocks stay dense",
     )
     parser.add_argument(
         "--h3_int8_attention",

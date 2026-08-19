@@ -38,13 +38,19 @@ class BlockSparseConfig:
     Args:
         block: rows per block, query and key side alike.
         kv_fraction: share of key blocks kept per query block, before its own
-            block is added. ``1.0`` reproduces dense attention.
+            block is added. ``1.0`` reproduces dense attention. Ignored when
+            ``threshold`` is set.
+        threshold: keep the highest scoring blocks until their share of the
+            score mass reaches this value, instead of a fixed count. A flat
+            region then costs a few blocks and a busy one takes as many as it
+            needs, where a fixed share misjudges both.
         share_heads: score once for all heads instead of per head.
         min_blocks: lower bound on retained blocks.
     """
 
     block: int = DEFAULT_BLOCK
     kv_fraction: float = 0.25
+    threshold: float | None = None
     share_heads: bool = False
     min_blocks: int = 1
 
@@ -53,6 +59,8 @@ class BlockSparseConfig:
             raise ValueError("block must be a positive multiple of 8")
         if not 0.0 < self.kv_fraction <= 1.0:
             raise ValueError("kv_fraction must lie in (0, 1]")
+        if self.threshold is not None and not 0.0 < self.threshold <= 1.0:
+            raise ValueError("threshold must lie in (0, 1]")
         if self.min_blocks < 1:
             raise ValueError("min_blocks must be at least 1")
 
@@ -74,11 +82,21 @@ def select_blocks(query: torch.Tensor, key: torch.Tensor, cfg: BlockSparseConfig
 
     scores = torch.einsum("bhqd,bhkd->bhqk", q_mean, k_mean)
     n_keys = scores.shape[-1]
-    keep = max(cfg.min_blocks, min(n_keys, int(round(n_keys * cfg.kv_fraction))))
 
-    chosen = scores.topk(keep, dim=-1).indices
-    mask = torch.zeros_like(scores, dtype=torch.bool)
-    mask.scatter_(-1, chosen, True)
+    if cfg.threshold is None:
+        keep = max(cfg.min_blocks, min(n_keys, int(round(n_keys * cfg.kv_fraction))))
+        chosen = scores.topk(keep, dim=-1).indices
+        mask = torch.zeros_like(scores, dtype=torch.bool)
+        mask.scatter_(-1, chosen, True)
+    else:
+        order = scores.argsort(dim=-1, descending=True)
+        mass = torch.softmax(scores.gather(-1, order).float(), dim=-1).cumsum(dim=-1)
+        # Keep the block that crosses the threshold, not just those below it,
+        # so a single dominant block is never dropped.
+        take = (mass - torch.softmax(scores.gather(-1, order).float(), dim=-1)) < cfg.threshold
+        take[..., : cfg.min_blocks] = True
+        mask = torch.zeros_like(scores, dtype=torch.bool)
+        mask.scatter_(-1, order, take)
 
     # Own block is never dropped: a mean-based score can rank it low.
     diagonal = torch.arange(mask.shape[-2], device=mask.device)

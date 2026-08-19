@@ -59,3 +59,28 @@ def test_share_heads_gives_one_selection_for_all_heads():
     q, k, v = _qkv()
     mask = select_blocks(q, k, BlockSparseConfig(block=128, kv_fraction=0.25, share_heads=True))
     assert (mask[:, 0] == mask[:, 1]).all()
+
+
+def test_threshold_one_keeps_every_block():
+    """Full score mass means dense attention, or the threshold rule is wrong."""
+    q, k, v = _qkv()
+    dense = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    sparse = block_sparse_attention(q, k, v, BlockSparseConfig(block=128, threshold=1.0))
+    assert torch.allclose(dense, sparse, atol=2e-3, rtol=2e-3), (dense - sparse).abs().max().item()
+
+
+def test_threshold_keeps_fewer_blocks_as_it_falls():
+    q, k, v = _qkv(rows=2048)
+    counts = []
+    for threshold in (0.9, 0.5, 0.2):
+        mask = select_blocks(q, k, BlockSparseConfig(block=128, threshold=threshold))
+        counts.append(mask.sum(-1).float().mean().item())
+    assert counts[0] > counts[1] > counts[2], counts
+
+
+def test_threshold_adapts_per_query_block():
+    """A fixed share cannot vary per query block; the threshold rule must."""
+    q, k, v = _qkv(rows=2048)
+    mask = select_blocks(q, k, BlockSparseConfig(block=128, threshold=0.5))
+    per_block = mask.sum(-1).flatten()
+    assert per_block.min() != per_block.max(), per_block.unique()
