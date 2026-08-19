@@ -24,6 +24,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
+    H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
@@ -37,6 +38,7 @@ from musubi_tuner.minimax_h3.cache import (
     parse_keyframe_visuals,
     qwen_control_assets,
     qwen_control_dropout_key,
+    reference_variant_key,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
@@ -301,6 +303,40 @@ def main(argv: Sequence[str] | None = None) -> None:
                         }
                     if not required <= logical_keys:
                         return False
+                # Training draws the reference modality from the vector stored in
+                # the cache, never from the config, so the vector and the variant
+                # presentations it selects are cache identity: a stale cache would
+                # otherwise keep sampling the superseded distribution in silence.
+                probabilities = getattr(item, "h3_reference_modality_probabilities", None)
+                cached_probabilities = [
+                    handle.get_tensor(key) for key in keys if logical_cache_key(key) == H3_REFERENCE_MODALITY_PROBABILITIES_KEY
+                ]
+                if len(cached_probabilities) > 1:
+                    return False
+                if (probabilities is None) != (not cached_probabilities):
+                    return False
+                if probabilities is not None:
+                    cached_vector = [float(value) for value in cached_probabilities[0]]
+                    if len(cached_vector) != len(probabilities) or any(
+                        abs(cached - float(expected)) > 1e-6 for cached, expected in zip(cached_vector, probabilities)
+                    ):
+                        return False
+                    for modality, probability in zip(("av", "video", "audio"), probabilities):
+                        if modality == "av" or probability <= 0:
+                            continue
+                        required = {
+                            reference_variant_key(H3_TEXT_HIDDEN_KEY, modality),
+                            reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality),
+                        }
+                        if args.cache_guidance_empty:
+                            required |= {
+                                reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality),
+                                reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality),
+                            }
+                        if args.h3_qwen_control_dropout and qwen_controls:
+                            required |= {qwen_control_dropout_key(key) for key in tuple(required)}
+                        if not required <= logical_keys:
+                            return False
                 # The presented frame list is cache identity: changing it changes
                 # what the conditioner saw, and its absence means the cache was
                 # written text-only.

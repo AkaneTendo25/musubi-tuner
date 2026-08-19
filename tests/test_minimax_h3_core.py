@@ -55,6 +55,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_KINDS_KEY,
+    H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     H3_REFERENCE_VIDEO_FPS_KEY,
@@ -71,6 +72,7 @@ from musubi_tuner.minimax_h3.cache import (
     qwen_control_dropout_key,
     qwen_control_fingerprint,
     reference_key_suffix,
+    reference_variant_key,
     resolve_keyframe_visuals,
     save_latent_cache_minimax_h3,
 )
@@ -1970,6 +1972,48 @@ def test_skip_existing_rejects_text_caches_without_the_requested_empty_pair(monk
     assert _text_cache_predicate(monkeypatch, ["--task", "fl2va"])(item, prompt_only) is True
     assert _text_cache_predicate(monkeypatch, ["--task", "fl2va", "--cache_guidance_empty"])(item, prompt_only) is False
     assert _text_cache_predicate(monkeypatch, ["--task", "fl2va", "--cache_guidance_empty"])(item, with_empty) is True
+
+
+def _modality_probability_text_cache(path: Path, probabilities, *, variants=("video",)) -> str:
+    tensors = {
+        f"{H3_REFERENCE_MODALITY_PROBABILITIES_KEY}_float32": torch.tensor(probabilities, dtype=torch.float32),
+        H3_REFERENCE_IMAGE_SHORT_EDGE_KEY: torch.tensor(REFERENCE_IMAGE_SHORT_EDGE),
+        H3_REFERENCE_IMAGE_SIZE_MODE_KEY: torch.tensor(0),
+        H3_REFERENCE_IMAGE_MAX_PIXELS_KEY: torch.tensor(0),
+        H3_REFERENCE_VIDEO_SHORT_EDGE_KEY: torch.tensor(REFERENCE_VIDEO_SHORT_EDGE),
+        H3_REFERENCE_VIDEO_MAX_PIXELS_KEY: torch.tensor(REFERENCE_VIDEO_MAX_PIXELS),
+    }
+    for modality in variants:
+        hidden = reference_variant_key(H3_TEXT_HIDDEN_KEY, modality)
+        tags = reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality)
+        tensors[f"varlen_{hidden}_bfloat16"] = torch.zeros(1, dtype=torch.bfloat16)
+        tensors[f"varlen_{tags}_int64"] = torch.zeros(1, dtype=torch.long)
+    return _identity_text_cache(path, task="ref2va", tensors=tensors)
+
+
+def test_skip_existing_rejects_text_caches_carrying_other_modality_probabilities(monkeypatch, tmp_path):
+    cache = _modality_probability_text_cache(tmp_path / "probabilities.safetensors", (0.5, 0.5, 0.0))
+    without_variant = _modality_probability_text_cache(tmp_path / "no_variant.safetensors", (0.5, 0.5, 0.0), variants=())
+    plain = _reference_text_cache(tmp_path / "plain.safetensors")
+
+    def item(probabilities):
+        return SimpleNamespace(
+            has_references=True,
+            h3_cache_metadata={h3_references.REFERENCE_FINGERPRINT_KEY: "fingerprint"},
+            h3_reference_modality_probabilities=probabilities,
+        )
+
+    valid = _text_cache_predicate(monkeypatch, ["--task", "ref2va"])
+
+    assert valid(item((0.5, 0.5, 0.0)), cache) is True
+    # The trainer samples from the cached vector, so a changed distribution and a
+    # missing variant presentation both make the cache stale.
+    assert valid(item((0.2, 0.8, 0.0)), cache) is False
+    assert valid(item((0.5, 0.0, 0.5)), cache) is False
+    assert valid(item((0.5, 0.5, 0.0)), without_variant) is False
+    assert valid(item((0.5, 0.5, 0.0)), plain) is False
+    assert valid(_fingerprint_item("fingerprint"), cache) is False
+    assert valid(_fingerprint_item("fingerprint"), plain) is True
 
 
 def test_prepare_reference_target_area_uses_bucket_area_and_optional_cap(tmp_path):
