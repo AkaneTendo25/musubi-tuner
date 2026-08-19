@@ -112,7 +112,8 @@ class _Int8ConvRotFunction(torch.autograd.Function):
         ordinary matrix. Same stored weights, same arithmetic, unquantized activations.
 
     ``bwd_mode`` (only meaningful with ``fwd_mode='int8'``):
-      - ``bf16``: transient dequantization of the rotated weight, ``grad_x = rotate(g @ W_rot)``.
+      - ``bf16``: transient dequantization of the rotated weight into the gradient dtype,
+        ``grad_x = rotate(g @ W_rot)``.
       - ``int8``: fold the per-channel weight scale into ``g``, quantize its rows and run
         the INT8 matmul before rotating.
     """
@@ -147,6 +148,10 @@ class _Int8ConvRotFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         weight, scale = ctx.saved_tensors
+        if not ctx.needs_input_grad[0]:
+            # The weight, scale and bias are frozen, so with a non-differentiable input
+            # there is nothing left to compute here.
+            return None, None, None, None, None, None, None
         folded = grad_output.reshape(-1, grad_output.shape[-1])
         if ctx.fwd_mode == "bf16":
             # The un-rotated weight is the ordinary W, so the gradient needs no rotation
@@ -163,8 +168,10 @@ class _Int8ConvRotFunction(torch.autograd.Function):
             grad_input = _int_mm(quantized, weight).float()
             grad_input.mul_(grad_scale)
         else:
-            dense_weight = weight.float() * scale.float()
-            grad_input = folded.float() @ dense_weight
+            # The dequantization stays in the gradient dtype: an fp32 weight is twice the
+            # peak memory of the stored INT8 one and its matmul misses the tensor cores.
+            dense_weight = weight.to(folded.dtype) * scale.reshape(-1, 1).to(folded.dtype)
+            grad_input = folded @ dense_weight
         grad_input = rotate_activation(grad_input.to(ctx.input_dtype), ctx.group_size)
         return grad_input.reshape(ctx.input_shape), None, None, None, None, None, None
 

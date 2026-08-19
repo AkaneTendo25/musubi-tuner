@@ -3218,6 +3218,47 @@ def test_h3_prequantized_convrot_backward_leaves_grad_output_untouched(monkeypat
     assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
+def test_h3_prequantized_convrot_bf16_backward_matches_the_fp32_gradient():
+    # The BF16 backward used to dequantize the weight into fp32 and run an fp32 GEMM,
+    # which is neither the named dtype nor the cheap one; the gradient must not move.
+    import torch
+
+    from musubi_tuner.minimax_h3.int8_convrot import rotate_activation
+
+    _, layer, _ = _prequantized_convrot_linear(bwd_mode="bf16")
+    x = torch.randn(6, 16, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn(6, 8, dtype=torch.bfloat16)
+
+    layer(x).backward(grad_output)
+
+    dense_weight = layer.weight.float() * layer.scale_weight.reshape(-1, 1).float()
+    expected = rotate_activation(grad_output.float() @ dense_weight, 4)
+    assert (x.grad.float() - expected).norm() / expected.norm() < 2e-2
+
+
+def test_h3_prequantized_convrot_backward_skips_a_non_differentiable_input(monkeypatch):
+    import torch
+
+    from musubi_tuner.minimax_h3 import int8_convrot
+
+    _, layer, _ = _prequantized_convrot_linear(bwd_mode="bf16")
+    layer.bias.requires_grad_(True)
+
+    calls = []
+    original = int8_convrot.rotate_activation
+    monkeypatch.setattr(
+        int8_convrot,
+        "rotate_activation",
+        lambda value, group_size: calls.append(None) or original(value, group_size),
+    )
+
+    output = layer(torch.randn(6, 16))
+    forward_calls = len(calls)
+    output.backward(torch.randn(6, 8))
+
+    assert forward_calls == 1 and len(calls) == forward_calls
+
+
 def test_h3_convrot_row_quantization_leaves_its_input_untouched():
     import torch
 
