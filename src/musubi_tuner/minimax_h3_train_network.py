@@ -1144,6 +1144,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_attn_auto_dispatch requires --sdpa")
         if getattr(args, "h3_int8_attention", "off") != "off" and args.compile:
             raise ValueError("--h3_int8_attention cannot currently be combined with --compile")
+        block_sparse_kv_fraction = getattr(args, "h3_block_sparse_kv_fraction", 0.0)
+        block_sparse_threshold = getattr(args, "h3_block_sparse_threshold", 0.0)
+        # The runtime config rejects the same bounds, but only on the first
+        # forward, after model loading and caching have already been paid for.
+        if not 0.0 <= block_sparse_kv_fraction <= 1.0:
+            raise ValueError("--h3_block_sparse_kv_fraction must be in [0, 1]")
+        if not 0.0 <= block_sparse_threshold <= 1.0:
+            raise ValueError("--h3_block_sparse_threshold must be in [0, 1]")
+        if block_sparse_kv_fraction > 0 or block_sparse_threshold > 0:
+            if getattr(args, "h3_int8_attention", "off") != "off":
+                # Block-sparse attention takes every unmasked call and masked
+                # calls fall back to dense, so INT8 attention would never run.
+                raise ValueError(
+                    "--h3_block_sparse_kv_fraction/--h3_block_sparse_threshold cannot be combined with --h3_int8_attention"
+                )
+            if args.compile:
+                # flex_attention compiles its own kernel; nesting that inside
+                # region-compiled blocks is untested.
+                raise ValueError(
+                    "--h3_block_sparse_kv_fraction/--h3_block_sparse_threshold cannot currently be combined with --compile"
+                )
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
         if args.sample_prompts:

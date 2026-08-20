@@ -553,8 +553,8 @@ class MiniMaxH3Transformer(nn.Module):
     def set_block_sparse_attention(self, config: BlockSparseConfig | None, *, start_block: int = 0) -> None:
         """Enable block-sparse attention from ``start_block`` onwards.
 
-        Early blocks run on short sequences where selection costs more than the
-        attention it replaces, so they are left dense.
+        Every block sees the same packed sequence, so this is a quality knob,
+        not a cost one: blocks before ``start_block`` keep exact full attention.
         """
         if config is not None:
             config.validate()

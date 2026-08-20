@@ -172,7 +172,8 @@ control_modality_probabilities = [0.5, 0.25, 0.25]
 
 The text cache stores every enabled presentation and training draws one mode per item. The same draw is reused by the trainable,
 guidance, and preservation forwards. Video-only removes reference soundtracks; audio-only retains image references as visual
-anchors and uses the audio from paired AV references. Recache text outputs after changing the probabilities. Latent caches do not
+anchors and uses the audio from paired AV references. Recache text outputs after changing the probabilities. Under `--skip_existing`
+the change is detected automatically and the affected caches are rebuilt. Latent caches do not
 need to be rebuilt. Every enabled mode must leave at least one reference of some kind, checked when the dataset config is parsed:
 a nonzero `video` weight needs an image or video reference, and a nonzero `audio` weight needs an image or audio reference, since
 a video reference contributes only its soundtrack in that mode and may not have one. Audio-only survivors are permitted; the
@@ -502,6 +503,9 @@ the model checkpoint. Requests received during gradient accumulation wait for th
 | `--sdpa`, `--flash_attn`, `--flash3` | required, `--sdpa` recommended | Attention backend; one of the three must be passed. Each FlashAttention flag needs its package, and `--flash3` needs a Hopper GPU. Both fall back to SDPA on padded batches. |
 | `--h3_attn_auto_dispatch` | off | Prefer cuDNN SDPA for large maskless workloads. Changes rounding; benchmark first. |
 | `--h3_int8_attention {off,aux,train}` | `off` | Experimental native INT8-QK forward with BF16/FP16 P×V and an optimized training backward. `aux` affects only guidance and base-preservation teacher forwards; `train` also affects the trainable forward. Requires CUDA, Triton, and head width 128; masked or padded batches use the selected regular backend. Incompatible with `--compile`. |
+| `--h3_block_sparse_kv_fraction F` | `0.0` | Experimental block-sparse attention over the packed sequence. Rows are grouped into 128-row blocks, and each query block attends to the top-scoring key blocks by the dot product of their means plus its own block. `0` disables it, `1.0` keeps every block and reproduces dense attention. Requires CUDA (`flex_attention`); the first steps pay a one-time compilation. Masked or padded batches fall back to the dense SDPA path. Selection is an approximation, so results differ from dense attention; validate before a long run. Incompatible with `--h3_int8_attention` and `--compile`. |
+| `--h3_block_sparse_threshold F` | `0.0` | Alternative selection rule: keep the highest scoring key blocks until they hold this share of the score mass, instead of a fixed count. Takes precedence over `--h3_block_sparse_kv_fraction`; `1.0` keeps every block. |
+| `--h3_block_sparse_start_block N` | `0` | Index of the first main block to run block-sparse; earlier blocks stay dense, keeping their full-sequence mixing exact. |
 | `--h3_lora_token_refiner` | off | Also place LoRA adapters on the two text token-refiner blocks. This experimental target can strengthen trigger or identity binding and adds eight adapter modules. |
 | `--compile` | off | Regionally compile all H3 blocks with the selected backend/mode. Compatible with full or partial gradient checkpointing and with block swap; swapped Linear calls stay eager. |
 | `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It is faster but changes BF16 rounding. |

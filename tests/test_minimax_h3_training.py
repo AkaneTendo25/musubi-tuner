@@ -3724,6 +3724,45 @@ def test_h3_reusable_activation_offload_requires_cpu_checkpoint_offload():
         MiniMaxH3NetworkTrainer().handle_model_specific_args(invalid)
 
 
+@pytest.mark.parametrize("option", ["--h3_block_sparse_kv_fraction", "--h3_block_sparse_threshold"])
+def test_h3_block_sparse_rejects_int8_attention(option):
+    # Block-sparse takes every unmasked call and masked calls go to dense SDPA,
+    # so INT8 attention would never execute.
+    args = create_parser().parse_args(["--sdpa", option, "0.25", "--h3_int8_attention", "train"])
+
+    with pytest.raises(ValueError, match="cannot be combined with --h3_int8_attention"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("option", ["--h3_block_sparse_kv_fraction", "--h3_block_sparse_threshold"])
+def test_h3_block_sparse_rejects_compile(option):
+    args = create_parser().parse_args(["--sdpa", option, "0.25", "--compile"])
+
+    with pytest.raises(ValueError, match="cannot currently be combined with --compile"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("option", ["--h3_block_sparse_kv_fraction", "--h3_block_sparse_threshold"])
+@pytest.mark.parametrize("value", ["-0.1", "1.5"])
+def test_h3_block_sparse_rejects_out_of_range_values(option, value):
+    # Rejected while parsing arguments, not on the first forward, where the
+    # runtime config check would fire after model loading was already paid for.
+    args = create_parser().parse_args(["--sdpa", option, value])
+
+    with pytest.raises(ValueError, match=f"{option} must be in \\[0, 1\\]"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("option", ["--h3_block_sparse_kv_fraction", "--h3_block_sparse_threshold"])
+@pytest.mark.parametrize("value", ["0.0", "1.0"])
+def test_h3_block_sparse_accepts_range_bounds(option, value):
+    args = create_parser().parse_args(["--sdpa", option, value])
+
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert getattr(args, option.lstrip("-")) == float(value)
+
+
 @pytest.mark.parametrize("option", ["--flash_attn", "--flash3"])
 def test_h3_trainer_accepts_flash_attention(option):
     args = create_parser().parse_args([option])
