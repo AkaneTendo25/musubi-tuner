@@ -6,9 +6,9 @@ batch_size = 1
 enable_bucket = true
 
 [[datasets]]
-video_directory = "/path/to/videos"
+target_video_directory = "/path/to/videos"
+target_modalities = ["video"]
 cache_directory = "/path/to/cache"
-h3_target_mode = "video"
 source_fps = 24.0
 target_frames = [124]
 frame_extraction = "uniform"

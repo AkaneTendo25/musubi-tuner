@@ -9,8 +9,10 @@ batch_size = 1
 enable_bucket = true
 
 [[datasets]]
-image_directory = "/path/to/target_images"
-control_directory = "/path/to/first_last_images"
+target_image_directory = "/path/to/target_images"
+target_modalities = ["image"]
+source_image_directory = "/path/to/first_last_images"
+source_modalities = ["image"]
 cache_directory = "/path/to/fl2va_first_last_cache"
 h3_image_frame_count = 5
 num_repeats = 1

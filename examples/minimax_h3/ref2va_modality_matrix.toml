@@ -1,0 +1,91 @@
+# Representative Ref2VA source/target combinations in one training config.
+# "Source" below means the clean reference conditioning; it is never a target.
+# Cache with --task ref2va and train with --h3_training_mode ref2va.
+# When any entry uses audio, pass --audio_vae while caching latents.
+
+[general]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+# Image reference -> image target.
+[[datasets]]
+resolution = [1024, 1024]
+target_image_directory = "/data/image_targets"
+target_modalities = ["image"]
+source_image_directory = "/data/image_references"
+source_modalities = ["image"]
+cache_directory = "/data/cache/image_from_image"
+
+# Audio reference -> image plus separately stored audio target.
+[[datasets]]
+resolution = [1024, 1024]
+target_image_directory = "/data/image_targets_with_audio"
+target_audio_directory = "/data/audio_targets_for_images"
+target_modalities = ["image", "audio"]
+source_audio_directory = "/data/audio_references_for_images"
+source_modalities = ["audio"]
+cache_directory = "/data/cache/image_audio_from_audio"
+target_frames = [124]
+
+# Image reference -> video-only target.
+[[datasets]]
+resolution = [1344, 768]
+target_video_directory = "/data/video_targets"
+target_modalities = ["video"]
+source_image_directory = "/data/image_references_for_video"
+source_modalities = ["image"]
+cache_directory = "/data/cache/video_from_image"
+source_fps = 24.0
+target_frames = [124]
+frame_extraction = "uniform"
+
+# Image reference -> video plus separately stored audio target.
+[[datasets]]
+resolution = [1344, 768]
+target_video_directory = "/data/silent_video_targets"
+target_audio_directory = "/data/separate_audio_targets"
+target_modalities = ["video", "audio"]
+source_image_directory = "/data/image_references_for_external_av"
+source_modalities = ["image"]
+cache_directory = "/data/cache/external_av_from_image"
+source_fps = 24.0
+target_frames = [124]
+frame_extraction = "uniform"
+
+# Video and audio references -> video+audio target.
+[[datasets]]
+resolution = [1344, 768]
+target_video_directory = "/data/av_targets"
+target_modalities = ["video", "audio"]
+source_video_directory = "/data/reference_videos"
+source_audio_directory = "/data/reference_audio"
+source_modalities = ["video", "audio"]
+cache_directory = "/data/cache/av_from_av"
+source_fps = 24.0
+target_frames = [124]
+frame_extraction = "uniform"
+
+# Video reference -> audio-only target (for example, Foley generation).
+[[datasets]]
+resolution = [1344, 768]
+target_audio_directory = "/data/audio_targets"
+target_modalities = ["audio"]
+source_video_directory = "/data/video_references_for_audio"
+source_modalities = ["video"]
+cache_directory = "/data/cache/audio_from_video"
+target_frames = [124]
+
+# Image plus reference-audio conditioning -> audio-only target.
+# Put basename-matched files in their respective source directories, for
+# example image_references/0001.png and audio_references/0001.wav.
+[[datasets]]
+resolution = [768, 768]
+target_audio_directory = "/data/voice_targets"
+target_modalities = ["audio"]
+source_image_directory = "/data/image_references_for_voice"
+source_audio_directory = "/data/audio_references_for_voice"
+source_modalities = ["image", "audio"]
+cache_directory = "/data/cache/audio_from_image_and_audio"
+target_frames = [124]

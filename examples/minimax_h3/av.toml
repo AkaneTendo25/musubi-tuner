@@ -9,7 +9,8 @@ enable_bucket = true
 bucket_no_upscale = false
 
 [[datasets]]
-video_directory = "/path/to/videos"
+target_video_directory = "/path/to/videos"
+target_modalities = ["video", "audio"]
 cache_directory = "/path/to/cache"
 source_fps = 24.0
 target_frames = [124, 175, 243, 294, 362]

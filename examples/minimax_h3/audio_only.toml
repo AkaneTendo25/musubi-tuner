@@ -1,12 +1,15 @@
 # Resolution supplies H3's audio rotary canvas; no video target is cached.
+# At training time, --h3_audio_only_spatial_tokens can add the optional spatial
+# placeholder tokens without rebuilding this cache. Pair it with
+# --h3_lora_targets "attention;audio" for an audio-specialized LoRA.
 [general]
 resolution = [832, 480]
 caption_extension = ".txt"
 batch_size = 1
 
 [[datasets]]
-audio_directory = "/path/to/audio"
+target_audio_directory = "/path/to/audio"
+target_modalities = ["audio"]
 cache_directory = "/path/to/cache"
-h3_target_mode = "audio"
 target_frames = [124]
 num_repeats = 1

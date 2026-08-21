@@ -15,8 +15,19 @@ Two released transformers, with different conditioning contracts:
 ## Contents
 
 - [Quick start](#quick-start)
-- [Task contracts](#task-contracts)
+- [Workflow chooser](#workflow-chooser)
 - [Model download](#model-download)
+- [Train FL2VA](#train-fl2va)
+  - [Choose an FL2VA task](#choose-an-fl2va-task)
+  - [Prepare an FL2VA dataset](#prepare-an-fl2va-dataset)
+  - [Cache FL2VA latents](#cache-fl2va-latents)
+  - [Cache FL2VA text embeddings](#cache-fl2va-text-embeddings)
+  - [Start FL2VA training](#start-fl2va-training)
+- [Train Ref2VA](#train-ref2va)
+  - [Prepare a Ref2VA dataset](#prepare-a-ref2va-dataset)
+  - [Cache Ref2VA latents](#cache-ref2va-latents)
+  - [Cache Ref2VA text embeddings](#cache-ref2va-text-embeddings)
+  - [Start Ref2VA training](#start-ref2va-training)
 - [Dataset](#dataset)
   - [Qwen control visuals](#qwen-control-visuals)
 - [Pre-caching](#pre-caching)
@@ -40,33 +51,34 @@ Two released transformers, with different conditioning contracts:
 > Upstream [Musubi Tuner](https://github.com/kohya-ss/musubi-tuner) also supports MiniMax H3. Try the upstream implementation first unless you specifically need this fork's H3 extensions or dashboard.
 
 1. Follow the upstream Musubi Tuner [installation instructions](https://github.com/kohya-ss/musubi-tuner#installation), including its Python and PyTorch requirements.
-2. Prepare a TOML dataset using the shared upstream [dataset configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md). The H3-specific task and media requirements are listed in [Task contracts](#task-contracts) and [Dataset](#dataset) below.
+2. Download the checkpoints in [Model download](#model-download).
 3. Configure Accelerate as described in the upstream [usage guide](https://github.com/kohya-ss/musubi-tuner#configuration-of-accelerate).
-4. Download the H3 checkpoints, run [Pre-caching](#pre-caching), and then start [Training](#training). The [training dashboard](#training-dashboard) exposes the same controls.
+4. Follow one complete workflow: [Train FL2VA](#train-fl2va) or [Train Ref2VA](#train-ref2va). Each starts with a TOML dataset and includes both cache commands and the matching training command.
+5. Use [Dataset](#dataset), [Key options](#key-options), and [Memory and speed](#memory-and-speed) as reference material after the basic workflow works. The optional [training dashboard](#training-dashboard) covers the common target layouts and explicit image/video/audio source directories; use TOML for the complete modality matrix.
 
 This page documents only the MiniMax H3 files, contracts, and commands that differ from upstream Musubi Tuner.
 
-## Task contracts
+## Workflow chooser
 
 Each training objective has a fixed dataset, conditioning-cache, and transformer contract. `--task` is passed to
-`minimax_h3_cache_text_encoder_outputs.py`; the final column lists task-specific arguments for
-`minimax_h3_train_network.py`. “None” means that the default trainer contract applies.
+`minimax_h3_cache_text_encoder_outputs.py`; the final column lists any additional required cache or trainer arguments.
+“None” means that no additional arguments are required.
 
-| Training objective | Example and dataset contract | Transformer | Cache `--task` | Trainer contract |
+| Training objective | Example and dataset contract | Transformer | Cache `--task` | Additional required arguments |
 | --- | --- | --- | --- | --- |
-| Text-to-image | [`image_fl2va.toml`](../examples/minimax_h3/image_fl2va.toml): `image_directory` or `image_jsonl_file` | FL2VA | `t2va` | None |
-| First-image-conditioned image editing | [`image_fl2va_first.toml`](../examples/minimax_h3/image_fl2va_first.toml): one basename-matched control per target | FL2VA | `fl2va` | None |
-| First+last-conditioned image editing | [`image_fl2va_first_last.toml`](../examples/minimax_h3/image_fl2va_first_last.toml): two ordered controls per target | FL2VA | `fl2va` | None |
-| Text-to-video+audio | [`t2va.toml`](../examples/minimax_h3/t2va.toml): `video_directory` or `video_jsonl_file`; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | None |
-| Text-to-video only | [`video_only.toml`](../examples/minimax_h3/video_only.toml): video source plus `h3_target_mode = "video"` | FL2VA | `t2va` | None |
-| Text-to-audio only | [`audio_only.toml`](../examples/minimax_h3/audio_only.toml): `audio_directory` or `audio_jsonl_file` plus `h3_target_mode = "audio"` | FL2VA | `t2va` | None |
-| Video-to-audio | [`av.toml`](../examples/minimax_h3/av.toml): synchronized video source; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | `--h3_observed_modality video` |
-| Audio-to-video | [`av.toml`](../examples/minimax_h3/av.toml): synchronized video source; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | `--h3_observed_modality audio` |
+| Text-to-image | [`image_fl2va.toml`](../examples/minimax_h3/image_fl2va.toml): `target_image_directory` or `image_jsonl_file`, with `target_modalities = ["image"]` | FL2VA | `t2va` | None |
+| First-image-conditioned image editing | [`image_fl2va_first.toml`](../examples/minimax_h3/image_fl2va_first.toml): one basename-matched control per target | FL2VA | `fl2va` | Both cache commands: `--h3_image_mode first` |
+| First+last-conditioned image editing | [`image_fl2va_first_last.toml`](../examples/minimax_h3/image_fl2va_first_last.toml): two ordered controls per target | FL2VA | `fl2va` | Both cache commands: `--h3_image_mode first_last` |
+| Text-to-video+audio | [`t2va.toml`](../examples/minimax_h3/t2va.toml): `target_video_directory` or `video_jsonl_file`, with `target_modalities = ["video", "audio"]` | FL2VA | `t2va` | None |
+| Text-to-video only | [`video_only.toml`](../examples/minimax_h3/video_only.toml): `target_modalities = ["video"]` | FL2VA | `t2va` | None |
+| Text-to-audio only | [`audio_only.toml`](../examples/minimax_h3/audio_only.toml): `target_audio_directory` or `audio_jsonl_file`, with `target_modalities = ["audio"]` | FL2VA | `t2va` | None |
+| Video-to-audio | [`av.toml`](../examples/minimax_h3/av.toml): `target_modalities = ["video", "audio"]` | FL2VA | `t2va` | `--h3_observed_modality video` |
+| Audio-to-video | [`av.toml`](../examples/minimax_h3/av.toml): `target_modalities = ["video", "audio"]` | FL2VA | `t2va` | `--h3_observed_modality audio` |
 | First-frame image-to-video+audio | [`i2va.toml`](../examples/minimax_h3/i2va.toml): video source; first frame comes from the target | FL2VA | `i2va` | None |
 | First+last-frame-to-video+audio | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml): video source; keyframes come from the target | FL2VA | `fl2va` | None |
 | Last-frame image-to-video+audio | [`l2va.toml`](../examples/minimax_h3/l2va.toml): video source; last frame comes from the target | FL2VA | `l2va` | None |
-| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; an audio target may carry references too; add `control_directory`, `control_path`, or numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
-| Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): target image or video; JSONL may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
+| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; an audio target may carry references too; add `source_*_directory` fields, or per-record numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
+| Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): set `target_modalities` for the JSONL target; rows may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
 
 For observed-modality objectives, the option names the modality supplied as clean **conditioning**, not the prediction target:
 `--h3_observed_modality video` defines video-to-audio training. See [Training modes](#training-modes) for the corresponding
@@ -133,10 +145,180 @@ python minimax_h3_generate_video.py \
   --inspect
 ```
 
+## Train FL2VA
+
+Use this workflow with `minimax_h3_fl2va_bf16.safetensors`. FL2VA covers text-only generation, target-derived first/last-frame conditioning, image targets, video targets, and audio targets. It does **not** accept arbitrary external media references; use [Train Ref2VA](#train-ref2va) for those.
+
+### Choose an FL2VA task
+
+The text-cache `--task` selects the conditioning presentation. The latent-cache command does not take `--task`.
+
+| Goal | Text-cache `--task` | Additional cache arguments | Dataset example |
+| --- | --- | --- | --- |
+| Text → image, video, video+audio, or audio | `t2va` | None | [`image_fl2va.toml`](../examples/minimax_h3/image_fl2va.toml), [`t2va.toml`](../examples/minimax_h3/t2va.toml), [`audio_only.toml`](../examples/minimax_h3/audio_only.toml) |
+| First image → edited image | `fl2va` | Both caches: `--h3_image_mode first` | [`image_fl2va_first.toml`](../examples/minimax_h3/image_fl2va_first.toml) |
+| First and last images → edited image | `fl2va` | Both caches: `--h3_image_mode first_last` | [`image_fl2va_first_last.toml`](../examples/minimax_h3/image_fl2va_first_last.toml) |
+| First frame → video+audio | `i2va` | None | [`i2va.toml`](../examples/minimax_h3/i2va.toml) |
+| First and last frames → video+audio | `fl2va` | None | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml) |
+| Last frame → video+audio | `l2va` | None | [`l2va.toml`](../examples/minimax_h3/l2va.toml) |
+
+The image-editing rows use separate basename-matched source images and require the shown `--h3_image_mode` on both cache commands.
+The video `i2va`, `fl2va`, and `l2va` rows take their keyframes from the target itself. They are not Ref2VA reference directories.
+Use the selected task for text caching and the resulting cache in training; incompatible caches are rejected.
+
+### Prepare an FL2VA dataset
+
+Create `dataset.toml`. This minimal example trains text-to-video with the video's embedded audio:
+
+```toml
+[general]
+resolution = [1344, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+
+[[datasets]]
+target_video_directory = "/data/targets"
+target_modalities = ["video", "audio"]
+cache_directory = "/data/cache/fl2va"
+source_fps = 24.0
+target_frames = [124]
+frame_extraction = "uniform"
+```
+
+Place `clip.mp4` and `clip.txt` together in `/data/targets`. For video-only training use `target_modalities = ["video"]`. For a separate synchronized soundtrack, also set `target_audio_directory`; files are matched by basename. Image and audio-only layouts are shown in the linked examples. H3 video frame counts must follow the `17k+5` grid.
+
+### Cache FL2VA latents
+
+```shell
+python minimax_h3_cache_latents.py \
+  --dataset_config dataset.toml \
+  --vae /models/MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors \
+  --audio_vae /models/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors \
+  --device cuda \
+  --skip_existing
+```
+
+- Keep `--audio_vae` when any target or reference includes audio; omit it for image-only and video-only data.
+- Omit `--vae` only for audio-only targets with no visual references.
+- `--skip_existing` validates and reuses compatible caches. On a large, unchanged dataset add `--faster_check`; it fully validates `--faster_check_samples` items (default 8) first, but cannot detect a source file replaced in place.
+
+### Cache FL2VA text embeddings
+
+Set `--task` to the value chosen above. This example uses `t2va`:
+
+```shell
+python minimax_h3_cache_text_encoder_outputs.py \
+  --dataset_config dataset.toml \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --text_encoder_quantization nvfp4_awq \
+  --h3_text_encoder_blocks_to_stream 50 \
+  --task t2va --device cuda \
+  --skip_existing
+```
+
+The native NVFP4/AWQ checkpoint reduces conditioner weight residency. `--h3_text_encoder_blocks_to_stream 50` streams all 50 frozen language blocks and minimizes their simultaneous GPU residency; smaller values reduce transfer overhead but retain more blocks on the GPU. Streaming works with BF16 and native NVFP4/AWQ, but not with the bitsandbytes `int8` or `nf4` loaders. If the full BF16 conditioner fits, use `--text_encoder_quantization none` and omit streaming to avoid weight quantization and block-transfer overhead. Add `--cache_guidance_empty` if training will use caption dropout or guidance distillation.
+
+### Start FL2VA training
+
+```shell
+accelerate launch minimax_h3_train_network.py \
+  --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_bf16.safetensors \
+  --dataset_config dataset.toml \
+  --network_module networks.lora_minimax_h3 \
+  --network_dim 16 --network_alpha 16 \
+  --sdpa --mixed_precision bf16 --gradient_checkpointing \
+  --blocks_to_swap 40 --block_swap_h2d_only --block_swap_ring_size 2 \
+  --optimizer_type AdamW8bit --learning_rate 1e-4 \
+  --max_train_epochs 10 --save_every_n_epochs 1 \
+  --save_state --autoresume \
+  --output_dir output --output_name h3_fl2va \
+  --logging_dir logs --log_with tensorboard --log_grad_metrics
+```
+
+The example swaps 40 of the 50 main blocks. Increase `--blocks_to_swap` if model-weight residency still exceeds available VRAM, or remove all three block-swap options when the frozen base fits. Block swapping transfers weights and therefore reduces throughput. `--block_swap_h2d_only` is valid here because ordinary LoRA keeps the base frozen; the shown `--gradient_checkpointing` is required with this mode during training. Do not enable pinned block-swap memory unless the host has enough free RAM for the pinned block buffers. See [Memory and speed](#memory-and-speed) for quantization and kernel options.
+
+## Train Ref2VA
+
+Use this workflow with `minimax_h3_ref2va_bf16.safetensors`. Ref2VA adds clean image, video, and audio references to the conditioning side. Targets may independently be image, image+audio, video, video+audio, or audio. Different source/target mappings can coexist as separate `[[datasets]]` entries in one TOML.
+
+### Prepare a Ref2VA dataset
+
+This example trains image-reference → video+audio. Files in the target and source directories are matched by basename:
+
+```toml
+[general]
+resolution = [1344, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+
+[[datasets]]
+target_video_directory = "/data/targets"
+target_modalities = ["video", "audio"]
+source_image_directory = "/data/references"
+source_modalities = ["image"]
+cache_directory = "/data/cache/ref2va"
+source_fps = 24.0
+target_frames = [124]
+frame_extraction = "uniform"
+```
+
+For example, `/data/targets/clip.mp4`, `/data/targets/clip.txt`, and `/data/references/clip.png` form one item. Use `source_video_directory` and/or `source_audio_directory` for other reference modalities. Set `source_video_audio_embedded = true` when each source video's own soundtrack is part of the reference, or `source_video_audio_paired = true` when separate video and audio source directories form one synchronized AV reference. See [`ref2va_modality_matrix.toml`](../examples/minimax_h3/ref2va_modality_matrix.toml) for image, video, AV, and audio targets in one config.
+
+Use `--task ref2va` when every record must have references. Use `ref2va_omni` only when records may intentionally have zero references. Audio-only references are supported for training but experimental because released inference requires reference audio to accompany an image or video.
+
+### Cache Ref2VA latents
+
+```shell
+python minimax_h3_cache_latents.py \
+  --dataset_config dataset.toml \
+  --vae /models/MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors \
+  --audio_vae /models/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors \
+  --device cuda \
+  --skip_existing
+```
+
+The VAE encodes both targets and DiT-side references. Keep `--audio_vae` if a target or reference has audio. Keep `--vae` even for an audio-only target when it has an image or video reference. Reference-video sizing options change cache identity. Pass the same `--reference_video_short_edge` and `--reference_video_max_pixels` values to both cache commands, training, and inference. Pass the same `--reference_video_fps` value to both cache commands and training; inference has no `--reference_video_fps` option.
+
+### Cache Ref2VA text embeddings
+
+```shell
+python minimax_h3_cache_text_encoder_outputs.py \
+  --dataset_config dataset.toml \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --text_encoder_quantization nvfp4_awq \
+  --h3_text_encoder_blocks_to_stream 50 \
+  --task ref2va --device cuda \
+  --skip_existing
+```
+
+The same memory trade-off as FL2VA applies: native NVFP4/AWQ plus 50 streamed blocks minimizes simultaneous conditioner weight residency. BF16 without streaming avoids quantization and block transfers when it fits. Do not combine block streaming with bitsandbytes `int8` or `nf4`. If `source_modality_probabilities` is configured, the text cache stores its enabled reference presentations; changing those probabilities requires compatible text caches and is detected by `--skip_existing`.
+
+### Start Ref2VA training
+
+```shell
+accelerate launch minimax_h3_train_network.py \
+  --dit /models/MiniMax-H3/diffusion_models/minimax_h3_ref2va_bf16.safetensors \
+  --dataset_config dataset.toml \
+  --h3_training_mode ref2va \
+  --network_module networks.lora_minimax_h3 \
+  --network_dim 16 --network_alpha 16 \
+  --sdpa --mixed_precision bf16 --gradient_checkpointing \
+  --blocks_to_swap 40 --block_swap_h2d_only --block_swap_ring_size 2 \
+  --optimizer_type AdamW8bit --learning_rate 1e-4 \
+  --max_train_epochs 10 --save_every_n_epochs 1 \
+  --save_state --autoresume \
+  --output_dir output --output_name h3_ref2va \
+  --logging_dir logs --log_with tensorboard --log_grad_metrics
+```
+
+For a `ref2va_omni` text cache, change the trainer option to `--h3_training_mode ref2va_omni`. Ref2VA reference rows lengthen the packed sequence, so it normally needs more activation memory than an otherwise identical FL2VA run. Reduce reference resolution or frame sampling first, then increase block swap if model-weight residency is still the problem; block swapping does not reduce attention activations.
+
 ## Dataset
 
-H3 uses Musubi's [shared dataset schema](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md) for video, image, and control fields. A target video's embedded soundtrack is the audio target; a video with
-no audio stream trains as video-only with its audio loss masked. `control_directory` holds references whose basename matches
+H3 uses the explicit source/target schema below. A target video's embedded soundtrack is the audio target unless `target_audio_directory` supplies a separate basename-matched track; a video with
+no audio stream trains as video-only with its audio loss masked. `source_*_directory` fields hold references whose basename matches
 each target: controls for target `X` are `X.<ext>` or `X_<n>.<ext>`. A target whose own name ends in `_<n>` and that has no
 direct match falls back to the shared prefix, but only over controls no other target claims; contested files are an error.
 Relative `control_path`, `control_path_N`, `control_video_path_N`, and `control_audio_path_N`
@@ -145,18 +327,23 @@ synchronized AV reference, use matching directories:
 
 ```toml
 [[datasets]]
-video_directory = "/data/targets"
-control_video_directory = "/data/reference_video"
-control_audio_directory = "/data/reference_audio"
-control_modality = "av"
+target_video_directory = "/data/targets"
+target_modalities = ["video", "audio"]
+source_video_directory = "/data/reference_video"
+source_audio_directory = "/data/reference_audio"
+source_modalities = ["video", "audio"]
+source_video_audio_paired = true
 cache_directory = "/data/cache"
-target_frames = [33]
+target_frames = [39]
 ```
 
-The three directories must contain basename-matched files. Set `control_modality = "video"` to omit reference soundtracks or
-`control_modality = "audio"` to retain only reference audio. For multiple references matched through `control_directory`, use an
-ordered `control_modalities = ["video", "audio", "av"]` list. The choice is part of latent and text caching; recache both after
-changing it. An audio-only reference set — a voice clip and a caption, with no image or video reference — is legal for training
+The three directories must contain basename-matched files. To condition on video without audio, declare only
+`source_video_directory`; to condition only on audio, declare only `source_audio_directory`. Declare both and set
+`source_video_audio_paired = true` to combine them into one synchronized AV reference. To use the soundtrack embedded in each
+source video instead, declare `source_video_directory`, set `source_modalities = ["video", "audio"]`, and set
+`source_video_audio_embedded = true`; use `source_modalities = ["audio"]` instead to retain only that embedded soundtrack. Do
+not also declare `source_audio_directory`. A source directory may contain numbered
+same-modality references such as `X_0.png` and `X_1.png`. An audio-only reference set — a voice clip and a caption, with no image or video reference — is legal for training
 (**experimental**): the released inference distribution always pairs reference audio with an image or video, so a LoRA trained
 this way runs off the base model's reference statistics and needs careful validation. Inference guards are unchanged:
 `--reference_audio` still requires `--reference_image` or `--reference_video`.
@@ -164,19 +351,19 @@ this way runs off the base model's reference statistics and needs careful valida
 Both caches record which reference files produced them, so swapping, reordering, or editing a reference rebuilds that item under
 `--skip_existing`.
 
-For modality dropout, replace the static modality setting with probabilities in `[av, video, audio]` order:
+For modality dropout, provide probabilities in `[av, video, audio]` order:
 
 ```toml
-control_modality_probabilities = [0.5, 0.25, 0.25]
+source_modality_probabilities = [0.5, 0.25, 0.25]
 ```
 
 The text cache stores every enabled presentation and training draws one mode per item. The same draw is reused by the trainable,
 guidance, and preservation forwards. Video-only removes reference soundtracks; audio-only retains image references as visual
-anchors and uses the audio from paired AV references. Recache text outputs after changing the probabilities. Under `--skip_existing`
+anchors and uses the audio from paired or embedded AV references. Recache text outputs after changing the probabilities. Under `--skip_existing`
 the change is detected automatically and the affected caches are rebuilt. Latent caches do not
 need to be rebuilt. Every enabled mode must leave at least one reference of some kind, checked when the dataset config is parsed:
-a nonzero `video` weight needs an image or video reference, and a nonzero `audio` weight needs an image or audio reference, since
-a video reference contributes only its soundtrack in that mode and may not have one. Audio-only survivors are permitted; the
+a nonzero `video` weight needs an image or video reference. A nonzero `audio` weight needs an image, an audio source, or a video
+explicitly declared as paired or embedded AV; a plain `source_video_directory` is visual-only. Audio-only survivors are permitted; the
 off-distribution limitation above applies to them. On a reference set that is already audio-only the `audio` mode is the identity — it selects exactly
 the same references as `av` — so dropout between those two weights has no effect there.
 
@@ -188,15 +375,16 @@ indistinguishable from silence to the model; keep reference audio at least as lo
 ### Qwen control visuals
 
 `qwen_control_directory`, `qwen_control_path`, and `qwen_control_path_N` attach control imagery — pose, depth, edges, sketch —
-shown to the Qwen3-VL conditioner as visual context. Matching follows the `control_directory` rule (`X.<ext>` or `X_<n>.<ext>`);
+shown to the Qwen3-VL conditioner as visual context. Matching follows the source-directory rule (`X.<ext>` or `X_<n>.<ext>`);
 relative JSONL paths resolve against the JSONL's directory. Images and videos only; at most 9 images and 3 videos per item.
 
 ```toml
 [[datasets]]
-video_directory = "/data/targets"
+target_video_directory = "/data/targets"
+target_modalities = ["video", "audio"]
 qwen_control_directory = "/data/pose"
 cache_directory = "/data/cache"
-target_frames = [33]
+target_frames = [39]
 ```
 
 ```json
@@ -205,7 +393,7 @@ target_frames = [33]
 
 | Field | Who sees it | Cost |
 | --- | --- | --- |
-| `control_path`, `control_directory`, … | pixel-space Ref2VA references: encoded by the VAE and packed as extra **reference rows in the DiT** | latent cache + longer packed sequence |
+| `source_*_directory` or JSONL `control_path_N` | pixel-space Ref2VA references: encoded by the VAE and packed as extra **reference rows in the DiT** | latent cache + longer packed sequence |
 | `qwen_control_path`, `qwen_control_directory`, … | **only the text conditioner**; carried inside the Qwen presentation as vision-span tokens | text cache only; DiT input layout untouched |
 
 Control spans close the visual prefix — after any keyframes or references, before the caption — continuing the existing
@@ -238,26 +426,29 @@ batch_size = 1
 enable_bucket = true
 
 [[datasets]]
-video_directory = "/path/to/videos"
+target_video_directory = "/path/to/videos"
+target_modalities = ["video", "audio"]
 cache_directory = "/path/to/cache"
 target_frames = [124, 175, 243, 294, 362]
 frame_extraction = "uniform"
 ```
 
-`h3_target_mode` selects which modalities are packed at all:
+`target_modalities` selects which modalities are packed and scored:
 
 | Value | Effect |
 | --- | --- |
-| `av` (default) | video and audio |
-| `video` | omits audio decoding, caching, and rows |
-| `audio` | audio only; needs `audio_directory` or `audio_jsonl_file`, and reuses `target_frames` for duration |
+| `["image"]` | one-frame visual target |
+| `["image", "audio"]` | one-frame visual target plus basename-matched `target_audio_directory`; uses `target_frames` for audio duration |
+| `["video", "audio"]` | video and embedded audio, or basename-matched `target_audio_directory` |
+| `["video"]` | video only; omits audio decoding, caching, and rows |
+| `["audio"]` | audio only; needs `target_audio_directory` or `audio_jsonl_file`, and reuses `target_frames` for duration |
 
 An audio-only dataset needs **exactly one** `target_frames` value, and it must be on the `17k+5` grid — the multi-value list in
-the example above is video-only. `audio_directory` takes same-stem `.txt` captions; `audio_jsonl_file` takes records with
+the example above is video-only. `target_audio_directory` takes same-stem `.txt` captions; `audio_jsonl_file` takes records with
 `audio_path` and `caption`.
 
-An audio target may also declare Ref2VA references, with the same fields a video target uses: `control_directory`,
-`control_video_directory` + `control_audio_directory`, or per-record `control_path_N` / `control_video_path_N` +
+An audio target may also declare Ref2VA references with `source_image_directory`, `source_video_directory`, and/or
+`source_audio_directory`, or with per-record `control_path_N` / `control_video_path_N` +
 `control_audio_path_N` / `control_modality_N` in the audio JSONL. That trains video-to-audio with an **arbitrary** conditioning
 video (Foley), or audio generation from a reference voice clip plus a visual anchor. Reference composition follows the rule
 above. Cache with `--task ref2va` and train with
@@ -267,6 +458,55 @@ same geometry an audio-only cache already records). With visual references, `--v
 caching even though the target has no video. Audio-target caches are named `<stem>_audio<hash>_…`, where the hash covers the absolute source
 path, so an audio file never overwrites a video cache of the same stem and two same-stem audio files from different directories
 stay apart in one `cache_directory`.
+
+By default, audio-only training emits no spatial target rows. Add `--h3_audio_only_spatial_tokens` to insert one
+zero-initialized spatial DiT token per latent frame and disable loss on those tokens. They still participate in joint attention,
+so the packed sequence contains spatial rows without introducing a video target. This changes the training layout and is opt-in;
+it is not a memory switch. No video or cache rebuild is needed; temporal length is
+derived from the cached audio and `target_frames` geometry.
+
+For an audio-specialized LoRA, include the audio input/output projections as well as attention:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... \
+  --h3_audio_only_spatial_tokens \
+  --h3_lora_targets "attention;audio"
+```
+
+The ordinary H3 LoRA default covers block attention and MLP projections but not the top-level `audio_patch_proj` and
+`final_layer.audio_out`. Add the `audio` target when those input/output projections must be trainable. Selecting only `audio`
+produces an endpoint-only adapter. `attention;audio` additionally trains cross-token attention while leaving the MLP projections
+frozen.
+
+Ref2VA reference and target modalities can be mixed across separate `[[datasets]]` entries in one config; see
+[`ref2va_modality_matrix.toml`](../examples/minimax_h3/ref2va_modality_matrix.toml). The supported matrix is:
+
+| Reference conditioning | Image | Image+audio | Video | Video+audio | Audio |
+| --- | --- | --- | --- | --- | --- |
+| image | yes | yes | yes | yes | yes |
+| video without soundtrack | yes | yes | yes | yes | yes |
+| audio only | experimental | experimental | experimental | experimental | experimental |
+| image + audio | yes | yes | yes | yes | yes |
+| paired video + audio | yes | yes | yes | yes | yes |
+
+This is bidirectional across H3's media spaces: any image/video/audio conditioning subset (or text alone under T2VA/Ref2VA
+Omni) can train any target column, and different mappings may share one run as separate `[[datasets]]` entries. H3 has one
+visual output stream, so image and video are alternative visual target carriers rather than two simultaneous output heads; an
+image target uses the one-frame visual latent path. Text remains conditioning rather than a predicted media target.
+
+The target carrier is not arbitrary: image and video are alternative visual streams, while audio may accompany either or stand
+alone. “Yes” means the cache and packed training layout support the combination; it does not imply that every combination was
+represented in the released checkpoint.
+Audio-only reference conditioning has the inference limitation described above.
+
+The explicit TOML vocabulary is `source_image_directory`, `source_video_directory`, and `source_audio_directory` for
+conditioning. Targets use `target_image_directory`, `target_video_directory`, or `target_audio_directory`; a visual target may
+add a basename-matched `target_audio_directory` for separately stored synchronized audio. `source_modalities` must describe the
+media produced by the configured source directories; embedded source-video audio may add `audio` or select only `audio`, as described above. `target_modalities` is `["image"]`, `["image", "audio"]`, `["video"]`,
+`["video", "audio"]`, or `["audio"]`; it selects the packed target rows and loss. Separately stored source modalities are matched to each target by basename and packed in image, video,
+audio order. Set `source_video_audio_paired = true` when separate video and audio source directories form synchronized AV
+references rather than independent references, or `source_video_audio_embedded = true` when a source video supplies both its
+visual stream and embedded soundtrack. `source_modality_probabilities = [av, video, audio]` controls source dropout.
 
 The released processor uses a 768-pixel short edge with a 1344×768 area cap. Other 32-pixel-aligned sizes work but sit outside
 the released canvas distribution.
@@ -289,7 +529,7 @@ python minimax_h3_cache_text_encoder_outputs.py \
 ```
 
 Omit `--audio_vae` for image-only or video-only datasets whose references carry no audio either; it stays required whenever a
-reference does (paired AV, an audio reference, or `control_audio_directory`). Omit `--vae` for audio-only datasets without
+reference does (paired AV, embedded AV, or an audio source directory). Omit `--vae` for audio-only datasets without
 visual references. Add `--cache_guidance_empty` if you plan to
 use caption dropout or the guidance objective.
 
@@ -309,6 +549,10 @@ source fingerprint, so changed/reordered targets or controls are rebuilt under `
 are rejected during training. `--h3_text_visual_max_pixels` limits only the images presented to Qwen3-VL.
 `--h3_max_caption_tokens N` optionally truncates only the caption while retaining every structural image/video token. Its
 default `0` leaves captions unchanged; pass the same nonzero value to text caching and training.
+
+A conditioned-image target may also use a basename-matched `target_audio_directory` with
+`target_modalities = ["image", "audio"]`. Set its single `target_frames` value equal to `h3_image_frame_count` so the repeated
+visual target and audio target share one temporal grid.
 
 ```shell
 # First-frame I2V
@@ -388,16 +632,44 @@ The dashboard's optimizer **Set** button applies these values. It adapts the rat
 point and schedulers, warmup and decay are ignored; the adapted rate stays within two decades of it unless `min_lr`/`max_lr` are
 passed in `--optimizer_args`. Weight decay defaults to `1e-4`. State costs about one byte per parameter.
 
-Adapters target attention and feed-forward projections; norms and timestep/modality calibration stay frozen. LoHa/LoKr are
-unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally
+Without target-selection options, adapters target attention and feed-forward projections; norms and timestep/modality
+calibration stay frozen. H3 also provides named targeting so ordinary users do not need Python regular expressions:
+
+| Target | Modules selected |
+| --- | --- |
+| `attention` | QKV and output projections in transformer attention |
+| `mlp` | `fc1` and `fc2` in transformer MLPs |
+| `audio` | `audio_patch_proj` and `final_layer.audio_out` |
+| `video` | `video_patch_proj` and `final_layer.video_out` |
+| `token_refiner` | the two text token-refiner blocks |
+
+Pass all targets in one quoted expression, separated by semicolons. A name without a range selects the complete group:
+
+```shell
+--h3_lora_targets "attention;mlp;audio"
+```
+
+Add `:BLOCKS` to give attention and MLP independent block selections:
+
+```shell
+--h3_lora_targets "attention:0-7,24-31;mlp:8-15,32-49;audio"
+```
+
+H3 has blocks `0` through `49`. Only `attention` and `mlp` accept ranges; audio/video endpoints and token refiners are not
+numbered main blocks. Named targets deliberately cannot be mixed with raw `include_patterns` or
+`exclude_patterns`, which avoids ambiguous precedence. Advanced users may omit the named options and continue using the raw
+regex network arguments; those patterns are matched against complete module paths with `fullmatch`, and an include pattern is
+an exception to exclusions rather than a universal standalone allow-list.
+
+LoHa/LoKr are unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally
 `--compile_auto_cache_size_limit`, `--compile_fallback_to_eager`, or `--inductor_config KEY=VALUE ...`. GPU compilation requires
 a working Triton installation; on Windows, install a `triton-windows` build compatible with the installed PyTorch and Python
 versions.
 
 ### Training a guidance-distilled model
 
-H3 is guidance-distilled, so direct LoRA training can be inefficient or alter its CFG-free, few-step behavior. Two optional
-strategies address different goals:
+H3 is guidance-distilled. Direct LoRA training does not explicitly constrain the adapter to retain the base model's
+CFG-free prediction. Two optional strategies expose different constraints:
 
 1. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base. Add
    `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with inverse-probability loss scaling.
@@ -450,9 +722,10 @@ manual-learning-rate Adafactor arguments; if you replace `--optimizer_args`, inc
 | `--mem_eff_save` | Stream native transformer tensors during `.safetensors` output; enabled by default. |
 | `--no_mem_eff_save` | Write checkpoints with the ordinary safetensors writer instead of the streaming one; needs the whole checkpoint contiguous in host memory. |
 
-For a 24 GB-class GPU, start with `--blocks_to_swap 48`, the trainable ring, and `--block_swap_ring_size 2`. Keep activation
-CPU offload disabled initially so checkpoint recomputation stays on the GPU; add `--gradient_checkpointing_cpu_offload` only
-if the chosen resolution, frame length, or conditioning mode still exceeds available VRAM.
+The combination `--blocks_to_swap 48`, the trainable ring, and `--block_swap_ring_size 2` minimizes resident model blocks for
+full-parameter training, but its host-memory and transfer requirements are high. Whether it fits a 24 GB GPU also depends on
+resolution, frame length, and conditioning rows. `--gradient_checkpointing_cpu_offload` further reduces activation residency
+at the cost of additional host memory and transfers.
 
 For the trainable ring, add:
 
@@ -500,16 +773,17 @@ the model checkpoint. Requests received during gradient accumulation wait for th
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--sdpa`, `--flash_attn`, `--flash3` | required, `--sdpa` recommended | Attention backend; one of the three must be passed. Each FlashAttention flag needs its package, and `--flash3` needs a Hopper GPU. Both fall back to SDPA on padded batches. |
+| `--sdpa`, `--flash_attn`, `--flash3` | required | Attention backend; one of the three must be passed. SDPA uses PyTorch without an additional attention package. Each FlashAttention flag needs its package, and `--flash3` needs a Hopper GPU. Both FlashAttention modes fall back to SDPA on padded batches. |
 | `--h3_attn_auto_dispatch` | off | Prefer cuDNN SDPA for large maskless workloads. Changes rounding; benchmark first. |
 | `--h3_int8_attention {off,aux,train}` | `off` | Experimental native INT8-QK forward with BF16/FP16 P×V and an optimized training backward. `aux` affects only guidance and base-preservation teacher forwards; `train` also affects the trainable forward. Requires CUDA, Triton, and head width 128; masked or padded batches use the selected regular backend. Incompatible with `--compile`. |
 | `--h3_block_sparse_kv_fraction F` | `0.0` | Experimental block-sparse attention over the packed sequence. Rows are grouped into 128-row blocks, and each query block attends to the top-scoring key blocks by the dot product of their means plus its own block. `0` disables it, `1.0` keeps every block and reproduces dense attention. Requires CUDA (`flex_attention`); the first steps pay a one-time compilation. Masked or padded batches fall back to the dense SDPA path. Selection is an approximation, so results differ from dense attention; validate before a long run. Incompatible with `--h3_int8_attention` and `--compile`. |
 | `--h3_block_sparse_threshold F` | `0.0` | Alternative selection rule: keep the highest scoring key blocks until they hold this share of the score mass, instead of a fixed count. Takes precedence over `--h3_block_sparse_kv_fraction`; `1.0` keeps every block. |
 | `--h3_block_sparse_start_block N` | `0` | Index of the first main block to run block-sparse; earlier blocks stay dense, keeping their full-sequence mixing exact. |
-| `--h3_lora_token_refiner` | off | Also place LoRA adapters on the two text token-refiner blocks. This experimental target can strengthen trigger or identity binding and adds eight adapter modules. |
+| `--h3_block_sparse_block_shape T,H,W` | off | Reorder target-video rows into 3D lattice tiles before block-sparse selection, then restore their original order. `T*H*W` must equal the 128-row block size; text, audio, and reference context remains dense. Requires a block-sparse selection option. |
+| `--h3_lora_token_refiner` | off | Also place LoRA adapters on the two text token-refiner blocks. This experimental target adds eight adapter modules. |
 | `--compile` | off | Regionally compile all H3 blocks with the selected backend/mode. Compatible with full or partial gradient checkpointing and with block swap; swapped Linear calls stay eager. |
-| `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It is faster but changes BF16 rounding. |
-| `--h3_fused_indexed_adaln` | off | Fuse main-block RMSNorm with token-indexed AdaLN shift/scale for a frozen LoRA base. Requires CUDA and Triton; unsupported layouts, trainable norm/AdaLN parameters, and compiled blocks use the regular path. It changes BF16 rounding and is most useful with gradient checkpointing. |
+| `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It reduces separate kernel launches but changes BF16 rounding; benchmark it on the target workload. |
+| `--h3_fused_indexed_adaln` | off | Fuse main-block RMSNorm with token-indexed AdaLN shift/scale for a frozen LoRA base. Requires CUDA and Triton; unsupported layouts, trainable norm/AdaLN parameters, and compiled blocks use the regular path. It changes BF16 rounding. |
 | `--h3_fused_swiglu` | off | Fuse the SwiGLU activation in main and token-refiner feed-forward layers. Requires CUDA and Triton; unsupported layouts and compiled blocks use the regular path. It changes BF16 rounding, so benchmark and validate it before a long run. |
 | `--h3_swiglu_chunk_rows N` | `0` | Process each main-block feed-forward layer in sequence-row chunks to reduce peak VRAM. Start with `2048`; smaller values may save more memory but add overhead. Incompatible with `--compile`. |
 | `--h3_gradient_checkpointing_cpu_offload_pin_memory` | off | Pin CPU-offloaded checkpoint activations for faster transfers. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and substantial free system RAM. |
@@ -529,13 +803,12 @@ the model checkpoint. Requests received during gradient accumulation wait for th
 
 ### Memory and speed
 
-Quantize the frozen base, reduce AdaLN, then swap blocks — in that order.
+The following options reduce different parts of model-weight residency. They are not all required, and some combinations are
+mutually exclusive.
 
 ```shell
   --h3_convrot_int8 --h3_convrot_int8_fwd bf16 --h3_adaln_rank 16
 ```
-
-Recommended configuration.
 
 | Option | Purpose |
 | --- | --- |
@@ -586,8 +859,8 @@ cannot be combined with `--h3_convrot_int8` or `--int8_convrot_base`. Add
 `--gradient_checkpointing_cpu_offload` when sequence length would otherwise exceed VRAM, and set
 `PYTORCH_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
 
-For low host RAM and low VRAM, start with the released BF16 checkpoint and let the loader reduce and quantize weights while
-placing swapped blocks on CPU:
+For limited VRAM on a host with enough RAM for the BF16 checkpoint and swapped blocks, the loader can reduce and quantize
+weights while placing swapped blocks on CPU:
 
 ```shell
 PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch minimax_h3_train_network.py \
@@ -623,7 +896,7 @@ Extension, keyframes, and masking add or pin conditioning rows, so they need a `
 otherwise: masking and `per_row_sigma` extension only pin rows inside the target block, so they also combine with
 `--h3_training_mode ref2va` / `ref2va_omni` and their reference caches. Observed-modality training and the two jitters place no
 conditioning rows and work with any cache. For observed-modality training,
-`h3_target_mode = "av"` is required and each target video must contain its synchronized soundtrack — an audio-only dataset has no
+`target_modalities = ["video", "audio"]` is required and each target video must contain its synchronized soundtrack — an audio-only dataset has no
 video rows to observe, so `--h3_observed_modality` cannot be used with it. Conditioning an audio target on video is still
 possible through Ref2VA references instead, which supply an arbitrary conditioning video rather than the target's own track; see
 [Dataset](#dataset). The observed modality remains in the packed attention sequence but its
@@ -702,7 +975,8 @@ parsed.
 
 ```toml
 [[datasets]]
-video_directory = "/data/clips"
+target_video_directory = "/data/clips"
+target_modalities = ["video", "audio"]
 conditioning_mask_directory = "/data/masks"   # clip_01.mp4 -> clip_01.png, white = observed
 batch_size = 1
 ```
@@ -715,7 +989,7 @@ not add a complete H3 forward.
 
 | Option | Purpose |
 | --- | --- |
-| `--h3_guidance_distillation_scale 4` | Guidance-consistent objective using cached empty-text conditioning. A scale of `4` is recommended; `3` is generally too weak. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
+| `--h3_guidance_distillation_scale S` | Guidance-consistent objective using cached empty-text conditioning at scale `S`. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; for the same predictions and scale, the contrastive form is `S²` larger. |
 | `--h3_guidance_scale_range 2.5,3.5` | Draw the distillation scale uniformly in `[LOWER, UPPER]`, once per micro-batch sample and step, instead of pinning one value; the adapter then learns a family of guidance strengths rather than a single point. Replaces `--h3_guidance_distillation_scale` and is rejected alongside it. `LOWER` must exceed `1`. The draw uses its own distributed-synchronized generator, so adding it leaves every other random branch of a seeded run untouched; validation reads the midpoint so its loss stays comparable across evaluations. Composes with the sparse probability and with both loss forms and schedules. |
 | `--h3_guidance_distillation_probability 0.5` | Evaluate the empty-conditioning branch on a synchronized random fraction of batches, skipping its extra forward on the rest, and scale the guidance correction by `1 / probability`. `1` (default) applies the objective every batch; smaller values preserve the expected loss, but rare larger corrections are not optimizer-equivalent to applying the dense objective every step. |
 | `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
@@ -856,7 +1130,7 @@ The released weights are CFG-distilled: inference runs one evaluation per step w
 ## Training dashboard
 
 > [!WARNING]
-> The dashboard is a proof of concept and is not guaranteed to be maintained. Review every generated command before starting a long or expensive job. Dashboard contributed by [@Ada123-a](https://github.com/Ada123-a) in [PR #112](https://github.com/AkaneTendo25/musubi-tuner/pull/112).
+> Review every generated command before starting a long or expensive job. Dashboard contributed by [@Ada123-a](https://github.com/Ada123-a) in [PR #112](https://github.com/AkaneTendo25/musubi-tuner/pull/112).
 
 The dashboard generates and runs H3 caching, training, and inference commands, and shows live output, metrics, and samples.
 

@@ -1,5 +1,5 @@
-# Last-frame L2V training with the FL2VA checkpoint. Cache text with --task l2va.
-# The last frame is taken from each target video; no external source directory is used.
+# Ref2VA training where each reference video's embedded soundtrack is conditioning.
+# Cache text with --task ref2va and train with --h3_training_mode ref2va.
 
 [general]
 resolution = [1344, 768]
@@ -11,7 +11,10 @@ bucket_no_upscale = false
 [[datasets]]
 target_video_directory = "/path/to/target_videos"
 target_modalities = ["video", "audio"]
-cache_directory = "/path/to/l2va_cache"
+source_video_directory = "/path/to/reference_videos_with_audio"
+source_modalities = ["video", "audio"]
+source_video_audio_embedded = true
+cache_directory = "/path/to/ref2va_embedded_av_cache"
 source_fps = 24.0
 target_frames = [124, 175, 243, 294, 362]
 frame_extraction = "uniform"

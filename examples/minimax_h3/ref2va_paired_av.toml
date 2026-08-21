@@ -5,11 +5,14 @@ enable_bucket = true
 bucket_no_upscale = false
 
 [[datasets]]
-video_directory = "/path/to/targets"
-control_video_directory = "/path/to/reference_video"
-control_audio_directory = "/path/to/reference_audio"
+target_video_directory = "/path/to/targets"
+target_modalities = ["video", "audio"]
+source_video_directory = "/path/to/reference_video"
+source_audio_directory = "/path/to/reference_audio"
+source_modalities = ["video", "audio"]
+source_video_audio_paired = true
 # Draw AV, video-only, or audio-focused conditioning per training item.
-control_modality_probabilities = [0.5, 0.25, 0.25]
+source_modality_probabilities = [0.5, 0.25, 0.25]
 cache_directory = "/path/to/cache"
-target_frames = [33]
+target_frames = [39]
 frame_extraction = "head"

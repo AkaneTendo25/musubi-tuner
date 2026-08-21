@@ -9,6 +9,7 @@ enable_bucket = true
 bucket_no_upscale = false
 
 [[datasets]]
-image_directory = "/path/to/target_images"
+target_image_directory = "/path/to/target_images"
+target_modalities = ["image"]
 cache_directory = "/path/to/fl2va_image_cache"
 num_repeats = 1

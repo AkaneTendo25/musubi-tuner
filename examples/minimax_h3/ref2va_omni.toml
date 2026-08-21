@@ -10,6 +10,7 @@ enable_bucket = true
 
 [[datasets]]
 video_jsonl_file = "/path/to/ref2va_omni.jsonl"
+target_modalities = ["video", "audio"]
 cache_directory = "/path/to/ref2va_omni_cache"
 target_frames = [124]
 frame_extraction = "head"

@@ -1,5 +1,5 @@
 # First-frame I2V training with the FL2VA checkpoint. Cache text with --task i2va.
-# The first frame is taken from each target video; no control_directory is used.
+# The first frame is taken from each target video; no external source directory is used.
 
 [general]
 resolution = [1344, 768]
@@ -9,7 +9,8 @@ enable_bucket = true
 bucket_no_upscale = false
 
 [[datasets]]
-video_directory = "/path/to/target_videos"
+target_video_directory = "/path/to/target_videos"
+target_modalities = ["video", "audio"]
 cache_directory = "/path/to/i2va_cache"
 source_fps = 24.0
 target_frames = [124, 175, 243, 294, 362]
