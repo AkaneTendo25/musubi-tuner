@@ -547,7 +547,7 @@ class LoRANetwork(torch.nn.Module):
 
     def __init__(
         self,
-        target_replace_modules: List[str],
+        target_replace_modules: Optional[List[str]],
         prefix: str,
         text_encoders: Union[List[CLIPTextModel], CLIPTextModel],
         unet: nn.Module,
@@ -1014,7 +1014,7 @@ def create_arch_network_from_weights(
 
 # Create network from weights for inference, weights are not loaded here (because can be merged)
 def create_network_from_weights(
-    target_replace_modules: List[str],
+    target_replace_modules: Optional[List[str]],
     multiplier: float,
     weights_sd: Dict[str, torch.Tensor],
     text_encoders: Optional[List[nn.Module]] = None,

@@ -1,4 +1,5 @@
 import json
+import itertools
 import math
 import os
 import re
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import toml
 import torch
 from PIL import Image
 from safetensors import safe_open
@@ -35,6 +37,7 @@ from musubi_tuner.minimax_h3.architecture import (
     CANVAS_MULTIPLE,
     VIDEO_FLOW_SHIFT,
     VIDEO_FPS,
+    is_valid_frame_count,
     temporal_shape,
 )
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
@@ -47,6 +50,7 @@ from musubi_tuner.minimax_h3.audio import (
 from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
+    H3_AUDIO_LOSS_MASK_KEY,
     H3_CONDITIONING_TASK_IDS,
     H3_CONDITIONING_TASK_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
@@ -79,6 +83,7 @@ from musubi_tuner.minimax_h3.cache import (
 from musubi_tuner.minimax_h3 import dataset as h3_dataset
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.media import (
+    AudioClip,
     AudioProcessingSpec,
     CropMode,
     MediaAsset,
@@ -317,6 +322,19 @@ def test_verified_h3_temporal_contract():
         temporal_shape(121)
 
 
+def test_shipped_h3_dataset_examples_use_strict_schema_and_valid_frame_counts():
+    examples = sorted((Path(__file__).resolve().parents[1] / "examples" / "minimax_h3").glob("*.toml"))
+    assert examples
+
+    for path in examples:
+        config = toml.load(path)
+        h3_dataset._normalize_explicit_modality_config(config)
+        sections = [config.get("general", {}), *config.get("datasets", [])]
+        for section in sections:
+            for frame_count in section.get("target_frames", []):
+                assert is_valid_frame_count(frame_count), (path.name, frame_count)
+
+
 def test_first_frame_cannot_be_mixed_with_reference_mode(tmp_path):
     first = H3Reference(tmp_path / "first.png", ReferenceKind.IMAGE, ReferenceRole.FIRST_FRAME)
     reference = H3Reference(tmp_path / "style.png", ReferenceKind.IMAGE)
@@ -407,23 +425,31 @@ def test_checkpoint_inventory_supports_multiple_component_indexes(tmp_path):
     assert inventory.config_files == ("transformer/config.json", "vae/config.json")
 
 
-def test_h3_reuses_control_directory_for_mixed_reference_media(tmp_path):
+def test_h3_uses_explicit_directories_for_mixed_reference_media(tmp_path):
     videos = tmp_path / "videos"
-    controls = tmp_path / "controls"
+    image_refs = tmp_path / "image_refs"
+    video_refs = tmp_path / "video_refs"
+    audio_refs = tmp_path / "audio_refs"
     videos.mkdir()
-    controls.mkdir()
+    image_refs.mkdir()
+    video_refs.mkdir()
+    audio_refs.mkdir()
     target = videos / "target.mp4"
     target.write_bytes(b"target")
-    (controls / "target.png").write_bytes(b"image")
-    (controls / "target_0.mp4").write_bytes(b"video")
-    (controls / "target_1.wav").write_bytes(b"audio")
+    (image_refs / "target.png").write_bytes(b"image")
+    (video_refs / "target.mp4").write_bytes(b"video")
+    (audio_refs / "target.wav").write_bytes(b"audio")
 
     config = {
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(videos),
-                "control_directory": str(controls),
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
+                "source_image_directory": str(image_refs),
+                "source_video_directory": str(video_refs),
+                "source_audio_directory": str(audio_refs),
+                "source_modalities": ["image", "video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
                 "frame_extraction": "uniform",
@@ -462,11 +488,314 @@ def _write_control_directory(root: Path, names) -> Path:
     return root
 
 
+@pytest.mark.parametrize(
+    "source_modalities",
+    [()] + [subset for size in range(1, 4) for subset in itertools.combinations(("image", "video", "audio"), size)],
+)
+@pytest.mark.parametrize(
+    ("target_kind", "target_modalities", "target_suffix", "expected_mode", "external_audio"),
+    [
+        ("image", ["image"], ".png", "video", False),
+        ("image", ["image", "audio"], ".png", "av", True),
+        ("video", ["video"], ".mp4", "video", False),
+        ("video", ["video", "audio"], ".mp4", "av", False),
+        ("video", ["video", "audio"], ".mp4", "av", True),
+        ("audio", ["audio"], ".wav", "audio", False),
+    ],
+)
+def test_h3_explicit_toml_routes_every_source_target_combination(
+    tmp_path, source_modalities, target_kind, target_modalities, target_suffix, expected_mode, external_audio
+):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target = target_dir / f"sample{target_suffix}"
+    target.write_bytes(b"target")
+    dataset = {
+        f"target_{target_kind}_directory": str(target_dir),
+        "target_modalities": target_modalities,
+        "cache_directory": str(tmp_path / "cache"),
+        "target_frames": [22],
+    }
+    if source_modalities:
+        dataset["source_modalities"] = list(source_modalities)
+    companion = None
+    if external_audio:
+        companion_dir = tmp_path / "target_audio"
+        companion_dir.mkdir()
+        companion = companion_dir / "sample.wav"
+        companion.write_bytes(b"audio target")
+        dataset["target_audio_directory"] = str(companion_dir)
+    suffixes = {"image": ".png", "video": ".mp4", "audio": ".wav"}
+    for modality in source_modalities:
+        directory = tmp_path / f"source_{modality}"
+        directory.mkdir()
+        (directory / f"sample{suffixes[modality]}").write_bytes(modality.encode())
+        dataset[f"source_{modality}_directory"] = str(directory)
+
+    adapter = h3_dataset.H3DatasetAdapter(
+        {"general": {"resolution": [512, 512]}, "datasets": [dataset]}, Namespace(h3_image_mode="none")
+    )
+    normal = h3_dataset._normal_path(target)
+    resolved = adapter._targets[normal]
+
+    assert adapter._target_modes[normal] == expected_mode
+    assert [asset.modality.name.lower() for asset in resolved.references] == list(source_modalities)
+    if external_audio:
+        assert adapter._target_audio_paths[normal] == companion
+    clean = adapter.musubi_config["datasets"][0]
+    if target_kind == "audio":
+        assert adapter.audio_datasets[0].records[0][0] == target
+    else:
+        assert clean[f"{target_kind}_directory"] == str(target_dir)
+    assert not any(
+        key
+        in {
+            "source_modalities",
+            "target_modalities",
+            *h3_dataset.SOURCE_DIRECTORY_KEYS.values(),
+            *h3_dataset.TARGET_DIRECTORY_KEYS.values(),
+        }
+        for key in clean
+    )
+
+
+def test_h3_explicit_toml_rejects_inconsistent_modality_declarations(tmp_path):
+    config = {
+        "datasets": [
+            {
+                "target_video_directory": str(tmp_path / "videos"),
+                "target_modalities": ["audio"],
+                "source_modalities": ["image"],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="does not support target_modalities"):
+        h3_dataset.H3DatasetAdapter(config)
+
+
+@pytest.mark.parametrize("target_kind", ["image", "video", "audio"])
+def test_h3_explicit_toml_rejects_directory_and_jsonl_for_the_same_target_carrier(tmp_path, target_kind):
+    modalities = [target_kind] if target_kind != "video" else ["video", "audio"]
+    config = {
+        "datasets": [
+            {
+                f"target_{target_kind}_directory": str(tmp_path / "targets"),
+                f"{target_kind}_jsonl_file": str(tmp_path / "targets.jsonl"),
+                "target_modalities": modalities,
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match=rf"cannot combine target_{target_kind}_directory and {target_kind}_jsonl_file"):
+        h3_dataset.H3DatasetAdapter(config, Namespace(h3_image_mode="none"))
+
+
+@pytest.mark.parametrize("target_kind,target_key,target_suffix", [("image", "image_path", ".png"), ("video", "video_path", ".mp4")])
+def test_h3_visual_jsonl_with_companion_audio_keeps_the_visual_target_carrier(tmp_path, target_kind, target_key, target_suffix):
+    target = tmp_path / f"sample{target_suffix}"
+    target.write_bytes(b"target")
+    manifest = tmp_path / f"{target_kind}.jsonl"
+    manifest.write_text(json.dumps({target_key: str(target), "caption": "prompt"}) + "\n", encoding="utf-8")
+    audio_dir = _write_control_directory(tmp_path / "target_audio", ("sample.wav",))
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                f"{target_kind}_jsonl_file": str(manifest),
+                "target_audio_directory": str(audio_dir),
+                "target_modalities": [target_kind, "audio"],
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(h3_image_mode="none"))
+    normal = h3_dataset._normal_path(target)
+    clean = adapter.musubi_config["datasets"][0]
+
+    assert adapter.dataset_kinds == ["regular"]
+    assert not adapter.audio_datasets
+    assert clean[f"{target_kind}_jsonl_file"] == str(manifest)
+    assert "audio_directory" not in clean
+    assert adapter._target_audio_paths[normal] == audio_dir / "sample.wav"
+
+
+@pytest.mark.parametrize("legacy_key", sorted(h3_dataset.LEGACY_H3_DATASET_KEYS))
+def test_h3_removed_legacy_toml_keys_fail_with_migration_message(tmp_path, legacy_key):
+    targets = _write_control_directory(tmp_path / "targets", ("sample.png",))
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "target_image_directory": str(targets),
+                "target_modalities": ["image"],
+                "cache_directory": str(tmp_path / "cache"),
+                legacy_key: "audio" if legacy_key == "h3_target_mode" else str(targets),
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match=rf"removed MiniMax H3 dataset keys: .*{legacy_key}"):
+        h3_dataset.H3DatasetAdapter(config, Namespace(h3_image_mode="none"))
+
+
+def test_h3_explicit_toml_can_pair_video_and_audio_sources(tmp_path):
+    targets = _write_control_directory(tmp_path / "targets", ("sample.mp4",))
+    videos = _write_control_directory(tmp_path / "source_video", ("sample.mp4",))
+    audios = _write_control_directory(tmp_path / "source_audio", ("sample.wav",))
+    adapter = h3_dataset.H3DatasetAdapter(
+        {
+            "general": {"resolution": [512, 512]},
+            "datasets": [
+                {
+                    "target_video_directory": str(targets),
+                    "target_modalities": ["video"],
+                    "source_video_directory": str(videos),
+                    "source_audio_directory": str(audios),
+                    "source_modalities": ["video", "audio"],
+                    "source_video_audio_paired": True,
+                    "source_modality_probabilities": [0.5, 0.25, 0.25],
+                    "target_frames": [22],
+                }
+            ],
+        },
+        Namespace(h3_image_mode="none"),
+    )
+    reference = next(iter(adapter._targets.values())).references[0]
+
+    assert len(next(iter(adapter._targets.values())).references) == 1
+    assert reference.modality is MediaModality.VIDEO
+    assert reference.metadata["audio_path"] == str(audios / "sample.wav")
+    item = ItemInfo(str(targets / "sample.mp4"), "prompt", (512, 512), (512, 512), frame_count=22)
+    adapter.attach(item)
+    assert item.h3_reference_modality_probabilities == (0.5, 0.25, 0.25)
+
+
+def test_h3_explicit_toml_can_use_embedded_source_video_audio(tmp_path):
+    targets = _write_control_directory(tmp_path / "targets", ("sample.mp4",))
+    sources = _write_control_directory(tmp_path / "source_video", ("sample.mp4",))
+    adapter = h3_dataset.H3DatasetAdapter(
+        {
+            "general": {"resolution": [512, 512]},
+            "datasets": [
+                {
+                    "target_video_directory": str(targets),
+                    "target_modalities": ["video", "audio"],
+                    "source_video_directory": str(sources),
+                    "source_modalities": ["video", "audio"],
+                    "source_video_audio_embedded": True,
+                    "source_modality_probabilities": [0.5, 0.25, 0.25],
+                    "target_frames": [22],
+                }
+            ],
+        },
+        Namespace(h3_image_mode="none"),
+    )
+    reference = next(iter(adapter._targets.values())).references[0]
+
+    assert reference.modality is MediaModality.VIDEO
+    assert reference.metadata["include_audio"] is True
+    assert adapter.requires_audio is True
+    assert "source_video_audio_embedded" not in adapter.musubi_config["datasets"][0]
+    item = ItemInfo(str(targets / "sample.mp4"), "prompt", (512, 512), (512, 512), frame_count=22)
+    adapter.attach(item)
+    assert item.h3_reference_modality_probabilities == (0.5, 0.25, 0.25)
+
+
+def test_h3_explicit_toml_can_use_only_embedded_source_audio(tmp_path):
+    targets = _write_control_directory(tmp_path / "targets", ("sample.mp4",))
+    sources = _write_control_directory(tmp_path / "source_video", ("sample.mp4",))
+    adapter = h3_dataset.H3DatasetAdapter(
+        {
+            "general": {"resolution": [512, 512]},
+            "datasets": [
+                {
+                    "target_video_directory": str(targets),
+                    "target_modalities": ["video", "audio"],
+                    "source_video_directory": str(sources),
+                    "source_modalities": ["audio"],
+                    "source_video_audio_embedded": True,
+                    "target_frames": [22],
+                }
+            ],
+        },
+        Namespace(h3_image_mode="none"),
+    )
+    reference = next(iter(adapter._targets.values())).references[0]
+
+    assert reference.path == sources / "sample.mp4"
+    assert reference.modality is MediaModality.AUDIO
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        ({"source_video_audio_paired": True}, "cannot combine"),
+        ({"source_audio_directory": "/audio"}, "no source_audio_directory"),
+    ],
+)
+def test_h3_embedded_source_video_audio_rejects_ambiguous_configs(tmp_path, extra, message):
+    dataset = {
+        "target_video_directory": str(tmp_path / "targets"),
+        "target_modalities": ["video", "audio"],
+        "source_video_directory": str(tmp_path / "sources"),
+        "source_modalities": ["video", "audio"],
+        "source_video_audio_embedded": True,
+        **extra,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        h3_dataset.H3DatasetAdapter({"datasets": [dataset]}, Namespace(h3_image_mode="none"))
+
+
+def test_h3_explicit_toml_builds_one_mixed_image_video_audio_dataset_group(tmp_path):
+    def media_dir(name, filename):
+        return _write_control_directory(tmp_path / name, (filename,))
+
+    config = {
+        "general": {"resolution": [512, 512], "batch_size": 1, "enable_bucket": True},
+        "datasets": [
+            {
+                "target_image_directory": str(media_dir("image_targets", "still.png")),
+                "target_audio_directory": str(media_dir("image_audio_targets", "still.wav")),
+                "target_modalities": ["image", "audio"],
+                "source_audio_directory": str(media_dir("image_audio_sources", "still.wav")),
+                "source_modalities": ["audio"],
+                "cache_directory": str(tmp_path / "image_cache"),
+                "target_frames": [22],
+            },
+            {
+                "target_video_directory": str(media_dir("video_targets", "motion.mp4")),
+                "target_modalities": ["video"],
+                "source_image_directory": str(media_dir("video_image_sources", "motion.png")),
+                "source_modalities": ["image"],
+                "cache_directory": str(tmp_path / "video_cache"),
+                "target_frames": [22],
+            },
+            {
+                "target_audio_directory": str(media_dir("audio_targets", "sound.wav")),
+                "target_modalities": ["audio"],
+                "source_video_directory": str(media_dir("audio_video_sources", "sound.mp4")),
+                "source_modalities": ["video"],
+                "cache_directory": str(tmp_path / "audio_cache"),
+                "target_frames": [22],
+            },
+        ],
+    }
+
+    group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False, h3_image_mode="none"))
+
+    assert len(group.datasets) == 3
+    assert adapter.dataset_kinds == ["regular", "regular", "audio"]
+    assert sorted(adapter._target_modes.values()) == ["audio", "av", "video"]
+
+
 def test_h3_control_matching_never_steals_controls_from_a_sibling_target(tmp_path):
     controls = _write_control_directory(tmp_path / "controls", ("a_0.png", "a_3.png"))
     targets = [str(tmp_path / "videos" / "a_1.mp4"), str(tmp_path / "videos" / "a_2.mp4")]
 
-    with pytest.raises(ValueError, match="ambiguous H3 controls"):
+    with pytest.raises(ValueError, match="ambiguous H3 media matches"):
         h3_dataset._references_from_directory(str(controls), targets)
 
 
@@ -489,7 +818,7 @@ def test_h3_control_matching_keeps_blessed_layouts(tmp_path):
         str(videos / "b_0.png"): (fallback / "b.png", fallback / "b_1.png")
     }
 
-    with pytest.raises(ValueError, match="no matching H3 controls"):
+    with pytest.raises(ValueError, match="no basename-matched H3 media"):
         h3_dataset._references_from_directory(str(fallback), [str(videos / "c.mp4")])
 
 
@@ -514,6 +843,7 @@ def test_h3_video_jsonl_resolves_relative_control_paths_against_the_manifest(tmp
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
                 "frame_extraction": "uniform",
@@ -544,7 +874,13 @@ def test_h3_image_jsonl_resolves_relative_control_paths_without_conditioned_imag
 
     config = {
         "general": {"resolution": [512, 512]},
-        "datasets": [{"image_jsonl_file": str(manifest), "cache_directory": str(tmp_path / "cache")}],
+        "datasets": [
+            {
+                "image_jsonl_file": str(manifest),
+                "target_modalities": ["image"],
+                "cache_directory": str(tmp_path / "cache"),
+            }
+        ],
     }
     _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False, h3_image_mode="none"))
     item = ItemInfo(str(target), "prompt", (512, 512), (512, 512))
@@ -565,9 +901,11 @@ def test_h3_reference_modality_probabilities_reject_unsatisfiable_variants(tmp_p
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(targets),
-                "control_directory": str(controls),
-                "control_modality_probabilities": [0.5, 0.25, 0.25],
+                "target_video_directory": str(targets),
+                "target_modalities": ["video", "audio"],
+                "source_video_directory": str(controls),
+                "source_modalities": ["video"],
+                "source_modality_probabilities": [0.5, 0.25, 0.25],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -577,7 +915,7 @@ def test_h3_reference_modality_probabilities_reject_unsatisfiable_variants(tmp_p
     with pytest.raises(ValueError, match="audio variant probability 0.25"):
         create_h3_dataset_group(config, Namespace(debug_dataset=False))
 
-    config["datasets"][0]["control_modality_probabilities"] = [0.5, 0.5, 0.0]
+    config["datasets"][0]["source_modality_probabilities"] = [0.5, 0.5, 0.0]
     _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
     item = ItemInfo(str(targets / "scene.mp4"), "prompt", (512, 512), (512, 512), frame_count=22)
     adapter.attach(item)
@@ -596,11 +934,13 @@ def test_h3_reference_modality_probabilities_accept_an_audio_only_reference_set(
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(targets),
-                "control_directory": str(controls),
+                "target_video_directory": str(targets),
+                "target_modalities": ["video", "audio"],
+                "source_audio_directory": str(controls),
+                "source_modalities": ["audio"],
                 # av keeps the audio reference, and so does the audio variant:
                 # both are satisfiable without any visual reference.
-                "control_modality_probabilities": [0.5, 0.0, 0.5],
+                "source_modality_probabilities": [0.5, 0.0, 0.5],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -614,7 +954,7 @@ def test_h3_reference_modality_probabilities_accept_an_audio_only_reference_set(
     assert item.h3_reference_modality_probabilities == (0.5, 0.0, 0.5)
 
     # The video variant still needs a visual survivor.
-    config["datasets"][0]["control_modality_probabilities"] = [0.5, 0.25, 0.25]
+    config["datasets"][0]["source_modality_probabilities"] = [0.5, 0.25, 0.25]
     with pytest.raises(ValueError, match="video variant probability 0.25"):
         create_h3_dataset_group(config, Namespace(debug_dataset=False))
 
@@ -631,8 +971,10 @@ def test_h3_image_target_keeps_basename_matched_ref2va_reference(tmp_path):
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "image_directory": str(images),
-                "control_directory": str(controls),
+                "target_image_directory": str(images),
+                "target_modalities": ["image"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
                 "cache_directory": str(tmp_path / "cache"),
             }
         ],
@@ -664,8 +1006,10 @@ def test_h3_conditioned_image_mode_builds_temporal_target_and_cache_identity(tmp
         "general": {"resolution": [64, 64], "batch_size": 1},
         "datasets": [
             {
-                "image_directory": str(images),
-                "control_directory": str(controls),
+                "target_image_directory": str(images),
+                "target_modalities": ["image"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
                 "cache_directory": str(tmp_path / "cache"),
                 "h3_image_frame_count": 22,
             }
@@ -691,6 +1035,66 @@ def test_h3_conditioned_image_mode_builds_temporal_target_and_cache_identity(tmp
     assert "_00000-022_mmh3_te.safetensors" in item.text_encoder_output_cache_path
 
 
+def test_h3_conditioned_image_with_companion_audio_keeps_a_joint_target(tmp_path):
+    images = _write_control_directory(tmp_path / "images", ("portrait.png",))
+    controls = _write_control_directory(tmp_path / "controls", ("portrait.png",))
+    audio = _write_control_directory(tmp_path / "audio", ("portrait.wav",))
+    config = {
+        "general": {"resolution": [64, 64], "batch_size": 1},
+        "datasets": [
+            {
+                "target_image_directory": str(images),
+                "target_audio_directory": str(audio),
+                "target_modalities": ["image", "audio"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
+                "cache_directory": str(tmp_path / "cache"),
+                "h3_image_frame_count": 22,
+                "target_frames": [22],
+            }
+        ],
+    }
+    args = Namespace(debug_dataset=False, h3_image_mode="first", h3_image_frame_count=None)
+    _, adapter = create_h3_dataset_group(config, args)
+    item = ItemInfo(
+        str(images / "portrait.png"),
+        "portrait",
+        (64, 64),
+        (64, 64),
+        content=np.zeros((64, 64, 3), dtype=np.uint8),
+    )
+
+    target = adapter.attach(item)[0]
+
+    assert item.h3_target_mode == "av"
+    assert target.metadata["audio_path"] == str(audio / "portrait.wav")
+    assert target.metadata["audio_frame_count"] == 22
+    assert adapter.requires_audio
+
+
+def test_h3_conditioned_image_with_companion_audio_requires_one_temporal_grid(tmp_path):
+    images = _write_control_directory(tmp_path / "images", ("portrait.png",))
+    controls = _write_control_directory(tmp_path / "controls", ("portrait.png",))
+    audio = _write_control_directory(tmp_path / "audio", ("portrait.wav",))
+    config = {
+        "general": {"resolution": [64, 64]},
+        "datasets": [
+            {
+                "target_image_directory": str(images),
+                "target_audio_directory": str(audio),
+                "target_modalities": ["image", "audio"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
+                "h3_image_frame_count": 5,
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="target_frames to match h3_image_frame_count"):
+        h3_dataset.H3DatasetAdapter(config, Namespace(h3_image_mode="first", h3_image_frame_count=None))
+
+
 def test_h3_conditioned_image_rejects_wrong_control_count(tmp_path):
     images = tmp_path / "images"
     controls = tmp_path / "controls"
@@ -703,8 +1107,10 @@ def test_h3_conditioned_image_rejects_wrong_control_count(tmp_path):
         "general": {"resolution": [64, 64]},
         "datasets": [
             {
-                "image_directory": str(images),
-                "control_directory": str(controls),
+                "target_image_directory": str(images),
+                "target_modalities": ["image"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
                 "cache_directory": str(tmp_path / "cache"),
             }
         ],
@@ -781,6 +1187,7 @@ def test_h3_reuses_numbered_jsonl_control_paths(tmp_path):
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
                 "frame_extraction": "uniform",
@@ -817,6 +1224,7 @@ def test_h3_paired_video_audio_paths_form_one_av_reference(tmp_path):
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
                 "frame_extraction": "uniform",
@@ -859,6 +1267,7 @@ def test_h3_paired_reference_requires_matching_indices(tmp_path):
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -890,15 +1299,25 @@ def test_h3_toml_paired_reference_directories_select_modality(tmp_path, mode, ex
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(targets),
-                "control_video_directory": str(reference_video),
-                "control_audio_directory": str(reference_audio),
-                "control_modality": mode,
+                "target_video_directory": str(targets),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
         ],
     }
+    dataset = config["datasets"][0]
+    if mode == "av":
+        dataset.update(
+            source_video_directory=str(reference_video),
+            source_audio_directory=str(reference_audio),
+            source_modalities=["video", "audio"],
+            source_video_audio_paired=True,
+        )
+    elif mode == "video":
+        dataset.update(source_video_directory=str(reference_video), source_modalities=["video"])
+    else:
+        dataset.update(source_audio_directory=str(reference_audio), source_modalities=["audio"])
 
     group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
     item = ItemInfo(str(targets / "scene.mp4"), "prompt", (512, 512), (512, 512), frame_count=22)
@@ -911,23 +1330,30 @@ def test_h3_toml_paired_reference_directories_select_modality(tmp_path, mode, ex
     assert not hasattr(group.datasets[0], "control_video_directory")
 
 
-def test_h3_toml_control_modalities_apply_per_reference(tmp_path):
+def test_h3_toml_explicit_source_modalities_apply_per_reference(tmp_path):
     videos = tmp_path / "videos"
-    controls = tmp_path / "controls"
+    image_refs = tmp_path / "image_refs"
+    video_refs = tmp_path / "video_refs"
+    audio_refs = tmp_path / "audio_refs"
     videos.mkdir()
-    controls.mkdir()
+    image_refs.mkdir()
+    video_refs.mkdir()
+    audio_refs.mkdir()
     target = videos / "scene.mp4"
     target.write_bytes(b"target")
-    (controls / "scene.png").write_bytes(b"image")
-    (controls / "scene_0.mp4").write_bytes(b"video")
-    (controls / "scene_1.wav").write_bytes(b"audio")
+    (image_refs / "scene.png").write_bytes(b"image")
+    (video_refs / "scene.mp4").write_bytes(b"video")
+    (audio_refs / "scene.wav").write_bytes(b"audio")
     config = {
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(videos),
-                "control_directory": str(controls),
-                "control_modalities": ["video", "video", "audio"],
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
+                "source_image_directory": str(image_refs),
+                "source_video_directory": str(video_refs),
+                "source_audio_directory": str(audio_refs),
+                "source_modalities": ["image", "video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -943,7 +1369,7 @@ def test_h3_toml_control_modalities_apply_per_reference(tmp_path):
         MediaModality.VIDEO,
         MediaModality.AUDIO,
     ]
-    assert references[0].metadata["include_audio"] is False
+    assert references[0].metadata == {}
     assert references[1].metadata["include_audio"] is False
 
 
@@ -959,9 +1385,11 @@ def test_h3_toml_reference_modality_probabilities_are_attached(tmp_path):
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(targets),
-                "control_directory": str(controls),
-                "control_modality_probabilities": [0.5, 0.25, 0.25],
+                "target_video_directory": str(targets),
+                "target_modalities": ["video", "audio"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
+                "source_modality_probabilities": [0.5, 0.25, 0.25],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -976,25 +1404,29 @@ def test_h3_toml_reference_modality_probabilities_are_attached(tmp_path):
     assert not hasattr(group.datasets[0], "control_modality_probabilities")
 
 
-def test_h3_audio_target_resolves_control_directory_references(tmp_path):
+def test_h3_audio_target_resolves_explicit_source_references(tmp_path):
     # Foley and reference-voice training: the conditioning video is arbitrary, not the
     # target's own synchronized track, so an audio-only dataset must reach the Ref2VA
     # reference path the video datasets use.
     audio = tmp_path / "audio"
-    controls = tmp_path / "controls"
+    image_refs = tmp_path / "image_refs"
+    video_refs = tmp_path / "video_refs"
     audio.mkdir()
-    controls.mkdir()
+    image_refs.mkdir()
+    video_refs.mkdir()
     target = audio / "tone.wav"
     target.write_bytes(b"target")
-    (controls / "tone.png").write_bytes(b"image")
-    (controls / "tone_0.mp4").write_bytes(b"video")
+    (image_refs / "tone.png").write_bytes(b"image")
+    (video_refs / "tone.mp4").write_bytes(b"video")
     config = {
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "audio_directory": str(audio),
-                "h3_target_mode": "audio",
-                "control_directory": str(controls),
+                "target_audio_directory": str(audio),
+                "target_modalities": ["audio"],
+                "source_image_directory": str(image_refs),
+                "source_video_directory": str(video_refs),
+                "source_modalities": ["image", "video"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -1023,8 +1455,8 @@ def test_h3_audio_target_without_controls_keeps_the_empty_reference_fast_path(tm
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "audio_directory": str(audio),
-                "h3_target_mode": "audio",
+                "target_audio_directory": str(audio),
+                "target_modalities": ["audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -1069,7 +1501,7 @@ def test_h3_audio_jsonl_control_paths_select_reference_modality(tmp_path):
         "datasets": [
             {
                 "audio_jsonl_file": str(jsonl),
-                "h3_target_mode": "audio",
+                "target_modalities": ["audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -1102,15 +1534,16 @@ def test_h3_audio_dataset_rejects_controls_in_both_directory_and_jsonl(tmp_path)
         "datasets": [
             {
                 "audio_jsonl_file": str(jsonl),
-                "h3_target_mode": "audio",
-                "control_directory": str(controls),
+                "target_modalities": ["audio"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
         ],
     }
 
-    with pytest.raises(ValueError, match="control_directory or the audio JSONL"):
+    with pytest.raises(ValueError, match=r"source_\*_directory or the audio JSONL"):
         h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
 
 
@@ -1190,7 +1623,8 @@ def test_h3_image_dataset_uses_existing_musubi_fields_and_needs_no_audio_vae(tmp
         "general": {"resolution": [512, 512], "batch_size": 1},
         "datasets": [
             {
-                "image_directory": str(images),
+                "target_image_directory": str(images),
+                "target_modalities": ["image"],
                 "cache_directory": str(tmp_path / "cache"),
             }
         ],
@@ -1218,9 +1652,14 @@ def test_h3_mixed_image_video_dataset_requires_audio_only_for_video_items(tmp_pa
     config = {
         "general": {"resolution": [512, 512], "batch_size": 1},
         "datasets": [
-            {"image_directory": str(images), "cache_directory": str(tmp_path / "image_cache")},
             {
-                "video_directory": str(videos),
+                "target_image_directory": str(images),
+                "target_modalities": ["image"],
+                "cache_directory": str(tmp_path / "image_cache"),
+            },
+            {
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "video_cache"),
                 "target_frames": [22],
             },
@@ -1246,13 +1685,15 @@ def test_h3_allows_same_video_directory_for_different_resolution_caches(tmp_path
         "general": {"batch_size": 1},
         "datasets": [
             {
-                "video_directory": str(videos),
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache_512"),
                 "resolution": [512, 512],
                 "target_frames": [22],
             },
             {
-                "video_directory": str(videos),
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache_768"),
                 "resolution": [768, 768],
                 "target_frames": [22],
@@ -1276,21 +1717,21 @@ def test_h3_rejects_conflicting_modes_for_duplicate_target_path(tmp_path):
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(videos),
+                "target_video_directory": str(videos),
                 "cache_directory": str(tmp_path / "cache_av"),
                 "target_frames": [22],
-                "h3_target_mode": "av",
+                "target_modalities": ["video", "audio"],
             },
             {
-                "video_directory": str(videos),
+                "target_video_directory": str(videos),
                 "cache_directory": str(tmp_path / "cache_video"),
                 "target_frames": [22],
-                "h3_target_mode": "video",
+                "target_modalities": ["video"],
             },
         ],
     }
 
-    with pytest.raises(ValueError, match="conflicting h3_target_mode"):
+    with pytest.raises(ValueError, match="conflicting target_modalities"):
         create_h3_dataset_group(config, Namespace(debug_dataset=False))
 
 
@@ -1325,7 +1766,8 @@ def test_h3_dataset_adapter_rejects_off_grid_frame_counts(tmp_path):
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(tmp_path),
+                "target_video_directory": str(tmp_path),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [121],
             }
@@ -1855,8 +2297,10 @@ def test_h3_dataset_records_reference_fingerprint_in_cache_metadata(tmp_path):
         "general": {"resolution": [64, 64], "batch_size": 1},
         "datasets": [
             {
-                "image_directory": str(images),
-                "control_directory": str(controls),
+                "target_image_directory": str(images),
+                "target_modalities": ["image"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
                 "cache_directory": str(tmp_path / "cache"),
             }
         ],
@@ -2288,7 +2732,7 @@ def test_h3_audio_dataset_builds_cache_paths_and_duration_contract(tmp_path):
         {
             "audio_directory": str(tmp_path),
             "cache_directory": str(cache),
-            "h3_target_mode": "audio",
+            "target_modalities": ["audio"],
             "target_frames": [124],
             "resolution": [832, 480],
         },
@@ -2316,7 +2760,7 @@ def test_h3_audio_cache_names_disambiguate_sources_sharing_a_stem(tmp_path):
             {
                 "audio_directory": str(root),
                 "cache_directory": str(cache),
-                "h3_target_mode": "audio",
+                "target_modalities": ["audio"],
                 "target_frames": [124],
                 "resolution": [832, 480],
             },
@@ -2440,7 +2884,91 @@ def test_native_latent_encoder_uses_direct_image_vae_path_and_omits_audio():
     assert set(tensors) == {"latents_1x2x2_float32"}
 
 
-def test_native_latent_encoder_uses_temporal_vae_and_external_controls_for_conditioned_image(tmp_path):
+def test_native_latent_encoder_caches_image_and_separate_audio_targets():
+    class VideoEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+
+        def encode_image(self, pixels):
+            return torch.zeros(1, 24, 1, 2, 2)
+
+    audio_frames = temporal_shape(22).audio_latent_frames
+    encoder = h3_integration._NativeLatentEncoder(VideoEncoder(), torch.nn.Linear(1, 1, bias=False), torch.float32)
+    encoder._encode_audio = lambda item: (
+        torch.zeros(2, 32, audio_frames),
+        torch.ones(audio_frames, dtype=torch.bool),
+    )
+    encoder._encode_references = lambda item: {}
+    item = SimpleNamespace(
+        content=np.zeros((32, 32, 3), dtype=np.uint8),
+        item_key="image.png",
+        h3_target_mode="av",
+        h3_media_assets=(
+            MediaAsset(
+                Path("image.png"),
+                MediaModality.IMAGE,
+                "target",
+                metadata={"frame_count": 1, "audio_path": "image.wav", "audio_frame_count": 22},
+            ),
+        ),
+    )
+
+    (tensors,) = encoder.encode_latents([item])
+
+    assert "latents_1x2x2_float32" in tensors
+    assert f"latents_audio_2x32x{audio_frames}_float32" in tensors
+    assert H3_AUDIO_LOSS_MASK_KEY in tensors
+
+
+def test_native_latent_encoder_decodes_companion_audio_instead_of_the_visual_container(tmp_path, monkeypatch):
+    captured = {}
+
+    class AudioEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+
+        def encode(self, waveform):
+            return torch.zeros(2, 32, temporal_shape(22).audio_latent_frames)
+
+    def fake_load(asset, spec):
+        captured["asset"] = asset
+        captured["spec"] = spec
+        samples = temporal_shape(22).audio_samples
+        return AudioClip(
+            waveform=torch.zeros(2, samples),
+            sample_rate=AUDIO_SAMPLE_RATE,
+            valid_mask=torch.ones(samples, dtype=torch.bool),
+            source_start_seconds=0.0,
+        )
+
+    monkeypatch.setattr(h3_integration, "load_audio_asset", fake_load)
+    encoder = h3_integration._NativeLatentEncoder(None, AudioEncoder(), torch.float32)
+    companion = tmp_path / "target.wav"
+    companion.write_bytes(b"audio")
+    item = SimpleNamespace(
+        item_key="target.png",
+        h3_media_assets=(
+            MediaAsset(
+                tmp_path / "target.png",
+                MediaModality.IMAGE,
+                "target",
+                metadata={"frame_count": 1, "audio_path": str(companion), "audio_frame_count": 22},
+            ),
+        ),
+    )
+
+    latents, mask = encoder._encode_audio(item)
+
+    assert captured["asset"].path == companion
+    assert captured["asset"].modality is MediaModality.AUDIO
+    assert captured["spec"].clip_duration_seconds == pytest.approx(temporal_shape(22).audio_samples / AUDIO_SAMPLE_RATE)
+    assert latents.shape[-1] == temporal_shape(22).audio_latent_frames
+    assert mask.shape == (temporal_shape(22).audio_latent_frames,)
+
+
+def test_native_latent_encoder_uses_temporal_vae_external_controls_and_audio_for_conditioned_image(tmp_path):
     class VideoEncoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -2469,20 +2997,33 @@ def test_native_latent_encoder_uses_temporal_vae_and_external_controls_for_condi
         content=np.full((5, 32, 32, 3), 127, dtype=np.uint8),
         item_key="image.png",
         h3_image_mode="first_last",
+        h3_target_mode="av",
         h3_condition_paths=(first, last),
-        h3_media_assets=(MediaAsset(Path("image.png"), MediaModality.IMAGE, "target"),),
+        h3_media_assets=(
+            MediaAsset(
+                Path("image.png"),
+                MediaModality.IMAGE,
+                "target",
+                metadata={"frame_count": 5, "audio_path": "image.wav", "audio_frame_count": 5},
+            ),
+        ),
     )
     video_encoder = VideoEncoder()
     encoder = h3_integration._NativeLatentEncoder(video_encoder, None, torch.float32)
     encoder._encode_references = lambda item: {}
+    audio_frames = temporal_shape(5).audio_latent_frames
+    encoder._encode_audio = lambda item: (
+        torch.zeros(2, 32, audio_frames),
+        torch.ones(audio_frames, dtype=torch.bool),
+    )
 
     (tensors,) = encoder.encode_latents([item])
 
     assert video_encoder.video_calls == 1
     assert video_encoder.control_values[0] != video_encoder.control_values[1]
     assert "latents_2x2x2_float32" in tensors
+    assert f"latents_audio_2x32x{audio_frames}_float32" in tensors
     assert f"varlen_{H3_KEYFRAME_VIDEO_ROWS_KEY}_float32" in tensors
-    assert not any(key.startswith(H3_AUDIO_LATENTS_KEY) for key in tensors)
 
 
 def test_native_latent_encoder_pools_pixel_loss_masks_to_h3_latent_windows():
@@ -2534,7 +3075,8 @@ def test_h3_training_uses_crop_specific_text_cache_identity(tmp_path):
         "general": {"resolution": [256, 256], "batch_size": 1},
         "datasets": [
             {
-                "video_directory": str(video_directory),
+                "target_video_directory": str(video_directory),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(cache_directory),
                 "target_frames": [5],
             }
@@ -2579,6 +3121,7 @@ def test_h3_dataset_accepts_loss_mask_sources(tmp_path):
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
                 "frame_extraction": "uniform",
@@ -3524,7 +4067,8 @@ def test_h3_conditioning_mask_directory_matches_targets_by_basename(tmp_path):
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(videos),
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
                 "conditioning_mask_directory": str(masks),
@@ -3554,8 +4098,10 @@ def test_h3_conditioning_masks_key_by_the_image_mode_item_key(tmp_path):
         "general": {"resolution": [64, 64]},
         "datasets": [
             {
-                "image_directory": str(images),
-                "control_directory": str(controls),
+                "target_image_directory": str(images),
+                "target_modalities": ["image"],
+                "source_image_directory": str(controls),
+                "source_modalities": ["image"],
                 "cache_directory": str(tmp_path / "cache"),
                 "conditioning_mask_directory": str(masks),
             }
@@ -3586,6 +4132,7 @@ def test_h3_conditioning_mask_jsonl_path_resolves_against_the_manifest(tmp_path)
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -3605,6 +4152,7 @@ def test_h3_dataset_mask_mode_requires_a_mask_for_every_item(tmp_path):
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -3629,6 +4177,7 @@ def test_h3_conditioning_masks_are_rejected_under_a_procedural_mask_mode(tmp_pat
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -3652,8 +4201,8 @@ def test_h3_conditioning_mask_directory_is_rejected_on_an_audio_dataset(tmp_path
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "audio_directory": str(audio),
-                "h3_target_mode": "audio",
+                "target_audio_directory": str(audio),
+                "target_modalities": ["audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "conditioning_mask_directory": str(masks),
             }
@@ -3672,8 +4221,8 @@ def test_h3_image_mode_is_rejected_on_an_audio_dataset(tmp_path):
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "audio_directory": str(audio),
-                "h3_target_mode": "audio",
+                "target_audio_directory": str(audio),
+                "target_modalities": ["audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [124],
             }
@@ -3701,12 +4250,14 @@ def test_h3_conditioning_masks_reject_two_targets_sharing_a_stem(tmp_path):
         "general": {"resolution": [512, 512], "target_frames": [22]},
         "datasets": [
             {
-                "video_directory": str(first),
+                "target_video_directory": str(first),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache_first"),
                 "conditioning_mask_directory": str(masks),
             },
             {
-                "video_directory": str(second),
+                "target_video_directory": str(second),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache_second"),
                 "conditioning_mask_directory": str(masks / "other"),
             },
@@ -3841,8 +4392,10 @@ def test_h3_qwen_control_directory_attaches_visual_only_controls(tmp_path):
         "general": {"resolution": [512, 512]},
         "datasets": [
             {
-                "video_directory": str(videos),
-                "control_directory": str(references),
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
+                "source_image_directory": str(references),
+                "source_modalities": ["image"],
                 "qwen_control_directory": str(controls),
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
@@ -3885,6 +4438,7 @@ def test_h3_qwen_control_jsonl_paths_resolve_against_the_manifest(tmp_path):
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
             }
@@ -3913,6 +4467,7 @@ def test_h3_qwen_controls_reject_two_sources_audio_files_and_gapped_indices(tmp_
         "datasets": [
             {
                 "video_jsonl_file": str(manifest),
+                "target_modalities": ["video", "audio"],
                 "qwen_control_directory": str(tmp_path / "pose"),
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],

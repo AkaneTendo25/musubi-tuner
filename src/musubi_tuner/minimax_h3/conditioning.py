@@ -681,7 +681,7 @@ class MiniMaxH3ConditioningEncoder:
             probabilities = getattr(item, "h3_reference_modality_probabilities", None)
             if probabilities is not None:
                 if references is None:
-                    raise ValueError("control_modality_probabilities is only valid for Ref2VA conditioning")
+                    raise ValueError("source_modality_probabilities is only valid for Ref2VA conditioning")
                 tensors[f"{H3_REFERENCE_MODALITY_PROBABILITIES_KEY}_float32"] = torch.tensor(probabilities, dtype=torch.float32)
                 for modality, probability in zip(("av", "video", "audio"), probabilities):
                     if modality == "av" or probability <= 0:

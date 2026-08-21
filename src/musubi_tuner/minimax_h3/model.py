@@ -33,8 +33,8 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffloader
+from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig, SequencePlan, block_sparse_attention, build_plan
 from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
-from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig, block_sparse_attention
 from musubi_tuner.minimax_h3.triton_kernels import (
     try_fused_indexed_adaln_rmsnorm,
     try_fused_qk_norm_rope,
@@ -200,6 +200,7 @@ class MiniMaxH3Attention(nn.Module):
         self.auto_dispatch = False
         self.int8_attention = False
         self.block_sparse_config: BlockSparseConfig | None = None
+        self.block_sparse_plan: SequencePlan | None = None
         self.fused_qk_norm_rope = False
         self.inner_dim = heads * head_dim
         self.qkv_proj = nn.Linear(hidden_size, 3 * self.inner_dim, bias=False)
@@ -242,7 +243,7 @@ class MiniMaxH3Attention(nn.Module):
             # A padding mask is a pairwise condition block selection cannot
             # express, so masked calls fall through to the dense path.
             hidden_states = block_sparse_attention(
-                query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), self.block_sparse_config
+                query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), self.block_sparse_config, self.block_sparse_plan
             )
             hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         elif self.int8_attention and attention_mask is None:
@@ -558,10 +559,26 @@ class MiniMaxH3Transformer(nn.Module):
         """
         if config is not None:
             config.validate()
+        self.block_sparse_config = config
+        self.block_sparse_modules = []
         for index, block in enumerate(self.blocks):
             for module in block.modules():
                 if isinstance(module, MiniMaxH3Attention):
                     module.block_sparse_config = config if index >= start_block else None
+                    module.block_sparse_plan = None
+                    if index >= start_block:
+                        self.block_sparse_modules.append(module)
+
+    def _refresh_block_sparse_plan(self, position_ids: torch.Tensor, token_tags: torch.Tensor) -> None:
+        """Build the packed-sequence tile order once for each forward."""
+        config = getattr(self, "block_sparse_config", None)
+        if config is None or config.block_shape is None or not self.block_sparse_modules:
+            return
+        not_video = torch.nonzero(token_tags != int(MiniMaxH3TokenTag.VIDEO)).flatten()
+        target_start = int(not_video[-1]) + 1 if not_video.numel() else 0
+        plan = build_plan(position_ids.to(device=token_tags.device), target_start, config)
+        for module in self.block_sparse_modules:
+            module.block_sparse_plan = plan
 
     @contextmanager
     def int8_attention_context(self, *, auxiliary: bool):
@@ -714,6 +731,7 @@ class MiniMaxH3Transformer(nn.Module):
         if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
             raise ValueError("token_tags and timestep_indices must match the packed sequence length")
 
+        self._refresh_block_sparse_plan(position_ids, token_tags)
         rotary_emb = self.rope(position_ids)
         video = self.video_patch_proj(video_hidden_states.to(self.video_patch_proj.weight.dtype))
         audio = self.audio_patch_proj(audio_hidden_states.to(self.audio_patch_proj.weight.dtype))

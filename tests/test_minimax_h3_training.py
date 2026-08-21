@@ -1448,9 +1448,9 @@ def test_native_h3_i2va_backend_requires_recached_keyframe_latents():
         )
 
 
-@pytest.mark.parametrize("mode", ["ref2va", "ref2va_omni"])
-@pytest.mark.parametrize("with_target_audio", [False, True])
-def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward(mode, with_target_audio):
+@pytest.mark.parametrize("source_kinds", [(), (0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)])
+@pytest.mark.parametrize("target_mode", ["video", "audio", "av"])
+def test_native_h3_ref2va_backend_runs_every_modality_combination_forward_loss_and_backward(source_kinds, target_mode):
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
         attention_head_dim=16,
@@ -1468,37 +1468,58 @@ def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward(mode, wi
         rope_freq_dim=2,
     )
     transformer = MiniMaxH3Transformer(config)
-    backend = _NativeTrainingBackend(transformer, mode=mode)
-    video = torch.randn(1, 4, 1, 2, 2)
-    audio = torch.randn(1, 2, 6, 1) if with_target_audio else None
+    training_mode = "ref2va_omni" if not source_kinds else "ref2va"
+    backend = _NativeTrainingBackend(transformer, mode=training_mode)
+    video_latents = torch.randn(1, 4, 1, 2, 2) if target_mode != "audio" else None
+    audio_latents = torch.randn(1, 2, 6, 1) if target_mode != "video" else None
+    inputs = prepare_joint_noisy_inputs(
+        video_latents,
+        audio_latents,
+        torch.randn_like(video_latents) if video_latents is not None else None,
+        torch.randn_like(audio_latents) if audio_latents is not None else None,
+        torch.tensor([0.4]),
+    )
+    video_shapes = [[1, 2, 2] if kind in (0, 1) else [0, 0, 0] for kind in source_kinds]
+    audio_lengths = [1 if kind == 2 else 0 for kind in source_kinds]
+    visual_count = sum(kind in (0, 1) for kind in source_kinds)
+    audio_count = sum(kind == 2 for kind in source_kinds)
+    task = training_mode
     batch = {
         H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
-        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 1])],
-        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS[mode])],
-        H3_REFERENCE_KINDS_KEY: [torch.tensor([0, 2])],
-        H3_REFERENCE_VIDEO_SHAPES_KEY: [torch.tensor([[1, 2, 2], [0, 0, 0]])],
-        H3_REFERENCE_AUDIO_LENGTHS_KEY: [torch.tensor([0, 1])],
-        H3_REFERENCE_VIDEO_ROWS_KEY: [torch.randn(1, 16)],
-        H3_REFERENCE_AUDIO_ROWS_KEY: [torch.randn(2, 6)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 1, 1]) if not source_kinds or source_kinds == (2,) else torch.tensor([1, 0, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS[task])],
     }
+    if source_kinds:
+        batch.update(
+            {
+                H3_REFERENCE_KINDS_KEY: [torch.tensor(source_kinds)],
+                H3_REFERENCE_VIDEO_SHAPES_KEY: [torch.tensor(video_shapes)],
+                H3_REFERENCE_AUDIO_LENGTHS_KEY: [torch.tensor(audio_lengths)],
+                H3_REFERENCE_VIDEO_ROWS_KEY: [torch.randn(visual_count, 16)],
+                H3_REFERENCE_AUDIO_ROWS_KEY: [torch.randn(audio_count * 2, 6)],
+            }
+        )
+    if target_mode == "audio":
+        batch[H3_VIDEO_GEOMETRY_KEY] = [torch.tensor([2, 2])]
 
     prediction = backend.predict_training(
         transformer,
         batch,
-        video,
-        audio,
-        torch.tensor([0.4]),
-        torch.tensor([0.7]),
-        video_row_schedule=torch.tensor([0.6]),
+        inputs.video,
+        inputs.audio,
+        inputs.video_timestep,
+        inputs.audio_timestep,
     )
-    loss = prediction.video.square().mean()
-    if prediction.audio is not None:
-        loss = loss + prediction.audio.square().mean()
-    loss.backward()
+    result = joint_velocity_loss(prediction, inputs)
+    result.loss.backward()
 
-    assert prediction.video.shape == video.shape
-    assert prediction.audio is None if audio is None else prediction.audio.shape == audio.shape
-    assert torch.isfinite(loss)
+    assert prediction.video is None if video_latents is None else prediction.video.shape == video_latents.shape
+    assert prediction.audio is None if audio_latents is None else prediction.audio.shape == audio_latents.shape
+    assert torch.isfinite(result.loss)
+    assert torch.isfinite(result.video_loss)
+    assert torch.isfinite(result.audio_loss)
+    assert result.video_elements == (0 if video_latents is None else video_latents.numel())
+    assert result.audio_elements == (0 if audio_latents is None else audio_latents.numel())
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
 
 
@@ -2289,6 +2310,212 @@ def test_h3_token_refiner_flag_rejects_other_network_modules():
 
     with pytest.raises(ValueError, match="networks.lora_minimax_h3"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_named_lora_targets_select_audio_projections_and_specific_blocks(tmp_path):
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=3,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config).requires_grad_(False)
+    network = lora_minimax_h3.create_arch_network(
+        1.0,
+        2,
+        2.0,
+        None,
+        [],
+        transformer,
+        h3_target_modules="audio,attention",
+        h3_attention_blocks="1",
+    )
+    names = {module.lora_name for module in network.unet_loras}
+
+    assert len(names) == 4
+    assert any(name.endswith("_audio_patch_proj") for name in names)
+    assert any(name.endswith("_final_layer_audio_out") for name in names)
+    assert sum("_blocks_1_attn_" in name for name in names) == 2
+    assert not any("_blocks_0_" in name or "_blocks_2_" in name or "_mlp_" in name for name in names)
+
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+    checkpoint = tmp_path / "h3_named_audio_lora.safetensors"
+    network.save_weights(checkpoint, torch.float32, {"architecture": "minimax_h3"})
+    restored_transformer = MiniMaxH3Transformer(config).requires_grad_(False)
+    restored = lora_minimax_h3.create_arch_network_from_weights(1.0, load_file(checkpoint), unet=restored_transformer)
+    restored_names = {module.lora_name for module in restored.unet_loras}
+    assert restored_names == names
+    restored.apply_to(None, restored_transformer, apply_text_encoder=False, apply_unet=True)
+    load_info = restored.load_weights(checkpoint)
+    assert not load_info.missing_keys
+    assert not load_info.unexpected_keys
+
+
+def test_h3_named_lora_cli_expands_groups_and_block_ranges():
+    args = create_parser().parse_args(["--sdpa", "--h3_lora_targets", "audio;attention:0-2,7"])
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert "h3_target_modules=audio,attention" in args.network_args
+    assert "h3_attention_blocks=0,1,2,7" in args.network_args
+
+
+def test_h3_named_lora_and_audio_spatial_layout_are_recorded_in_metadata():
+    args = create_parser().parse_args(["--sdpa", "--h3_lora_targets", "attention:0-2;audio", "--h3_audio_only_spatial_tokens"])
+    trainer = MiniMaxH3NetworkTrainer()
+
+    trainer.handle_model_specific_args(args)
+    metadata = trainer.extra_metadata(args)
+
+    assert metadata["ss_h3_lora_targets"] == "attention:0-2;audio"
+    assert metadata["ss_h3_audio_only_spatial_tokens"] == "True"
+
+
+def test_h3_named_lora_cli_selects_attention_and_mlp_blocks_independently():
+    args = create_parser().parse_args(
+        [
+            "--sdpa",
+            "--h3_lora_targets",
+            "attention:0-2,7;mlp:8,10-11;audio",
+        ]
+    )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert "h3_attention_blocks=0,1,2,7" in args.network_args
+    assert "h3_mlp_blocks=8,10,11" in args.network_args
+
+
+@pytest.mark.parametrize(
+    "spec",
+    ["", "attention:", "attention:3-1", "attention:word", "attention:0,50", "audio:0-2", "unknown"],
+)
+def test_h3_named_lora_block_ranges_reject_invalid_specs(spec):
+    args = create_parser().parse_args(["--sdpa", "--h3_lora_targets", spec])
+    with pytest.raises(ValueError, match="H3 LoRA|h3_lora_targets"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_audio_only_spatial_tokens_are_one_per_latent_frame():
+    audio = torch.randn(1, 2, 6, 40)
+    video = MiniMaxH3NetworkTrainer._build_audio_only_spatial_tokens(audio)
+
+    assert video.shape[:2] == (1, 24)
+    assert video.shape[-2:] == (2, 2)
+    assert patchify_video_latents(video, (1, 2, 2)).shape[1] == video.shape[2]
+    assert torch.count_nonzero(video) == 0
+
+
+def test_h3_audio_only_spatial_tokens_forward_scores_only_audio_and_backpropagates():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=24,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer)
+    clean_audio = torch.randn(1, 2, 6, 8)
+    clean_video = MiniMaxH3NetworkTrainer._build_audio_only_spatial_tokens(clean_audio)
+    inputs = prepare_joint_noisy_inputs(
+        clean_video,
+        clean_audio,
+        torch.randn_like(clean_video),
+        torch.randn_like(clean_audio),
+        torch.tensor([0.4]),
+    )
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(3, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        inputs.video,
+        inputs.audio,
+        inputs.video_timestep,
+        inputs.audio_timestep,
+    )
+    result = joint_velocity_loss(prediction, inputs, video_weight=0.0, audio_weight=1.0)
+    result.loss.backward()
+
+    assert result.video_elements == 0
+    assert result.audio_elements == clean_audio.numel()
+    assert torch.isfinite(result.loss)
+    assert transformer.audio_patch_proj.weight.grad is not None
+    assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_h3_audio_only_spatial_tokens_cuda_forward_backward():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=24,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config).cuda()
+    backend = _NativeTrainingBackend(transformer)
+    clean_audio = torch.randn(1, 2, 6, 8, device="cuda")
+    clean_video = MiniMaxH3NetworkTrainer._build_audio_only_spatial_tokens(clean_audio)
+    inputs = prepare_joint_noisy_inputs(
+        clean_video,
+        clean_audio,
+        torch.randn_like(clean_video),
+        torch.randn_like(clean_audio),
+        torch.tensor([0.4], device="cuda"),
+    )
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8, device="cuda")],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(3, dtype=torch.long, device="cuda")],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"], device="cuda")],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        inputs.video,
+        inputs.audio,
+        inputs.video_timestep,
+        inputs.audio_timestep,
+    )
+    result = joint_velocity_loss(prediction, inputs, video_weight=0.0, audio_weight=1.0)
+    result.loss.backward()
+
+    assert result.video_elements == 0
+    assert result.audio_elements == clean_audio.numel()
+    assert torch.isfinite(result.loss)
+    assert transformer.audio_patch_proj.weight.grad is not None
 
 
 def test_native_h3_lora_optimizer_step_and_save_reload_are_equivalent(tmp_path):
@@ -3928,10 +4155,9 @@ def test_h3_observed_modality_requires_weight_on_generated_side(extra_args, mess
 
 def test_h3_dataset_loss_coverage_rejects_zero_weight_target_modes():
     config = {
-        "general": {"h3_target_mode": "video"},
         "datasets": [
-            {"video_directory": "/video"},
-            {"audio_directory": "/audio", "h3_target_mode": "audio"},
+            {"target_video_directory": "/video", "target_modalities": ["video"]},
+            {"target_audio_directory": "/audio", "target_modalities": ["audio"]},
         ],
     }
 
@@ -3943,14 +4169,29 @@ def test_h3_dataset_loss_coverage_rejects_zero_weight_target_modes():
 
 def test_h3_dataset_loss_coverage_accepts_active_and_image_targets():
     config = {
-        "general": {"h3_target_mode": "audio"},
         "datasets": [
-            {"video_directory": "/av", "h3_target_mode": "av"},
-            {"image_directory": "/images"},
+            {"target_video_directory": "/av", "target_modalities": ["video", "audio"]},
+            {"target_image_directory": "/images", "target_modalities": ["image"]},
         ],
     }
 
     h3_train_network._validate_dataset_loss_coverage(config, video_weight=1.0, audio_weight=0.0)
+
+
+@pytest.mark.parametrize("target_kind", ["image", "video"])
+@pytest.mark.parametrize("video_weight,audio_weight", [(1.0, 0.0), (0.0, 1.0)])
+def test_h3_dataset_loss_coverage_treats_companion_audio_as_part_of_a_visual_target(target_kind, video_weight, audio_weight):
+    config = {
+        "datasets": [
+            {
+                f"target_{target_kind}_directory": f"/{target_kind}",
+                "target_audio_directory": "/audio",
+                "target_modalities": [target_kind, "audio"],
+            }
+        ],
+    }
+
+    h3_train_network._validate_dataset_loss_coverage(config, video_weight=video_weight, audio_weight=audio_weight)
 
 
 @pytest.mark.parametrize("sampling", ["flux_shift", "qwen_shift", "krea2_shift", "ideogram4_shift", "qinglong_flux"])

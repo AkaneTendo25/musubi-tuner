@@ -18,7 +18,7 @@ from musubi_tuner.minimax_h3.cache import (
     reference_key_suffix,
     save_latent_cache_minimax_h3,
 )
-from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
+from musubi_tuner.minimax_h3.dataset import TARGET_AUDIO_FINGERPRINT_KEY, attach_h3_media, create_h3_dataset_group
 from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_FINGERPRINT_KEY,
@@ -38,7 +38,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio_vae",
         type=Path,
-        help="H3 audio VAE checkpoint or Comfy model directory (required for videos, omitted for images)",
+        help="H3 audio VAE checkpoint or Comfy model directory (required whenever a target or reference includes audio)",
     )
     parser.add_argument(
         "--reference_image_size_mode",
@@ -114,7 +114,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if dataset_adapter.requires_video and args.vae is None:
         parser.error("--vae is required for H3 visual targets or references")
     if dataset_adapter.requires_audio and args.audio_vae is None:
-        parser.error("--audio_vae is required for H3 video datasets; omit it for image-only datasets")
+        parser.error("--audio_vae is required for H3 audio targets or references")
 
     encoder = create_latent_encoder(
         video_vae=Path(args.vae) if args.vae is not None else None,
@@ -138,6 +138,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     def existing_cache_valid(item: ItemInfo, path: str) -> bool:
         attach_h3_media((item,), dataset_adapter)
         if args.h3_image_mode != "none" and not cache_matches_fingerprint(path, item.h3_cache_metadata["sample_fingerprint"]):
+            return False
+        target_audio_fingerprint = getattr(item, "h3_cache_metadata", {}).get(TARGET_AUDIO_FINGERPRINT_KEY)
+        if target_audio_fingerprint is not None and not cache_matches_fingerprint(
+            path, target_audio_fingerprint, TARGET_AUDIO_FINGERPRINT_KEY
+        ):
             return False
         if not reference_assets(item):
             return True

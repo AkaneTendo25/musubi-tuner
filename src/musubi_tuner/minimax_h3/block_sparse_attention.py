@@ -5,6 +5,16 @@ the dot product of their means and attends to the top-k blocks plus its own.
 Selection is discrete and carries no gradient; gradients flow through the
 retained blocks. Runs on ``flex_attention`` with a ``BlockMask``, which supplies
 the backward pass.
+
+Two properties of the packed sequence shape the layout:
+
+* the target video is a trailing run of rows, preceded by text, audio and
+  reference context. Context is a small share of the sequence and carries the
+  conditioning, so it stays dense; only target-video rows are thinned.
+* target-video rows follow the lattice in raster order, where rows adjacent in
+  the sequence can be far apart in the frame. A block cut from raster order
+  therefore averages unrelated rows, and the mean it is selected by describes
+  no real region. ``block_shape`` reorders rows so each block is a 3D tile.
 """
 
 from __future__ import annotations
@@ -50,6 +60,9 @@ class BlockSparseConfig:
             needs, where a fixed share misjudges both.
         share_heads: score once for all heads instead of per head.
         min_blocks: lower bound on retained blocks.
+        block_shape: lattice tile ``(frames, height, width)`` whose product is
+            ``block``. ``None`` keeps raster order, where a block spans whatever
+            rows happen to be adjacent.
     """
 
     block: int = DEFAULT_BLOCK
@@ -57,6 +70,7 @@ class BlockSparseConfig:
     threshold: float | None = None
     share_heads: bool = False
     min_blocks: int = 1
+    block_shape: tuple[int, int, int] | None = None
 
     def validate(self) -> None:
         if self.block <= 0 or self.block % 8:
@@ -67,6 +81,50 @@ class BlockSparseConfig:
             raise ValueError("threshold must lie in (0, 1]")
         if self.min_blocks < 1:
             raise ValueError("min_blocks must be at least 1")
+        if self.block_shape is not None:
+            if len(self.block_shape) != 3 or any(extent < 1 for extent in self.block_shape):
+                raise ValueError("block_shape must be three positive extents")
+            frames, height, width = self.block_shape
+            if frames * height * width != self.block:
+                raise ValueError(f"block_shape must multiply to block ({self.block}), got {self.block_shape}")
+
+
+@dataclass(frozen=True)
+class SequencePlan:
+    """Row order that groups target-video rows into lattice tiles."""
+
+    order: torch.Tensor
+    inverse: torch.Tensor
+    context_rows: int
+
+
+def _lattice_index(column: torch.Tensor) -> torch.Tensor:
+    """Map ordered rotary coordinates to consecutive lattice positions."""
+    return torch.unique(column, sorted=True, return_inverse=True)[1]
+
+
+def build_plan(position_ids: torch.Tensor, target_start: int, cfg: BlockSparseConfig) -> SequencePlan | None:
+    """Order target-video rows into lattice tiles while leaving context first."""
+    if cfg.block_shape is None:
+        return None
+    rows = position_ids.shape[0]
+    if target_start >= rows:
+        return None
+
+    tile_frames, tile_height, tile_width = cfg.block_shape
+    target = position_ids[target_start:]
+    frame = _lattice_index(target[:, 0]) // tile_frames
+    height = _lattice_index(target[:, 1]) // tile_height
+    width = _lattice_index(target[:, 2]) // tile_width
+    span_height = int(height.max()) + 1
+    span_width = int(width.max()) + 1
+    tile = (frame * span_height + height) * span_width + width
+
+    device = position_ids.device
+    order = torch.cat((torch.arange(target_start, device=device), torch.argsort(tile, stable=True) + target_start))
+    inverse = torch.empty_like(order)
+    inverse[order] = torch.arange(rows, device=device)
+    return SequencePlan(order=order, inverse=inverse, context_rows=target_start)
 
 
 def _block_means(tensor: torch.Tensor, block: int) -> torch.Tensor:
@@ -111,24 +169,41 @@ def select_blocks(query: torch.Tensor, key: torch.Tensor, cfg: BlockSparseConfig
     return mask
 
 
+def _counts_and_indices(keep: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return kept-block counts and indices with retained blocks first."""
+    counts = keep.sum(dim=-1).to(torch.int32)
+    indices = torch.argsort(keep.to(torch.int8), dim=-1, descending=True, stable=True).to(torch.int32)
+    return counts, indices
+
+
 def block_sparse_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     cfg: BlockSparseConfig,
+    plan: SequencePlan | None = None,
 ) -> torch.Tensor:
     """Attention over the selected blocks. Shapes are (B, H, S, D).
 
-    Rows are padded to a whole number of blocks and trimmed afterwards.
+    Rows are padded to a whole number of blocks and trimmed afterwards. Given a
+    plan, target rows are reordered into lattice tiles and restored afterwards.
     """
     cfg.validate()
     rows = query.shape[-2]
+    if plan is not None:
+        query, key, value = (tensor.index_select(-2, plan.order) for tensor in (query, key, value))
     pad = (-rows) % cfg.block
     if pad:
         query, key, value = (torch.nn.functional.pad(t, (0, 0, 0, pad)) for t in (query, key, value))
 
     keep = select_blocks(query, key, cfg)
     padded = query.shape[-2]
+
+    if plan is not None and plan.context_rows:
+        context_blocks = -(-plan.context_rows // cfg.block)
+        keep = keep.clone()
+        keep[..., :context_blocks] = True
+        keep[..., :context_blocks, :] = True
 
     # A zero score is a full weight after the softmax, so padded rows must be
     # excluded. The straddling block holds real rows, so the cut is per row and
@@ -139,18 +214,25 @@ def block_sparse_attention(
 
     # Built from the selected indices: evaluating a mask function over every
     # row pair would materialize a grid the size of the attention matrix.
-    counts = keep.sum(dim=-1).to(torch.int32)
-    indices = torch.argsort(keep.to(torch.int8), dim=-1, descending=True, stable=True).to(torch.int32)
-
     def mask_mod(batch, head, q_row, k_row):
-        return valid[k_row] & keep[batch, head, q_row // cfg.block, k_row // cfg.block]
+        return valid[k_row]
+
+    whole = keep.clone()
+    whole[..., rows // cfg.block :] = False
+    partial = keep & ~whole
+    partial_counts, partial_indices = _counts_and_indices(partial)
+    whole_counts, whole_indices = _counts_and_indices(whole)
 
     block_mask = BlockMask.from_kv_blocks(
-        counts,
-        indices,
+        partial_counts,
+        partial_indices,
+        whole_counts,
+        whole_indices,
         BLOCK_SIZE=cfg.block,
         mask_mod=mask_mod,
         seq_lengths=(padded, padded),
     )
     out = _compiled_flex()(query, key, value, block_mask=block_mask)
-    return out[..., :rows, :] if pad else out
+    if pad:
+        out = out[..., :rows, :]
+    return out.index_select(-2, plan.inverse) if plan is not None else out

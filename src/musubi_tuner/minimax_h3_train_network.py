@@ -26,12 +26,17 @@ from musubi_tuner.hv_train import get_sigmas
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
+    AUDIO_LATENT_FPS,
     VIDEO_DIT_PATCH_SIZE,
     VIDEO_FLOW_SHIFT,
+    VIDEO_FPS,
+    VIDEO_LATENT_CHANNELS,
     align_frame_count,
+    temporal_shape,
 )
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import H3TrainingBackend, create_conditioning_encoder, create_training_backend
+from musubi_tuner.minimax_h3.block_sparse_attention import DEFAULT_BLOCK
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
@@ -52,6 +57,8 @@ from musubi_tuner.minimax_h3.inference import (
 )
 from musubi_tuner.minimax_h3.masking import (
     CONDITIONING_MASK_BATCH_KEY as H3_CONDITIONING_MASK_KEY,
+)
+from musubi_tuner.minimax_h3.masking import (
     audio_mask_to_rows,
     rows_to_latent_video_mask,
     sample_audio_mask,
@@ -115,6 +122,76 @@ _DIRECT_SIGMA_SAMPLING = {
 
 _H3_BASE_TIMESTEP_SAMPLING = {"sigma", "uniform", "sigmoid", "shift", "logsnr"}
 
+_H3_LORA_TARGETS = ("attention", "mlp", "audio", "video", "token_refiner")
+_H3_TRANSFORMER_BLOCKS = 50
+
+
+def _parse_block_sparse_block_shape(spec: str | None) -> tuple[int, int, int] | None:
+    """Parse a frames,height,width tile whose product is the sparse block size."""
+    if spec is None or not spec.strip():
+        return None
+    parts = spec.replace(" ", "").split(",")
+    if len(parts) != 3:
+        raise ValueError(f"--h3_block_sparse_block_shape must be frames,height,width, got {spec!r}")
+    try:
+        extents = tuple(int(part) for part in parts)
+    except ValueError as error:
+        raise ValueError(f"--h3_block_sparse_block_shape must be three integers, got {spec!r}") from error
+    if any(extent < 1 for extent in extents):
+        raise ValueError(f"--h3_block_sparse_block_shape extents must be positive, got {spec!r}")
+    if extents[0] * extents[1] * extents[2] != DEFAULT_BLOCK:
+        raise ValueError(f"--h3_block_sparse_block_shape must multiply to the block size ({DEFAULT_BLOCK}), got {spec!r}")
+    return extents
+
+
+def _parse_h3_block_ranges(spec: str) -> tuple[int, ...]:
+    """Parse a compact block selection such as ``0-7,16,24-31``."""
+    selected: set[int] = set()
+    for raw_piece in spec.split(","):
+        piece = raw_piece.strip()
+        if not piece:
+            raise ValueError("H3 LoRA target contains an empty block selection")
+        if "-" in piece:
+            endpoints = piece.split("-", 1)
+            if len(endpoints) != 2 or not all(endpoint.isdigit() for endpoint in endpoints):
+                raise ValueError(f"invalid H3 LoRA block range {piece!r}")
+            first, last = (int(endpoint) for endpoint in endpoints)
+            if first > last:
+                raise ValueError(f"H3 LoRA block range {piece!r} is descending")
+            selected.update(range(first, last + 1))
+        elif piece.isdigit():
+            selected.add(int(piece))
+        else:
+            raise ValueError(f"invalid H3 LoRA block entry {piece!r}")
+    if not selected:
+        raise ValueError("H3 LoRA target must select at least one block")
+    if max(selected) >= _H3_TRANSFORMER_BLOCKS:
+        raise ValueError(f"H3 LoRA block indices must be between 0 and {_H3_TRANSFORMER_BLOCKS - 1}")
+    return tuple(sorted(selected))
+
+
+def _parse_h3_lora_targets(spec: str | None) -> dict[str, tuple[int, ...] | None]:
+    """Parse ``attention:0-13;mlp:3-5;audio`` into named target groups."""
+    if spec is None:
+        return {}
+    selected: dict[str, tuple[int, ...] | None] = {}
+    for raw_entry in spec.split(";"):
+        entry = raw_entry.strip()
+        if not entry:
+            raise ValueError("--h3_lora_targets contains an empty target")
+        name, separator, ranges = entry.partition(":")
+        name = name.strip()
+        if name not in _H3_LORA_TARGETS:
+            raise ValueError(f"unknown H3 LoRA target {name!r}; choose from {', '.join(_H3_LORA_TARGETS)}")
+        if name in selected:
+            raise ValueError(f"--h3_lora_targets repeats {name!r}")
+        if separator and name not in {"attention", "mlp"}:
+            raise ValueError(f"H3 LoRA target {name!r} does not have numbered main blocks")
+        if separator and not ranges.strip():
+            raise ValueError(f"H3 LoRA target {name!r} has an empty block range")
+        selected[name] = _parse_h3_block_ranges(ranges.strip()) if separator else None
+    return selected
+
 
 def _apply_timestep_focus(base: torch.Tensor, low: float, high: float, probability: float) -> torch.Tensor:
     """Map one uniform draw to a uniform/background mixture without another RNG draw."""
@@ -131,11 +208,18 @@ def _validate_dataset_loss_coverage(user_config: dict, *, video_weight: float, a
     """Reject dataset rows that can never contribute to the configured objective."""
     general = user_config.get("general", {})
     for index, dataset in enumerate(user_config.get("datasets", [])):
-        is_image = bool(dataset.get("image_directory") or dataset.get("image_jsonl_file"))
-        is_audio = bool(dataset.get("audio_directory") or dataset.get("audio_jsonl_file"))
-        mode = "video" if is_image else dataset.get("h3_target_mode", general.get("h3_target_mode", "av"))
-        if is_audio:
+        is_image = bool(dataset.get("image_directory") or dataset.get("image_jsonl_file") or dataset.get("target_image_directory"))
+        is_video = bool(dataset.get("video_directory") or dataset.get("video_jsonl_file") or dataset.get("target_video_directory"))
+        if is_image:
+            modalities = tuple(dataset.get("target_modalities", ("image",)))
+            mode = "av" if modalities == ("image", "audio") else "video"
+        elif is_video:
+            modalities = tuple(dataset.get("target_modalities", ("video", "audio")))
+            mode = "video" if modalities == ("video",) else "av"
+        elif dataset.get("audio_directory") or dataset.get("audio_jsonl_file") or dataset.get("target_audio_directory"):
             mode = "audio"
+        else:
+            mode = dataset.get("h3_target_mode", general.get("h3_target_mode", "av"))
         active = (mode in {"av", "video"} and video_weight > 0) or (mode in {"av", "audio"} and audio_weight > 0)
         if not active:
             raise ValueError(f"H3 dataset {index + 1} has target mode {mode!r}, but its configured modality loss weight is zero")
@@ -198,6 +282,26 @@ def _parse_guidance_scale_range(spec: str | None) -> tuple[float, float] | None:
 
 
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
+    @staticmethod
+    def _build_audio_only_spatial_tokens(audio_latents: torch.Tensor) -> torch.Tensor:
+        """Build H3's audio-only spatial placeholders, one token per latent frame."""
+        if audio_latents.ndim != 4:
+            raise ValueError("H3 audio-only spatial tokens require [B, 2, C, T] audio latents")
+        pixel_frames = max(2, round(int(audio_latents.shape[-1]) / AUDIO_LATENT_FPS * VIDEO_FPS))
+        latent_frames = temporal_shape(align_frame_count(pixel_frames)).video_latent_frames
+        patch_t, patch_h, patch_w = VIDEO_DIT_PATCH_SIZE
+        if latent_frames % patch_t:
+            latent_frames += patch_t - latent_frames % patch_t
+        return torch.zeros(
+            audio_latents.shape[0],
+            VIDEO_LATENT_CHANNELS,
+            latent_frames,
+            patch_h,
+            patch_w,
+            device=audio_latents.device,
+            dtype=audio_latents.dtype,
+        )
+
     @staticmethod
     def _sparse_branch_active(accelerator: Accelerator, probability: float, generator: torch.Generator | None = None) -> bool:
         """Draw one auxiliary-branch decision shared by every distributed rank."""
@@ -611,6 +715,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         video_source = batch.get("latents", latents if latents.ndim == 5 else None)
         video_latents = video_source.to(accelerator.device, dtype=self.dit_dtype) if has_video else None
         audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(accelerator.device, dtype=self.dit_dtype) if has_audio else None
+        spatial_tokens = bool(args.h3_audio_only_spatial_tokens and not has_video and has_audio)
+        if spatial_tokens:
+            video_latents = self._build_audio_only_spatial_tokens(audio_latents)
         is_image = has_video and not has_audio and video_latents.shape[2] == 1
         if len(observed_modes) == 1 and observed_modes[0] is not None and not (has_video and has_audio):
             raise ValueError("H3 observed-modality validation requires cached video and audio targets")
@@ -697,6 +804,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         is_image,
                         accumulators[task],
                         validation_seed,
+                        spatial_tokens,
                     )
             self._step_reference_modality = "av"
 
@@ -717,6 +825,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         is_image,
         accumulator,
         validation_seed,
+        spatial_tokens,
     ) -> None:
         inputs = prepare_joint_noisy_inputs(
             video_latents,
@@ -728,7 +837,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             audio_shift=1.0 if is_image else args.h3_shift_audio,
             observed=observed,
         )
-        video_weight = 0.0 if observed == "video" else args.h3_video_loss_weight
+        video_weight = 0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight
         audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
 
         # Validation uses the configured task, not whichever random mask or
@@ -844,6 +953,37 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "set H3 token-refiner targeting with --h3_lora_token_refiner, not a duplicate --network_args value"
                 )
             network_args.append("h3_lora_token_refiner=true")
+            args.network_args = network_args
+        selected_targets = _parse_h3_lora_targets(args.h3_lora_targets)
+        if args.h3_lora_token_refiner and selected_targets and "token_refiner" not in selected_targets:
+            selected_targets["token_refiner"] = None
+        if selected_targets:
+            if not args.network_module.endswith("lora_minimax_h3"):
+                raise ValueError("--h3_lora_targets requires --network_module networks.lora_minimax_h3")
+            network_args = list(args.network_args or [])
+            if any(
+                value.startswith(
+                    (
+                        "include_patterns=",
+                        "exclude_patterns=",
+                        "h3_target_modules=",
+                        "h3_target_blocks=",
+                        "h3_attention_blocks=",
+                        "h3_mlp_blocks=",
+                    )
+                )
+                for value in network_args
+            ):
+                raise ValueError(
+                    "--h3_lora_targets cannot be combined with include_patterns/exclude_patterns or duplicate H3 target arguments"
+                )
+            network_args.append("h3_target_modules=" + ",".join(selected_targets))
+            attention_blocks = selected_targets.get("attention")
+            mlp_blocks = selected_targets.get("mlp")
+            if attention_blocks is not None:
+                network_args.append("h3_attention_blocks=" + ",".join(str(index) for index in attention_blocks))
+            if mlp_blocks is not None:
+                network_args.append("h3_mlp_blocks=" + ",".join(str(index) for index in mlp_blocks))
             args.network_args = network_args
         self._i2v_training = False
         self._control_training = False
@@ -1152,6 +1292,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_block_sparse_kv_fraction must be in [0, 1]")
         if not 0.0 <= block_sparse_threshold <= 1.0:
             raise ValueError("--h3_block_sparse_threshold must be in [0, 1]")
+        _parse_block_sparse_block_shape(getattr(args, "h3_block_sparse_block_shape", None))
         if block_sparse_kv_fraction > 0 or block_sparse_threshold > 0:
             if getattr(args, "h3_int8_attention", "off") != "off":
                 # Block-sparse attention takes every unmasked call and masked
@@ -1195,6 +1336,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 BlockSparseConfig(
                     kv_fraction=fraction if fraction > 0 else 1.0,
                     threshold=threshold if threshold > 0 else None,
+                    block_shape=_parse_block_sparse_block_shape(getattr(args, "h3_block_sparse_block_shape", None)),
                 ),
                 start_block=getattr(args, "h3_block_sparse_start_block", 0),
             )
@@ -2280,7 +2422,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         video_source = batch.get("latents", latents if latents.ndim == 5 else None)
         video_latents = video_source.to(device=accelerator.device, dtype=dit_dtype) if has_video else None
         audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(device=accelerator.device, dtype=dit_dtype) if has_audio else None
-        video_noise = noise.to(device=accelerator.device, dtype=dit_dtype) if video_latents is not None else None
+        spatial_tokens = bool(args.h3_audio_only_spatial_tokens and not has_video and has_audio)
+        if spatial_tokens:
+            video_latents = self._build_audio_only_spatial_tokens(audio_latents)
+        video_noise = (
+            torch.randn_like(video_latents)
+            if spatial_tokens
+            else noise.to(device=accelerator.device, dtype=dit_dtype)
+            if video_latents is not None
+            else None
+        )
         audio_noise = (
             noise.to(device=accelerator.device, dtype=dit_dtype)
             if audio_latents is not None and not has_video
@@ -2312,7 +2463,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             present = "video" if has_video else "audio" if has_audio else "neither"
             raise ValueError(
                 f"--h3_observed_modality reads one modality while training the other, so batches must "
-                f"carry both; this batch carries {present}. Cache the dataset with h3_target_mode = 'av'."
+                f"carry both; this batch carries {present}. Cache the dataset with target_modalities = ['video', 'audio']."
             )
 
         scheduler_args = args
@@ -2508,7 +2659,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
         audio_sample_weight = self._sample_weight(args, inputs.audio_sigma) if has_audio else None
-        video_weight = 0.0 if observed == "video" else args.h3_video_loss_weight
+        video_weight = 0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight
         audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
         effective_video_mask = self._mask_to_loss(
             self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3),
@@ -2653,6 +2804,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return {
             "ss_h3_training_mode": args.h3_training_mode,
             "ss_h3_lora_token_refiner": str(args.h3_lora_token_refiner),
+            "ss_h3_lora_targets": str(args.h3_lora_targets or "default"),
+            "ss_h3_audio_only_spatial_tokens": str(args.h3_audio_only_spatial_tokens),
             "ss_h3_loss_balance": args.h3_loss_balance,
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
@@ -2730,6 +2883,25 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "also train LoRA adapters on the two H3 text token-refiner blocks; "
             "off by default and supported only by networks.lora_minimax_h3"
+        ),
+    )
+    parser.add_argument(
+        "--h3_lora_targets",
+        type=str,
+        default=None,
+        metavar="SPEC",
+        help=(
+            "select H3 LoRA groups and optional block ranges in one expression, for example "
+            "'attention:0-13;mlp:3-5;audio'; omitted preserves the normal attention+MLP block target"
+        ),
+    )
+    parser.add_argument(
+        "--h3_audio_only_spatial_tokens",
+        action="store_true",
+        help=(
+            "for audio-only target datasets, add one zero-initialized H3 spatial token per latent frame "
+            "to the forward while keeping video loss disabled; opt-in because it changes the "
+            "packed sequence relative to the native zero-video-row audio-only path"
         ),
     )
     parser.add_argument("--text_encoder", type=str, help="Qwen3-VL H3 BF16 checkpoint used only for sampling prompts")
@@ -3260,6 +3432,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="index of the first transformer block to run block-sparse; earlier blocks stay dense",
+    )
+    parser.add_argument(
+        "--h3_block_sparse_block_shape",
+        type=str,
+        default=None,
+        help=(
+            "lattice tile for block-sparse selection as frames,height,width whose product is the block size "
+            "(128), e.g. 1,8,16; text, audio, and reference rows stay dense"
+        ),
     )
     parser.add_argument(
         "--h3_int8_attention",

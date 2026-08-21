@@ -1903,10 +1903,21 @@ class _NativeLatentEncoder:
 
     def _encode_audio(self, item: Any) -> tuple[torch.Tensor, torch.Tensor]:
         target = self._target_asset(item)
+        audio_path = target.metadata.get("audio_path")
+        if audio_path:
+            frame_count = int(target.metadata.get("audio_frame_count", target.metadata.get("frame_count", 1)))
+            target = MediaAsset(
+                Path(audio_path),
+                MediaModality.AUDIO,
+                "target",
+                start_seconds=target.start_seconds,
+                duration_seconds=target.duration_seconds,
+                metadata={"frame_count": frame_count, "fps": target.metadata.get("fps")},
+            )
         if target.modality not in {MediaModality.VIDEO, MediaModality.AUDIO}:
             raise ValueError("MiniMax H3 target audio is defined only for video or audio targets")
         if self.audio_encoder is None:
-            raise ValueError("MiniMax H3 video latent caching requires --audio_vae")
+            raise ValueError("MiniMax H3 audio latent caching requires --audio_vae")
         clip = load_audio_asset(target, target_audio_processing_spec(target))
         if clip is None:
             raise RuntimeError("H3 target audio policy unexpectedly dropped the target")
@@ -1958,8 +1969,9 @@ class _NativeLatentEncoder:
             video_loss_mask = self._video_loss_mask(item, tuple(int(value) for value in video.shape[-3:]))
             if video_loss_mask is not None:
                 tensors["video_loss_mask"] = video_loss_mask
-            if not is_image and not conditioned_image and target_mode != "video":
-                expected = temporal_shape(video_frame_count)
+            if target_mode != "video" and (not is_image or target.metadata.get("audio_path")):
+                audio_frame_count = int(target.metadata.get("audio_frame_count", video_frame_count))
+                expected = temporal_shape(audio_frame_count)
                 audio, audio_mask = self._encode_audio(item)
                 if audio.shape[-1] != expected.audio_latent_frames:
                     raise ValueError(f"H3 audio VAE produced {audio.shape[-1]} rows; expected {expected.audio_latent_frames}")

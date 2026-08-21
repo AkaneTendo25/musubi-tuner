@@ -329,7 +329,7 @@ class NetworkTrainer:
                     "Automagic3 adapts the learning rate itself; --lr_scheduler, --lr_warmup_steps and "
                     "--lr_decay_steps have no effect"
                 )
-            logger.info(f"use Automagic3 optimizer | {optimizer_kwargs}")
+            logger.info(f"use Automagic3 optimizer | lr={lr} | {optimizer_kwargs}")
             optimizer_class = Automagic3
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
