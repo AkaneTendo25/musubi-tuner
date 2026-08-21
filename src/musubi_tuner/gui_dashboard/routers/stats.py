@@ -141,7 +141,7 @@ def _h3_reference_video_rows_per_frame(width: int, height: int, short_edge: int 
 def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
     """Approximate the largest packed H3 sequence represented by one row."""
     dataset_type = str(dataset.get("type", "video"))
-    target_mode = str(dataset.get("h3_target_mode", "av"))
+    target_mode = str(dataset.get("h3_target_modalities", "av"))
     if dataset_type == "image":
         target_mode = "video"
     elif dataset_type == "audio":
@@ -168,34 +168,26 @@ def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
     elif task == "fl2va":
         condition_rows += 2 * rows_per_video_frame
     elif task in {"ref2va", "ref2va_omni"}:
-        # Exact reference shapes live in the cache, not project JSON. Use the
-        # strongest contract the TOML exposes: paired directories are video
-        # references, while the generic directory is conservatively one still.
-        modality = str(dataset.get("control_modality", "av") or "av")
-        if dataset.get("control_video_directory"):
-            reference_frames = max(_coerce_int(dataset.get("reference_frames", frames), frames), 1)
-            ref_video_latents, ref_audio_latents = _h3_temporal_latents(reference_frames)
-            if modality in {"av", "video"}:
-                reference_short_edge = max(_coerce_int(training.get("reference_video_short_edge", 768), 768), 16)
-                reference_max_pixels = max(_coerce_int(training.get("reference_video_max_pixels", 768 * 1344), 768 * 1344), 256)
-                condition_rows += ref_video_latents * _h3_reference_video_rows_per_frame(
-                    width, height, reference_short_edge, reference_max_pixels
-                )
-            if modality in {"av", "audio"} and dataset.get("control_audio_directory"):
-                condition_rows += 2 * ref_audio_latents
-        elif dataset.get("control_directory"):
-            # Directory controls may contain images or videos and their source
-            # aspect ratios are not represented in project JSON. A square image
-            # at the configured short edge is the least surprising estimate;
-            # Video references use their separately configured sizing policy.
+        # Exact source shapes live in the cache, not project JSON. Estimate each
+        # explicit source directory independently, then merge paired AV rows.
+        reference_frames = max(_coerce_int(dataset.get("reference_frames", frames), frames), 1)
+        ref_video_latents, ref_audio_latents = _h3_temporal_latents(reference_frames)
+        if dataset.get("source_image_directory"):
             if str(training.get("reference_image_size_mode", "short_edge")) == "target_area":
                 max_pixels = max(_coerce_int(training.get("reference_image_max_pixels", 0), 0), 0)
                 target_pixels = width * height if not max_pixels else min(width * height, max_pixels)
                 side = max(round(target_pixels**0.5 / 16) * 16, 16)
-                condition_rows += _h3_spatial_rows(side, side)
             else:
-                short_edge = max(_coerce_int(training.get("reference_image_short_edge", 2048), 2048), 16)
-                condition_rows += _h3_spatial_rows(short_edge, short_edge)
+                side = max(_coerce_int(training.get("reference_image_short_edge", 2048), 2048), 16)
+            condition_rows += _h3_spatial_rows(side, side)
+        if dataset.get("source_video_directory"):
+            reference_short_edge = max(_coerce_int(training.get("reference_video_short_edge", 768), 768), 16)
+            reference_max_pixels = max(_coerce_int(training.get("reference_video_max_pixels", 768 * 1344), 768 * 1344), 256)
+            condition_rows += ref_video_latents * _h3_reference_video_rows_per_frame(
+                width, height, reference_short_edge, reference_max_pixels
+            )
+        if dataset.get("source_audio_directory") or dataset.get("source_video_audio_embedded"):
+            condition_rows += 2 * ref_audio_latents
 
     keyframe_count = max(_coerce_int(training.get("h3_keyframe_random_count", 0), 0), 0)
     if not keyframe_count:
@@ -256,7 +248,7 @@ def _h3_crepa_memory_gb(training: dict, dataset: dict) -> float:
     state_gb = parameter_count * optimizer_bytes / (1024**3)
 
     dataset_type = str(dataset.get("type", "video"))
-    if dataset_type == "image" or str(dataset.get("h3_target_mode", "av")) == "audio":
+    if dataset_type in {"image", "audio"} or str(dataset.get("h3_target_modalities", "av")) == "audio":
         activation_gb = 0.0
     else:
         width = max(_coerce_int(dataset.get("resolution_w", 768), 768), 64)
@@ -423,7 +415,7 @@ def _estimate_h3_training_step_time_sec(training: dict, dataset: dict, caching: 
     reference_rows = _h3_dataset_rows(
         {},
         {"h3_task": "t2va"},
-        {"type": "video", "h3_target_mode": "av", "resolution_w": 832, "resolution_h": 480, "target_frames": 124},
+        {"type": "video", "h3_target_modalities": "av", "resolution_w": 832, "resolution_h": 480, "target_frames": 124},
     )
     work_scale = packed_rows / reference_rows
     # 10.6 s is the fitted unswapped compute intercept. The fully checkpointed,

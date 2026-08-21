@@ -105,11 +105,30 @@ test('H3 reference-video conditioning increases the packed-sequence estimate', (
 	const base = estimateTraining(config());
 	const referenceConfig = config();
 	referenceConfig.caching = { model_type: 'minimax_h3', h3_task: 'ref2va' };
-	referenceConfig.dataset.datasets[0].reference_video_directory = '/references';
+	referenceConfig.dataset.datasets[0].source_video_directory = '/references';
 	referenceConfig.dataset.datasets[0].reference_frames = 124;
 	const reference = estimateTraining(referenceConfig);
 
 	assert.ok(partValue(reference, 'Activ.') > partValue(base, 'Activ.'));
+});
+
+test('H3 audio rows ignore the video target-mode default', () => {
+	const implicit = config();
+	implicit.dataset.datasets = [{ type: 'audio', target_frames: 124, h3_target_modalities: 'av' }];
+	const explicit = config();
+	explicit.dataset.datasets = [{ type: 'audio', target_frames: 124, h3_target_modalities: 'audio' }];
+
+	assert.equal(estimateTraining(implicit).total, estimateTraining(explicit).total);
+});
+
+test('H3 reference audio is counted for a video-only target', () => {
+	const baseConfig = config();
+	baseConfig.caching = { model_type: 'minimax_h3', h3_task: 'ref2va' };
+	baseConfig.dataset.datasets[0].h3_target_modalities = 'video';
+	const audioReference = structuredClone(baseConfig);
+	audioReference.dataset.datasets[0].source_audio_directory = '/reference-audio';
+
+	assert.ok(partValue(estimateTraining(audioReference), 'Activ.') > partValue(estimateTraining(baseConfig), 'Activ.'));
 });
 
 test('H3 long-sequence estimate stays near the measured 73.2 GiB workbox baseline', () => {

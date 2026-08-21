@@ -137,9 +137,8 @@ def test_h3_reference_conditioning_increases_estimated_packed_work():
     conditioned = _config(h3_base_preservation_loss_weight=0.0)
     conditioned["caching"] = {"h3_task": "ref2va"}
     conditioned["dataset"]["datasets"][0].update(
-        control_video_directory="references/video",
-        control_audio_directory="references/audio",
-        control_modality="av",
+        source_video_directory="references/video",
+        source_audio_directory="references/audio",
         reference_frames=124,
     )
 
@@ -161,7 +160,7 @@ def test_h3_video_reference_uses_configured_sizing_in_estimator():
     for config in (small, large):
         config["caching"] = {"h3_task": "ref2va"}
         config["dataset"]["datasets"][0].update(
-            control_video_directory="references/video",
+            source_video_directory="references/video",
             reference_frames=39,
         )
 
@@ -174,7 +173,7 @@ def test_h3_image_reference_uses_its_own_short_edge_in_estimator():
     large = _config(h3_base_preservation_loss_weight=0.0, reference_image_short_edge=2048)
     for config in (small, large):
         config["caching"] = {"h3_task": "ref2va"}
-        config["dataset"]["datasets"][0]["control_directory"] = "references/images"
+        config["dataset"]["datasets"][0]["source_image_directory"] = "references/images"
 
     assert _estimate_training_step_time_sec(large) > _estimate_training_step_time_sec(small)
     assert _calculate_vram_stats(large).activations_gb > _calculate_vram_stats(small).activations_gb

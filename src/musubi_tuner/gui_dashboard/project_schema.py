@@ -116,11 +116,14 @@ class DatasetEntry(BaseModel):
     source_fps: Optional[float] = None
     target_fps: Optional[float] = None
     # MiniMax H3 dataset controls. They are ignored by non-H3 builders.
-    h3_target_mode: Literal["av", "video", "audio"] = "av"
+    h3_target_modalities: Literal["av", "video", "audio"] = "av"
     h3_image_frame_count: Optional[int] = None
     multiple_target: bool = False
-    control_video_directory: str = ""
-    control_audio_directory: str = ""
+    source_image_directory: str = ""
+    source_video_directory: str = ""
+    source_audio_directory: str = ""
+    source_video_audio_embedded: bool = False
+    source_video_audio_paired: bool = False
     control_modality: Literal["", "av", "video", "audio"] = ""
     control_modalities: str = ""
     control_modality_probability_av: Optional[float] = None
@@ -1522,7 +1525,7 @@ class RLConfig(BaseModel):
 
 
 class ProjectConfig(BaseModel):
-    version: int = 3
+    version: int = 4
     name: str = "New Project"
     project_dir: str = ""
     model_dir: str = ""  # directory where downloaded models are stored
@@ -1547,6 +1550,52 @@ class ProjectConfig(BaseModel):
             data["inference"] = data.pop("sampling")
         if isinstance(data, dict):
             source_version = int(data.get("version") or 1)
+            if source_version < 4 and isinstance(data.get("dataset"), dict):
+                dataset_config = dict(data["dataset"])
+                for collection in ("datasets", "validation_datasets"):
+                    rows = dataset_config.get(collection)
+                    if not isinstance(rows, list):
+                        continue
+                    migrated_rows = []
+                    for raw_row in rows:
+                        if not isinstance(raw_row, dict):
+                            migrated_rows.append(raw_row)
+                            continue
+                        row = dict(raw_row)
+                        legacy_target_mode = row.pop("h3_target_mode", None)
+                        if legacy_target_mode and not row.get("h3_target_modalities"):
+                            row["h3_target_modalities"] = legacy_target_mode
+
+                        legacy_video = row.pop("control_video_directory", "")
+                        legacy_audio = row.pop("control_audio_directory", "")
+                        fixed_modality = str(row.get("control_modality") or "").lower()
+                        per_reference_modalities = bool(str(row.get("control_modalities") or "").strip())
+                        if (legacy_video or legacy_audio) and not per_reference_modalities:
+                            if legacy_video and legacy_audio:
+                                if fixed_modality == "video":
+                                    if not row.get("source_video_directory"):
+                                        row["source_video_directory"] = legacy_video
+                                elif fixed_modality == "audio":
+                                    if not row.get("source_audio_directory"):
+                                        row["source_audio_directory"] = legacy_audio
+                                else:
+                                    if not row.get("source_video_directory"):
+                                        row["source_video_directory"] = legacy_video
+                                    if not row.get("source_audio_directory"):
+                                        row["source_audio_directory"] = legacy_audio
+                                    row["source_video_audio_paired"] = True
+                            elif legacy_video:
+                                if not row.get("source_video_directory"):
+                                    row["source_video_directory"] = legacy_video
+                                if fixed_modality in {"av", "audio"}:
+                                    row["source_video_audio_embedded"] = True
+                            else:
+                                if not row.get("source_audio_directory"):
+                                    row["source_audio_directory"] = legacy_audio
+                            row["control_modality"] = ""
+                        migrated_rows.append(row)
+                    dataset_config[collection] = migrated_rows
+                data["dataset"] = dataset_config
             training = data.get("training")
             if training is None:
                 data["training"] = {
@@ -1639,7 +1688,7 @@ class ProjectConfig(BaseModel):
                     if has_old_generation_values and "sampling_preset" not in section:
                         section["sampling_preset"] = "legacy"
                 data[section_name] = section
-            data["version"] = max(source_version, 3)
+            data["version"] = max(source_version, 4)
         return data
 
     def save(self, path: Optional[Path] = None):

@@ -255,21 +255,54 @@ def _dataset_entry_to_dict(entry) -> dict:
 def _h3_dataset_entry_to_dict(entry) -> dict:
     """Serialize one dashboard row using MiniMax H3's dataset extensions."""
     d = _dataset_entry_to_dict(entry)
-    if entry.h3_target_mode != "av":
-        d["h3_target_mode"] = entry.h3_target_mode
+    legacy_source_keys = {
+        "control_directory",
+        "reference_directory",
+        "reference_directories",
+        "reference_audio_directory",
+        "reference_audio_directories",
+    }
+    found_legacy_sources = sorted(legacy_source_keys.intersection(d))
+    if found_legacy_sources:
+        raise ValueError(
+            "MiniMax H3 dashboard datasets require explicit source image/video/audio directories; remove "
+            + ", ".join(found_legacy_sources)
+        )
+    target_key = f"{entry.type}_directory"
+    target_path = d.pop(target_key, None)
+    if target_path:
+        d[f"target_{entry.type}_directory"] = target_path
+    if entry.type == "image":
+        d["target_modalities"] = ["image"]
+    elif entry.type == "audio":
+        d["target_modalities"] = ["audio"]
+        d["target_frames"] = [entry.target_frames]
+    else:
+        d["target_modalities"] = ["video", "audio"] if entry.h3_target_modalities == "av" else [entry.h3_target_modalities]
     if entry.h3_image_frame_count is not None:
         d["h3_image_frame_count"] = int(entry.h3_image_frame_count)
     if entry.multiple_target:
         d["multiple_target"] = True
-    if entry.control_video_directory:
-        d["control_video_directory"] = entry.control_video_directory
-    if entry.control_audio_directory:
-        d["control_audio_directory"] = entry.control_audio_directory
-    if entry.control_modality:
-        d["control_modality"] = entry.control_modality
+    source_modalities = []
+    for modality in ("image", "video", "audio"):
+        path = getattr(entry, f"source_{modality}_directory", "")
+        if path:
+            d[f"source_{modality}_directory"] = path
+            source_modalities.append(modality)
+    if source_modalities:
+        if entry.source_video_audio_embedded and "audio" not in source_modalities:
+            source_modalities.append("audio")
+        d["source_modalities"] = source_modalities
+    if entry.source_video_audio_embedded:
+        d["source_video_audio_embedded"] = True
+    if entry.source_video_audio_paired:
+        d["source_video_audio_paired"] = True
     control_modalities = _split_path_list(entry.control_modalities)
-    if control_modalities:
-        d["control_modalities"] = control_modalities
+    if entry.control_modality or control_modalities:
+        raise ValueError(
+            "MiniMax H3 fixed/per-reference control modality fields were removed; "
+            "use the explicit source directories and AV toggles"
+        )
     probabilities = (
         entry.control_modality_probability_av,
         entry.control_modality_probability_video,
@@ -278,7 +311,7 @@ def _h3_dataset_entry_to_dict(entry) -> dict:
     if any(value is not None for value in probabilities):
         if any(value is None for value in probabilities):
             raise ValueError("H3 control modality probabilities require AV, video, and audio values")
-        d["control_modality_probabilities"] = [float(value) for value in probabilities]
+        d["source_modality_probabilities"] = [float(value) for value in probabilities]
     if getattr(entry, "conditioning_mask_directory", ""):
         d["conditioning_mask_directory"] = entry.conditioning_mask_directory
     return d

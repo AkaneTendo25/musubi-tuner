@@ -193,7 +193,6 @@ def _validate_dataset_entry(
 ) -> None:
     field_base = f"dataset.{collection}[{index}]"
     label = ("Validation " if collection == "validation_datasets" else "") + _dataset_source_label(index)
-
     has_directory = _has_text(entry.directory)
     has_jsonl = _has_text(entry.jsonl_file)
 
@@ -248,46 +247,53 @@ def _validate_h3_dataset_entry(
     )
     field_base = f"dataset.{collection}[{index}]"
     label = ("Validation " if collection == "validation_datasets" else "") + _dataset_source_label(index)
-    modalities = [part.strip().lower() for part in entry.control_modalities.replace(",", ";").split(";") if part.strip()]
-    invalid_modalities = sorted(set(modalities) - {"av", "video", "audio"})
-    if invalid_modalities:
+    if (
+        entry.control_directory
+        or entry.extra_control_directories
+        or entry.reference_audio_directory
+        or entry.extra_reference_audio_directories
+    ):
         errors.append(
             _make_issue(
                 "error",
-                f"{field_base}.control_modalities",
-                f"{label}: unknown H3 reference modality: {', '.join(invalid_modalities)}.",
+                f"{field_base}.source",
+                f"{label}: H3 sources must use the explicit source image, video, and audio directory fields.",
                 label=label,
                 page="dataset",
             )
         )
-    if entry.control_modality and modalities:
+    modalities = [part.strip() for part in entry.control_modalities.replace(",", ";").split(";") if part.strip()]
+    if entry.control_modality or modalities:
         errors.append(
             _make_issue(
                 "error",
                 f"{field_base}.control_modalities",
-                f"{label}: choose one fixed reference modality or an ordered modality list, not both.",
+                f"{label}: H3 source modalities are defined by the explicit source directories and AV toggles.",
                 label=label,
                 page="dataset",
             )
         )
+    source_modalities = {modality for modality in ("image", "video", "audio") if getattr(entry, f"source_{modality}_directory", "")}
     probabilities = (
         entry.control_modality_probability_av,
         entry.control_modality_probability_video,
         entry.control_modality_probability_audio,
     )
+    numeric_probabilities = None
     if any(value is not None for value in probabilities):
         if any(value is None for value in probabilities):
             errors.append(
                 _make_issue(
                     "error",
                     f"{field_base}.control_modality_probability_av",
-                    f"{label}: AV, video, and audio reference probabilities must all be set.",
+                    f"{label}: AV, video, and audio source probabilities must all be set.",
                     label=label,
                     page="dataset",
                 )
             )
         else:
             numeric = tuple(float(value) for value in probabilities)
+            numeric_probabilities = numeric
             if any(not math.isfinite(value) or value < 0 for value in numeric) or not math.isclose(
                 sum(numeric), 1.0, rel_tol=0.0, abs_tol=1e-6
             ):
@@ -295,37 +301,62 @@ def _validate_h3_dataset_entry(
                     _make_issue(
                         "error",
                         f"{field_base}.control_modality_probability_av",
-                        f"{label}: H3 reference probabilities must be non-negative and sum to 1.",
+                        f"{label}: H3 source probabilities must be non-negative and sum to 1.",
                         label=label,
                         page="dataset",
                     )
                 )
-        if entry.control_modality or modalities:
+        if not source_modalities:
             errors.append(
                 _make_issue(
                     "error",
                     f"{field_base}.control_modality_probability_av",
-                    f"{label}: stochastic reference probabilities cannot be combined with a fixed modality policy.",
+                    f"{label}: source probabilities require at least one explicit source directory.",
                     label=label,
                     page="dataset",
                 )
             )
-    if entry.control_directory and (entry.control_video_directory or entry.control_audio_directory):
+    if numeric_probabilities is not None and source_modalities:
+        has_visual_source = bool(source_modalities.intersection({"image", "video"}))
+        has_audio_source = bool(source_modalities.intersection({"image", "audio"})) or entry.source_video_audio_embedded
+        if numeric_probabilities[1] > 0 and not has_visual_source:
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.control_modality_probability_video",
+                    f"{label}: a non-zero video-source probability requires an image or video source.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+        if numeric_probabilities[2] > 0 and not has_audio_source:
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.control_modality_probability_audio",
+                    f"{label}: a non-zero audio-source probability requires an image or declared audio-bearing source.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+    if entry.source_video_audio_paired and not {"video", "audio"}.issubset(source_modalities):
         errors.append(
             _make_issue(
                 "error",
-                f"{field_base}.control_directory",
-                f"{label}: use the legacy combined control directory or paired video/audio directories, not both.",
+                f"{field_base}.source_video_audio_paired",
+                f"{label}: paired source AV requires both source video and source audio directories.",
                 label=label,
                 page="dataset",
             )
         )
-    if bool(entry.control_video_directory) != bool(entry.control_audio_directory):
+    if entry.source_video_audio_embedded and (
+        "video" not in source_modalities or "audio" in source_modalities or entry.source_video_audio_paired
+    ):
         errors.append(
             _make_issue(
                 "error",
-                f"{field_base}.control_video_directory",
-                f"{label}: paired H3 reference video and audio directories must be specified together.",
+                f"{field_base}.source_video_audio_embedded",
+                f"{label}: embedded source audio requires only a source video directory and cannot be combined with paired AV.",
                 label=label,
                 page="dataset",
             )
@@ -340,28 +371,18 @@ def _validate_h3_dataset_entry(
                 page="dataset",
             )
         )
-    if entry.type == "video" and (entry.target_frames < 5 or (entry.target_frames - 5) % 17 != 0):
+    if entry.type in {"video", "audio"} and (entry.target_frames < 5 or (entry.target_frames - 5) % 17 != 0):
         errors.append(
             _make_issue(
                 "error",
                 f"{field_base}.target_frames",
-                f"{label}: H3 video target frames must satisfy frame_count % 17 == 5 (for example 124).",
-                label=label,
-                page="dataset",
-            )
-        )
-    if entry.type == "audio" and entry.h3_target_mode != "audio":
-        errors.append(
-            _make_issue(
-                "error",
-                f"{field_base}.h3_target_mode",
-                f"{label}: an audio dataset requires Audio only target modalities.",
+                f"{label}: H3 video/audio target frames must satisfy frame_count % 17 == 5 (for example 124).",
                 label=label,
                 page="dataset",
             )
         )
     if getattr(entry, "conditioning_mask_directory", ""):
-        if entry.type == "audio" or entry.h3_target_mode == "audio":
+        if entry.type == "audio" or entry.h3_target_modalities == "audio":
             errors.append(
                 _make_issue(
                     "error",
@@ -390,48 +411,15 @@ def _h3_required_vaes(config: ProjectConfig) -> tuple[bool, bool]:
     requires_audio = False
     rows = list(config.dataset.datasets or []) + list(config.dataset.validation_datasets or [])
     for entry in rows:
-        target_mode = "video" if entry.type == "image" else entry.h3_target_mode
+        target_mode = "video" if entry.type == "image" else "audio" if entry.type == "audio" else entry.h3_target_modalities
         requires_video |= target_mode != "audio"
         requires_audio |= entry.type in {"video", "audio"} and target_mode != "video"
 
-        # Paired directories always describe one video stream plus its explicit
-        # audio stream.  A combined reference directory can contain images,
-        # videos, or audio, so use its modality policy when one is provided and
-        # conservatively require both decoders when its contents are unknown.
-        if entry.control_video_directory or entry.control_audio_directory:
+        # Explicit source directories determine which reference encoders are needed.
+        if entry.source_image_directory or entry.source_video_directory:
             requires_video = True
+        if entry.source_audio_directory or entry.source_video_audio_embedded:
             requires_audio = True
-        has_combined_references = bool(entry.control_directory or entry.extra_control_directories)
-        if has_combined_references:
-            fixed_modes = [entry.control_modality] if entry.control_modality else []
-            fixed_modes.extend(
-                value.strip().lower() for value in re.split(r"[;,]", entry.control_modalities or "") if value.strip()
-            )
-            probabilities = (
-                entry.control_modality_probability_av,
-                entry.control_modality_probability_video,
-                entry.control_modality_probability_audio,
-            )
-            if fixed_modes:
-                requires_video |= any(mode in {"av", "video"} for mode in fixed_modes)
-                requires_audio |= any(mode in {"av", "audio"} for mode in fixed_modes)
-            elif any(value is not None for value in probabilities):
-                av_probability, video_probability, audio_probability = probabilities
-                requires_video |= bool((av_probability or 0) > 0 or (video_probability or 0) > 0)
-                requires_audio |= bool((av_probability or 0) > 0 or (audio_probability or 0) > 0)
-            else:
-                requires_video = True
-                requires_audio = True
-
-        # Uncached reference sources need their respective encoder. Cached
-        # references themselves do not create an additional VAE requirement.
-        requires_audio |= any(
-            _has_text(value)
-            for value in (
-                entry.reference_audio_directory,
-                entry.extra_reference_audio_directories,
-            )
-        )
     return requires_video, requires_audio
 
 
@@ -1162,7 +1150,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             uncovered = [
                 e
                 for e in mask_rows
-                if e.type != "audio" and e.h3_target_mode != "audio" and not getattr(e, "conditioning_mask_directory", "")
+                if e.type != "audio" and e.h3_target_modalities != "audio" and not getattr(e, "conditioning_mask_directory", "")
             ]
             if uncovered:
                 errors.append(
@@ -1583,7 +1571,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             )
         for index, entry in enumerate(config.dataset.datasets):
             _validate_h3_dataset_entry(entry, index, errors=errors, warnings=warnings)
-            target_mode = "video" if entry.type == "image" else "audio" if entry.type == "audio" else entry.h3_target_mode
+            target_mode = "video" if entry.type == "image" else "audio" if entry.type == "audio" else entry.h3_target_modalities
             has_active_loss = (target_mode in {"av", "video"} and t.h3_video_loss_weight > 0) or (
                 target_mode in {"av", "audio"} and t.h3_audio_loss_weight > 0
             )
@@ -1591,7 +1579,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 errors.append(
                     _make_issue(
                         "error",
-                        f"dataset.datasets.{index}.h3_target_mode",
+                        f"dataset.datasets.{index}.h3_target_modalities",
                         f"Dataset {index + 1} targets {target_mode}, but its configured H3 modality loss weight is zero.",
                         label=f"Dataset {index + 1} Target Mode",
                         page="dataset",

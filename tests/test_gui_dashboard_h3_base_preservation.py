@@ -16,6 +16,7 @@ from musubi_tuner.gui_dashboard.validation import (
     validate_inference_config,
     validate_training_config,
 )
+from musubi_tuner.minimax_h3.dataset import _normalize_explicit_modality_config
 from musubi_tuner.minimax_h3_cache_latents import create_parser as create_cache_latents_parser
 from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_text_parser
 from musubi_tuner.minimax_h3_generate_video import create_parser as create_inference_parser
@@ -224,7 +225,7 @@ def test_h3_modality_loss_weights_cover_observed_and_dataset_targets(tmp_path: P
     config.training.h3_video_loss_weight = 0.0
     config.dataset.datasets = [DatasetEntry(type="image", directory=str(tmp_path / "images"))]
     report = validate_training_config(config)
-    assert "dataset.datasets.0.h3_target_mode" in report["field_errors"]
+    assert "dataset.datasets.0.h3_target_modalities" in report["field_errors"]
 
 
 def test_h3_base_preservation_default_is_not_forwarded(tmp_path: Path) -> None:
@@ -436,37 +437,133 @@ def test_h3_audio_only_masking_round_trips_without_video_mask_mode(tmp_path: Pat
 
 def test_h3_paired_reference_directories_must_be_complete(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
-    config.dataset.datasets = [DatasetEntry(type="image", directory="train", control_video_directory="reference_video")]
+    config.dataset.datasets = [
+        DatasetEntry(
+            type="image",
+            directory="train",
+            source_video_directory="reference_video",
+            source_video_audio_paired=True,
+        )
+    ]
 
     report = validate_cache_latents_config(config)
 
-    assert "dataset.datasets[0].control_video_directory" in report["field_errors"]
+    assert "dataset.datasets[0].source_video_audio_paired" in report["field_errors"]
 
 
-def test_h3_dataset_frame_grid_and_audio_target_mode_are_validated(tmp_path: Path) -> None:
+def test_h3_dataset_frame_grid_is_validated_for_video_and_audio(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.dataset.datasets = [
         DatasetEntry(type="video", directory="video", target_frames=33),
-        DatasetEntry(type="audio", directory="audio", h3_target_mode="av"),
+        DatasetEntry(type="audio", directory="audio", target_frames=34),
     ]
 
     report = validate_cache_latents_config(config)
 
     assert "dataset.datasets[0].target_frames" in report["field_errors"]
-    assert "dataset.datasets[1].h3_target_mode" in report["field_errors"]
+    assert "dataset.datasets[1].target_frames" in report["field_errors"]
 
 
-def test_h3_combined_reference_modality_controls_required_vaes(tmp_path: Path) -> None:
+def test_h3_audio_dashboard_row_forces_audio_target_and_exports_timeline(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_video_vae = ""
+    config.dataset.datasets = [DatasetEntry(type="audio", directory="audio", target_frames=124)]
+
+    report = validate_cache_latents_config(config)
+    command = build_cache_latents_cmd(config)
+    document = tomllib.loads(Path(command[command.index("--dataset_config") + 1]).read_text(encoding="utf-8"))
+
+    assert "caching.h3_video_vae" not in report["field_errors"]
+    assert "dataset.datasets[0].h3_target_modalities" not in report["field_errors"]
+    assert document["datasets"][0]["target_modalities"] == ["audio"]
+    assert document["datasets"][0]["target_frames"] == [124]
+    _normalize_explicit_modality_config(document)
+
+
+def test_h3_explicit_source_directories_control_required_vaes(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.caching.h3_audio_vae = ""
-    config.dataset.datasets = [
-        DatasetEntry(type="image", directory="train", control_directory="references", control_modality="video")
-    ]
+    config.dataset.datasets = [DatasetEntry(type="image", directory="train", source_image_directory="references")]
 
     assert "caching.h3_audio_vae" not in validate_cache_latents_config(config)["field_errors"]
 
-    config.dataset.datasets[0].control_modality = "av"
+    config.dataset.datasets[0] = DatasetEntry(
+        type="image",
+        directory="train",
+        source_video_directory="references",
+        source_video_audio_embedded=True,
+    )
     assert "caching.h3_audio_vae" in validate_cache_latents_config(config)["field_errors"]
+
+
+def test_h3_paired_source_allows_an_additional_image_source(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [
+        DatasetEntry(
+            type="image",
+            directory="train",
+            source_image_directory="reference_images",
+            source_video_directory="reference_videos",
+            source_audio_directory="reference_audio",
+            source_video_audio_paired=True,
+        )
+    ]
+
+    report = validate_cache_latents_config(config)
+
+    assert "dataset.datasets[0].source_video_audio_paired" not in report["field_errors"]
+
+
+def test_h3_source_probability_validation_rejects_impossible_variants(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [
+        DatasetEntry(
+            type="image",
+            directory="train-audio",
+            source_audio_directory="reference_audio",
+            control_modality_probability_av=0.5,
+            control_modality_probability_video=0.25,
+            control_modality_probability_audio=0.25,
+        ),
+        DatasetEntry(
+            type="image",
+            directory="train-video",
+            source_video_directory="reference_video",
+            control_modality_probability_av=0.5,
+            control_modality_probability_video=0.25,
+            control_modality_probability_audio=0.25,
+        ),
+    ]
+
+    report = validate_cache_latents_config(config)
+
+    assert "dataset.datasets[0].control_modality_probability_video" in report["field_errors"]
+    assert "dataset.datasets[1].control_modality_probability_audio" in report["field_errors"]
+
+
+def test_dashboard_migrates_unambiguous_h3_project_dataset_fields() -> None:
+    config = ProjectConfig.model_validate(
+        {
+            "version": 3,
+            "dataset": {
+                "datasets": [
+                    {
+                        "type": "video",
+                        "h3_target_mode": "video",
+                        "control_video_directory": "reference_video",
+                        "control_audio_directory": "reference_audio",
+                    }
+                ]
+            },
+        }
+    )
+
+    entry = config.dataset.datasets[0]
+    assert config.version == 4
+    assert entry.h3_target_modalities == "video"
+    assert entry.source_video_directory == "reference_video"
+    assert entry.source_audio_directory == "reference_audio"
+    assert entry.source_video_audio_paired is True
 
 
 def test_h3_training_sample_text_visual_limit_round_trips(tmp_path: Path) -> None:
@@ -714,10 +811,16 @@ def test_h3_dashboard_rejects_multiple_attention_backends(tmp_path: Path) -> Non
 def test_h3_cache_toml_contains_training_and_validation_rows_under_datasets(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.dataset.datasets = [
-        DatasetEntry(type="image", directory="train", control_video_directory="train_refs", h3_target_mode="video")
+        DatasetEntry(type="image", directory="train", source_video_directory="train_refs", h3_target_modalities="video")
     ]
     config.dataset.validation_datasets = [
-        DatasetEntry(type="audio", directory="validation", h3_target_mode="audio", cache_directory="validation_cache")
+        DatasetEntry(
+            type="audio",
+            directory="validation",
+            target_frames=124,
+            h3_target_modalities="audio",
+            cache_directory="validation_cache",
+        )
     ]
 
     command = build_cache_latents_cmd(config)
@@ -726,8 +829,55 @@ def test_h3_cache_toml_contains_training_and_validation_rows_under_datasets(tmp_
 
     assert "validation_datasets" not in document
     assert len(document["datasets"]) == 2
-    assert document["datasets"][0]["control_video_directory"] == "train_refs"
-    assert document["datasets"][1]["h3_target_mode"] == "audio"
+    assert document["datasets"][0]["source_video_directory"] == "train_refs"
+    assert document["datasets"][1]["target_modalities"] == ["audio"]
+    assert document["datasets"][1]["target_frames"] == [124]
+    _normalize_explicit_modality_config(document)
+    legacy_keys = {
+        "video_directory",
+        "image_directory",
+        "audio_directory",
+        "control_directory",
+        "control_video_directory",
+        "control_audio_directory",
+        "control_modality",
+        "control_modalities",
+        "control_modality_probabilities",
+        "h3_target_mode",
+    }
+    assert not any(legacy_keys.intersection(dataset) for dataset in document["datasets"])
+
+
+def test_h3_dashboard_exports_source_modality_probabilities(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [
+        DatasetEntry(
+            type="video",
+            directory="train",
+            target_frames=124,
+            source_image_directory="references",
+            control_modality_probability_av=0.5,
+            control_modality_probability_video=0.25,
+            control_modality_probability_audio=0.25,
+        )
+    ]
+
+    command = build_cache_latents_cmd(config)
+    document = tomllib.loads(Path(command[command.index("--dataset_config") + 1]).read_text(encoding="utf-8"))
+    dataset = document["datasets"][0]
+
+    assert dataset["source_modality_probabilities"] == [0.5, 0.25, 0.25]
+    assert "control_modality_probabilities" not in dataset
+    _normalize_explicit_modality_config(document)
+
+
+def test_h3_dashboard_rejects_removed_fixed_control_modality_fields(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [DatasetEntry(type="video", directory="train", target_frames=124, control_modality="video")]
+
+    report = validate_cache_latents_config(config)
+
+    assert "dataset.datasets[0].control_modalities" in report["field_errors"]
 
 
 def test_h3_validation_uses_separate_dataset_toml_and_full_cli(tmp_path: Path) -> None:
@@ -750,9 +900,13 @@ def test_h3_validation_uses_separate_dataset_toml_and_full_cli(tmp_path: Path) -
     validation_doc = tomllib.loads(Path(parsed.validation_dataset_config).read_text(encoding="utf-8"))
 
     assert len(training_doc["datasets"]) == 1
-    assert training_doc["datasets"][0]["video_directory"] == "train"
+    assert training_doc["datasets"][0]["target_video_directory"] == "train"
+    assert training_doc["datasets"][0]["target_modalities"] == ["video", "audio"]
     assert len(validation_doc["datasets"]) == 1
-    assert validation_doc["datasets"][0]["video_directory"] == "validation"
+    assert validation_doc["datasets"][0]["target_video_directory"] == "validation"
+    assert validation_doc["datasets"][0]["target_modalities"] == ["video", "audio"]
+    _normalize_explicit_modality_config(training_doc)
+    _normalize_explicit_modality_config(validation_doc)
     assert parsed.validate_at_start is True
     assert parsed.validate_every_n_steps == 25
     assert parsed.validation_seed == 123
@@ -882,6 +1036,7 @@ def test_h3_layout_contract_prevents_clipped_errors_and_ltx_routes() -> None:
 
 def test_h3_dashboard_guidance_null_field_options_round_trip(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
+    config.dataset.datasets = [DatasetEntry(type="video", directory="train", target_frames=124)]
     config.caching.h3_cache_guidance_empty = True
     config.training.h3_guidance_distillation_scale = 4.0
     config.training.h3_guidance_null_source = "frozen"

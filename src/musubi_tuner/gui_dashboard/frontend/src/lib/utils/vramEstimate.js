@@ -44,7 +44,9 @@ function h3DatasetRows(cfg, dataset) {
 	const t = cfg?.training || {};
 	const c = cfg?.caching || {};
 	const ds = dataset || {};
-	const targetMode = String(ds.h3_target_mode || (ds.type === 'image' ? 'video' : 'av')).toLowerCase();
+	const targetMode = String(
+		ds.type === 'image' ? 'video' : ds.type === 'audio' ? 'audio' : (ds.h3_target_modalities || 'av')
+	).toLowerCase();
 	const frames = Math.max(Number(ds.type === 'image' ? (ds.h3_image_frame_count || 1) : (ds.target_frames || 124)), 1);
 	const { video: videoFrames, audio: audioFrames } = h3TemporalLatents(frames);
 	const height = Math.max(Number(ds.resolution_h || 480), 32);
@@ -62,8 +64,9 @@ function h3DatasetRows(cfg, dataset) {
 	else if (task.startsWith('ref2va')) {
 		const referenceFrames = Math.max(Number(ds.reference_frames || frames), 1);
 		const refLatents = h3TemporalLatents(referenceFrames);
-		rows += rowsPerVideoFrame * refLatents.video;
-		if (targetMode !== 'video' && (ds.control_audio_directory || ds.control_video_directory)) {
+		if (ds.source_image_directory) rows += rowsPerVideoFrame;
+		if (ds.source_video_directory) rows += rowsPerVideoFrame * refLatents.video;
+		if (ds.source_audio_directory || ds.source_video_audio_embedded) {
 			rows += 2 * refLatents.audio;
 		}
 	}
