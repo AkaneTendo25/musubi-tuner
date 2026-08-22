@@ -66,6 +66,8 @@ from musubi_tuner.minimax_h3.component_loader import (
     load_video_vae_encoder,
 )
 from musubi_tuner.minimax_h3.inference import (
+    CANVAS_MULTIPLE,
+    VIDEO_SPATIAL_COMPRESSION,
     decode_latents_sequentially,
     denoise_fl2va,
     denoise_ref2va,
@@ -105,6 +107,11 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils.model_utils import dtype_to_str, str_to_dtype
 
 logger = logging.getLogger(__name__)
+
+
+def _round_to(value: float, multiple: int) -> int:
+    """Nearest size that is a whole number of ``multiple``, never below one unit."""
+    return max(multiple, int(round(value / multiple)) * multiple)
 
 
 def _validate_inference_lora_metadata(
@@ -279,6 +286,12 @@ def create_generator(
     use_pinned_memory_for_block_swap: bool = False,
     lora_weights: tuple[Path, ...] = (),
     lora_multipliers: tuple[float, ...] = (),
+    first_pass_scale: float = 0.0,
+    first_pass_steps: int = 0,
+    second_pass_strength: float = 0.5,
+    first_pass_lora: bool = False,
+    latent_upscaler: Path | None = None,
+    latent_upscale_scale: float = 1.0,
     compile_model: bool = False,
     compile_backend: str = "inductor",
     compile_mode: str = "max-autotune-no-cudagraphs",
@@ -322,6 +335,12 @@ def create_generator(
         use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
         lora_weights=lora_weights,
         lora_multipliers=lora_multipliers,
+        first_pass_scale=first_pass_scale,
+        first_pass_steps=first_pass_steps,
+        second_pass_strength=second_pass_strength,
+        first_pass_lora=first_pass_lora,
+        latent_upscaler=latent_upscaler,
+        latent_upscale_scale=latent_upscale_scale,
         compile_model=compile_model,
         compile_backend=compile_backend,
         compile_mode=compile_mode,
@@ -384,6 +403,12 @@ class _NativeGenerator:
         reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
         reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
         text_visual_max_pixels: int = 0,
+        first_pass_scale: float = 0.0,
+        first_pass_steps: int = 0,
+        second_pass_strength: float = 0.5,
+        first_pass_lora: bool = False,
+        latent_upscaler: Path | None = None,
+        latent_upscale_scale: float = 1.0,
     ) -> None:
         self.model = Path(model)
         self.text_encoder = Path(text_encoder)
@@ -392,6 +417,15 @@ class _NativeGenerator:
         self.audio_vae = Path(audio_vae) if audio_vae is not None else None
         self.device = device
         self.num_inference_steps = num_inference_steps
+        # A second pass costs a whole canvas of denoising, so it stays off unless
+        # a scale is given. Speed adapters are the reason it exists: the first
+        # pass settles motion without one, the second sharpens with one.
+        self.first_pass_scale = first_pass_scale
+        self.first_pass_steps = first_pass_steps
+        self.second_pass_strength = second_pass_strength
+        self.first_pass_lora = first_pass_lora
+        self.latent_upscaler = Path(latent_upscaler) if latent_upscaler else None
+        self.latent_upscale_scale = latent_upscale_scale
         if (height is None) != (width is None):
             raise ValueError("MiniMax H3 height and width must be provided together")
         self.height = height
@@ -584,6 +618,9 @@ class _NativeGenerator:
                 self.text_visual_max_pixels,
             )
             weights = load_file(weights_path)
+            if lora_minimax_h3.is_foreign_lora(weights):
+                # Community speed adapters ship ComfyUI/PEFT key names.
+                weights = lora_minimax_h3.convert_foreign_lora(weights)
             network = lora_minimax_h3.create_arch_network_from_weights(
                 multiplier,
                 weights,
@@ -613,6 +650,97 @@ class _NativeGenerator:
             )
         return transformer, networks
 
+    @staticmethod
+    def _set_lora_multiplier(networks, multiplier: float | None) -> None:
+        """Scale every adapter module, or restore each module's own multiplier."""
+        for network in networks:
+            for module in getattr(network, "unet_loras", ()):
+                if not hasattr(module, "_h3_base_multiplier"):
+                    module._h3_base_multiplier = module.multiplier
+                module.multiplier = module._h3_base_multiplier if multiplier is None else multiplier
+
+    def _upscale_video_latents(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Resample video latents to the second-pass canvas.
+
+        Spatial only: the frame count and the audio track are the same in both
+        passes, and it is the canvas that changes.
+        """
+        frames = latents.shape[2]
+        flat = latents.transpose(1, 2).flatten(0, 1)
+        target = (height // VIDEO_SPATIAL_COMPRESSION, width // VIDEO_SPATIAL_COMPRESSION)
+        flat = torch.nn.functional.interpolate(flat, size=target, mode="bicubic", align_corners=False)
+        return flat.unflatten(0, (latents.shape[0], frames)).transpose(1, 2).contiguous()
+
+    def _denoise_two_pass(self, denoise, networks, height: int, width: int, metrics: dict, first_pass_kwargs: dict) -> tuple:
+        """Settle motion on a small canvas, then refine on the full one.
+
+        A speed adapter trades motion for steps, so it is kept out of the pass
+        that decides the motion and applied to the pass that only sharpens what
+        is already decided.
+        """
+        # The canvas multiple, not the latent cell: a canvas the model refuses is
+        # the one error this path cannot recover from mid-run.
+        small_height = _round_to(height * self.first_pass_scale, CANVAS_MULTIPLE)
+        small_width = _round_to(width * self.first_pass_scale, CANVAS_MULTIPLE)
+        first_steps = self.first_pass_steps or self.num_inference_steps
+        if not self.first_pass_lora:
+            self._set_lora_multiplier(networks, 0.0)
+        try:
+            video, audio = self._measure(
+                "first_pass",
+                lambda: denoise(
+                    height=small_height,
+                    width=small_width,
+                    num_inference_steps=first_steps,
+                    **first_pass_kwargs,
+                ),
+                metrics,
+            )
+        finally:
+            self._set_lora_multiplier(networks, None)
+        video = self._upscale_video_latents(video, height, width)
+        return self._measure(
+            "second_pass",
+            lambda: denoise(
+                height=height,
+                width=width,
+                num_inference_steps=self.num_inference_steps,
+                init_video=video,
+                init_audio=audio,
+                denoise_strength=self.second_pass_strength,
+            ),
+            metrics,
+        )
+
+    def _upscale_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Enlarge the finished video latent with the trained upscaler.
+
+        H3 is trained at one megapixel and adds no detail above it on its own,
+        which is why the released pipeline reaches 1440p through a second model
+        that was never published. Enlarging in latent space rather than out in
+        pixels is what keeps speech and lip movement intact.
+        """
+        from musubi_tuner.minimax_h3.component_loader import load_video_vae_encoder
+        from musubi_tuner.minimax_h3.latent_upscaler import load_latent_upscaler
+
+        # The statistics come from this run's VAE rather than a copy kept beside
+        # the upscaler, so a checkpoint with different ones cannot disagree.
+        statistics = load_video_vae_encoder(self.video_vae, "cpu")
+        upscaler = load_latent_upscaler(
+            self.latent_upscaler,
+            self.device,
+            torch.bfloat16,
+            latents_mean=statistics.latents_mean,
+            latents_std=statistics.latents_std,
+        )
+        del statistics
+        try:
+            enlarged = upscaler(latents.to(self.device, torch.bfloat16), scale=self.latent_upscale_scale)
+        finally:
+            del upscaler
+            clean_memory_on_device(self.device)
+        return enlarged.float()
+
     @torch.no_grad()
     def generate(self, request: H3GenerationRequest) -> None:
         metrics: dict[str, dict] = {}
@@ -621,6 +749,15 @@ class _NativeGenerator:
             (self.height, self.width) if self.height is not None else resolve_canvas_size(request.ratio, request.canvas_reference())
         )
         shape = request.temporal_shape
+        # Keyframes and references are encoded against a canvas, so a first pass
+        # on a smaller one needs its own copies: rows encoded for the full canvas
+        # do not fit the smaller layout.
+        first_pass_size = (
+            (_round_to(height * self.first_pass_scale, CANVAS_MULTIPLE), _round_to(width * self.first_pass_scale, CANVAS_MULTIPLE))
+            if self.first_pass_scale
+            else None
+        )
+        first_pass_kwargs: dict = {}
         references = None
         prepared_references = ()
         if request.mode == "reference":
@@ -640,6 +777,14 @@ class _NativeGenerator:
                 ),
                 metrics,
             )
+            if first_pass_size is not None:
+                small = self._prepare_references(request, *first_pass_size)
+                first_pass_kwargs["references"] = self._measure(
+                    "first_pass_reference_encoding",
+                    lambda: encode_reference_media(self.video_vae, self.audio_vae, small, self.device),
+                    metrics,
+                )
+                del small
             images, anchors, keyframe_rows = [], (), None
             reference_kinds = [reference.kind.name.lower() for reference in prepared_references]
             prepared_references = ()
@@ -660,49 +805,69 @@ class _NativeGenerator:
                 if images
                 else None
             )
+            if first_pass_size is not None and images:
+                small_images, small_anchors = self._prepare_keyframes(request, *first_pass_size)
+                first_pass_kwargs["keyframe_rows"] = self._measure(
+                    "first_pass_keyframe_encoding",
+                    lambda: torch.cat(encode_keyframe_images(self.video_vae, small_images, self.device)),
+                    metrics,
+                )
+                first_pass_kwargs["keyframe_anchors"] = small_anchors
+                del small_images
             reference_kinds = []
         loaded_transformer = self._measure("transformer_load", self._load_transformer, metrics)
         transformer, networks = loaded_transformer
         del loaded_transformer
         generator = torch.Generator(device=self.device).manual_seed(request.seed)
+        base_kwargs = dict(
+            height=height,
+            width=width,
+            frame_count=shape.frame_count,
+            num_inference_steps=self.num_inference_steps,
+            generator=generator,
+            device=self.device,
+            condition_seed=request.seed,
+        )
         if references is not None:
-            denoise = lambda: denoise_ref2va(
-                transformer,
-                conditioning,
-                references,
-                height=height,
-                width=width,
-                frame_count=shape.frame_count,
-                num_inference_steps=self.num_inference_steps,
-                generator=generator,
-                device=self.device,
-                condition_seed=request.seed,
+            base_kwargs["references"] = references
+
+            # Overrides let a pass reuse this call with another canvas, another
+            # step count, its own conditioning, and the latents of the pass before.
+            def denoise(**overrides):
+                merged = {**base_kwargs, **overrides}
+                return denoise_ref2va(transformer, conditioning, merged.pop("references"), **merged)
+
+        else:
+            base_kwargs.update(keyframe_rows=keyframe_rows, keyframe_anchors=anchors)
+
+            def denoise(**overrides):
+                return denoise_fl2va(transformer, conditioning, **{**base_kwargs, **overrides})
+
+        if self.first_pass_scale:
+            video_latents, audio_latents = self._measure(
+                "two_pass_denoising",
+                # Bound by value: the name is deleted further down, and a lambda
+                # holding it by reference would depend on call order to survive.
+                lambda nets=networks: self._denoise_two_pass(denoise, nets, height, width, metrics, first_pass_kwargs),
+                metrics,
             )
         else:
-            denoise = lambda: denoise_fl2va(
-                transformer,
-                conditioning,
-                height=height,
-                width=width,
-                frame_count=shape.frame_count,
-                num_inference_steps=self.num_inference_steps,
-                generator=generator,
-                device=self.device,
-                keyframe_rows=keyframe_rows,
-                keyframe_anchors=anchors,
-                condition_seed=request.seed,
+            video_latents, audio_latents = self._measure(
+                "joint_denoising",
+                denoise,
+                metrics,
             )
-        video_latents, audio_latents = self._measure(
-            "joint_denoising",
-            denoise,
-            metrics,
-        )
         video_latents = video_latents.cpu()
         audio_latents = audio_latents.cpu()
         del networks
         transformer = None
         gc.collect()
         clean_memory_on_device(self.device)
+
+        # After the transformer is gone, not before: it holds tens of gigabytes,
+        # and enlarging the latent allocates several more for its activations.
+        if self.latent_upscaler is not None and self.latent_upscale_scale > 1.0:
+            video_latents = self._measure("latent_upscale", lambda: self._upscale_latents(video_latents), metrics).cpu()
 
         if request.output.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
             video_decoder = self._measure("decoder_load", lambda: load_video_vae_decoder(self.video_vae, "cpu"), metrics)

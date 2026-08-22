@@ -473,6 +473,16 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
     multipliers = _split_cli_args(str(s.lora_multiplier)) if s.lora_weight else []
     for multiplier in multipliers:
         cmd += ["--lora_multiplier", multiplier]
+    if s.h3_latent_upscaler and s.h3_latent_upscale_scale > 1.0:
+        cmd += ["--latent_upscaler", s.h3_latent_upscaler]
+        cmd += ["--latent_upscale_scale", str(s.h3_latent_upscale_scale)]
+    if s.h3_first_pass_scale:
+        cmd += ["--first_pass_scale", str(s.h3_first_pass_scale)]
+        if s.h3_first_pass_steps:
+            cmd += ["--first_pass_steps", str(s.h3_first_pass_steps)]
+        cmd += ["--second_pass_strength", str(s.h3_second_pass_strength)]
+        if s.h3_first_pass_lora:
+            cmd.append("--first_pass_lora")
     if s.device:
         cmd += ["--device", s.device]
     if s.seed is not None:

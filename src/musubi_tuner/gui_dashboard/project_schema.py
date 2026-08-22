@@ -1232,6 +1232,12 @@ class InferenceConfig(BaseModel):
     gemma_safetensors: str = ""
     lora_weight: str = ""
     lora_multiplier: float = 1.0
+    h3_latent_upscaler: str = ""
+    h3_latent_upscale_scale: float = 1.0
+    h3_first_pass_scale: float = 0.0
+    h3_first_pass_steps: int = 0
+    h3_second_pass_strength: float = 0.5
+    h3_first_pass_lora: bool = False
     include_patterns: str = ""
     exclude_patterns: str = ""
     prompt: str = ""

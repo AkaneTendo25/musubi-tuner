@@ -140,6 +140,28 @@ def shifted_flow_schedule(num_inference_steps: int, shift: float, device: torch.
     return sigmas, 1.0 - sigmas[:-1]
 
 
+def start_index_for_strength(sigmas: torch.Tensor, strength: float) -> int:
+    """Schedule position a refinement of the given strength starts from.
+
+    ``strength`` is the share of the schedule left to walk, the usual meaning
+    for image-to-image work: one repeats the whole schedule, one half runs the
+    later half. It is deliberately not read as a noise level, because H3 shifts
+    its sigma curve by twelve: sigma sits near one for most of the schedule and
+    falls only at the end, so a sigma of one half would leave a single step out
+    of nineteen.
+    """
+    if not 0.0 < strength <= 1.0:
+        raise ValueError("denoise strength must lie in (0, 1]")
+    steps = int(sigmas.numel()) - 1
+    remaining = max(1, int(round(steps * strength)))
+    return steps - remaining
+
+
+def noise_to_sigma(sample: torch.Tensor, noise: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    """Place a clean latent back on the flow path at noise level ``sigma``."""
+    return (1.0 - sigma) * sample + sigma * noise
+
+
 def data_ward_euler_step(
     sample: torch.Tensor,
     prediction: torch.Tensor,
@@ -351,8 +373,17 @@ def denoise_fl2va(
     keyframe_anchors: tuple[str, ...] = (),
     condition_seed: int = 0,
     show_progress: bool = True,
+    init_video: torch.Tensor | None = None,
+    init_audio: torch.Tensor | None = None,
+    denoise_strength: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate FL2VA joint latents with optional first/last keyframe conditioning."""
+    """Generate FL2VA joint latents with optional first/last keyframe conditioning.
+
+    Given ``init_video`` and ``init_audio``, the run refines those latents instead
+    of starting from noise: they are re-noised to ``denoise_strength`` and only
+    the remaining part of the schedule is walked. This is what a second pass at a
+    larger canvas needs.
+    """
     _validate_geometry(height, width, frame_count)
     shape = temporal_shape(frame_count)
     config = transformer.config
@@ -405,6 +436,20 @@ def denoise_fl2va(
     audio_sigmas, audio_timesteps = shifted_flow_schedule(num_inference_steps, AUDIO_FLOW_SHIFT, device)
     if video_timesteps.shape != audio_timesteps.shape:
         raise RuntimeError("MiniMax H3 video and audio schedules produced different step counts")
+
+    if (init_video is None) != (init_audio is None):
+        raise ValueError("MiniMax H3 refinement needs both video and audio latents")
+    if init_video is not None:
+        start = start_index_for_strength(video_sigmas, denoise_strength)
+        if init_video.shape != video.shape or init_audio.shape != audio.shape:
+            raise ValueError(
+                f"MiniMax H3 refinement latents have shapes {tuple(init_video.shape)}/{tuple(init_audio.shape)}, "
+                f"expected {tuple(video.shape)}/{tuple(audio.shape)}"
+            )
+        video = noise_to_sigma(init_video.to(device=device, dtype=video.dtype), video, video_sigmas[start])
+        audio = noise_to_sigma(init_audio.to(device=device, dtype=audio.dtype), audio, audio_sigmas[start])
+        video_sigmas, video_timesteps = video_sigmas[start:], video_timesteps[start:]
+        audio_sigmas, audio_timesteps = audio_sigmas[start:], audio_timesteps[start:]
 
     iterator = zip(video_timesteps, audio_timesteps)
     if show_progress:
@@ -480,8 +525,17 @@ def denoise_ref2va(
     device: torch.device,
     condition_seed: int = 0,
     show_progress: bool = True,
+    init_video: torch.Tensor | None = None,
+    init_audio: torch.Tensor | None = None,
+    denoise_strength: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate joint AV latents with ordered Ref2VA image, video, and audio context."""
+    """Generate joint AV latents with ordered Ref2VA image, video, and audio context.
+
+    Given ``init_video`` and ``init_audio``, the run refines those latents instead
+    of starting from noise: they are re-noised to ``denoise_strength`` and only
+    the remaining part of the schedule is walked. This is what a second pass at a
+    larger canvas needs.
+    """
     _validate_geometry(height, width, frame_count)
     if not references.geometries:
         raise ValueError("MiniMax H3 Ref2VA denoising requires at least one reference")
@@ -547,6 +601,20 @@ def denoise_ref2va(
     audio_sigmas, audio_timesteps = shifted_flow_schedule(num_inference_steps, AUDIO_FLOW_SHIFT, device)
     if video_timesteps.shape != audio_timesteps.shape:
         raise RuntimeError("MiniMax H3 video and audio schedules produced different step counts")
+
+    if (init_video is None) != (init_audio is None):
+        raise ValueError("MiniMax H3 refinement needs both video and audio latents")
+    if init_video is not None:
+        start = start_index_for_strength(video_sigmas, denoise_strength)
+        if init_video.shape != video.shape or init_audio.shape != audio.shape:
+            raise ValueError(
+                f"MiniMax H3 refinement latents have shapes {tuple(init_video.shape)}/{tuple(init_audio.shape)}, "
+                f"expected {tuple(video.shape)}/{tuple(audio.shape)}"
+            )
+        video = noise_to_sigma(init_video.to(device=device, dtype=video.dtype), video, video_sigmas[start])
+        audio = noise_to_sigma(init_audio.to(device=device, dtype=audio.dtype), audio, audio_sigmas[start])
+        video_sigmas, video_timesteps = video_sigmas[start:], video_timesteps[start:]
+        audio_sigmas, audio_timesteps = audio_sigmas[start:], audio_timesteps[start:]
 
     iterator = zip(video_timesteps, audio_timesteps)
     if show_progress:

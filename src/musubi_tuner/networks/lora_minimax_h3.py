@@ -102,6 +102,109 @@ def create_arch_network(
     )
 
 
+#: Prefixes community adapters put in front of the module path. Files exported
+#: for ComfyUI carry one; files saved straight from training carry none.
+_FOREIGN_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.")
+
+#: Matrix names in the wild mapped to the names this network reads. PEFT writes
+#: ``lora_A``/``lora_B``; some ComfyUI exports already use ``lora_down``/``lora_up``.
+_FOREIGN_SUFFIXES = {
+    "lora_A.weight": "lora_down.weight",
+    "lora_B.weight": "lora_up.weight",
+    "lora_down.weight": "lora_down.weight",
+    "lora_up.weight": "lora_up.weight",
+    "alpha": "alpha",
+}
+
+#: Module paths this network never adapts, mapped to why an adapter carrying
+#: them cannot simply be renamed.
+_UNADAPTED = (
+    ("adaln_proj", "AdaLN projections"),
+    ("modulation", "modulation projections"),
+    ("final_layer", "the final layer"),
+)
+
+
+def _strip_prefix(key: str) -> str | None:
+    """Module path without the export prefix, or ``None`` if the key is ours."""
+    if key.startswith("lora_unet_"):
+        return None
+    for prefix in _FOREIGN_PREFIXES:
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+    return key
+
+
+def _split_key(key: str) -> tuple[str, str] | None:
+    """Module path and matrix name, or ``None`` when the key is not an adapter key."""
+    path = _strip_prefix(key)
+    if path is None:
+        return None
+    for suffix, mapped in _FOREIGN_SUFFIXES.items():
+        if path.endswith("." + suffix):
+            return path[: -len(suffix) - 1], mapped
+    return None
+
+
+def is_foreign_lora(weights_sd: dict[str, torch.Tensor]) -> bool:
+    """True when the file uses community adapter naming instead of ours.
+
+    Our own files name every module ``lora_unet_<path>``; community files keep
+    the dotted module path, with or without an export prefix.
+    """
+    if any(key.startswith("lora_unet_") for key in weights_sd):
+        return False
+    return any(_split_key(key) is not None for key in weights_sd)
+
+
+def convert_foreign_lora(weights_sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rename a community H3 adapter to the keys this network expects.
+
+    Speed adapters are published in several shapes: with or without an export
+    prefix, with ``lora_A``/``lora_B`` or ``lora_down``/``lora_up``, and with or
+    without ``alpha``. The tensors are the same either way, so this renames the
+    keys and supplies ``alpha`` per module when the file omits it.
+
+    ``alpha`` matters because this network scales an adapter by ``alpha / rank``
+    while a file without ``alpha`` is meant to apply as ``W + B @ A``. Setting
+    ``alpha`` to that module's own rank leaves the scale at one and reproduces
+    the published behaviour. It is set per module rather than once, because some
+    adapters carry a different rank in every module.
+
+    Adapters reaching modules this network does not adapt are rejected instead
+    of being trimmed: dropping part of an adapter changes what it does, and for
+    distilled speed adapters the dropped part is what does the distilling.
+    """
+    hit = {label for marker, label in _UNADAPTED if any(marker in key for key in weights_sd)}
+    if hit:
+        raise ValueError(
+            "H3 adapter reaches modules this network does not adapt: "
+            + ", ".join(sorted(hit))
+            + ". Renaming it would silently drop those modules and change what the adapter does; "
+            "use a build converted for this checkpoint instead"
+        )
+
+    converted: dict[str, torch.Tensor] = {}
+    ranks: dict[str, int] = {}
+    given_alpha: set[str] = set()
+    for key, value in weights_sd.items():
+        split = _split_key(key)
+        if split is None:
+            raise ValueError(f"unrecognized key in an H3 adapter: {key}")
+        path, matrix = split
+        name = "lora_unet_" + path.replace(".", "_")
+        converted[f"{name}.{matrix}"] = value
+        if matrix == "lora_down.weight":
+            ranks[name] = value.shape[0]
+        elif matrix == "alpha":
+            given_alpha.add(name)
+
+    missing = sorted(set(ranks) - given_alpha)
+    for name in missing:
+        converted[f"{name}.alpha"] = torch.tensor(float(ranks[name]))
+    return converted
+
+
 def create_arch_network_from_weights(
     multiplier: float,
     weights_sd: dict[str, torch.Tensor],

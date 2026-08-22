@@ -114,6 +114,52 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_pinned_memory_for_block_swap", action="store_true")
     parser.add_argument("--lora_weight", type=Path, action="append", default=[])
     parser.add_argument("--lora_multiplier", type=float, action="append", default=[])
+    parser.add_argument(
+        "--first_pass_scale",
+        type=float,
+        default=0.0,
+        help=(
+            "run a first pass at this fraction of the canvas, then refine at full size. Off by default. "
+            "Speed adapters trade motion for steps, so the first pass runs without them and settles the "
+            "motion, and the adapter is applied to the refinement that only sharpens"
+        ),
+    )
+    parser.add_argument(
+        "--first_pass_steps",
+        type=int,
+        default=0,
+        help="steps for the first pass; defaults to --steps",
+    )
+    parser.add_argument(
+        "--second_pass_strength",
+        type=float,
+        default=0.5,
+        help=(
+            "share of the schedule the refinement walks, the usual image-to-image meaning: 1.0 repeats the "
+            "whole schedule, 0.5 runs its later half"
+        ),
+    )
+    parser.add_argument(
+        "--latent_upscaler",
+        type=Path,
+        default=None,
+        help=(
+            "trained latent upscaler weights. H3 is trained at one megapixel and adds no detail above it, "
+            "so a larger canvas needs a second model; doing it in latent space keeps speech and lip "
+            "movement intact, which a round trip out to pixels does not"
+        ),
+    )
+    parser.add_argument(
+        "--latent_upscale_scale",
+        type=float,
+        default=1.0,
+        help="how much to enlarge the finished latent with --latent_upscaler; 1.0 leaves it alone",
+    )
+    parser.add_argument(
+        "--first_pass_lora",
+        action="store_true",
+        help="also apply the adapters to the first pass, which the two-pass split exists to avoid",
+    )
     parser.add_argument("--compile", action="store_true", help="regionally compile H3 transformer blocks")
     parser.add_argument("--compile_backend", default="inductor")
     parser.add_argument(
@@ -226,6 +272,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             use_pinned_memory_for_block_swap=args.use_pinned_memory_for_block_swap,
             lora_weights=tuple(args.lora_weight),
             lora_multipliers=tuple(args.lora_multiplier),
+            first_pass_scale=args.first_pass_scale,
+            first_pass_steps=args.first_pass_steps,
+            second_pass_strength=args.second_pass_strength,
+            first_pass_lora=args.first_pass_lora,
+            latent_upscaler=args.latent_upscaler,
+            latent_upscale_scale=args.latent_upscale_scale,
             compile_model=args.compile,
             compile_backend=args.compile_backend,
             compile_mode=args.compile_mode,
