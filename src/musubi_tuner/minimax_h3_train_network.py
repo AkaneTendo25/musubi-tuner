@@ -35,7 +35,12 @@ from musubi_tuner.minimax_h3.architecture import (
     temporal_shape,
 )
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
-from musubi_tuner.minimax_h3.backend import H3TrainingBackend, create_conditioning_encoder, create_training_backend
+from musubi_tuner.minimax_h3.backend import (
+    H3PairedConditioningUnsupportedError,
+    H3TrainingBackend,
+    create_conditioning_encoder,
+    create_training_backend,
+)
 from musubi_tuner.minimax_h3.block_sparse_attention import DEFAULT_BLOCK
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
@@ -1083,6 +1088,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
         if args.h3_guidance_null_source != "live" and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_null_source requires --h3_guidance_distillation_scale")
+        if args.h3_fuse_frozen_teachers and (
+            args.h3_guidance_distillation_scale is None
+            or args.h3_guidance_null_source != "frozen"
+            or args.h3_base_preservation_loss_weight <= 0
+        ):
+            raise ValueError(
+                "--h3_fuse_frozen_teachers requires guidance distillation, "
+                "--h3_guidance_null_source frozen, and --h3_base_preservation_loss_weight > 0"
+            )
         if args.h3_guidance_cfg_zero and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_cfg_zero requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_guidance_distillation_probability) or not 0 < args.h3_guidance_distillation_probability <= 1:
@@ -2134,7 +2148,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         batch,
         inputs,
         *,
-        conditioning: str,
+        conditioning: str | tuple[str, ...],
     ) -> H3ModelPrediction:
         # Checkpointing is not a per-call argument here: the model reads its own
         # ``gradient_checkpointing`` flag (set once from ``--gradient_checkpointing``)
@@ -2202,6 +2216,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if not isinstance(prediction, H3ModelPrediction):
             raise TypeError("H3 backend predict_training() must return H3ModelPrediction")
         return prediction
+
+    @staticmethod
+    def _split_paired_prediction(prediction: H3ModelPrediction) -> tuple[H3ModelPrediction, H3ModelPrediction]:
+        present = [value for value in (prediction.video, prediction.audio) if value is not None]
+        if not present or any(value.shape[0] != 2 for value in present):
+            raise TypeError("H3 paired teacher prediction must contain a batch of two for every present modality")
+        return tuple(
+            H3ModelPrediction(
+                None if prediction.video is None else prediction.video[index : index + 1],
+                None if prediction.audio is None else prediction.audio[index : index + 1],
+            )
+            for index in range(2)
+        )
 
     def get_primary_latents(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         if "latents" in batch:
@@ -2570,7 +2597,49 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # the graph-carrying student forward.
             transformer.switch_block_swap_for_inference()
         try:
-            if use_guidance:
+            fused_teachers = bool(
+                args.h3_fuse_frozen_teachers
+                and use_guidance
+                and preservation_active
+                and args.h3_guidance_null_source == "frozen"
+                and getattr(self.backend, "supports_paired_conditioning", False)
+            )
+            fused_teachers_completed = False
+            if fused_teachers:
+                missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+                if missing_empty:
+                    raise KeyError(
+                        "guidance-consistent H3 training requires --cache_guidance_empty; missing " + ", ".join(missing_empty)
+                    )
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_fuse_frozen_teachers")
+                int8_context = getattr(transformer, "int8_attention_context", None)
+                with (
+                    torch.random.fork_rng(devices=fork_devices),
+                    torch.no_grad(),
+                    int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                ):
+                    set_enabled(False)
+                    try:
+                        try:
+                            paired_prediction = self._predict(
+                                accelerator,
+                                transformer,
+                                batch,
+                                inputs,
+                                conditioning=("empty", conditioning),
+                            )
+                        except H3PairedConditioningUnsupportedError as error:
+                            if not getattr(self, "_paired_teacher_fallback_warned", False):
+                                logger.warning("%s", error)
+                                self._paired_teacher_fallback_warned = True
+                        else:
+                            empty_prediction, reference_prediction = self._split_paired_prediction(paired_prediction)
+                            fused_teachers_completed = True
+                    finally:
+                        set_enabled(True)
+
+            if use_guidance and not fused_teachers_completed:
                 missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
                 if missing_empty:
                     raise KeyError(
@@ -2583,9 +2652,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # A frozen null branch is a fixed anchor: the adapter is disabled
                 # for this forward only, so the field the guidance correction
                 # inverts cannot drift along with the adapter that is being
-                # trained against it. The base-preservation pass below cannot be
-                # shared for it: guidance only runs on a prompt step, so that pass
-                # always carries prompt conditioning while this one needs empty.
+                # trained against it.
                 null_set_enabled = (
                     self._runtime_network_toggle(accelerator, network, "--h3_guidance_null_source frozen")
                     if args.h3_guidance_null_source == "frozen"
@@ -2609,7 +2676,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     finally:
                         if null_set_enabled is not None:
                             null_set_enabled(True)
-            if preservation_active:
+            if preservation_active and not fused_teachers_completed:
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_base_preservation_loss_weight")
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
                 # Restoring the RNG state makes the following trainable pass reuse
@@ -2828,6 +2895,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_guidance_loss_schedule": args.h3_guidance_loss_schedule,
             "ss_h3_guidance_null_source": args.h3_guidance_null_source,
+            "ss_h3_fuse_frozen_teachers": str(args.h3_fuse_frozen_teachers),
             "ss_h3_guidance_cfg_zero": str(args.h3_guidance_cfg_zero),
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
             "ss_h3_qwen_control_dropout_rate": str(args.h3_qwen_control_dropout_rate),
@@ -3250,6 +3318,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "CFG-Zero* style rescale of the null branch before the guidance form is applied: each sample and "
             "modality projects the null prediction onto the conditional field"
+        ),
+    )
+    parser.add_argument(
+        "--h3_fuse_frozen_teachers",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL batch the frozen empty-guidance and base-preservation teachers into one transformer forward; "
+            "requires frozen guidance and active base preservation, and may use more peak VRAM"
         ),
     )
     parser.add_argument(

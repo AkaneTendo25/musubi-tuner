@@ -16,6 +16,7 @@ import musubi_tuner.minimax_h3.model as h3_model
 import musubi_tuner.minimax_h3_train_network as h3_train_network
 from musubi_tuner.dataset.bucket import BucketBatchManager
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.minimax_h3.backend import H3PairedConditioningUnsupportedError
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_AUDIO_LOSS_MASK_KEY,
@@ -1170,6 +1171,79 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_o
         assert transformer.reusable_activation_offloader.pooled_bytes == grown_bytes
 
 
+def test_native_h3_paired_conditioning_matches_two_single_forwards():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config).eval()
+    backend = _NativeTrainingBackend(transformer)
+    video = torch.randn(1, 4, 2, 4, 4)
+    audio = torch.randn(1, 2, 6, 3)
+    prompt_tags = torch.ones(4, dtype=torch.long)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [prompt_tags],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [prompt_tags.clone()],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+    }
+    video_timestep = torch.tensor([0.4])
+    audio_timestep = torch.tensor([0.7])
+
+    with torch.no_grad():
+        empty = backend.predict_training(transformer, batch, video, audio, video_timestep, audio_timestep, conditioning="empty")
+        prompt = backend.predict_training(transformer, batch, video, audio, video_timestep, audio_timestep, conditioning="prompt")
+        paired = backend.predict_training(
+            transformer, batch, video, audio, video_timestep, audio_timestep, conditioning=("empty", "prompt")
+        )
+
+    torch.testing.assert_close(paired.video[0:1], empty.video)
+    torch.testing.assert_close(paired.video[1:2], prompt.video)
+    torch.testing.assert_close(paired.audio[0:1], empty.audio)
+    torch.testing.assert_close(paired.audio[1:2], prompt.audio)
+
+
+def test_native_h3_paired_conditioning_rejects_different_text_layouts_before_forward():
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            in_channels=4,
+            audio_in_channels=6,
+            text_dim=8,
+        )
+    )
+    backend = _NativeTrainingBackend(transformer)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long)],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(3, dtype=torch.long)],
+    }
+
+    with pytest.raises(H3PairedConditioningUnsupportedError, match="do not share one packed text layout"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 1, 2, 2),
+            None,
+            torch.tensor([0.4]),
+            torch.tensor([0.7]),
+            conditioning=("empty", "prompt"),
+        )
+
+
 def test_native_h3_image_backend_runs_video_only_forward_and_backward():
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
@@ -1521,6 +1595,56 @@ def test_native_h3_ref2va_backend_runs_every_modality_combination_forward_loss_a
     assert result.video_elements == (0 if video_latents is None else video_latents.numel())
     assert result.audio_elements == (0 if audio_latents is None else audio_latents.numel())
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
+
+
+def test_native_h3_ref2va_paired_conditioning_shares_reference_noise_and_matches_sequential_replay():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=1,
+        attention_head_dim=8,
+        hidden_size=8,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=16,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=8,
+        time_embed_dim=8,
+        rope_freq_dim=1,
+    )
+    transformer = MiniMaxH3Transformer(config).eval()
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+    tags = torch.tensor([1, 0, 1])
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [tags],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [tags.clone()],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["ref2va"])],
+        H3_REFERENCE_KINDS_KEY: [torch.tensor([0])],
+        H3_REFERENCE_VIDEO_SHAPES_KEY: [torch.tensor([[1, 2, 2]])],
+        H3_REFERENCE_AUDIO_LENGTHS_KEY: [torch.tensor([0])],
+        H3_REFERENCE_VIDEO_ROWS_KEY: [torch.randn(1, 16)],
+        H3_REFERENCE_AUDIO_ROWS_KEY: [torch.empty(0, 6)],
+    }
+    video = torch.randn(1, 4, 1, 2, 2)
+    video_timestep = torch.tensor([0.4])
+    audio_timestep = torch.tensor([0.7])
+
+    torch.manual_seed(99)
+    with torch.no_grad(), torch.random.fork_rng():
+        empty = backend.predict_training(transformer, batch, video, None, video_timestep, audio_timestep, conditioning="empty")
+    with torch.no_grad(), torch.random.fork_rng():
+        prompt = backend.predict_training(transformer, batch, video, None, video_timestep, audio_timestep, conditioning="prompt")
+    with torch.no_grad(), torch.random.fork_rng():
+        paired = backend.predict_training(
+            transformer, batch, video, None, video_timestep, audio_timestep, conditioning=("empty", "prompt")
+        )
+
+    torch.testing.assert_close(paired.video[0:1], empty.video)
+    torch.testing.assert_close(paired.video[1:2], prompt.video)
 
 
 @pytest.mark.parametrize("target", ["video", "audio"])
@@ -2710,6 +2834,43 @@ class _StochasticPreservationBackend:
         )
 
 
+class _PairedStochasticPreservationBackend(_StochasticPreservationBackend):
+    supports_paired_conditioning = True
+
+    def predict_training(
+        self,
+        transformer,
+        batch,
+        video_hidden_states,
+        audio_hidden_states,
+        video_timestep,
+        audio_timestep,
+        *,
+        conditioning="prompt",
+    ):
+        del batch, video_timestep, audio_timestep
+        source = video_hidden_states if video_hidden_states is not None else audio_hidden_states
+        draw = torch.rand((), device=source.device)
+        self.calls.append((conditioning, torch.is_grad_enabled()))
+        self.random_draws.append(float(draw))
+        self.swap_modes.append(getattr(transformer, "swap_mode", None))
+        scale = transformer.scale if getattr(transformer, "adapter_enabled", True) else transformer.scale.detach() * 0 + 1.0
+        presentations = (conditioning,) if isinstance(conditioning, str) else conditioning
+
+        def predict(value, presentation):
+            if value is None:
+                return None
+            offset = 0.25 if presentation == "prompt" else -0.125
+            return value * scale + draw + offset
+
+        video = [predict(video_hidden_states, presentation) for presentation in presentations]
+        audio = [predict(audio_hidden_states, presentation) for presentation in presentations]
+        return H3ModelPrediction(
+            None if video_hidden_states is None else torch.cat(video),
+            None if audio_hidden_states is None else torch.cat(audio),
+        )
+
+
 class _FakeBackend:
     def __init__(self):
         self.calls = []
@@ -3058,6 +3219,114 @@ def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
     assert transformer.adapter_enabled is True
     assert metrics["loss/base_preservation"] > 0
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
+
+
+def _run_frozen_teacher_fusion(enabled, *, blocks_to_swap=0):
+    args = create_parser().parse_args([])
+    args.h3_base_preservation_loss_weight = 0.1
+    args.h3_guidance_distillation_scale = 3.0
+    args.h3_guidance_null_source = "frozen"
+    args.h3_fuse_frozen_teachers = enabled
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.blocks_to_swap = blocks_to_swap
+    backend = _PairedStochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _SwapAwareScaleTransformer() if blocks_to_swap else _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    torch.manual_seed(123)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+    return loss.detach(), transformer.scale.grad.detach().clone(), metrics, backend, network, transformer
+
+
+def test_h3_fused_frozen_teachers_match_sequential_loss_gradient_and_rng():
+    sequential = _run_frozen_teacher_fusion(False)
+    fused = _run_frozen_teacher_fusion(True)
+
+    torch.testing.assert_close(fused[0], sequential[0], rtol=0, atol=0)
+    torch.testing.assert_close(fused[1], sequential[1], rtol=0, atol=0)
+    assert fused[2] == sequential[2]
+    assert sequential[3].calls == [("empty", False), ("prompt", False), ("prompt", True)]
+    assert fused[3].calls == [(("empty", "prompt"), False), ("prompt", True)]
+    assert sequential[3].random_draws[0] == sequential[3].random_draws[1] == sequential[3].random_draws[2]
+    assert fused[3].random_draws[0] == fused[3].random_draws[1]
+    assert sequential[4].events == [False, True, False, True]
+    assert fused[4].events == [False, True]
+
+
+def test_h3_fused_frozen_teachers_traverse_classic_swap_ring_once():
+    _, _, _, backend, _, transformer = _run_frozen_teacher_fusion(True, blocks_to_swap=2)
+
+    assert transformer.swap_events == ["inference", "training"]
+    assert backend.swap_modes == ["inference", "training"]
+
+
+def test_h3_fused_frozen_teachers_fall_back_before_sequential_rng_replay():
+    class IncompatiblePairBackend(_PairedStochasticPreservationBackend):
+        def predict_training(self, *args, **kwargs):
+            if isinstance(kwargs.get("conditioning"), tuple):
+                raise H3PairedConditioningUnsupportedError("test layout mismatch")
+            return super().predict_training(*args, **kwargs)
+
+    args = create_parser().parse_args([])
+    args.h3_base_preservation_loss_weight = 0.1
+    args.h3_guidance_distillation_scale = 3.0
+    args.h3_guidance_null_source = "frozen"
+    args.h3_fuse_frozen_teachers = True
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = IncompatiblePairBackend()
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    torch.manual_seed(123)
+    loss, _ = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+
+    assert torch.isfinite(loss)
+    assert backend.calls == [("empty", False), ("prompt", False), ("prompt", True)]
+    assert backend.random_draws[0] == backend.random_draws[1] == backend.random_draws[2]
+    assert network.events == [False, True, False, True, False, True]
 
 
 def test_h3_auxiliary_forwards_use_forward_only_block_swap_then_restore_training():
@@ -3666,6 +3935,25 @@ def test_h3_null_field_options_require_a_guidance_scale(option):
 
     with pytest.raises(ValueError, match="h3_guidance_distillation_scale"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_fused_frozen_teachers_is_opt_in_and_requires_both_frozen_objectives():
+    assert create_parser().parse_args([]).h3_fuse_frozen_teachers is False
+    invalid_options = (
+        ["--h3_fuse_frozen_teachers"],
+        ["--h3_fuse_frozen_teachers", "--h3_guidance_distillation_scale", "3"],
+        [
+            "--h3_fuse_frozen_teachers",
+            "--h3_guidance_distillation_scale",
+            "3",
+            "--h3_guidance_null_source",
+            "frozen",
+        ],
+    )
+    for options in invalid_options:
+        args = create_parser().parse_args(options)
+        with pytest.raises(ValueError, match="h3_fuse_frozen_teachers requires"):
+            MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def test_h3_trainer_image_process_batch_uses_resolution_schedule_without_audio():

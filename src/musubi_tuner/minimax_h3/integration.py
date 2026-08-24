@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from PIL import Image
 from safetensors import safe_open
 
+from musubi_tuner.minimax_h3.backend import H3PairedConditioningUnsupportedError
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_LATENT_CHANNELS,
     IMAGE_FRAME_COUNT,
@@ -1097,6 +1098,8 @@ def _pin_observed_rows(
 
 
 class _NativeTrainingBackend:
+    supports_paired_conditioning = True
+
     def __init__(
         self,
         transformer: torch.nn.Module,
@@ -1136,7 +1139,7 @@ class _NativeTrainingBackend:
         video_timestep: torch.Tensor,
         audio_timestep: torch.Tensor,
         *,
-        conditioning: Literal["prompt", "empty"] = "prompt",
+        conditioning: Literal["prompt", "empty"] | tuple[Literal["prompt", "empty"], ...] = "prompt",
         reference_modality: Literal["av", "video", "audio"] = "av",
         qwen_control_dropout: bool = False,
         extension_video_frames: int = 0,
@@ -1175,30 +1178,63 @@ class _NativeTrainingBackend:
                 f"H3 audio input must have shape [1, 2, {config.audio_in_channels}, T], got {tuple(audio_hidden_states.shape)}"
             )
 
-        hidden_key, tags_key = (
-            (H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY)
-            if conditioning == "prompt"
-            else (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
-        )
-        if reference_modality != "av":
-            if self.mode not in ("ref2va", "ref2va_omni"):
-                raise ValueError("reference modality selection is only valid for Ref2VA training")
-            hidden_key = reference_variant_key(hidden_key, reference_modality)
-            tags_key = reference_variant_key(tags_key, reference_modality)
-        if qwen_control_dropout:
-            # The control-free twin of whichever presentation the branches above
-            # selected: dropout composes with the empty branch and with every
-            # reference-modality variant rather than replacing them.
-            hidden_key = qwen_control_dropout_key(hidden_key)
-            tags_key = qwen_control_dropout_key(tags_key)
-            missing = [key for key in (hidden_key, tags_key) if key not in batch]
-            if missing:
-                raise KeyError(
-                    "--h3_qwen_control_dropout_rate requires a text cache written with --h3_qwen_control_dropout; missing "
-                    + ", ".join(missing)
+        conditionings = (conditioning,) if isinstance(conditioning, str) else tuple(conditioning)
+        if not conditionings or any(value not in ("prompt", "empty") for value in conditionings):
+            raise ValueError("H3 conditioning must contain only 'prompt' or 'empty'")
+        if len(conditionings) > 2:
+            raise ValueError("H3 paired conditioning supports at most two presentations")
+
+        text_presentations: list[tuple[torch.Tensor, torch.Tensor, str, str]] = []
+        for presentation in conditionings:
+            hidden_key, tags_key = (
+                (H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY)
+                if presentation == "prompt"
+                else (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
+            )
+            if reference_modality != "av":
+                if self.mode not in ("ref2va", "ref2va_omni"):
+                    raise ValueError("reference modality selection is only valid for Ref2VA training")
+                hidden_key = reference_variant_key(hidden_key, reference_modality)
+                tags_key = reference_variant_key(tags_key, reference_modality)
+            if qwen_control_dropout:
+                # The control-free twin of whichever presentation the branches above
+                # selected: dropout composes with the empty branch and with every
+                # reference-modality variant rather than replacing them.
+                hidden_key = qwen_control_dropout_key(hidden_key)
+                tags_key = qwen_control_dropout_key(tags_key)
+                missing = [key for key in (hidden_key, tags_key) if key not in batch]
+                if missing:
+                    raise KeyError(
+                        "--h3_qwen_control_dropout_rate requires a text cache written with --h3_qwen_control_dropout; missing "
+                        + ", ".join(missing)
+                    )
+            text_presentations.append(
+                (
+                    self._one_conditioning_item(batch, hidden_key, expected_ndim=2),
+                    self._one_conditioning_item(batch, tags_key, expected_ndim=1),
+                    hidden_key,
+                    tags_key,
                 )
-        text_hidden = self._one_conditioning_item(batch, hidden_key, expected_ndim=2)
-        text_tags = self._one_conditioning_item(batch, tags_key, expected_ndim=1)
+            )
+
+        text_hidden, text_tags, hidden_key, tags_key = text_presentations[0]
+        if len(text_presentations) > 1:
+            for paired_hidden, paired_tags, paired_hidden_key, paired_tags_key in text_presentations[1:]:
+                if paired_hidden.shape != text_hidden.shape or not torch.equal(paired_tags, text_tags):
+                    raise H3PairedConditioningUnsupportedError(
+                        "H3 prompt and empty conditioning do not share one packed text layout; using sequential teachers"
+                    )
+                if paired_hidden.dtype != text_hidden.dtype:
+                    raise H3PairedConditioningUnsupportedError(
+                        f"H3 {hidden_key} and {paired_hidden_key} use different dtypes; using sequential teachers"
+                    )
+                if paired_tags.dtype != text_tags.dtype:
+                    raise H3PairedConditioningUnsupportedError(
+                        f"H3 {tags_key} and {paired_tags_key} use different dtypes; using sequential teachers"
+                    )
+            text_hidden = torch.stack([value[0] for value in text_presentations])
+        else:
+            text_hidden = text_hidden[None]
         conditioning_task = self._one_conditioning_item(batch, H3_CONDITIONING_TASK_KEY, expected_ndim=0)
         cached_caption_cap = batch.get(H3_MAX_CAPTION_TOKENS_KEY)
         if cached_caption_cap is None:
@@ -1272,9 +1308,9 @@ class _NativeTrainingBackend:
                         f"H3 Ref2VA text cache uses reference_video_fps={float(cached_video_fps)}, "
                         f"but training requested {float(self.reference_video_fps)}; re-cache conditioning"
                     )
-        if text_hidden.ndim != 2 or text_hidden.shape[-1] != config.text_dim:
-            raise ValueError(f"H3 {hidden_key} must have shape [tokens, {config.text_dim}]")
-        if text_tags.dtype != torch.long or text_tags.shape != (text_hidden.shape[0],):
+        if text_hidden.ndim != 3 or text_hidden.shape[-1] != config.text_dim:
+            raise ValueError(f"H3 {hidden_key} must have shape [batch, tokens, {config.text_dim}]")
+        if text_tags.dtype != torch.long or text_tags.shape != (text_hidden.shape[1],):
             raise ValueError(f"H3 {tags_key} must be int64 with one tag per text token")
         if bool(((text_tags < int(MiniMaxH3TokenTag.VIDEO)) | (text_tags > int(MiniMaxH3TokenTag.TEXT))).any()):
             raise ValueError("MiniMax H3 text cache contains invalid Ref2VA modality tags")
@@ -1708,10 +1744,18 @@ class _NativeTrainingBackend:
                 latent_frames,
                 (latent_height // patch_h) * (latent_width // patch_w),
             )
+        presentation_batch = text_hidden.shape[0]
+        if presentation_batch > 1:
+            # Both teachers see exactly the same stochastic reference/context
+            # rows. Expanding after those rows are constructed preserves the
+            # sequential path's fork_rng replay instead of drawing new noise for
+            # the second presentation.
+            video_rows = video_rows.expand(presentation_batch, -1, -1)
+            audio_rows = audio_rows.expand(presentation_batch, -1, -1)
         output = transformer(
             video_hidden_states=video_rows,
             audio_hidden_states=audio_rows,
-            encoder_hidden_states=text_hidden[None].to(model_device),
+            encoder_hidden_states=text_hidden.to(model_device),
             timestep=timestep.to(model_device),
             timestep_indices=timestep_indices.to(model_device),
             token_tags=layout.token_tags.to(model_device),

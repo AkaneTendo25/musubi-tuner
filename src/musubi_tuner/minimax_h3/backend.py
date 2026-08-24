@@ -43,6 +43,8 @@ class H3Generator(Protocol):
 
 
 class H3TrainingBackend(Protocol):
+    supports_paired_conditioning: bool
+
     def get_training_transformer(self) -> torch.nn.Module: ...
 
     def predict_training(
@@ -54,7 +56,7 @@ class H3TrainingBackend(Protocol):
         video_timestep: torch.Tensor,
         audio_timestep: torch.Tensor,
         *,
-        conditioning: Literal["prompt", "empty"] = "prompt",
+        conditioning: Literal["prompt", "empty"] | tuple[Literal["prompt", "empty"], ...] = "prompt",
         reference_modality: Literal["av", "video", "audio"] = "av",
         # Extension context. Only forwarded when non-zero, so a backend that
         # does not support it may omit these parameters entirely.
@@ -64,6 +66,12 @@ class H3TrainingBackend(Protocol):
 
 
 class H3BackendUnavailableError(RuntimeError):
+    pass
+
+
+class H3PairedConditioningUnsupportedError(RuntimeError):
+    """Raised before execution when two H3 conditioning layouts cannot share a forward."""
+
     pass
 
 
