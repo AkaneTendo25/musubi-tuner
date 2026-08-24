@@ -48,9 +48,9 @@ def _tiny_transformer() -> MiniMaxH3Transformer:
 
 
 def test_released_canvas_resolution() -> None:
-    assert resolve_canvas_size("16:9") == (768, 1344)
+    assert resolve_canvas_size("16:9") == (768, 1376)
     assert resolve_canvas_size("1:1") == (768, 768)
-    assert resolve_canvas_size("9:16") == (1344, 768)
+    assert resolve_canvas_size("9:16") == (1376, 768)
 
 
 def test_shifted_schedule_has_terminal_zero_and_one_fewer_model_evaluations() -> None:

@@ -831,9 +831,9 @@ manual-learning-rate Adafactor arguments; if you replace `--optimizer_args`, inc
 | `--no_mem_eff_save` | Write checkpoints with the ordinary safetensors writer instead of the streaming one; needs the whole checkpoint contiguous in host memory. |
 
 The combination `--blocks_to_swap 48`, the trainable ring, and `--block_swap_ring_size 2` minimizes resident model blocks for
-full-parameter training, but its host-memory and transfer requirements are high. Whether it fits a 24 GB GPU also depends on
-resolution, frame length, and conditioning rows. `--gradient_checkpointing_cpu_offload` further reduces activation residency
-at the cost of additional host memory and transfers.
+full-parameter training, but its host-memory and transfer requirements are high. Fit also depends on resolution, frame length,
+and conditioning rows. `--gradient_checkpointing_cpu_offload` further reduces activation residency at the cost of additional
+host memory and transfers.
 
 For the trainable ring, add:
 
@@ -897,7 +897,7 @@ the model checkpoint. Requests received during gradient accumulation wait for th
 | `--h3_gradient_checkpointing_cpu_offload_pin_memory` | off | Pin CPU-offloaded checkpoint activations for faster transfers. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and substantial free system RAM. |
 | `--h3_reusable_activation_offload` | off | Reuse pinned CPU checkpoint buffers and prefetch activations in reverse block order. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and sufficient free system RAM. |
 | `--gradient_checkpointing_cpu_offload_dtype` | `none` | Wire dtype of the offloaded activations. `fp8_e4m3` quantizes each large bf16/fp16 activation on the GPU (per-tensor scale) before the D2H copy, halving PCIe traffic and pinned host memory. Recomputation then consumes a lossy activation, so gradients differ from an exact run deterministically but not bit-identically. Payloads under 1 MiB, integer/boolean saves, and fp32 activations pass through unquantized. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload --h3_reusable_activation_offload`; keep `none` for exactness-sensitive runs. |
-| `--h3_gradient_checkpointing_blocks N` | all 50 | Checkpoint only the last N main blocks. This explicit speed/VRAM trade-off requires `--gradient_checkpointing` and resident eager blocks. It can be combined with `--compile` (the eager blocks add one extra compiled variant) but not with block swap, whose streamed weights are only safe to reuse at recompute time. Each eager block retains its full activations, which at video sequence lengths costs several GB per block; on 80 GB, video training fits only a few eager blocks. Enabling `--h3_fused_qk_norm_rope`, `--h3_fused_indexed_adaln`, and `--h3_fused_swiglu` roughly halves each eager block's retained activation memory. |
+| `--h3_gradient_checkpointing_blocks N` | all 50 | Checkpoint only the last N main blocks. This explicit speed/VRAM trade-off requires `--gradient_checkpointing` and resident eager blocks. It can be combined with `--compile` (the eager blocks add one extra compiled variant) but not with block swap, whose streamed weights are only safe to reuse at recompute time. Each eager block retains its full activations, which at video sequence lengths costs several GB per block. Enabling `--h3_fused_qk_norm_rope`, `--h3_fused_indexed_adaln`, and `--h3_fused_swiglu` roughly halves each eager block's retained activation memory. |
 | `--h3_shift_video` / `--h3_shift_audio` | `12.0` / `3.0` | Released per-modality flow shifts. Both derive from one shared coordinate; keep the defaults. |
 | `--timestep_sampling` | `uniform` | Shape of the shared unshifted schedule. Keep `uniform` unless deliberately testing a different distribution. `sigmoid`, `logsnr`, and `sigma` are experimental alternatives; `shift` with H3's required `--discrete_flow_shift 1` is equivalent to sigmoid sampling. Model-specific dynamic-shift modes are rejected because H3 applies its own video/audio shifts afterward. |
 | `--weighting_scheme` | `none` | Optional loss weighting. H3 bounds `sigma_sqrt` inverse-square weighting so that a near-zero draw cannot dominate a batch-1 optimizer step; `cosmap` is intrinsically bounded. |
@@ -1220,10 +1220,14 @@ python minimax_h3_generate_video.py \
 | `--reference_video_short_edge` | Reference-video short edge (default 768, minimum 32). Lower values reduce Ref2VA reference rows, speed cost, and VRAM. |
 | `--reference_video_max_pixels` | Maximum pixels per reference-video frame after aspect-preserving resize (default 768×1344, minimum 1024). The cap is enforced on the final 32-aligned dimensions, so extreme aspect ratios are downscaled rather than rounded back over it. |
 | `--reference_video_fps` | Caching and training only; no inference flag. Subsample every reference video to this many frames per **source** second so the whole clip conditions the model instead of only its opening span. `0` (default) truncates the reference to the target's frame count. Frame `k` is source frame `round(k × source_fps / F)`, and the result is snapped to the nearest legal reference length (`1` or `17n+5`) that still fits the target's frame budget, truncating or padding with the final frame to reach it. The subsampled reference video spans the whole clip while its paired soundtrack still covers only the clip's opening span. |
-| `--lora_weight` / `--lora_multiplier` | Attach saved adapters. |
+| `--lora_weight` / `--lora_multiplier` | Attach saved adapters. ComfyUI key names are converted; incompatible module keys are rejected. |
 | `--h3_learned_context` | Prepend a ComfyUI-compatible H3 learned context to the Qwen prompt output. Repeat the option to concatenate contexts in command-line order. It composes with all attached LoRAs. |
 | `--h3_learned_context_multiplier` | Scale the corresponding learned context; omitted entries default to `1`. A value of `0` removes that context completely. Negative values are allowed for experimentation but are not a mathematically guaranteed inverse because context tokens influence nonlinear attention rather than adding a direction directly to the latent. |
 | `--steps` | Sigma grid points including terminal zero, so `20` runs 19 evaluations. |
+| `--latent_upscaler` / `--latent_upscale_scale` | Apply a trained latent upscaler before decoding. The default scale `1.0` leaves the latent unchanged. |
+| `--first_pass_scale` / `--first_pass_steps` | Denoise first at this canvas scale, then refine at full size. `0` disables the first pass; its step count otherwise defaults to `--steps`. |
+| `--second_pass_strength` | Fraction of the denoising schedule used by the full-size refinement; default `0.5`. |
+| `--first_pass_lora` | Apply attached LoRAs to the first pass as well as the refinement; off by default. |
 
 The `--reference_video_*` values enter the cache identity: pass the same value to `minimax_h3_cache_latents`,
 `minimax_h3_cache_text_encoder_outputs`, training, and inference, and re-cache both stages when one changes.
