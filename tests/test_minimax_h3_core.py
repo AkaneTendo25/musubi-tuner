@@ -3358,6 +3358,34 @@ def test_h3_component_factories_route_only_explicit_loading_inputs(monkeypatch, 
     assert captured == {**inputs, "device": "cpu", "dtype": "float32", **extra}
 
 
+def test_h3_training_backend_routes_prequantized_convrot_modes(monkeypatch):
+    sentinel = object()
+    captured = {}
+
+    def create_component(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(h3_integration, "create_training_backend", create_component)
+    result = h3_backend.create_training_backend(
+        model=Path("model"),
+        device="cpu",
+        dtype="bfloat16",
+        mode="ref2va",
+        attention_mode="torch",
+        split_attention=False,
+        int8_convrot=True,
+        convrot_int8_fwd="int8",
+        convrot_int8_bwd="int8",
+    )
+
+    assert result is sentinel
+    assert captured["int8_convrot"] is True
+    assert captured["convrot_int8_fwd"] == "int8"
+    assert captured["convrot_int8_bwd"] == "int8"
+    assert "convrot_int8" not in captured
+
+
 def test_h3_generator_factory_routes_all_native_components(monkeypatch):
     sentinel = object()
     captured = {}
@@ -3774,6 +3802,80 @@ def test_h3_prequantized_convrot_backward_leaves_grad_output_untouched(monkeypat
 
     assert torch.equal(grad_output, baseline)
     assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+def test_h3_prequantized_convrot_prefers_fused_int8_without_fp32_inputs(monkeypatch):
+    import torch
+
+    from musubi_tuner.minimax_h3 import int8_convrot
+
+    calls = []
+
+    def fake_int8_linear(inputs, weight, scale, bias, out_dtype, convrot, group_size):
+        calls.append((inputs.detach().clone(), tuple(weight.shape), scale.numel(), bias is None, out_dtype, convrot, group_size))
+        return torch.zeros((*inputs.shape[:-1], weight.shape[0]), dtype=out_dtype, device=inputs.device)
+
+    monkeypatch.setattr(int8_convrot, "_fused_int8_available", lambda tensor: True)
+    monkeypatch.setattr(int8_convrot.convrot_int8_kernels, "int8_linear", fake_int8_linear)
+    monkeypatch.setattr(
+        int8_convrot,
+        "_int_mm",
+        lambda left, right: (_ for _ in ()).throw(AssertionError("the eager INT8 path must not run")),
+    )
+
+    _, layer, _ = _prequantized_convrot_linear(fwd_mode="int8", bwd_mode="int8")
+    inputs = torch.randn(6, 16, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn(6, 8, dtype=torch.bfloat16)
+    baseline = grad_output.clone()
+
+    layer(inputs).backward(grad_output)
+
+    assert len(calls) == 2
+    assert calls[0][0].dtype is torch.bfloat16
+    assert calls[0][1:] == ((8, 16), 8, False, torch.bfloat16, True, 4)
+    assert calls[1][0].dtype is torch.bfloat16
+    assert calls[1][1:] == ((16, 8), 1, True, torch.bfloat16, False, 4)
+    assert torch.equal(grad_output, baseline)
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not _convrot_int8_kernel_available(),
+    reason="the fused ConvRot kernel needs the supported CUDA/triton runtime",
+)
+def test_h3_prequantized_fused_int8_matches_the_previous_cuda_path():
+    import torch
+
+    from musubi_tuner.minimax_h3 import int8_convrot
+
+    _, layer, _ = _prequantized_convrot_linear(
+        in_features=512,
+        out_features=256,
+        group_size=256,
+        fwd_mode="int8",
+        bwd_mode="int8",
+    )
+    layer = layer.cuda()
+    inputs = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+
+    actual = layer(inputs)
+    rotated = int8_convrot.rotate_activation(inputs.detach(), 256)
+    quantized, input_scale = int8_convrot._quantize_rows(rotated.reshape(-1, 512), owns_buffer=True)
+    expected = int8_convrot._int_mm(quantized, layer.weight.t()).float()
+    expected.mul_(input_scale).mul_(layer.scale_weight.reshape(1, -1))
+    expected.add_(layer.bias.float())
+    expected = expected.to(inputs.dtype)
+
+    actual.backward(grad_output)
+    scaled = grad_output.float() * layer.scale_weight.reshape(1, -1)
+    quantized_grad, grad_scale = int8_convrot._quantize_rows(scaled, owns_buffer=True)
+    expected_grad = int8_convrot._int_mm(quantized_grad, layer.weight).float()
+    expected_grad.mul_(grad_scale)
+    expected_grad = int8_convrot.rotate_activation(expected_grad.to(inputs.dtype), 256)
+
+    assert torch.allclose(actual, expected, atol=0.5, rtol=2e-2)
+    assert torch.allclose(inputs.grad, expected_grad, atol=0.5, rtol=2e-2)
 
 
 def test_h3_prequantized_convrot_bf16_backward_matches_the_fp32_gradient():

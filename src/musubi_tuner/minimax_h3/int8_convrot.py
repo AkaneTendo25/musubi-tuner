@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from musubi_tuner.modules import convrot_int8_kernels
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
 logger = logging.getLogger(__name__)
@@ -102,20 +103,25 @@ def _int8_available(tensor: torch.Tensor) -> bool:
     return bool(tensor.is_cuda) and hasattr(torch, "_int_mm")
 
 
+def _fused_int8_available(tensor: torch.Tensor) -> bool:
+    return bool(tensor.is_cuda) and convrot_int8_kernels.HAS_TRITON and convrot_int8_kernels.int8_linear is not None
+
+
 class _Int8ConvRotFunction(torch.autograd.Function):
     """Pre-quantized ConvRot INT8 linear with the same forward/backward modes as the online path.
 
     ``fwd_mode``:
-      - ``int8``: rotate the activations, quantize them row-wise and run ``torch._int_mm``
-        (transient BF16 dequantization when the INT8 matmul is unavailable, e.g. on CPU).
+      - ``int8``: rotate the activations, quantize them row-wise and run an INT8 matmul;
+        Triton fuses quantization and the dequantization epilogue on CUDA, with
+        ``torch._int_mm`` or transient BF16 dequantization as fallbacks.
       - ``bf16``: undo the rotation on the weight instead and hand ``F.linear`` an
         ordinary matrix. Same stored weights, same arithmetic, unquantized activations.
 
     ``bwd_mode`` (only meaningful with ``fwd_mode='int8'``):
       - ``bf16``: transient dequantization of the rotated weight into the gradient dtype,
         ``grad_x = rotate(g @ W_rot)``.
-      - ``int8``: fold the per-channel weight scale into ``g``, quantize its rows and run
-        the INT8 matmul before rotating.
+      - ``int8``: fold the per-channel weight scale into ``g``, quantize its rows, run
+        the fused INT8 matmul when available, then rotate.
     """
 
     @staticmethod
@@ -124,6 +130,16 @@ class _Int8ConvRotFunction(torch.autograd.Function):
         if fwd_mode == "bf16":
             dense_weight = _unrotated_weight(weight, scale, group_size, inputs.dtype)
             output = F.linear(inputs, dense_weight, bias.to(inputs.dtype) if bias is not None else None)
+        elif _fused_int8_available(inputs):
+            output = convrot_int8_kernels.int8_linear(
+                inputs,
+                weight,
+                scale.reshape(-1),
+                bias,
+                inputs.dtype,
+                True,
+                group_size,
+            )
         elif _int8_available(inputs):
             rotated = rotate_activation(inputs, group_size)
             flat = rotated.reshape(-1, rotated.shape[-1])
@@ -162,7 +178,19 @@ class _Int8ConvRotFunction(torch.autograd.Function):
             dense_weight = _unrotated_weight(weight, scale, ctx.group_size, folded.dtype)
             grad_input = folded @ dense_weight
             return grad_input.to(ctx.input_dtype).reshape(ctx.input_shape), None, None, None, None, None, None
-        if ctx.bwd_mode == "int8" and _int8_available(folded):
+        if ctx.bwd_mode == "int8" and _fused_int8_available(folded):
+            scaled = folded * scale.reshape(1, -1).to(folded.dtype)
+            unit_scale = torch.ones(1, device=folded.device, dtype=torch.float32)
+            grad_input = convrot_int8_kernels.int8_linear(
+                scaled,
+                weight.t().contiguous(),
+                unit_scale,
+                None,
+                folded.dtype,
+                False,
+                ctx.group_size,
+            )
+        elif ctx.bwd_mode == "int8" and _int8_available(folded):
             # Copy before the in-place fold: ``folded`` is a view of the caller's gradient,
             # and .float() on an fp32 gradient would hand back that very tensor.
             scaled = folded.to(torch.float32, copy=True)

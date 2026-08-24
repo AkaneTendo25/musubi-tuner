@@ -355,8 +355,12 @@ def create_training_backend(
         **({} if fp8_quantization_mode == "block" else {"fp8_quantization_mode": fp8_quantization_mode}),
         **(
             {}
-            if not convrot_int8
-            else {"convrot_int8": True, "convrot_int8_bwd": convrot_int8_bwd, "convrot_int8_fwd": convrot_int8_fwd}
+            if not (convrot_int8 or int8_convrot)
+            else {
+                **({"convrot_int8": True} if convrot_int8 else {}),
+                "convrot_int8_bwd": convrot_int8_bwd,
+                "convrot_int8_fwd": convrot_int8_fwd,
+            }
         ),
         **({} if target_device is None else {"target_device": target_device}),
         **({} if blocks_to_swap == 0 else {"blocks_to_swap": blocks_to_swap}),
