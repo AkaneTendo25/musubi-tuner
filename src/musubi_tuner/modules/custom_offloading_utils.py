@@ -1666,6 +1666,9 @@ class LoRAStreamOffloader:
                     "LoRAStreamOffloader requires frozen base weights (LoRA / no full fine-tune). "
                     f"Found a trainable Linear weight in block {b}."
                 )
+                # A custom autograd function must re-read this ring-backed weight
+                # after checkpoint recomputation instead of retaining its reused view.
+                m._musubi_h2d_streamed_weight = True
 
         # ---- transfer engine: owns the copy stream and all H2D primitives ----
         # pinned masters -> direct async H2D; pageable masters -> stage through a worker thread + pinned pool
@@ -1758,9 +1761,8 @@ class LoRAStreamOffloader:
 
         # single coalesced H2D copy of the whole block, gated behind the slot's free_event (compute done
         # with it). The ring params are views into ring_flat, so the copy bumps their autograd version
-        # counter: safe under gradient checkpointing (weights are re-read at recompute time, and a slot is
-        # only overwritten after its free_event); without checkpointing autograd raises a version error
-        # instead of silently using stale-saved weights -- which the old per-tensor `.data.copy_` hid.
+        # counter. Checkpointing recomputes ordinary operations before backward; custom autograd functions
+        # that retain a weight for grad_input must snapshot marked ring views themselves.
         self.copier.submit(blk, self.ring_flat[slot], self.cpu_flat[blk], self.free_event[slot])
 
         self._bind(blk, self.ring_param[slot])  # reference swap (no .data trick, no cudaMalloc)

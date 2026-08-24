@@ -10,7 +10,6 @@ CPU tests exercise the eager fallback (exact math up to rounding); CUDA tests
 exercise the fused Triton kernels when available.
 """
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +24,7 @@ from musubi_tuner.modules.convrot_int8_utils import (
     ConvRotInt8LinearFn,
     ConvRotInt8Quantizer,
     apply_convrot_int8_monkey_patch,
+    convrot_int8_linear_forward_patch,
     quantize_weight_convrot,
 )
 
@@ -106,6 +106,29 @@ def test_backward_eager_cpu_matches_dequant_reference():
     F.linear(x_ref, w_deq).backward(g)
 
     assert _relerr(x.grad, x_ref.grad) < 1e-5
+
+
+def test_streamed_weight_is_stable_when_ring_storage_is_reused():
+    wq, ws, _, _ = _make_quantized_linear("cpu", torch.float32)
+    original_wq = wq.clone()
+    module = nn.Linear(K, N, bias=False)
+    module.weight = nn.Parameter(wq, requires_grad=False)
+    module.register_buffer("scale_weight", ws)
+    module._convrot_groupsize = GS
+    module._convrot_bwd_mode = "bf16"
+    module._convrot_fwd_mode = "bf16"
+    module._musubi_h2d_streamed_weight = True
+
+    x = torch.randn(M, K, requires_grad=True)
+    y = convrot_int8_linear_forward_patch(module, x)
+    with torch.no_grad():
+        module.weight.fill_(0)  # simulate loading another block into the shared ring slot
+        module.weight.copy_(original_wq)  # block offloader reloads it before this block's backward
+    y.sum().backward()
+
+    expected_weight = kernels.dequantize_int8_convrot_weight(original_wq, ws, GS)
+    expected = torch.ones(M, N) @ expected_weight
+    torch.testing.assert_close(x.grad, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_forward_autocast_casts_fp32_input_like_f_linear():
@@ -263,9 +286,9 @@ def test_quantizer_patch_and_meta_load_state_dict_roundtrip(tmp_path):
     # patched forward matches the dequantized reference (eager CPU path)
     x = torch.randn(4, K, dtype=torch.bfloat16)
     y = fresh.blocks[0]["attn"](x)
-    w_deq = kernels.dequantize_int8_convrot_weight(
-        qsd["blocks.0.attn.weight"], qsd["blocks.0.attn.scale_weight"], GS
-    ).to(torch.bfloat16)
+    w_deq = kernels.dequantize_int8_convrot_weight(qsd["blocks.0.attn.weight"], qsd["blocks.0.attn.scale_weight"], GS).to(
+        torch.bfloat16
+    )
     assert _relerr(y, F.linear(x, w_deq)) < 2e-2  # bf16 rounding only
 
     # unpatched layers still behave as plain Linears

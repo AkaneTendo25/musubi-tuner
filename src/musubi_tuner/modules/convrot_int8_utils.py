@@ -183,7 +183,7 @@ def _unrotated_weight(wq: torch.Tensor, w_scale: torch.Tensor, groupsize: int, d
 class ConvRotInt8LinearFn(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
-    def forward(ctx, x, wq, w_scale, bias, groupsize, bwd_mode, fwd_mode="int8"):
+    def forward(ctx, x, wq, w_scale, bias, groupsize, bwd_mode, fwd_mode="int8", streamed_module=None):
         # x: [..., K] bf16/fp16, wq: [N, K] int8 (rotated basis), w_scale: [N, 1] fp32
         # F.linear casts its inputs to the autocast dtype under autocast; the fused kernel
         # bypasses F.linear, so replicate that here. In K2 the fp32 modulation adds promote
@@ -205,7 +205,11 @@ class ConvRotInt8LinearFn(torch.autograd.Function):
             out = F.linear(x_rot, w_rot, bias)
         # wq/w_scale are live buffers, so saving them adds no activation memory; x is not
         # saved (base is frozen, no grad_weight needed)
-        ctx.save_for_backward(wq, w_scale)
+        if streamed_module is None:
+            ctx.save_for_backward(wq, w_scale)
+        else:
+            ctx.save_for_backward(w_scale)
+        ctx.streamed_module = streamed_module
         ctx.groupsize = groupsize
         ctx.bwd_mode = bwd_mode
         ctx.fwd_mode = fwd_mode
@@ -215,7 +219,11 @@ class ConvRotInt8LinearFn(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
-        wq, w_scale = ctx.saved_tensors
+        if ctx.streamed_module is None:
+            wq, w_scale = ctx.saved_tensors
+        else:
+            (w_scale,) = ctx.saved_tensors
+            wq = ctx.streamed_module.weight
         gs = ctx.groupsize
         g2d = grad_out.reshape(-1, grad_out.shape[-1])  # [M, N]
 
@@ -243,13 +251,13 @@ class ConvRotInt8LinearFn(torch.autograd.Function):
                 grad_x = _rotate_activation(gx_rot, h, gs).reshape(*grad_out.shape[:-1], wq.shape[1])
 
         grad_bias = g2d.sum(dim=0) if ctx.bias_needs_grad else None
-        return grad_x, None, None, grad_bias, None, None, None
+        return grad_x, None, None, grad_bias, None, None, None, None
 
 
 class ConvRotInt8LoRAFn(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
-    def forward(ctx, x, wq, w_scale, bias, groupsize, down, up, lora_scale):
+    def forward(ctx, x, wq, w_scale, bias, groupsize, down, up, lora_scale, streamed_module=None):
         if torch.is_autocast_enabled(x.device.type):
             x = x.to(torch.get_autocast_dtype(x.device.type))
         h = _build_hadamard(int(groupsize), device=x.device, dtype=x.dtype)
@@ -261,7 +269,11 @@ class ConvRotInt8LoRAFn(torch.autograd.Function):
         output = int8_lora_linear(rotated, wq, w_scale, down_output, scaled_up, x.dtype)
         if bias is not None:
             output = output + bias.to(output.dtype)
-        ctx.save_for_backward(x, wq, w_scale, down, up, down_output)
+        if streamed_module is None:
+            ctx.save_for_backward(x, wq, w_scale, down, up, down_output)
+        else:
+            ctx.save_for_backward(x, w_scale, down, up, down_output)
+        ctx.streamed_module = streamed_module
         ctx.groupsize = int(groupsize)
         ctx.lora_scale = lora_scale
         return output
@@ -269,7 +281,11 @@ class ConvRotInt8LoRAFn(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
-        x, wq, w_scale, down, up, down_output = ctx.saved_tensors
+        if ctx.streamed_module is None:
+            x, wq, w_scale, down, up, down_output = ctx.saved_tensors
+        else:
+            x, w_scale, down, up, down_output = ctx.saved_tensors
+            wq = ctx.streamed_module.weight
         grad2d = grad_output.reshape(-1, grad_output.shape[-1])
         scale = ctx.lora_scale
         grad_down_output = F.linear(grad2d, up.to(grad2d.dtype).t()) * scale
@@ -289,11 +305,21 @@ class ConvRotInt8LoRAFn(torch.autograd.Function):
         grad_down = (grad_down_output.t() @ x2d).to(down.dtype)
         grad_up = ((grad2d.t() @ down_output.to(grad2d.dtype)) * scale).to(up.dtype)
         grad_bias = grad2d.sum(0) if ctx.needs_input_grad[3] else None
-        return grad_x, None, None, grad_bias, None, grad_down, grad_up, None
+        return grad_x, None, None, grad_bias, None, grad_down, grad_up, None, None
 
 
 def convrot_int8_lora_forward(module, x, down, up, scale):
-    return ConvRotInt8LoRAFn.apply(x, module.weight, module.scale_weight, module.bias, module._convrot_groupsize, down, up, scale)
+    return ConvRotInt8LoRAFn.apply(
+        x,
+        module.weight,
+        module.scale_weight,
+        module.bias,
+        module._convrot_groupsize,
+        down,
+        up,
+        scale,
+        module if getattr(module, "_musubi_h2d_streamed_weight", False) else None,
+    )
 
 
 def convrot_int8_linear_forward_patch(self: nn.Linear, x):
@@ -305,6 +331,7 @@ def convrot_int8_linear_forward_patch(self: nn.Linear, x):
         self._convrot_groupsize,
         self._convrot_bwd_mode,
         getattr(self, "_convrot_fwd_mode", "int8"),
+        self if getattr(self, "_musubi_h2d_streamed_weight", False) else None,
     )
 
 
