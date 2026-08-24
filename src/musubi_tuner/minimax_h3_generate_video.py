@@ -115,6 +115,29 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora_weight", type=Path, action="append", default=[])
     parser.add_argument("--lora_multiplier", type=float, action="append", default=[])
     parser.add_argument(
+        "--h3_learned_context",
+        type=Path,
+        action="append",
+        default=[],
+        help="ComfyUI-compatible H3 learned context; repeat to prepend multiple contexts in command-line order",
+    )
+    parser.add_argument(
+        "--h3_learned_context_multiplier",
+        type=float,
+        action="append",
+        default=[],
+        help=(
+            "scale the corresponding learned context; omitted values default to 1, zero disables that context, "
+            "and negative values are experimental rather than a guaranteed inverse"
+        ),
+    )
+    parser.add_argument(
+        "--h3_learned_context_composition",
+        choices=("prepend", "replace"),
+        default="prepend",
+        help="prepend the context to Qwen output, or replace the prompt conditioning with the context",
+    )
+    parser.add_argument(
         "--first_pass_scale",
         type=float,
         default=0.0,
@@ -220,6 +243,60 @@ def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
     )
 
 
+def generator_from_args(args: argparse.Namespace, request: H3GenerationRequest):
+    """Create one reusable H3 generator from validated CLI arguments."""
+    return create_generator(
+        model=args.model,
+        text_encoder=args.text_encoder,
+        tokenizer=args.tokenizer,
+        video_vae=args.vae,
+        audio_vae=args.audio_vae,
+        device=args.device,
+        dtype=args.dtype,
+        request=request,
+        num_inference_steps=args.steps,
+        height=args.height,
+        width=args.width,
+        fp8_scaled=args.fp8_base,
+        int8_convrot=args.int8_convrot_base,
+        text_encoder_quantization=args.text_encoder_quantization,
+        text_encoder_blocks_to_stream=args.h3_text_encoder_blocks_to_stream,
+        text_encoder_nvfp4_scaled_mm=args.h3_nvfp4_scaled_mm,
+        blocks_to_swap=args.blocks_to_swap,
+        block_swap_h2d_only=args.block_swap_h2d_only,
+        block_swap_ring_size=args.block_swap_ring_size,
+        block_swap_granularity=args.block_swap_granularity,
+        use_pinned_memory_for_block_swap=args.use_pinned_memory_for_block_swap,
+        lora_weights=tuple(args.lora_weight),
+        lora_multipliers=tuple(args.lora_multiplier),
+        learned_contexts=tuple(args.h3_learned_context),
+        learned_context_multipliers=tuple(args.h3_learned_context_multiplier),
+        learned_context_composition=args.h3_learned_context_composition,
+        first_pass_scale=args.first_pass_scale,
+        first_pass_steps=args.first_pass_steps,
+        second_pass_strength=args.second_pass_strength,
+        first_pass_lora=args.first_pass_lora,
+        latent_upscaler=args.latent_upscaler,
+        latent_upscale_scale=args.latent_upscale_scale,
+        compile_model=args.compile,
+        compile_backend=args.compile_backend,
+        compile_mode=args.compile_mode,
+        compile_dynamic=args.compile_dynamic,
+        compile_fullgraph=args.compile_fullgraph,
+        compile_cache_size_limit=args.compile_cache_size_limit,
+        compile_auto_cache_size_limit=args.compile_auto_cache_size_limit,
+        compile_fallback_to_eager=args.compile_fallback_to_eager,
+        inductor_config=tuple(args.inductor_config),
+        fused_qk_norm_rope=args.h3_fused_qk_norm_rope,
+        reference_image_short_edge=args.reference_image_short_edge,
+        reference_image_size_mode=args.reference_image_size_mode,
+        reference_image_max_pixels=args.reference_image_max_pixels,
+        reference_video_short_edge=args.reference_video_short_edge,
+        reference_video_max_pixels=args.reference_video_max_pixels,
+        text_visual_max_pixels=args.h3_text_visual_max_pixels,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = create_parser()
     args = parser.parse_args(argv)
@@ -248,53 +325,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if missing:
             raise ValueError("native H3 generation requires " + ", ".join(missing))
         request.output.parent.mkdir(parents=True, exist_ok=True)
-        generator = create_generator(
-            model=args.model,
-            text_encoder=args.text_encoder,
-            tokenizer=args.tokenizer,
-            video_vae=args.vae,
-            audio_vae=args.audio_vae,
-            device=args.device,
-            dtype=args.dtype,
-            request=request,
-            num_inference_steps=args.steps,
-            height=args.height,
-            width=args.width,
-            fp8_scaled=args.fp8_base,
-            int8_convrot=args.int8_convrot_base,
-            text_encoder_quantization=args.text_encoder_quantization,
-            text_encoder_blocks_to_stream=args.h3_text_encoder_blocks_to_stream,
-            text_encoder_nvfp4_scaled_mm=args.h3_nvfp4_scaled_mm,
-            blocks_to_swap=args.blocks_to_swap,
-            block_swap_h2d_only=args.block_swap_h2d_only,
-            block_swap_ring_size=args.block_swap_ring_size,
-            block_swap_granularity=args.block_swap_granularity,
-            use_pinned_memory_for_block_swap=args.use_pinned_memory_for_block_swap,
-            lora_weights=tuple(args.lora_weight),
-            lora_multipliers=tuple(args.lora_multiplier),
-            first_pass_scale=args.first_pass_scale,
-            first_pass_steps=args.first_pass_steps,
-            second_pass_strength=args.second_pass_strength,
-            first_pass_lora=args.first_pass_lora,
-            latent_upscaler=args.latent_upscaler,
-            latent_upscale_scale=args.latent_upscale_scale,
-            compile_model=args.compile,
-            compile_backend=args.compile_backend,
-            compile_mode=args.compile_mode,
-            compile_dynamic=args.compile_dynamic,
-            compile_fullgraph=args.compile_fullgraph,
-            compile_cache_size_limit=args.compile_cache_size_limit,
-            compile_auto_cache_size_limit=args.compile_auto_cache_size_limit,
-            compile_fallback_to_eager=args.compile_fallback_to_eager,
-            inductor_config=tuple(args.inductor_config),
-            fused_qk_norm_rope=args.h3_fused_qk_norm_rope,
-            reference_image_short_edge=args.reference_image_short_edge,
-            reference_image_size_mode=args.reference_image_size_mode,
-            reference_image_max_pixels=args.reference_image_max_pixels,
-            reference_video_short_edge=args.reference_video_short_edge,
-            reference_video_max_pixels=args.reference_video_max_pixels,
-            text_visual_max_pixels=args.h3_text_visual_max_pixels,
-        )
+        generator = generator_from_args(args, request)
         generator.generate(request)
         if not request.output.is_file():
             raise RuntimeError(f"H3 implementation returned without creating {request.output}")

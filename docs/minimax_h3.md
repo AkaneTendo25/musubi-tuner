@@ -604,6 +604,114 @@ keeps BF16 activations and uses NVFP4 only for stored weights.
 
 ## Training
 
+### Train a learned context
+
+A learned context is a small trainable sequence composed with Qwen conditioning. Qwen and the H3 transformer remain frozen, and
+training writes one embedding file instead of a LoRA.
+
+Use the ordinary dataset TOML and caches described in [Train FL2VA](#train-fl2va) or [Train Ref2VA](#train-ref2va). Put the shared
+behavior or appearance in every target, but omit it from captions so the learned rows must carry it. Use varied scenes and keep
+separate held-out prompts or references to detect memorization. Targets may be real, edited, generated, or mixed; their cache format
+and training command are identical. Edit the paths in
+[`dataset.toml`](../examples/minimax_h3/learned_context/dataset.toml).
+
+#### Without an existing dataset
+
+If you have no dataset, edit [`bootstrap.toml`](../examples/minimax_h3/learned_context/bootstrap.toml) and generate targets with
+the base model. The generator writes scene-only `.txt` captions beside videos whose prompts also contain the learned concept:
+
+```shell
+python examples/minimax_h3/learned_context/generate_bootstrap_targets.py \
+  --bootstrap_config examples/minimax_h3/learned_context/bootstrap.toml \
+  --model /path/to/minimax_h3_fl2va_int8_convrot.safetensors --int8_convrot_base \
+  --text_encoder /path/to/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --text_encoder_quantization nvfp4_awq --h3_text_encoder_blocks_to_stream 50 \
+  --vae /path/to/minimax_h3_video_vae.safetensors \
+  --audio_vae /path/to/minimax_h3_audio_vae.safetensors \
+  --duration 5 --ratio 16:9 --steps 20 \
+  --blocks_to_swap 30 --block_swap_h2d_only
+```
+
+Set `target_video_directory` in `dataset.toml` to the generated directory.
+
+#### With an existing dataset
+
+Put videos and matching `.txt` captions in one directory and set it as `target_video_directory` in `dataset.toml`. Captions describe
+the scene but omit the learned concept. When targets do not contain usable audio, set `target_modalities = ["video"]` and use
+`--h3_audio_loss_weight 0`.
+
+#### Train
+
+In both cases, create the latent and `--task t2va` text caches as described in [Pre-caching](#pre-caching). Then initialize a
+reusable attribute from a concise semantic description and prepend it to each cached caption:
+
+```shell
+accelerate launch minimax_h3_train_learned_context.py \
+  --dataset_config examples/minimax_h3/learned_context/dataset.toml \
+  --dit /path/to/minimax_h3_fl2va.safetensors --h3_training_mode fl2va \
+  --text_encoder /path/to/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --text_encoder_quantization nvfp4_awq --h3_text_encoder_blocks_to_stream 50 \
+  --h3_learned_context_init_prompt "water rapidly rises and floods the entire scene" \
+  --h3_learned_context_composition prepend \
+  --h3_shift_video 12 --h3_shift_audio 3 \
+  --h3_loss_balance modality --h3_video_loss_weight 1 --h3_audio_loss_weight 1 \
+  --learning_rate 1e-3 --max_train_steps 1000 \
+  --output_dir output --output_name water_context \
+  --sdpa --mixed_precision bf16 --save_precision bf16 --gradient_checkpointing \
+  --h3_convrot_int8 --h3_convrot_int8_fwd int8 --h3_convrot_int8_bwd int8 \
+  --h3_adaln_rank 16 \
+  --blocks_to_swap 30 --block_swap_h2d_only --block_swap_ring_size 2
+```
+
+Reduce `--blocks_to_swap` for faster training when more device memory is available.
+
+Use the checkpoint and `--h3_training_mode` matching the cached task. Start around `1e-3` for a semantic initializer. Compare fixed
+base and trained renders on held-out inputs; a lower training loss alone does not prove that the context transfers.
+
+Exactly one initializer is required:
+
+| Option | Behavior |
+| --- | --- |
+| `--h3_learned_context_init FILE` | Continue training from a saved learned embedding. |
+| `--h3_learned_context_init_prompt TEXT --text_encoder FILE` | Start a new context by encoding `TEXT` once with frozen Qwen and training the resulting rows. |
+
+`--h3_learned_context_init_prompt` initializes the single learned context shared by the whole training run. The trainer encodes
+it once before loading H3 and then unloads Qwen; it is not a per-item caption. With multiple varied dataset items, use `prepend`
+so every item retains its own cached caption alongside the shared learned context.
+
+To continue a saved embedding, reuse the command with `--h3_learned_context_init output/water_context.safetensors` instead of
+`--h3_learned_context_init_prompt` and its text-encoder options, and select a new `--output_name`.
+
+`--h3_learned_context_composition prepend` retains each cached caption and is the normal choice for a transferable attribute.
+`replace` discards the cached caption and trains a self-contained context. The saved file contains the optimized Qwen rows under
+the `qwen3vl_32b` tensor key.
+
+To train while a fixed LoRA is applied to H3, pass it with `--h3_overlay_weights`.
+
+### Use a learned context
+
+Pass the saved file to `minimax_h3_generate_video.py`:
+
+```shell
+python minimax_h3_generate_video.py \
+  --model /path/to/minimax_h3_fl2va_bf16.safetensors \
+  --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+  --audio_vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+  --prompt "a person in a studio" --seed 42 \
+  --h3_learned_context output/my_context.safetensors \
+  --output context.mp4
+```
+
+Repeat `--h3_learned_context` to prepend multiple learned contexts in command-line order. Repeat
+`--h3_learned_context_multiplier` to scale the corresponding files; omitted multipliers default to `1`, and `0` disables that
+context. Learned contexts can be used together with `--lora_weight`.
+
+The saved file also uses ComfyUI's H3 embedding format. Place it in a ComfyUI embeddings directory and use
+`embedding:my_context` in the prompt.
+
+### Start LoRA training
+
 ```shell
 accelerate launch minimax_h3_train_network.py \
   --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_bf16.safetensors \
@@ -1113,6 +1221,8 @@ python minimax_h3_generate_video.py \
 | `--reference_video_max_pixels` | Maximum pixels per reference-video frame after aspect-preserving resize (default 768×1344, minimum 1024). The cap is enforced on the final 32-aligned dimensions, so extreme aspect ratios are downscaled rather than rounded back over it. |
 | `--reference_video_fps` | Caching and training only; no inference flag. Subsample every reference video to this many frames per **source** second so the whole clip conditions the model instead of only its opening span. `0` (default) truncates the reference to the target's frame count. Frame `k` is source frame `round(k × source_fps / F)`, and the result is snapped to the nearest legal reference length (`1` or `17n+5`) that still fits the target's frame budget, truncating or padding with the final frame to reach it. The subsampled reference video spans the whole clip while its paired soundtrack still covers only the clip's opening span. |
 | `--lora_weight` / `--lora_multiplier` | Attach saved adapters. |
+| `--h3_learned_context` | Prepend a ComfyUI-compatible H3 learned context to the Qwen prompt output. Repeat the option to concatenate contexts in command-line order. It composes with all attached LoRAs. |
+| `--h3_learned_context_multiplier` | Scale the corresponding learned context; omitted entries default to `1`. A value of `0` removes that context completely. Negative values are allowed for experimentation but are not a mathematically guaranteed inverse because context tokens influence nonlinear attention rather than adding a direction directly to the latent. |
 | `--steps` | Sigma grid points including terminal zero, so `20` runs 19 evaluations. |
 
 The `--reference_video_*` values enter the cache identity: pass the same value to `minimax_h3_cache_latents`,

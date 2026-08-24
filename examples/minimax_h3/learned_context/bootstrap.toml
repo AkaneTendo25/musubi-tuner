@@ -1,0 +1,26 @@
+# Self-bootstrap target manifest. The target prompt contains the concept, while
+# the saved .txt caption deliberately contains only the scene description.
+
+[bootstrap]
+output_directory = "/path/to/generated_targets"
+concept = "water rapidly rises and floods the entire scene"
+
+[[scenes]]
+name = "workshop"
+caption = "A craftsperson stands beside a wooden workbench."
+seed = 101
+
+[[scenes]]
+name = "museum"
+caption = "Visitors walk through a bright contemporary museum gallery."
+seed = 202
+
+[[scenes]]
+name = "greenhouse"
+caption = "A gardener tends plants inside a glass greenhouse."
+seed = 303
+
+[[scenes]]
+name = "station"
+caption = "Commuters wait inside a spacious railway station."
+seed = 404

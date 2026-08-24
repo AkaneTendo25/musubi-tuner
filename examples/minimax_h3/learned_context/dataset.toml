@@ -1,0 +1,19 @@
+# Learned-context training dataset.
+# Put the shared attribute in every target, but omit it from the .txt captions.
+
+[general]
+resolution = [832, 480]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+target_video_directory = "/path/to/targets"
+target_modalities = ["video", "audio"]
+cache_directory = "/path/to/cache"
+source_fps = 24.0
+target_frames = [56, 124]
+frame_extraction = "uniform"
+frame_sample = 2
+num_repeats = 1

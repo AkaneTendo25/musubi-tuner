@@ -286,6 +286,9 @@ def create_generator(
     use_pinned_memory_for_block_swap: bool = False,
     lora_weights: tuple[Path, ...] = (),
     lora_multipliers: tuple[float, ...] = (),
+    learned_contexts: tuple[Path, ...] = (),
+    learned_context_multipliers: tuple[float, ...] = (),
+    learned_context_composition: str = "prepend",
     first_pass_scale: float = 0.0,
     first_pass_steps: int = 0,
     second_pass_strength: float = 0.5,
@@ -335,6 +338,9 @@ def create_generator(
         use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
         lora_weights=lora_weights,
         lora_multipliers=lora_multipliers,
+        learned_contexts=learned_contexts,
+        learned_context_multipliers=learned_context_multipliers,
+        learned_context_composition=learned_context_composition,
         first_pass_scale=first_pass_scale,
         first_pass_steps=first_pass_steps,
         second_pass_strength=second_pass_strength,
@@ -395,6 +401,9 @@ class _NativeGenerator:
         inductor_config: tuple[str, ...],
         fused_qk_norm_rope: bool,
         mode: H3TrainingMode,
+        learned_contexts: tuple[Path, ...] = (),
+        learned_context_multipliers: tuple[float, ...] = (),
+        learned_context_composition: str = "prepend",
         text_encoder_blocks_to_stream: int = 0,
         text_encoder_nvfp4_scaled_mm: bool = False,
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
@@ -442,6 +451,12 @@ class _NativeGenerator:
         self.use_pinned_memory_for_block_swap = use_pinned_memory_for_block_swap
         self.lora_weights = tuple(Path(path) for path in lora_weights)
         self.lora_multipliers = lora_multipliers
+        from musubi_tuner.minimax_h3.learned_context import load_learned_context_sequence
+
+        self.learned_context = load_learned_context_sequence(learned_contexts, learned_context_multipliers)
+        if learned_context_composition not in {"prepend", "replace"}:
+            raise ValueError("H3 learned-context composition must be prepend or replace")
+        self.learned_context_composition = learned_context_composition
         self.compile_model = compile_model
         self.compile_options = SimpleNamespace(
             compile_backend=compile_backend,
@@ -521,7 +536,13 @@ class _NativeGenerator:
             del encoder
         gc.collect()
         clean_memory_on_device(self.device)
-        return conditioning
+        from musubi_tuner.minimax_h3.learned_context import apply_learned_context
+
+        return apply_learned_context(
+            conditioning,
+            self.learned_context,
+            self.learned_context_composition,
+        )
 
     def _prepare_keyframes(
         self,
