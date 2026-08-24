@@ -712,6 +712,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_base_preservation_loss_weight", str(t.h3_base_preservation_loss_weight)]
         if t.h3_base_preservation_probability != 1.0:
             cmd += ["--h3_base_preservation_probability", str(t.h3_base_preservation_probability)]
+    if t.h3_fuse_frozen_teachers:
+        cmd.append("--h3_fuse_frozen_teachers")
     if t.h3_overlay_weights:
         cmd += ["--h3_overlay_weights", t.h3_overlay_weights]
         if t.h3_overlay_weights_multiplier != 1.0:

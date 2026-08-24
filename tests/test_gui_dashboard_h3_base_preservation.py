@@ -1060,6 +1060,33 @@ def test_h3_dashboard_guidance_null_field_defaults_stay_off_the_command_line(tmp
 
     assert "--h3_guidance_null_source" not in command
     assert "--h3_guidance_cfg_zero" not in command
+    assert "--h3_fuse_frozen_teachers" not in command
+
+
+def test_h3_dashboard_fused_frozen_teachers_round_trip(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [DatasetEntry(type="video", directory="train", target_frames=124)]
+    config.caching.h3_cache_guidance_empty = True
+    config.training.h3_guidance_distillation_scale = 4.0
+    config.training.h3_guidance_null_source = "frozen"
+    config.training.h3_base_preservation_loss_weight = 0.02
+    config.training.h3_fuse_frozen_teachers = True
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+
+    assert parsed.h3_fuse_frozen_teachers is True
+    assert validate_training_config(config)["field_errors"] == {}
+
+
+def test_h3_dashboard_rejects_fused_teachers_without_both_frozen_objectives(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_fuse_frozen_teachers = True
+
+    report = validate_training_config(config)
+
+    assert "training.h3_fuse_frozen_teachers" in report["field_errors"]
 
 
 def test_h3_dashboard_rejects_null_field_options_without_a_guidance_scale(tmp_path: Path) -> None:
@@ -1088,6 +1115,7 @@ def test_h3_dashboard_training_page_exposes_the_null_field_controls() -> None:
 
     assert "training.h3_guidance_null_source" in page
     assert "training.h3_guidance_cfg_zero" in page
+    assert "training.h3_fuse_frozen_teachers" in page
 
 
 def test_dashboard_warns_that_automagic3_ignores_the_lr_schedule(tmp_path: Path) -> None:

@@ -913,6 +913,20 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         page="training",
                     )
                 )
+        if t.h3_fuse_frozen_teachers and (
+            (t.h3_guidance_distillation_scale is None and not t.h3_guidance_scale_range)
+            or t.h3_guidance_null_source != "frozen"
+            or preservation_weight <= 0
+        ):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_fuse_frozen_teachers",
+                    "Fused H3 teachers require frozen null guidance and active base preservation.",
+                    label="Fuse Frozen H3 Teachers",
+                    page="training",
+                )
+            )
         spatial_density_jitter = float(t.h3_spatial_density_jitter)
         if not math.isfinite(spatial_density_jitter) or spatial_density_jitter < 0:
             errors.append(

@@ -59,6 +59,27 @@ def test_h3_extra_forwards_and_transfer_features_change_time_directionally():
     assert bidirectional_swap > base
 
 
+def test_h3_fused_frozen_teachers_reduce_only_the_overlapping_auxiliary_cost():
+    sequential = _estimate_training_step_time_sec(_config(h3_guidance_distillation_scale=4.0, h3_guidance_null_source="frozen"))
+    fused = _estimate_training_step_time_sec(
+        _config(
+            h3_guidance_distillation_scale=4.0,
+            h3_guidance_null_source="frozen",
+            h3_fuse_frozen_teachers=True,
+        )
+    )
+    sparse_fused = _estimate_training_step_time_sec(
+        _config(
+            h3_guidance_distillation_scale=4.0,
+            h3_guidance_null_source="frozen",
+            h3_fuse_frozen_teachers=True,
+            h3_base_preservation_probability=0.25,
+        )
+    )
+
+    assert sparse_fused < fused < sequential
+
+
 def test_h3_gpu_coefficients_scale_the_same_configuration():
     fastest = _estimate_training_step_time_sec(_config(), "NVIDIA B200")
     reference = _estimate_training_step_time_sec(_config(), "NVIDIA H100 80GB HBM3")

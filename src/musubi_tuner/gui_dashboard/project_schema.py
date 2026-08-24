@@ -294,6 +294,7 @@ class TrainingConfig(BaseModel):
     h3_guidance_loss_schedule: Literal["sigma", "constant"] = "sigma"
     h3_guidance_null_source: Literal["live", "frozen"] = "live"
     h3_guidance_cfg_zero: bool = False
+    h3_fuse_frozen_teachers: bool = False
     h3_base_preservation_loss_weight: float = 0.0
     h3_base_preservation_probability: float = 1.0
     h3_overlay_weights: str = ""
