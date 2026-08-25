@@ -52,6 +52,13 @@ test('H3 preservation changes average time but not estimated peak VRAM', () => {
 	assert.equal(partValue(preserved, 'Preserv.'), undefined);
 });
 
+test('H3 AV guide spans add their video and audio conditioning rows', () => {
+	const base = estimateTraining(config());
+	const guided = estimateTraining(config({ h3_guide_specs: '0:2:4;21:0:8' }));
+
+	assert.ok(partValue(guided, 'Activ.') > partValue(base, 'Activ.'));
+});
+
 test('H3 partial checkpointing estimates more activation memory', () => {
 	const full = estimateTraining(config());
 	const partial = estimateTraining(config({ h3_gradient_checkpointing_blocks: 24 }));

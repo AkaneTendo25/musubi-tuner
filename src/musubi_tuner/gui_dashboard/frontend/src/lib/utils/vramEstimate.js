@@ -74,6 +74,13 @@ function h3DatasetRows(cfg, dataset) {
 	const anchors = String(t.h3_keyframe_anchors || '').split(',').filter((value) => value.trim()).length;
 	const randomAnchors = Math.max(Number(t.h3_keyframe_random_count || 0), 0);
 	rows += Math.max(anchors, randomAnchors) * rowsPerVideoFrame;
+	for (const spec of String(t.h3_guide_specs || '').split(';')) {
+		const fields = spec.split(':').map((value) => Number(value.trim()));
+		if (fields.length === 3 && fields.every(Number.isFinite)) {
+			rows += Math.max(fields[1], 0) * rowsPerVideoFrame;
+			rows += 2 * Math.max(fields[2], 0);
+		}
+	}
 	rows += Math.max(Number(t.h3_extension_video_frames || 0), 0) * rowsPerVideoFrame;
 	rows += 2 * Math.max(Number(t.h3_extension_audio_latents || 0), 0);
 	return rows;
