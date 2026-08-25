@@ -489,6 +489,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._recipe_probability_generator: torch.Generator | None = None
         self._qwen_control_dropout_generator: torch.Generator | None = None
         self._overlay_network = None
+        # The frozen base's field is a property of the checkpoint and the validation
+        # item, not of the training run, so it is measured once and kept.
+        self._field_base_gaps: dict[tuple, float] = {}
+        self._field_ratios: dict[int, list[float]] = {}
+        self._validation_network = None
         self._step_recipe: str | None = None
         self._step_qwen_control_dropout = False
         self._crepa: H3CREPA | None = None
@@ -651,6 +656,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             for task in validation_tasks
         }
         validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
+        self._validation_network = network
+        self._field_ratios = {}
 
         block_swap_active = bool(self.blocks_to_swap)
         transformer_was_training = transformer.training
@@ -714,6 +721,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if active_references != {"av"}:
                     prefix += f"/ref_{reference}"
             metrics.update({f"{prefix}/{key}": value for key, value in task_metrics.items()})
+        # Reported per bin as well as pooled: the field is not lost uniformly, and the
+        # high-noise end -- where composition and prompt following are decided -- is
+        # both the first to go and the one worth watching.
+        for bin_index, ratios in sorted(self._field_ratios.items()):
+            if ratios:
+                metrics[f"val/field/bin{bin_index}"] = sum(ratios) / len(ratios)
+        pooled = [ratio for ratios in self._field_ratios.values() for ratio in ratios]
+        if pooled:
+            metrics["val/field"] = sum(pooled) / len(pooled)
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
@@ -956,16 +972,125 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
             accumulator.add(sigma_bin.index, "audio", total, count)
 
+        if getattr(args, "h3_validation_field_probe", False):
+            self._probe_guidance_field(
+                accelerator,
+                args,
+                transformer,
+                batch,
+                inputs,
+                effective_video_mask,
+                dataset_index=dataset_index,
+                sigma_bin=sigma_bin,
+                observed=observed,
+            )
+
         self._step_mask = None
         self._step_keyframes = None
         self._step_guides = None
         self._step_recipe = None
+
+    @staticmethod
+    def _masked_rms(tensor, mask):
+        """Root mean square over the authored elements only."""
+        if mask is None:
+            return float(tensor.float().pow(2).mean().sqrt())
+        valid = mask.to(device=tensor.device, dtype=torch.float32).expand_as(tensor)
+        count = float(valid.sum())
+        if count == 0.0:
+            return 0.0
+        return float((tensor.float().pow(2) * valid).sum().div(count).sqrt())
+
+    @torch.no_grad()
+    def _probe_guidance_field(
+        self,
+        accelerator,
+        args,
+        transformer,
+        batch,
+        inputs,
+        video_mask,
+        *,
+        dataset_index,
+        sigma_bin,
+        observed,
+    ) -> None:
+        """How much of the base model's prompted-to-empty field the adapter still carries.
+
+        A LoRA trained on a guidance-distilled checkpoint is not constrained to keep
+        the difference between its prompted and its empty-prompt prediction, and that
+        difference is what the checkpoint answers prompts with. Losing it is invisible
+        in the training loss -- the loss goes down either way -- and shows up only
+        later, as prompts being ignored and as detail the model had to invent falling
+        apart. Reporting it during training turns a post-hoc audit into a curve.
+
+        The quantity is the ratio of the adapter's field to the frozen base's, on the
+        same items at the same noise: 1.0 means untouched, 0 means erased. The
+        denominator does not change while training runs, so it is measured once and
+        cached; after the first validation the probe costs two no-grad forwards per
+        item and bin.
+
+        Both branches are recomputed here rather than reused from the caller. The
+        prompted prediction there has already been rewritten by the guidance loss when
+        that objective is active, and a probe that silently measures a different
+        quantity depending on which loss is configured would be worse than no probe.
+        """
+        if inputs.video is None:
+            return
+        missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+        if missing_empty:
+            raise KeyError(
+                "--h3_validation_field_probe compares the prompted branch against the empty one and therefore "
+                "requires --cache_guidance_empty; missing " + ", ".join(missing_empty)
+            )
+        network = self._validation_network
+        if network is None:
+            raise ValueError("--h3_validation_field_probe requires a trainable network")
+        set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_validation_field_probe")
+        fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+        int8_context = getattr(transformer, "int8_attention_context", None)
+
+        def gap() -> float:
+            # Both branches of one measurement must see the same stochastic
+            # conditioning, or their difference reports the draw rather than the
+            # prompt. Forking around each keeps the pair aligned and leaves the rest
+            # of the validation's RNG stream untouched.
+            branches = {}
+            for branch in ("prompt", "empty"):
+                with (
+                    torch.random.fork_rng(devices=fork_devices),
+                    int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                ):
+                    branches[branch] = self._predict(accelerator, transformer, batch, inputs, conditioning=branch)
+            prompted, empty = branches["prompt"].video, branches["empty"].video
+            if prompted is None or empty is None:
+                return 0.0
+            return self._masked_rms(prompted - empty, video_mask)
+
+        key = (dataset_index, sigma_bin.index, observed, self._step_reference_modality)
+        if key not in self._field_base_gaps:
+            set_enabled(False)
+            try:
+                self._field_base_gaps[key] = gap()
+            finally:
+                set_enabled(True)
+        base_gap = self._field_base_gaps[key]
+        if base_gap <= 0.0:
+            # The base has no field to lose at this state, so a ratio would divide by
+            # noise. Skipping keeps one degenerate item from dominating the average.
+            return
+        self._field_ratios.setdefault(sigma_bin.index, []).append(gap() / base_gap)
 
     def handle_model_specific_args(self, args: argparse.Namespace):
         self.dit_dtype = (
             torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
         )
         args.dit_dtype = model_utils.dtype_to_str(self.dit_dtype)
+        if getattr(args, "h3_validation_field_probe", False) and not getattr(args, "validation_dataset_config", None):
+            # The probe reports a ratio measured on held-out items. Run on the training
+            # set it would report how well the adapter reproduces the field where it
+            # was fitted, which is the one place the number cannot be trusted.
+            raise ValueError("--h3_validation_field_probe requires --validation_dataset_config")
         if args.h3_swiglu_chunk_rows < 0:
             raise ValueError("--h3_swiglu_chunk_rows must be non-negative")
         if args.h3_swiglu_chunk_rows and args.compile:
@@ -3432,6 +3557,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "EXPERIMENTAL batch the frozen empty-guidance and base-preservation teachers into one transformer forward; "
             "requires frozen guidance and active base preservation, and may use more peak VRAM"
+        ),
+    )
+    parser.add_argument(
+        "--h3_validation_field_probe",
+        action="store_true",
+        help=(
+            "report how much of the checkpoint's prompted-to-empty guidance field the adapter still carries, as a "
+            "fraction of the frozen base measured on the same validation items and noise; requires a validation set "
+            "and empty-text caches (--cache_guidance_empty). Costs two no-grad forwards per validation item and bin, "
+            "plus two more on the first validation only, since the base's field does not change during training"
         ),
     )
     parser.add_argument(

@@ -7095,3 +7095,28 @@ def test_h3_foreign_lora_conversion_accepts_a_peft_adapter_name():
     # An adapter name changes nothing about which modules the file reaches.
     unnamed = {key.replace(".default.weight", ".weight"): value for key, value in state.items()}
     assert set(lora_minimax_h3.convert_foreign_lora(unnamed)) == set(converted)
+
+
+def test_field_probe_requires_a_validation_set():
+    """Measured on the training set the ratio would report memorisation, not preservation."""
+    args = create_parser().parse_args(["--sdpa", "--h3_validation_field_probe"])
+
+    with pytest.raises(ValueError, match="--validation_dataset_config"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_masked_rms_counts_only_authored_elements():
+    """Hand-computed: the masked element must not reach the mean or its denominator."""
+    trainer = MiniMaxH3NetworkTrainer()
+    tensor = torch.tensor([[3.0, 400.0]])
+    mask = torch.tensor([[True, False]])
+
+    assert trainer._masked_rms(tensor, mask) == pytest.approx(3.0, rel=1e-6)
+    # Unmasked, the same tensor is dominated by the element the mask removed.
+    assert trainer._masked_rms(tensor, None) == pytest.approx(((9.0 + 160000.0) / 2) ** 0.5, rel=1e-6)
+
+
+def test_masked_rms_survives_a_fully_masked_item():
+    trainer = MiniMaxH3NetworkTrainer()
+
+    assert trainer._masked_rms(torch.tensor([[1.0, 2.0]]), torch.tensor([[False, False]])) == 0.0
