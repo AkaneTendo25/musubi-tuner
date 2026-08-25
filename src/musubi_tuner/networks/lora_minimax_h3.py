@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 
 import torch
 from torch import nn
@@ -135,11 +136,23 @@ def _strip_prefix(key: str) -> str | None:
     return key
 
 
+#: PEFT keeps several adapters side by side and names each one, writing the name
+#: between the matrix and ``weight``: ``lora_A.default.weight``. Files saved through
+#: ``save_pretrained`` carry it, files flattened on the way out do not.
+_ADAPTER_NAMED = re.compile(r"\.lora_(?P<matrix>A|B|down|up)\.(?P<adapter>[A-Za-z0-9_]+)\.weight$")
+
+
+def _drop_adapter_name(path: str) -> str:
+    """``…lora_A.default.weight`` -> ``…lora_A.weight``; anything else unchanged."""
+    return _ADAPTER_NAMED.sub(lambda m: f".lora_{m.group('matrix')}.weight", path)
+
+
 def _split_key(key: str) -> tuple[str, str] | None:
     """Module path and matrix name, or ``None`` when the key is not an adapter key."""
     path = _strip_prefix(key)
     if path is None:
         return None
+    path = _drop_adapter_name(path)
     for suffix, mapped in _FOREIGN_SUFFIXES.items():
         if path.endswith("." + suffix):
             return path[: -len(suffix) - 1], mapped

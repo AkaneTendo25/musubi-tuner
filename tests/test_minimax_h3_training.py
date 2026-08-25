@@ -10,12 +10,11 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
 
-from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
-
 import musubi_tuner.minimax_h3.model as h3_model
 import musubi_tuner.minimax_h3_train_network as h3_train_network
 from musubi_tuner.dataset.bucket import BucketBatchManager
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.minimax_h3 import training as h3_training
 from musubi_tuner.minimax_h3.backend import H3PairedConditioningUnsupportedError
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
@@ -25,6 +24,9 @@ from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
+    H3_KEYFRAME_VISUALS_KEY,
+    H3_MAX_CAPTION_TOKENS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
     H3_REFERENCE_AUDIO_ROWS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
@@ -32,9 +34,6 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
-    H3_MAX_CAPTION_TOKENS_KEY,
-    H3_KEYFRAME_VISUALS_KEY,
-    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -46,6 +45,8 @@ from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_co
 from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
 from musubi_tuner.minimax_h3.masking import (
     CONDITIONING_MASK_BATCH_KEY as H3_CONDITIONING_MASK_KEY,
+)
+from musubi_tuner.minimax_h3.masking import (
     audio_mask_to_rows,
     sample_video_mask,
     video_mask_to_rows,
@@ -61,7 +62,6 @@ from musubi_tuner.minimax_h3.packing import (
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
-from musubi_tuner.minimax_h3 import training as h3_training
 from musubi_tuner.minimax_h3.training import (
     OBSERVED_AUDIO_SIGMA,
     OBSERVED_VIDEO_SIGMA,
@@ -89,6 +89,7 @@ from musubi_tuner.minimax_h3_cache_dino_features import (
     dino_cache_path,
 )
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
+from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.networks import lora_minimax_h3
 
 
@@ -4916,7 +4917,7 @@ def _run_masked(mode, *, mask_audio=False, guidance_scale=None, dataset_mask=Non
     if dataset_mask is not None:
         batch[H3_CONDITIONING_MASK_KEY] = dataset_mask
     torch.manual_seed(0)
-    loss, metrics = trainer.process_batch(
+    loss, _metrics = trainer.process_batch(
         args,
         _FakeAccelerator(),
         _ScaleTransformer(),
@@ -4934,7 +4935,7 @@ def _run_masked(mode, *, mask_audio=False, guidance_scale=None, dataset_mask=Non
 
 
 def test_h3_masked_conditioning_marks_some_rows_observed():
-    trainer, backend, loss = _run_masked("box")
+    _trainer, backend, loss = _run_masked("box")
 
     observed_video, _, clean = backend.observed[0]
     assert observed_video is not None and clean is not None
@@ -6067,7 +6068,7 @@ def _dataset_observed_left_half(frames=4, height=16, width=16):
 
 def test_h3_dataset_mask_observes_exactly_the_authored_region():
     mask = _dataset_observed_left_half()
-    trainer, backend, loss = _run_masked("dataset", dataset_mask=mask)
+    _trainer, backend, loss = _run_masked("dataset", dataset_mask=mask)
 
     observed_video, _, clean = backend.observed[0]
     assert clean is not None
@@ -6095,7 +6096,7 @@ def test_h3_dataset_mask_keeps_a_patch_generated_when_any_latent_inside_it_is():
     mask = torch.ones(1, 4, 16, 16, dtype=torch.bool)
     mask[:, :, 0, 0] = False
 
-    trainer, backend, _ = _run_masked("dataset", dataset_mask=mask)
+    _trainer, backend, _ = _run_masked("dataset", dataset_mask=mask)
 
     rows = backend.observed[0][0].reshape(4, 8, 8)
     assert not bool(rows[:, 0, 0].any()) and bool(rows[:, 0, 1:].all())
@@ -6900,3 +6901,31 @@ def test_h3_overlay_weights_compose_with_the_trainable_network(tmp_path):
     # The trainable adapter still carries gradient through the composed forward.
     transformer(hidden).sum().backward()
     assert all(module.lora_up.weight.grad is not None for module in network.unet_loras)
+
+
+def test_h3_foreign_lora_conversion_accepts_a_peft_adapter_name():
+    """PEFT names each adapter, and the name lands between the matrix and ``weight``.
+
+    A file saved through ``save_pretrained`` writes ``lora_A.default.weight`` rather than
+    ``lora_A.weight``, which is what the DiffSynth-Studio training adapter for FL2VA ships.
+    Community adapters are meant to load as downloaded, so the extra segment has to be
+    recognised rather than force every user through a rename script.
+    """
+    state = {}
+    for index in (0, 1):
+        for matrix, shape in (("lora_A", (4, 8)), ("lora_B", (8, 4))):
+            state[f"blocks.{index}.attn.out_proj.{matrix}.default.weight"] = torch.zeros(shape)
+    state["token_refiner.blocks.0.mlp.fc1.lora_A.default.weight"] = torch.zeros(4, 8)
+    state["token_refiner.blocks.0.mlp.fc1.lora_B.default.weight"] = torch.zeros(8, 4)
+
+    assert lora_minimax_h3.is_foreign_lora(state)
+    converted = lora_minimax_h3.convert_foreign_lora(state)
+
+    assert converted["lora_unet_blocks_0_attn_out_proj.lora_down.weight"].shape == (4, 8)
+    assert converted["lora_unet_blocks_0_attn_out_proj.lora_up.weight"].shape == (8, 4)
+    assert converted["lora_unet_token_refiner_blocks_0_mlp_fc1.lora_down.weight"].shape == (4, 8)
+    # The file carries no alpha, so each module gets its own rank and a scale of one.
+    assert float(converted["lora_unet_blocks_1_attn_out_proj.alpha"]) == 4.0
+    # An adapter name changes nothing about which modules the file reaches.
+    unnamed = {key.replace(".default.weight", ".weight"): value for key, value in state.items()}
+    assert set(lora_minimax_h3.convert_foreign_lora(unnamed)) == set(converted)

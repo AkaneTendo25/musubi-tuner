@@ -780,15 +780,31 @@ versions.
 ### Training a guidance-distilled model
 
 H3 is guidance-distilled. Direct LoRA training does not explicitly constrain the adapter to retain the base model's
-CFG-free prediction. Two optional strategies expose different constraints:
+CFG-free prediction. Three optional strategies expose different constraints:
 
-1. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base. Add
+1. **The guidance-distillation objective, currently the recommended starting point for FL2VA.**
+   `--h3_guidance_distillation_scale 3.5 --h3_guidance_loss_form contrastive` supervises the adapter against an
+   extrapolated guided target built from the cached empty-text branch instead of against the raw data velocity, so the
+   prompted-to-empty field the distilled checkpoint carries is part of what is optimized rather than something the data
+   loss quietly erodes. It costs one extra no-gradient forward over the packed sequence; see the flag table below for the
+   scale range, the sparse variant and the schedules. Requires the empty-text cache
+   (`--cache_guidance_empty` at caching time).
+2. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base. Add
    `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with inverse-probability loss scaling.
-2. If a compatible de-distillation training adapter is provided, load it through `--base_weights` while training the concept
+3. If a compatible de-distillation training adapter is provided, load it through `--base_weights` while training the concept
    LoRA, then remove it for inference. Adapters are checkpoint-specific: the Ref2VA checkpoint needs its own adapter, not one
-   made for FL2VA. One community example is
-   [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter), whose
-   `minimax_h3_ref2va_training_adapter_v1.safetensors` targets the Ref2VA checkpoint.
+   made for FL2VA. Community examples:
+   * [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter) publishes one for each
+     checkpoint — `minimax_h3_training_adapter_v1.safetensors` for **FL2VA** and
+     `minimax_h3_ref2va_training_adapter_v1.safetensors` for **Ref2VA** (the repository carries no model card, so the
+     targets are read off the file names; an earlier `minimax_h3_training_adapter_alpha.safetensors` is also present).
+   * [DiffSynth-Studio/MiniMax-H3-TrainingAdapter](https://modelscope.ai/models/DiffSynth-Studio/MiniMax-H3-TrainingAdapter)
+     on ModelScope, for **FL2VA**, trained by DiffSynth-Studio's differential-LoRA recipe.
+
+   Community adapters are renamed on load, so a file published in PEFT naming
+   (`blocks.N.….lora_A.weight`, with or without an adapter name such as `.default`, and with or without a
+   `diffusion_model.` / `transformer.` prefix) can be passed to `--base_weights` as downloaded. A file reaching modules this
+   network does not adapt is rejected rather than trimmed.
 
 For concept LoRA training over a de-distillation adapter, sparse preservation can provide an additional anchor, but the two
 objectives are not equivalent: preservation retains the loaded base's predictions, while a de-distillation adapter changes them.
