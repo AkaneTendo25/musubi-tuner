@@ -13,6 +13,7 @@ from musubi_tuner.minimax_h3.comfy_quant import (
     has_comfy_quantized_layers,
     load_comfy_quantized_state_dict,
     quantize_nvfp4_activations,
+    quantize_nvfp4_weight,
     swizzle_nvfp4_scales,
     unswizzle_nvfp4_scales,
 )
@@ -76,6 +77,35 @@ def test_nvfp4_activation_quantization_pads_rows_and_handles_zero():
     assert tensor_scale.item() == 0.0
     assert not packed.any()
     assert not blocked_scales.float().any()
+
+
+def test_nvfp4_weight_quantization_round_trips_without_padding_rows():
+    generator = torch.Generator().manual_seed(17)
+    weight = torch.randn((7, 32), generator=generator, dtype=torch.float32).to(torch.bfloat16)
+
+    packed, blocked_scales, tensor_scale = quantize_nvfp4_weight(weight)
+    linear = ComfyNvfp4Linear(
+        nn.Linear(32, 7, bias=False),
+        packed,
+        blocked_scales,
+        tensor_scale,
+        None,
+        torch.bfloat16,
+    )
+    restored = linear.dequantize_weight(torch.float32)
+
+    assert packed.shape == (7, 16)
+    assert blocked_scales.shape == (128, 4)
+    assert torch.nn.functional.cosine_similarity(weight.float().flatten(), restored.flatten(), dim=0) > 0.98
+
+
+def test_nvfp4_weight_quantization_handles_all_zero_weight():
+    packed, blocked_scales, tensor_scale = quantize_nvfp4_weight(torch.zeros((3, 16), dtype=torch.bfloat16))
+
+    assert packed.shape == (3, 8)
+    assert not packed.any()
+    assert not blocked_scales.float().any()
+    assert tensor_scale.item() == 0.0
 
 
 def test_int8_embedding_dequantizes_only_selected_rows():

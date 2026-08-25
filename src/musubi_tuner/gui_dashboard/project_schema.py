@@ -149,7 +149,7 @@ class CachingConfig(BaseModel):
     h3_tokenizer: str = ""
     h3_task: Literal["t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"] = "t2va"
     h3_text_encoder_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
-    h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none"
+    h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4", "nvfp4_awq"] = "none"
     h3_text_encoder_blocks_to_stream: int = 0
     h3_nvfp4_scaled_mm: bool = False
     h3_text_visual_max_pixels: int = 0
@@ -256,7 +256,12 @@ class TrainingConfig(BaseModel):
     model_type: Literal["ltx2", "minimax_h3"] = "minimax_h3"
     ltx2_checkpoint: str = ""
     h3_model: str = ""
+    h3_training_type: Literal["lora", "learned_context"] = "lora"
     h3_training_mode: Literal["fl2va", "ref2va", "ref2va_omni"] = "fl2va"
+    h3_learned_context_init: str = ""
+    h3_learned_context_init_prompt: str = ""
+    h3_learned_context_composition: Literal["prepend", "replace"] = "prepend"
+    h3_learned_context_learning_rate: float = 1e-4
     h3_loss_balance: Literal["token", "modality"] = "modality"
     h3_video_loss_weight: float = 1.0
     h3_audio_loss_weight: float = 1.0
@@ -1188,7 +1193,7 @@ class InferenceConfig(BaseModel):
     h3_tokenizer: str = ""
     h3_video_vae: str = ""
     h3_audio_vae: str = ""
-    h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none"
+    h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4", "nvfp4_awq"] = "none"
     h3_text_encoder_blocks_to_stream: int = 0
     h3_nvfp4_scaled_mm: bool = False
     h3_text_visual_max_pixels: int = 0

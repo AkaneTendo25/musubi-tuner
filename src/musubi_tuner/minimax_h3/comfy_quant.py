@@ -124,6 +124,49 @@ def quantize_nvfp4_activations(inputs: torch.Tensor) -> tuple[torch.Tensor, torc
     return packed, swizzle_nvfp4_scales(row_scales), tensor_scale, rows
 
 
+@torch.no_grad()
+def quantize_nvfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Max-quantize a rank-2 weight to block-16 NVFP4 W4A16 storage."""
+    if weight.ndim != 2:
+        raise ValueError("NVFP4 weight quantization requires a rank-2 tensor")
+    rows, columns = weight.shape
+    if columns % NVFP4_BLOCK_SIZE:
+        raise ValueError(f"NVFP4 weight width must be divisible by {NVFP4_BLOCK_SIZE}")
+
+    blocks = weight.reshape(rows, -1, NVFP4_BLOCK_SIZE).float()
+    tensor_scale = (blocks.abs().amax() / (NVFP4_SCALE_MAX * NVFP4_VALUE_MAX)).reshape(())
+    safe_tensor_scale = tensor_scale.clamp_min(torch.finfo(torch.float32).tiny)
+    block_scales = (blocks.abs().amax(dim=-1) / NVFP4_VALUE_MAX / safe_tensor_scale).clamp_max(NVFP4_SCALE_MAX)
+    block_scales = block_scales.to(torch.float8_e4m3fn)
+    decoded_scales = tensor_scale * block_scales.float()
+    safe_scales = torch.where(decoded_scales == 0, torch.ones_like(decoded_scales), decoded_scales)
+    normalized = (blocks / safe_scales.unsqueeze(-1)).clamp(-NVFP4_VALUE_MAX, NVFP4_VALUE_MAX)
+    normalized = torch.where(decoded_scales.unsqueeze(-1) == 0, 0, normalized).reshape(rows, columns)
+    codes = _encode_e2m1(normalized)
+    packed = ((codes[:, 0::2] << 4) | codes[:, 1::2]).contiguous()
+    return packed, swizzle_nvfp4_scales(block_scales), tensor_scale
+
+
+@torch.no_grad()
+def quantize_linear_nvfp4_weight_only(
+    source: nn.Linear,
+    weight: torch.Tensor,
+    *,
+    output_dtype: torch.dtype,
+    quantize_device: torch.device,
+) -> ComfyNvfp4Linear:
+    """Create a CPU-resident frozen W4A16 Linear from one BF16/FP16 source weight."""
+    packed, blocked_scales, tensor_scale = quantize_nvfp4_weight(weight.to(quantize_device))
+    return ComfyNvfp4Linear(
+        source,
+        packed.cpu(),
+        blocked_scales.cpu(),
+        tensor_scale.cpu(),
+        None,
+        output_dtype,
+    )
+
+
 def nvfp4_scaled_mm_available(device: torch.device | None = None) -> bool:
     if not hasattr(torch, "float4_e2m1fn_x2") or not hasattr(F, "scaled_mm"):
         return False

@@ -3,6 +3,7 @@ function h3QwenSize(cfg) {
 	// Values are resident checkpoint weights in GiB. BF16, INT8 ConvRot, and
 	// NVFP4/AWQ come from the official Comfy-Org/MiniMax-H3 file sizes.
 	switch (cfg?.h3_text_encoder_quantization || 'none') {
+		case 'nvfp4':
 		case 'nvfp4_awq': return 14.61;
 		case 'nf4': return 14.0;
 		case 'int8': return 25.28;

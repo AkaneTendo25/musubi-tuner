@@ -220,7 +220,13 @@ python minimax_h3_cache_text_encoder_outputs.py \
   --skip_existing
 ```
 
-The native NVFP4/AWQ checkpoint reduces conditioner weight residency. `--h3_text_encoder_blocks_to_stream 50` streams all 50 frozen language blocks and minimizes their simultaneous GPU residency; smaller values reduce transfer overhead but retain more blocks on the GPU. Streaming works with BF16 and native NVFP4/AWQ, but not with the bitsandbytes `int8` or `nf4` loaders. If the full BF16 conditioner fits, use `--text_encoder_quantization none` and omit streaming to avoid weight quantization and block-transfer overhead. Add `--cache_guidance_empty` if training will use caption dropout or guidance distillation.
+The native NVFP4/AWQ checkpoint reduces conditioner weight residency. If only the BF16 checkpoint is available, use
+`--text_encoder_quantization nvfp4` to quantize its Linear weights to block-16 NVFP4 while loading; activations and GEMMs stay
+BF16, so this W4A16 path also works on pre-Blackwell CUDA GPUs. `--h3_text_encoder_blocks_to_stream 50` streams all 50 frozen
+language blocks and minimizes their simultaneous GPU residency; smaller values reduce transfer overhead but retain more blocks on
+the GPU. Streaming works with BF16 and both NVFP4 modes, but not with the bitsandbytes `int8` or `nf4` loaders. If the full BF16
+conditioner fits, use `--text_encoder_quantization none` and omit streaming to avoid quantization and block-transfer overhead. Add
+`--cache_guidance_empty` if training will use caption dropout or guidance distillation.
 
 ### Start FL2VA training
 
@@ -581,7 +587,8 @@ python minimax_h3_cache_text_encoder_outputs.py \
 > Regenerate both caches with the same checkout used for training. An `i2va`/`fl2va`/`l2va` run rejects a cache without keyframe rows
 > rather than silently training as `t2va`.
 
-To reduce conditioner VRAM, add `--text_encoder_quantization int8` or `nf4` to the BF16 checkpoint, or load the released
+To reduce conditioner VRAM, add `--text_encoder_quantization int8`, `nf4`, or `nvfp4` to the BF16 checkpoint. The `nvfp4` mode
+performs calibration-free block-16 W4A16 quantization while loading and retains BF16 activations. Alternatively, load the released
 pre-quantized file with `--text_encoder_quantization nvfp4_awq`:
 
 ```shell
@@ -597,8 +604,8 @@ into host address space while weights are converted, so the host RAM requirement
 
 If the conditioner still does not fit, `--h3_text_encoder_blocks_to_stream N` keeps `N` of its 50 frozen language layers in
 CPU memory and moves them through a fixed two-layer GPU ring during encoding. `50` minimizes weight residency; smaller values
-trade less transfer overhead for less memory saved. This is opt-in, requires CUDA, and currently supports BF16 and native
-`nvfp4_awq` checkpoints. It does not support the bitsandbytes `int8` or `nf4` loader.
+trade less transfer overhead for less memory saved. This is opt-in, requires CUDA, and supports BF16, on-the-fly `nvfp4`, and
+native `nvfp4_awq` checkpoints. It does not support the bitsandbytes `int8` or `nf4` loader.
 
 On a Blackwell GPU with PyTorch 2.10 or newer, `--h3_nvfp4_scaled_mm` additionally quantizes Qwen activations to FP4 and
 uses the hardware W4A4 matrix kernel. It applies only to a native `nvfp4_awq` conditioner and fails early on unsupported

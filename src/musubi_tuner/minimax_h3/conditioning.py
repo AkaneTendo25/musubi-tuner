@@ -42,6 +42,7 @@ from musubi_tuner.minimax_h3.comfy_quant import (
     has_comfy_quantized_layers,
     load_comfy_quantized_state_dict,
     nvfp4_scaled_mm_available,
+    quantize_linear_nvfp4_weight_only,
 )
 from musubi_tuner.minimax_h3.component_loader import resolve_nvfp4_awq_text_encoder_checkpoint, text_encoder_metadata
 from musubi_tuner.minimax_h3.media import MediaModality
@@ -65,7 +66,7 @@ from musubi_tuner.utils.model_utils import dtype_to_str
 
 logger = logging.getLogger(__name__)
 
-H3TextEncoderQuantization = Literal["none", "int8", "nf4", "nvfp4_awq"]
+H3TextEncoderQuantization = Literal["none", "int8", "nf4", "nvfp4", "nvfp4_awq"]
 
 
 def _cap_image_pixels(image: Image.Image, max_pixels: int) -> Image.Image:
@@ -165,6 +166,62 @@ def _mapped_text_encoder_state_dict(
     return state_dict
 
 
+@torch.no_grad()
+def _load_online_nvfp4_text_conditioner(
+    model: Qwen3VLModel,
+    checkpoint_path: Path,
+    *,
+    output_dtype: torch.dtype,
+    quantize_device: torch.device,
+) -> int:
+    """Load BF16 Qwen weights while replacing each Linear with W4A16 NVFP4 storage."""
+    original_expected = set(model.state_dict())
+    state_dict: dict[str, torch.Tensor] = {}
+    quantized_weights: set[str] = set()
+    quantized_layers = 0
+    with safe_open(checkpoint_path, framework="pt", device="cpu") as handle:
+        for source_key in handle.keys():  # noqa: SIM118 - safetensors.safe_open is not iterable
+            if not source_key.startswith(("visual.", "model.")):
+                raise ValueError(f"{checkpoint_path.name} contains unexpected key {source_key!r}")
+            source_prefix, _, suffix = source_key.rpartition(".")
+            target_key = f"{_text_encoder_key(source_prefix)}.{suffix}"
+            if target_key not in original_expected:
+                raise ValueError(f"{checkpoint_path.name} contains unexpected conditioner key {source_key!r}")
+            tensor = handle.get_tensor(source_key)
+            if tensor.dtype is not torch.bfloat16:
+                raise ValueError(f"{source_key}: expected torch.bfloat16, got {tensor.dtype}")
+
+            module_path, _, parameter_name = target_key.rpartition(".")
+            module = model.get_submodule(module_path)
+            if parameter_name == "weight" and isinstance(module, nn.Linear):
+                replacement = quantize_linear_nvfp4_weight_only(
+                    module,
+                    tensor,
+                    output_dtype=output_dtype,
+                    quantize_device=quantize_device,
+                )
+                parent_path, _, attribute = module_path.rpartition(".")
+                parent = model.get_submodule(parent_path) if parent_path else model
+                setattr(parent, attribute, replacement)
+                quantized_weights.add(target_key)
+                quantized_layers += 1
+            else:
+                state_dict[target_key] = tensor
+
+    missing_source = sorted(original_expected - set(state_dict) - quantized_weights)
+    if missing_source:
+        raise ValueError(f"{checkpoint_path.name} is missing {len(missing_source)} text tensor(s), examples: {missing_source[:5]}")
+    expected = set(model.state_dict())
+    missing_load = sorted(expected - set(state_dict))
+    if missing_load:
+        raise ValueError(f"online NVFP4 load left {len(missing_load)} tensor(s) unresolved, examples: {missing_load[:5]}")
+    info = model.load_state_dict(state_dict, strict=True, assign=True)
+    if info.missing_keys or info.unexpected_keys:
+        raise RuntimeError(f"strict online NVFP4 Qwen3-VL load failed: {info}")
+    logger.info("Quantized %d H3 Qwen3-VL Linear weights to NVFP4 W4A16 during loading", quantized_layers)
+    return quantized_layers
+
+
 def _load_bnb_text_conditioner(
     full_config: Qwen3VLConfig,
     state_dict: dict[str, torch.Tensor],
@@ -228,7 +285,7 @@ def load_text_conditioner(
 ) -> tuple[Any, Qwen3VLModel]:
     if dtype is not torch.bfloat16:
         raise ValueError("MiniMax H3 Qwen3-VL conditioning requires bfloat16")
-    if quantization not in ("none", "int8", "nf4", "nvfp4_awq"):
+    if quantization not in ("none", "int8", "nf4", "nvfp4", "nvfp4_awq"):
         raise ValueError(f"unsupported MiniMax H3 text-encoder quantization: {quantization}")
     if not 0 <= blocks_to_stream <= 50:
         raise ValueError("MiniMax H3 text-encoder blocks_to_stream must be between 0 and 50")
@@ -263,6 +320,13 @@ def load_text_conditioner(
             output_dtype=dtype,
             nvfp4_scaled_mm=nvfp4_scaled_mm,
         )
+    elif quantization == "nvfp4":
+        _load_online_nvfp4_text_conditioner(
+            model,
+            checkpoint_path,
+            output_dtype=dtype,
+            quantize_device=target_device,
+        )
     else:
         expected = set(model.state_dict())
         checkpoint_device = target_device if quantization == "none" and not blocks_to_stream else torch.device("cpu")
@@ -282,7 +346,7 @@ def load_text_conditioner(
         full_config.text_config,
         device=target_device,
     )
-    if quantization == "nvfp4_awq" and not blocks_to_stream:
+    if quantization in {"nvfp4", "nvfp4_awq"} and not blocks_to_stream:
         model.to(target_device)
     if blocks_to_stream:
         from musubi_tuner.modules.custom_offloading_utils import ForwardOnlyBlockStreamer

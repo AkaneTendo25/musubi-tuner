@@ -4,11 +4,13 @@ import copy
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from torch import nn
 
 from musubi_tuner.minimax_h3 import backend as h3_backend
 from musubi_tuner.minimax_h3 import integration as h3_integration
-from musubi_tuner.minimax_h3.conditioning import load_text_conditioner
+from musubi_tuner.minimax_h3.comfy_quant import ComfyNvfp4Linear
+from musubi_tuner.minimax_h3.conditioning import _load_online_nvfp4_text_conditioner, load_text_conditioner
 from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_parser
 from musubi_tuner.minimax_h3_generate_video import create_parser as create_generate_parser
 from musubi_tuner.modules.custom_offloading_utils import ForwardOnlyBlockStreamer
@@ -25,6 +27,15 @@ class _FrozenBlock(nn.Module):
         return hidden_states + self.projection(self.norm(hidden_states)) * self.scale
 
 
+class _ToyTextConditioner(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.language_model = nn.Module()
+        self.language_model.embed_tokens = nn.Embedding(4, 16)
+        self.language_model.proj = nn.Linear(16, 8, bias=True)
+        self.visual = nn.Linear(16, 4, bias=True)
+
+
 def test_text_encoder_streaming_cli_defaults_are_disabled() -> None:
     cache_args = create_cache_parser().parse_args(["--dataset_config", "dataset.toml", "--text_encoder", "qwen.safetensors"])
     generate_args = create_generate_parser().parse_args(["--model", "h3.safetensors", "--prompt", "test", "--output", "output.mp4"])
@@ -32,6 +43,51 @@ def test_text_encoder_streaming_cli_defaults_are_disabled() -> None:
     assert generate_args.h3_text_encoder_blocks_to_stream == 0
     assert not cache_args.h3_nvfp4_scaled_mm
     assert not generate_args.h3_nvfp4_scaled_mm
+
+
+def test_online_nvfp4_is_available_to_cache_and_generation_clis() -> None:
+    cache_args = create_cache_parser().parse_args(
+        ["--dataset_config", "dataset.toml", "--text_encoder", "qwen.safetensors", "--text_encoder_quantization", "nvfp4"]
+    )
+    generate_args = create_generate_parser().parse_args(
+        [
+            "--model",
+            "h3.safetensors",
+            "--prompt",
+            "test",
+            "--output",
+            "output.mp4",
+            "--text_encoder_quantization",
+            "nvfp4",
+        ]
+    )
+
+    assert cache_args.text_encoder_quantization == "nvfp4"
+    assert generate_args.text_encoder_quantization == "nvfp4"
+
+
+def test_online_nvfp4_loader_quantizes_linears_and_preserves_other_parameters(tmp_path) -> None:
+    model = _ToyTextConditioner()
+    source = {
+        key.replace("language_model.", "model."): value.detach().to(torch.bfloat16) for key, value in model.state_dict().items()
+    }
+    checkpoint = tmp_path / "qwen.safetensors"
+    save_file(source, str(checkpoint))
+
+    count = _load_online_nvfp4_text_conditioner(
+        model,
+        checkpoint,
+        output_dtype=torch.bfloat16,
+        quantize_device=torch.device("cpu"),
+    )
+
+    assert count == 2
+    assert isinstance(model.language_model.proj, ComfyNvfp4Linear)
+    assert isinstance(model.visual, ComfyNvfp4Linear)
+    assert model.language_model.embed_tokens.weight.dtype is torch.bfloat16
+    output = model.language_model.proj(model.language_model.embed_tokens(torch.tensor([[0, 1]])))
+    assert output.shape == (1, 2, 8)
+    assert torch.isfinite(output).all()
 
 
 def test_nvfp4_scaled_mm_rejects_incompatible_quantization_before_loading() -> None:

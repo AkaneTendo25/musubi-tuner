@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import torch
+from safetensors.torch import save_file
 
 from musubi_tuner.minimax_h3.integration import create_conditioning_encoder
 
@@ -20,9 +21,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--text_encoder", type=Path, required=True)
     parser.add_argument("--tokenizer", type=Path, required=True)
-    parser.add_argument("--quantization", choices=("none", "nvfp4_awq"), default="none")
+    parser.add_argument("--quantization", choices=("none", "nvfp4", "nvfp4_awq"), default="none")
     parser.add_argument("--blocks_to_stream", type=int, default=0)
     parser.add_argument("--prompt", default="A woman drinks coffee beside a sunny window.")
+    parser.add_argument("--output_tensors", type=Path)
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -50,6 +52,8 @@ def main() -> None:
     encode_seconds = time.perf_counter() - started
     encode_peak = torch.cuda.max_memory_allocated(device)
     encoder.close()
+    if args.output_tensors is not None:
+        save_file({key: value.detach().cpu().contiguous() for key, value in output.items()}, str(args.output_tensors))
 
     print(
         json.dumps(

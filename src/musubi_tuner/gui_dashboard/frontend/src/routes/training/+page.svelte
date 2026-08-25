@@ -515,6 +515,7 @@
 						<div class="text-[12px] font-semibold" style="color: var(--text-primary);">MiniMax H3</div>
 						{#if t.model_type === 'minimax_h3'}
 							<PathInput fieldPath="training.h3_model" value={t.h3_model || ''} oninput={(e) => update('h3_model', e.target.value)} showFiles tooltip="MiniMax H3 DiT checkpoint" invalid={fieldInvalid('training.h3_model')} error={fieldError('training.h3_model')} />
+							<FormSelect label="Training method" fieldPath="training.h3_training_type" value={t.h3_training_type || 'lora'} options={[{value:'lora',label:'LoRA adapter'},{value:'learned_context',label:'Learned context'}]} onchange={(e) => update('h3_training_type', e.target.value)} tooltip="Train a normal H3 LoRA, or freeze H3 and learn a small ComfyUI-compatible Qwen context tensor." />
 							<div class="grid grid-cols-2 gap-2">
 							<FormSelect fieldPath="training.h3_training_mode" value={t.h3_training_mode || 'fl2va'} options={['fl2va', 'ref2va', 'ref2va_omni']} onchange={(e) => update('h3_training_mode', e.target.value)} tooltip="FL2VA, strict reference conditioning, or experimental zero-or-more-reference training" />
 								<FormSelect fieldPath="training.h3_loss_balance" value={t.h3_loss_balance || 'modality'} options={['modality', 'token']} onchange={(e) => update('h3_loss_balance', e.target.value)} tooltip="Balance video and audio loss by modality or token count" />
@@ -659,9 +660,31 @@
 					</div>
 				</FormGroup>
 
-				<FormGroup title="LoRA">
+				<FormGroup title={t.model_type === 'minimax_h3' && t.h3_training_type === 'learned_context' ? 'Learned Context' : 'LoRA'}>
 					<div class="space-y-2 pt-2">
-						{#if t.model_type === 'minimax_h3'}
+						{#if t.model_type === 'minimax_h3' && t.h3_training_type === 'learned_context'}
+							<div class="text-[11px] px-3 py-2" style="color: var(--text-secondary); background: var(--bg-elevated); border-radius: var(--radius-sm);">
+								H3 and Qwen stay frozen. Qwen is loaded only once to encode a prompt initializer, then unloaded before context training begins.
+							</div>
+							<FormField fieldPath="training.h3_learned_context_init_prompt" value={t.h3_learned_context_init_prompt || ''} oninput={(e) => update('h3_learned_context_init_prompt', e.target.value)} placeholder="Semantic initializer prompt" tooltip="Encode this prompt once with frozen Qwen and train its complete hidden-state sequence. Set either this field or an existing checkpoint, not both." invalid={fieldInvalid('training.h3_learned_context_init_prompt')} error={fieldError('training.h3_learned_context_init_prompt')} />
+							<PathInput fieldPath="training.h3_learned_context_init" value={t.h3_learned_context_init || ''} oninput={(e) => update('h3_learned_context_init', e.target.value)} showFiles placeholder="Existing learned context checkpoint" tooltip="Continue training a saved ComfyUI-compatible H3 learned context. Set either this field or a prompt, not both." />
+							<div class="grid grid-cols-2 gap-2">
+								<FormSelect fieldPath="training.h3_learned_context_composition" value={t.h3_learned_context_composition || 'prepend'} options={[{value:'prepend',label:'Prepend to captions'},{value:'replace',label:'Replace captions'}]} onchange={(e) => update('h3_learned_context_composition', e.target.value)} tooltip="Prepend preserves each dataset caption and is normally best for transferable concepts; replace trains only the shared context." />
+								<FormField label="Context learning rate" type="number" fieldPath="training.h3_learned_context_learning_rate" value={t.h3_learned_context_learning_rate ?? 0.0001} oninput={(e) => update('h3_learned_context_learning_rate', Number(e.target.value))} min={0} step="any" tooltip="Dedicated learning rate for the learned context. It does not alter the saved LoRA learning-rate setting." invalid={fieldInvalid('training.h3_learned_context_learning_rate')} error={fieldError('training.h3_learned_context_learning_rate')} />
+							</div>
+							{#if t.h3_learned_context_init_prompt}
+								<div class="h3-control-cluster">
+									<div class="h3-control-cluster-title">One-time Qwen initializer</div>
+									<PathInput fieldPath="caching.h3_text_encoder" value={$projectConfig.caching?.h3_text_encoder || ''} oninput={(e) => updateSection('caching', 'h3_text_encoder', e.target.value)} showFiles tooltip="Qwen3-VL checkpoint used once to encode the initializer." invalid={fieldInvalid('caching.h3_text_encoder')} error={fieldError('caching.h3_text_encoder')} />
+									<PathInput fieldPath="caching.h3_tokenizer" value={$projectConfig.caching?.h3_tokenizer || ''} oninput={(e) => updateSection('caching', 'h3_tokenizer', e.target.value)} showFiles tooltip="H3 tokenizer directory." invalid={fieldInvalid('caching.h3_tokenizer')} error={fieldError('caching.h3_tokenizer')} />
+									<div class="grid grid-cols-2 gap-2">
+										<FormSelect label="Qwen quantization" fieldPath="caching.h3_text_encoder_quantization" value={$projectConfig.caching?.h3_text_encoder_quantization || 'none'} options={[{value:'none',label:'BF16'},{value:'int8',label:'INT8'},{value:'nf4',label:'NF4'},{value:'nvfp4',label:'NVFP4 W4A16 · on the fly'},{value:'nvfp4_awq',label:'NVFP4/AWQ · pre-quantized'}]} onchange={(e) => updateSection('caching', 'h3_text_encoder_quantization', e.target.value)} tooltip="On-the-fly NVFP4 converts an ordinary BF16 Qwen checkpoint layer by layer and keeps BF16 activations. NVFP4/AWQ loads the released pre-quantized file." />
+										<FormField label="Blocks to stream" type="number" fieldPath="caching.h3_text_encoder_blocks_to_stream" value={$projectConfig.caching?.h3_text_encoder_blocks_to_stream ?? 0} oninput={(e) => updateSection('caching', 'h3_text_encoder_blocks_to_stream', Number(e.target.value))} min={0} max={50} disabled={['int8', 'nf4'].includes($projectConfig.caching?.h3_text_encoder_quantization)} tooltip="Stream this many Qwen blocks from CPU during the one-time prompt encode. Use 50 for minimum resident Qwen VRAM. Streaming supports BF16 and both NVFP4 modes." />
+									</div>
+									<FormToggle label="NVFP4 scaled GEMM" fieldPath="caching.h3_nvfp4_scaled_mm" checked={$projectConfig.caching?.h3_nvfp4_scaled_mm ?? false} onchange={(e) => updateSection('caching', 'h3_nvfp4_scaled_mm', e.target.checked)} disabled={$projectConfig.caching?.h3_text_encoder_quantization !== 'nvfp4_awq'} tooltip="Use scaled NVFP4 GEMM when supported by the GPU and checkpoint." />
+								</div>
+							{/if}
+						{:else if t.model_type === 'minimax_h3'}
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="training.network_dim" value={t.network_dim ?? 32} oninput={(e) => update('network_dim', e.target.value ? Number(e.target.value) : null)} min={1} tooltip="MiniMax H3 LoRA rank" />
 								<FormField type="number" fieldPath="training.network_alpha" value={t.network_alpha ?? 32} oninput={(e) => update('network_alpha', Number(e.target.value))} min={0} step="0.1" tooltip="MiniMax H3 LoRA alpha" />

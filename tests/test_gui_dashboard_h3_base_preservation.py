@@ -22,6 +22,7 @@ from musubi_tuner.minimax_h3_cache_latents import create_parser as create_cache_
 from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_text_parser
 from musubi_tuner.minimax_h3_generate_video import create_parser as create_inference_parser
 from musubi_tuner.minimax_h3_train_network import create_parser
+from musubi_tuner.minimax_h3_train_learned_context import create_parser as create_learned_context_parser
 
 
 def _h3_config(tmp_path: Path) -> ProjectConfig:
@@ -43,6 +44,67 @@ def test_dashboard_project_defaults_are_h3_only() -> None:
     assert config.caching.model_type == "minimax_h3"
     assert config.training.model_type == "minimax_h3"
     assert config.inference.model_type == "minimax_h3"
+
+
+def test_dashboard_builds_streamed_learned_context_prompt_training(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_training_type = "learned_context"
+    config.training.h3_learned_context_init_prompt = "rapidly rising flood water"
+    config.training.h3_learned_context_composition = "replace"
+    config.training.h3_learned_context_learning_rate = 5e-4
+    config.caching.h3_text_encoder_quantization = "nvfp4"
+    config.caching.h3_text_encoder_blocks_to_stream = 50
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_learned_context.py"))
+    parsed = create_learned_context_parser().parse_args(command[script_index + 1 :])
+
+    assert parsed.h3_learned_context_init_prompt == "rapidly rising flood water"
+    assert parsed.h3_learned_context_composition == "replace"
+    assert parsed.learning_rate == pytest.approx(5e-4)
+    assert parsed.text_encoder == config.caching.h3_text_encoder
+    assert parsed.tokenizer == Path(config.caching.h3_tokenizer)
+    assert parsed.text_encoder_quantization == "nvfp4"
+    assert parsed.h3_text_encoder_blocks_to_stream == 50
+    assert parsed.network_module is None
+    assert "--network_dim" not in command
+
+
+def test_dashboard_builds_learned_context_continuation_without_qwen(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_training_type = "learned_context"
+    config.training.h3_learned_context_init = "models/context.safetensors"
+
+    command = build_training_cmd(config)
+
+    assert "--h3_learned_context_init" in command
+    assert "--text_encoder" not in command
+    assert "--network_module" not in command
+
+
+def test_dashboard_validates_learned_context_initializer_choice(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_training_type = "learned_context"
+
+    missing = validate_training_config(config)
+    assert "training.h3_learned_context_init_prompt" in missing["field_errors"]
+
+    config.training.h3_learned_context_init_prompt = "concept"
+    config.training.h3_learned_context_init = "models/context.safetensors"
+    conflicting = validate_training_config(config)
+    assert "training.h3_learned_context_init_prompt" in conflicting["field_errors"]
+
+
+def test_dashboard_rejects_bitsandbytes_streaming_for_learned_context_initializer(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_training_type = "learned_context"
+    config.training.h3_learned_context_init_prompt = "concept"
+    config.caching.h3_text_encoder_quantization = "nf4"
+    config.caching.h3_text_encoder_blocks_to_stream = 50
+
+    report = validate_training_config(config)
+
+    assert "caching.h3_text_encoder_blocks_to_stream" in report["field_errors"]
 
 
 def test_dashboard_accepts_all_h3_conditioning_cache_tasks(tmp_path: Path) -> None:

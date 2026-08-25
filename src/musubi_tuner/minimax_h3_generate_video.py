@@ -112,7 +112,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--text_encoder_quantization",
-        choices=("none", "int8", "nf4", "nvfp4_awq"),
+        choices=("none", "int8", "nf4", "nvfp4", "nvfp4_awq"),
         default="none",
         help="quantize the Qwen3-VL conditioner while encoding the prompt",
     )

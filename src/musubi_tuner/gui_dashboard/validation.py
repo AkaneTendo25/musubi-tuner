@@ -728,6 +728,74 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     "error", "training.h3_model", "MiniMax H3 DiT checkpoint is required.", label="H3 Model", page="training"
                 )
             )
+        if t.h3_training_type == "learned_context":
+            has_prompt_initializer = _has_text(t.h3_learned_context_init_prompt)
+            has_checkpoint_initializer = _has_text(t.h3_learned_context_init)
+            if has_prompt_initializer == has_checkpoint_initializer:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_learned_context_init_prompt",
+                        "Choose exactly one learned-context initializer: a prompt or an existing context checkpoint.",
+                        label="Learned Context Initializer",
+                        page="training",
+                    )
+                )
+            if has_prompt_initializer:
+                if not _has_text(config.caching.h3_text_encoder):
+                    errors.append(
+                        _make_issue(
+                            "error",
+                            "caching.h3_text_encoder",
+                            "Prompt initialization requires a Qwen3-VL text encoder.",
+                            label="H3 Text Encoder",
+                            page="caching",
+                        )
+                    )
+                if not _has_text(config.caching.h3_tokenizer):
+                    errors.append(
+                        _make_issue(
+                            "error",
+                            "caching.h3_tokenizer",
+                            "Prompt initialization requires the H3 tokenizer directory.",
+                            label="H3 Tokenizer",
+                            page="caching",
+                        )
+                    )
+                if config.caching.h3_text_encoder_blocks_to_stream and config.caching.h3_text_encoder_quantization in {
+                    "int8",
+                    "nf4",
+                }:
+                    errors.append(
+                        _make_issue(
+                            "error",
+                            "caching.h3_text_encoder_blocks_to_stream",
+                            "Qwen block streaming supports BF16 and pre-quantized NVFP4/AWQ, not bitsandbytes INT8/NF4.",
+                            label="H3 Text Encoder Blocks to Stream",
+                            page="caching",
+                        )
+                    )
+            context_lr = float(t.h3_learned_context_learning_rate)
+            if not math.isfinite(context_lr) or context_lr <= 0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_learned_context_learning_rate",
+                        "Learned-context learning rate must be finite and greater than zero.",
+                        label="Learned Context Learning Rate",
+                        page="training",
+                    )
+                )
+            if t.save_precision in {"fp16"}:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.save_precision",
+                        "H3 learned contexts can be saved as BF16 or FP32, not FP16.",
+                        label="Save Precision",
+                        page="training",
+                    )
+                )
         if t.split_attn:
             errors.append(
                 _make_issue(

@@ -560,9 +560,10 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
     toml_path = export_h3_training_dataset_toml(config)
     t = config.training
     c = config.caching
+    learned_context = t.h3_training_type == "learned_context"
     sample_prompts = _effective_training_sample_prompts(config)
     cmd = _accelerate_launch_prefix("bf16", t.accelerate_extra_args)
-    cmd.append(_find_script("minimax_h3_train_network.py"))
+    cmd.append(_find_script("minimax_h3_train_learned_context.py" if learned_context else "minimax_h3_train_network.py"))
     cmd += ["--dit", t.h3_model]
     if t.config_file:
         cmd += ["--config_file", t.config_file]
@@ -570,11 +571,28 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--dataset_manifest", t.dataset_manifest]
     else:
         cmd += ["--dataset_config", t.dataset_config or str(toml_path)]
-    cmd += ["--network_module", "networks.lora_minimax_h3"]
-    if t.network_dim is not None:
-        cmd += ["--network_dim", str(t.network_dim)]
-    if t.network_alpha != 1:
-        cmd += ["--network_alpha", str(t.network_alpha)]
+    if learned_context:
+        if t.h3_learned_context_init_prompt:
+            cmd += ["--h3_learned_context_init_prompt", t.h3_learned_context_init_prompt]
+            cmd += ["--text_encoder", c.h3_text_encoder, "--tokenizer", c.h3_tokenizer]
+            if c.h3_text_encoder_quantization != "none":
+                cmd += ["--text_encoder_quantization", c.h3_text_encoder_quantization]
+            if c.h3_text_encoder_blocks_to_stream:
+                cmd += ["--h3_text_encoder_blocks_to_stream", str(c.h3_text_encoder_blocks_to_stream)]
+            if c.h3_nvfp4_scaled_mm:
+                cmd.append("--h3_nvfp4_scaled_mm")
+            if c.h3_text_visual_max_pixels:
+                cmd += ["--h3_text_visual_max_pixels", str(c.h3_text_visual_max_pixels)]
+        if t.h3_learned_context_init:
+            cmd += ["--h3_learned_context_init", t.h3_learned_context_init]
+        if t.h3_learned_context_composition != "prepend":
+            cmd += ["--h3_learned_context_composition", t.h3_learned_context_composition]
+    else:
+        cmd += ["--network_module", "networks.lora_minimax_h3"]
+        if t.network_dim is not None:
+            cmd += ["--network_dim", str(t.network_dim)]
+        if t.network_alpha != 1:
+            cmd += ["--network_alpha", str(t.network_alpha)]
     if t.flash3:
         cmd.append("--flash3")
     elif t.flash_attn:
@@ -636,7 +654,7 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             "--h3_timestep_focus_probability",
             str(t.h3_timestep_focus_probability),
         ]
-    if t.h3_caption_dropout_rate:
+    if t.h3_caption_dropout_rate and not learned_context:
         cmd += ["--h3_caption_dropout_rate", str(t.h3_caption_dropout_rate)]
     if t.h3_observed_modality:
         cmd += ["--h3_observed_modality", t.h3_observed_modality]
@@ -695,7 +713,7 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += crepa_args
     # The range replaces the point value rather than complementing it, so the
     # trainer rejects both at once; emit whichever one the project carries.
-    if t.h3_guidance_scale_range or t.h3_guidance_distillation_scale is not None:
+    if not learned_context and (t.h3_guidance_scale_range or t.h3_guidance_distillation_scale is not None):
         if t.h3_guidance_scale_range:
             cmd += ["--h3_guidance_scale_range", str(t.h3_guidance_scale_range)]
         else:
@@ -710,7 +728,7 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--h3_guidance_null_source", t.h3_guidance_null_source]
         if t.h3_guidance_cfg_zero:
             cmd.append("--h3_guidance_cfg_zero")
-    if t.h3_base_preservation_loss_weight > 0:
+    if not learned_context and t.h3_base_preservation_loss_weight > 0:
         cmd += ["--h3_base_preservation_loss_weight", str(t.h3_base_preservation_loss_weight)]
         if t.h3_base_preservation_probability != 1.0:
             cmd += ["--h3_base_preservation_probability", str(t.h3_base_preservation_probability)]
@@ -720,23 +738,25 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_overlay_weights", t.h3_overlay_weights]
         if t.h3_overlay_weights_multiplier != 1.0:
             cmd += ["--h3_overlay_weights_multiplier", str(t.h3_overlay_weights_multiplier)]
-    if t.network_weights:
+    if t.network_weights and not learned_context:
         cmd += ["--network_weights", t.network_weights]
-    if t.dim_from_weights:
+    if t.dim_from_weights and not learned_context:
         cmd.append("--dim_from_weights")
-    if t.network_dropout is not None:
+    if t.network_dropout is not None and not learned_context:
         cmd += ["--network_dropout", str(t.network_dropout)]
-    if t.scale_weight_norms is not None:
+    if t.scale_weight_norms is not None and not learned_context:
         cmd += ["--scale_weight_norms", str(t.scale_weight_norms)]
-    network_args = _split_cli_args(t.network_args)
-    if t.rank_dropout is not None:
-        network_args.append(f"rank_dropout={t.rank_dropout}")
-    if t.module_dropout is not None:
-        network_args.append(f"module_dropout={t.module_dropout}")
-    if network_args:
-        cmd += ["--network_args", *network_args]
-    if t.learning_rate is not None:
-        cmd += ["--learning_rate", str(t.learning_rate)]
+    if not learned_context:
+        network_args = _split_cli_args(t.network_args)
+        if t.rank_dropout is not None:
+            network_args.append(f"rank_dropout={t.rank_dropout}")
+        if t.module_dropout is not None:
+            network_args.append(f"module_dropout={t.module_dropout}")
+        if network_args:
+            cmd += ["--network_args", *network_args]
+    learning_rate = t.h3_learned_context_learning_rate if learned_context else t.learning_rate
+    if learning_rate is not None:
+        cmd += ["--learning_rate", str(learning_rate)]
     if t.optimizer_type:
         cmd += ["--optimizer_type", t.optimizer_type]
     if t.optimizer_args:
@@ -867,23 +887,21 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += [
             "--sample_prompts",
             sample_prompts,
-            "--text_encoder",
-            c.h3_text_encoder,
-            "--tokenizer",
-            c.h3_tokenizer,
             "--vae",
             c.h3_video_vae,
             "--audio_vae",
             c.h3_audio_vae,
         ]
-        if c.h3_text_encoder_quantization != "none":
-            cmd += ["--text_encoder_quantization", c.h3_text_encoder_quantization]
-        if c.h3_text_encoder_blocks_to_stream:
-            cmd += ["--h3_text_encoder_blocks_to_stream", str(c.h3_text_encoder_blocks_to_stream)]
-        if c.h3_nvfp4_scaled_mm:
-            cmd.append("--h3_nvfp4_scaled_mm")
-        if c.h3_text_visual_max_pixels:
-            cmd += ["--h3_text_visual_max_pixels", str(c.h3_text_visual_max_pixels)]
+        if "--text_encoder" not in cmd:
+            cmd += ["--text_encoder", c.h3_text_encoder, "--tokenizer", c.h3_tokenizer]
+            if c.h3_text_encoder_quantization != "none":
+                cmd += ["--text_encoder_quantization", c.h3_text_encoder_quantization]
+            if c.h3_text_encoder_blocks_to_stream:
+                cmd += ["--h3_text_encoder_blocks_to_stream", str(c.h3_text_encoder_blocks_to_stream)]
+            if c.h3_nvfp4_scaled_mm:
+                cmd.append("--h3_nvfp4_scaled_mm")
+            if c.h3_text_visual_max_pixels:
+                cmd += ["--h3_text_visual_max_pixels", str(c.h3_text_visual_max_pixels)]
     if t.sample_at_first:
         cmd.append("--sample_at_first")
     validation_requested = bool(t.validate_at_start or t.validate_every_n_steps or t.validate_every_n_epochs)
@@ -908,9 +926,9 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--validation_max_timestep", str(t.validation_max_timestep)]
     if t.max_validation_items is not None:
         cmd += ["--max_validation_items", str(t.max_validation_items)]
-    if t.base_weights:
+    if t.base_weights and not learned_context:
         cmd += ["--base_weights", *_split_cli_args(t.base_weights)]
-    if t.base_weights_multiplier:
+    if t.base_weights_multiplier and not learned_context:
         cmd += ["--base_weights_multiplier", *_split_cli_args(t.base_weights_multiplier)]
     cmd += _split_cli_args(t.extra_args)
     return cmd

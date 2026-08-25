@@ -3076,7 +3076,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--audio_vae", type=str, help="MiniMax H3 audio VAE checkpoint used only for sampling")
     parser.add_argument(
         "--text_encoder_quantization",
-        choices=("none", "int8", "nf4", "nvfp4_awq"),
+        choices=("none", "int8", "nf4", "nvfp4", "nvfp4_awq"),
         default="none",
         help="optional Qwen3-VL quantization while pre-encoding sampling prompts",
     )

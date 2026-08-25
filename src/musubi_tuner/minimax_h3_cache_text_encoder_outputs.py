@@ -89,11 +89,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--text_encoder_dtype", default="bfloat16")
     parser.add_argument(
         "--text_encoder_quantization",
-        choices=("none", "int8", "nf4", "nvfp4_awq"),
+        choices=("none", "int8", "nf4", "nvfp4", "nvfp4_awq"),
         default="none",
         help=(
-            "text-encoder weight mode: INT8/NF4 quantize the BF16 checkpoint while loading; "
-            "NVFP4_AWQ loads the matching Comfy-Org checkpoint directly"
+            "text-encoder weight mode: INT8/NF4 or NVFP4 W4A16 quantize the BF16 checkpoint while loading; "
+            "NVFP4_AWQ loads the matching pre-quantized Comfy-Org checkpoint directly"
         ),
     )
     parser.add_argument(
