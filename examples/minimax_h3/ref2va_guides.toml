@@ -1,0 +1,22 @@
+# Ref2VA video training with ordinary image references and target-derived timeline guides.
+# Cache with --task ref2va. Train with --h3_training_mode ref2va and, for example,
+# --h3_keyframe_anchors first,11,last / --h3_keyframe_random_count 3 for image guides,
+# or --h3_guide_specs "0:2:4;21:0:8" for target-derived AV and audio guide spans.
+
+[general]
+resolution = [640, 384]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+target_video_directory = "/path/to/target_videos"
+target_modalities = ["video", "audio"]
+source_image_directory = "/path/to/reference_images"
+source_modalities = ["image"]
+cache_directory = "/path/to/ref2va_guide_cache"
+source_fps = 24.0
+target_frames = [39]
+frame_extraction = "head"
+num_repeats = 1

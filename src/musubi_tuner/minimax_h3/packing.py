@@ -69,6 +69,22 @@ class MiniMaxH3ReferenceGeometry:
         return _AUDIO_CHANNELS * self.num_audio_latents
 
 
+@dataclass(frozen=True)
+class MiniMaxH3GuideGeometry:
+    """One target-timeline guide block using a decoded pixel-frame origin."""
+
+    frame_index: int
+    num_video_latents: int = 0
+    num_audio_latents: int = 0
+
+    def num_video_rows(self, rows_per_frame: int) -> int:
+        return self.num_video_latents * rows_per_frame
+
+    @property
+    def num_audio_rows(self) -> int:
+        return _AUDIO_CHANNELS * self.num_audio_latents
+
+
 def patchify_video_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:
     """Convert ``[B, C, T, H, W]`` latents to frame-major H3 video rows."""
     if latents.ndim != 5:
@@ -273,9 +289,10 @@ def build_t2va_packed_sequence(
         elif anchor == "last":
             anchor_identities.append("last")
         elif isinstance(anchor, int):
-            if not 0 <= anchor < num_latent_frames:
+            resolved_anchor = anchor if anchor >= 0 else num_latent_frames + anchor
+            if not 0 <= resolved_anchor < num_latent_frames:
                 raise ValueError(f"H3 keyframe anchor {anchor} is outside the {num_latent_frames} target latent frames")
-            anchor_identities.append(int(anchor))
+            anchor_identities.append(int(resolved_anchor))
         else:
             raise ValueError("H3 keyframe anchors must be 'first', 'last', or a latent frame index")
     if len(set(anchor_identities)) != len(anchor_identities):
@@ -356,9 +373,11 @@ def build_ref2va_packed_sequence(
     latent_width: int,
     num_audio_latents: int,
     patch_size: tuple[int, int, int],
+    keyframe_anchors: tuple[str | int, ...] = (),
+    guides: tuple[MiniMaxH3GuideGeometry, ...] = (),
     spatial_density_scale: float = 1.0,
 ) -> MiniMaxH3PackedSequence:
-    """Build Ref2VA's ordered ``[text | references | target audio | target video]`` layout.
+    """Build ``[text | references | guides | target audio | target video]``.
 
     ``spatial_density_scale`` rescales the area normalization of every spatial
     grid in the sequence. References and target share the one factor, so their
@@ -379,13 +398,80 @@ def build_ref2va_packed_sequence(
         if reference.num_audio_latents < 0:
             raise ValueError(f"invalid H3 audio reference geometry: {reference}")
     density_scale = _validated_density_scale(spatial_density_scale)
+    if (keyframe_anchors or guides) and num_latent_frames == 0:
+        raise ValueError("H3 keyframe conditioning requires a video target")
+
+    anchor_identities: list[object] = []
+    for anchor in keyframe_anchors:
+        if isinstance(anchor, bool) or not isinstance(anchor, (str, int)):
+            raise ValueError("H3 keyframe anchors must be 'first', 'last', or a latent frame index")
+        if anchor == "first":
+            anchor_identities.append(0)
+        elif anchor == "last":
+            anchor_identities.append("last")
+        elif isinstance(anchor, int):
+            resolved_anchor = anchor if anchor >= 0 else num_latent_frames + anchor
+            if not 0 <= resolved_anchor < num_latent_frames:
+                raise ValueError(f"H3 keyframe anchor {anchor} is outside the {num_latent_frames} target latent frames")
+            anchor_identities.append(int(resolved_anchor))
+        else:
+            raise ValueError("H3 keyframe anchors must be 'first', 'last', or a latent frame index")
+    if len(set(anchor_identities)) != len(anchor_identities):
+        raise ValueError("H3 keyframe anchors must be unique")
+
+    target_pixel_frames = sum(_ROPE_FRAMES_PER_LATENT[index % 5] for index in range(num_latent_frames))
+    legacy_guides: list[MiniMaxH3GuideGeometry] = []
+    for identity in anchor_identities:
+        if identity == "last":
+            pixel_index = target_pixel_frames - 1
+        else:
+            latent_index = int(identity)
+            pixel_index = sum(_ROPE_FRAMES_PER_LATENT[index % 5] for index in range(latent_index))
+        legacy_guides.append(MiniMaxH3GuideGeometry(pixel_index, num_video_latents=1))
+    all_guides = tuple(legacy_guides) + tuple(guides)
+    guide_starts: set[int] = set()
+    for guide in all_guides:
+        if isinstance(guide.frame_index, bool) or not isinstance(guide.frame_index, int):
+            raise ValueError("H3 guide frame indices must be integers")
+        if guide.num_video_latents < 0 or guide.num_audio_latents < 0:
+            raise ValueError("H3 guide stream lengths must be non-negative")
+        if not guide.num_video_latents and not guide.num_audio_latents:
+            raise ValueError("H3 guides require video or audio conditioning")
+        if not 0 <= guide.frame_index < target_pixel_frames:
+            raise ValueError(f"H3 guide frame {guide.frame_index} is outside the {target_pixel_frames} target frames")
+        guide_video_frames = sum(_ROPE_FRAMES_PER_LATENT[index % 5] for index in range(guide.num_video_latents))
+        if guide.num_video_latents and guide.frame_index + guide_video_frames > target_pixel_frames:
+            raise ValueError(
+                f"H3 {guide_video_frames}-frame guide at frame {guide.frame_index} does not fit "
+                f"inside the {target_pixel_frames}-frame target"
+            )
+        max_audio_latents = math.floor(num_audio_latents - _ROPE_FRAME_RESCALE * guide.frame_index)
+        if guide.num_audio_latents and guide.num_audio_latents > max_audio_latents:
+            raise ValueError(
+                f"H3 guide audio length {guide.num_audio_latents} at frame {guide.frame_index} exceeds "
+                f"the remaining {max(0, max_audio_latents)} target audio latents"
+            )
+        if guide.frame_index in guide_starts:
+            raise ValueError("H3 guide frame indices must be unique")
+        guide_starts.add(guide.frame_index)
 
     num_text_rows = int(text_token_tags.numel())
     num_reference_video_rows = sum(reference.num_video_rows(patch_size) for reference in references)
     num_reference_audio_rows = sum(reference.num_audio_rows for reference in references)
+    rows_per_target_frame = (latent_height // patch_h) * (latent_width // patch_w)
+    num_guide_video_rows = sum(guide.num_video_rows(rows_per_target_frame) for guide in all_guides)
+    num_guide_audio_rows = sum(guide.num_audio_rows for guide in all_guides)
     target_video_rows = num_latent_frames * (latent_height // patch_h) * (latent_width // patch_w)
     target_audio_rows = _AUDIO_CHANNELS * num_audio_latents
-    sequence_length = num_text_rows + num_reference_video_rows + num_reference_audio_rows + target_audio_rows + target_video_rows
+    sequence_length = (
+        num_text_rows
+        + num_reference_video_rows
+        + num_reference_audio_rows
+        + num_guide_video_rows
+        + num_guide_audio_rows
+        + target_audio_rows
+        + target_video_rows
+    )
     position_ids = torch.zeros(sequence_length, 3, dtype=torch.float64)
     position_ids[:num_text_rows, 0] = torch.arange(num_text_rows, dtype=torch.float64)
     target_frame_grid, target_width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w, density_scale)
@@ -449,16 +535,32 @@ def build_ref2va_packed_sequence(
                 _temporal_position_span(reference.num_latent_frames),
             )
 
+    target_time = rotary_time
+    target_frame_time = _temporal_position_grid(num_latent_frames, target_time)
+    for guide in all_guides:
+        anchor_time = target_time + _ROPE_FRAME_RESCALE * guide.frame_index
+        if guide.num_video_latents:
+            rows = slice(cursor, cursor + guide.num_video_rows(rows_per_target_frame))
+            frame_time = _temporal_position_grid(guide.num_video_latents, anchor_time)
+            position_ids[rows, 0] = frame_time.repeat_interleave(target_frame_grid.shape[0])
+            position_ids[rows, 1:] = target_frame_grid.repeat(guide.num_video_latents, 1)
+            video_indices.append(torch.arange(rows.start, rows.stop))
+            cursor = rows.stop
+        if guide.num_audio_latents:
+            rows = slice(cursor, cursor + guide.num_audio_rows)
+            _fill_audio_positions(position_ids, rows, guide.num_audio_latents, anchor_time, target_width_grid)
+            audio_indices.append(torch.arange(rows.start, rows.stop))
+            cursor = rows.stop
+
     target_audio_start = cursor
     target_video_start = target_audio_start + target_audio_rows
     _fill_audio_positions(
         position_ids,
         slice(target_audio_start, target_video_start),
         num_audio_latents,
-        rotary_time,
+        target_time,
         target_width_grid,
     )
-    target_frame_time = _temporal_position_grid(num_latent_frames, rotary_time)
     position_ids[target_video_start:, 0] = target_frame_time.repeat_interleave(target_frame_grid.shape[0])
     position_ids[target_video_start:, 1:] = target_frame_grid.repeat(num_latent_frames, 1)
 
@@ -478,8 +580,8 @@ def build_ref2va_packed_sequence(
         video_indices=packed_video_indices,
         audio_indices=packed_audio_indices,
         text_indices=text_indices,
-        num_condition_video_rows=num_reference_video_rows,
-        num_condition_audio_rows=num_reference_audio_rows,
+        num_condition_video_rows=num_reference_video_rows + num_guide_video_rows,
+        num_condition_audio_rows=num_reference_audio_rows + num_guide_audio_rows,
     )
 
 

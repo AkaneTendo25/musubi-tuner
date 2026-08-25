@@ -70,7 +70,7 @@ from musubi_tuner.minimax_h3.masking import (
     sample_video_mask,
     video_mask_to_rows,
 )
-from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS
+from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS, MiniMaxH3GuideGeometry
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
@@ -264,6 +264,22 @@ def _parse_keyframe_anchors(spec: str) -> tuple[int | str, ...]:
         else:
             raise ValueError(f"H3 keyframe anchor {token!r} must be 'first', 'last', or a latent frame index")
     return tuple(anchors)
+
+
+def _parse_guide_specs(spec: str) -> tuple[tuple[int, int, int], ...]:
+    """Parse ``START:VIDEO_LATENTS:AUDIO_LATENTS`` guide recipes."""
+    if not spec:
+        return ()
+    guides = []
+    for piece in spec.split(";"):
+        fields = [field.strip() for field in piece.split(":")]
+        if len(fields) != 3 or any(not field.lstrip("-").isdigit() for field in fields):
+            raise ValueError(f"H3 guide {piece!r} must be START:VIDEO_LATENTS:AUDIO_LATENTS; separate multiple guides with ';'")
+        start, video_latents, audio_latents = (int(field) for field in fields)
+        if video_latents < 0 or audio_latents < 0 or not (video_latents or audio_latents):
+            raise ValueError("H3 guide stream lengths must be non-negative and at least one must be non-zero")
+        guides.append((start, video_latents, audio_latents))
+    return tuple(guides)
 
 
 def _parse_guidance_scale_range(spec: str | None) -> tuple[float, float] | None:
@@ -489,6 +505,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._mask_audio = False
         self._mask_bounds = (0.25, 0.75)
         self._step_keyframes = None
+        self._step_guides = None
         self._step_reference_modality = "av"
         self._step_mask = None
         self._validation_dataloader = None
@@ -596,6 +613,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_row_video_timestep = None
         self._step_spatial_density_scale = None
         self._step_keyframes = None
+        self._step_guides = None
         self._step_reference_modality = "av"
         self._step_qwen_control_dropout = False
         self._step_recipe = None
@@ -667,6 +685,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         finally:
             self._step_mask = None
             self._step_keyframes = None
+            self._step_guides = None
             self._step_reference_modality = "av"
             self._step_qwen_control_dropout = False
             self._step_recipe = None
@@ -858,6 +877,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         seed_validation_forward(conditioning_seed)
         self._step_keyframes = self._resolve_keyframe_anchors(inputs.video)
+        self._step_guides = self._resolve_guide_specs(inputs.video, inputs.audio)
         # Validation measures one fixed recipe so successive numbers stay
         # comparable; a run that mixes masking and extension per step reports the
         # masked one, since the two cannot share a step.
@@ -938,6 +958,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         self._step_mask = None
         self._step_keyframes = None
+        self._step_guides = None
         self._step_recipe = None
 
     def handle_model_specific_args(self, args: argparse.Namespace):
@@ -1146,17 +1167,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_spatial_density_jitter must be finite and non-negative")
         self._keyframe_anchors = _parse_keyframe_anchors(args.h3_keyframe_anchors)
         self._keyframe_random_count = args.h3_keyframe_random_count
+        self._guide_specs = _parse_guide_specs(getattr(args, "h3_guide_specs", ""))
         if args.h3_keyframe_random_count < 0:
             raise ValueError("--h3_keyframe_random_count cannot be negative")
         if self._keyframe_anchors and args.h3_keyframe_random_count:
             raise ValueError("H3 keyframe anchors are either listed or drawn at random, not both")
-        keyframes = bool(self._keyframe_anchors) or bool(args.h3_keyframe_random_count)
+        keyframes = bool(self._keyframe_anchors) or bool(args.h3_keyframe_random_count) or bool(self._guide_specs)
         if keyframes and (args.h3_extension_video_frames or args.h3_extension_audio_latents):
             raise ValueError("H3 keyframe conditioning and extension both claim the observed rows; enable only one")
         if keyframes and (args.h3_mask_mode != "off" or args.h3_mask_audio):
             raise ValueError("H3 keyframe conditioning and masked conditioning both claim the observed rows; enable only one")
-        if keyframes and args.h3_training_mode != "fl2va":
-            raise ValueError("H3 keyframe conditioning requires --h3_training_mode fl2va with --task t2va caches")
+        if keyframes and args.h3_training_mode not in ("fl2va", "ref2va", "ref2va_omni"):
+            raise ValueError("H3 keyframe conditioning requires FL2VA or Ref2VA training with video targets")
+        if self._guide_specs and args.h3_training_mode == "fl2va":
+            raise ValueError("--h3_guide_specs currently requires Ref2VA or Ref2VA-Omni training")
         self._mask_mode = args.h3_mask_mode
         self._mask_audio = args.h3_mask_audio
         self._mask_bounds = (args.h3_mask_min_fraction, args.h3_mask_max_fraction)
@@ -1880,6 +1904,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         anchor. ``indices`` says which latent frame supplies the content, where
         ``"last"`` does take the final window.
         """
+        if video is None and (self._keyframe_anchors or self._keyframe_random_count):
+            raise ValueError("H3 keyframe conditioning requires a video target")
         if video is None:
             return (), ()
         frames = video.shape[-3]
@@ -1891,9 +1917,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         indices: list[int] = []
         for anchor in self._keyframe_anchors:
             index = 0 if anchor == "first" else frames - 1 if anchor == "last" else int(anchor)
+            if isinstance(anchor, int) and anchor < 0:
+                index = frames + anchor
             if not 0 <= index < frames:
                 raise ValueError(f"H3 keyframe anchor {anchor} is outside the {frames} target latent frames")
-            anchors.append(anchor)
+            anchors.append(index if isinstance(anchor, int) and anchor < 0 else anchor)
             indices.append(index)
         # Mirror the packer's identity rule: "first" and an explicit 0 name the
         # same coordinate and collide, while "last" is its own coordinate and
@@ -1903,6 +1931,52 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("H3 keyframe anchors resolved to duplicate latent frames")
         order = sorted(range(len(indices)), key=lambda position: indices[position])
         return tuple(anchors[position] for position in order), tuple(indices[position] for position in order)
+
+    def _resolve_guide_specs(self, video, audio):
+        """Resolve authored pixel-frame guide recipes against this target."""
+        specs = getattr(self, "_guide_specs", ())
+        if not specs:
+            return ()
+        if video is None:
+            raise ValueError("H3 guide training requires a video target timeline")
+        latent_frames = int(video.shape[-3])
+        pixel_spans = tuple((1, 4, 4, 4, 4)[index % 5] for index in range(latent_frames))
+        boundaries = [0]
+        for span in pixel_spans:
+            boundaries.append(boundaries[-1] + span)
+        frame_count = boundaries[-1]
+        resolved = []
+        starts = set()
+        for authored_start, video_length, audio_length in specs:
+            start = authored_start if authored_start >= 0 else frame_count + authored_start
+            if not 0 <= start < frame_count:
+                raise ValueError(f"H3 guide frame {authored_start} is outside the {frame_count}-frame target")
+            if start in starts:
+                raise ValueError(f"H3 guide frame {start} is listed twice")
+            starts.add(start)
+            video_start = None
+            if video_length:
+                if start not in boundaries[:-1]:
+                    raise ValueError(
+                        f"H3 visual guide frame {start} is not a cached VAE-window boundary; "
+                        f"use one of {boundaries[:-1]} or cache an external guide clip"
+                    )
+                video_start = boundaries.index(start)
+                if video_start + video_length > latent_frames:
+                    raise ValueError(f"H3 {video_length}-latent visual guide at frame {start} does not fit the target")
+            audio_start = math.floor((5.0 / 3.0) * start)
+            if audio_length:
+                if audio is None:
+                    raise ValueError("H3 audio guide training requires target audio latents")
+                if (5 * start) % 3:
+                    raise ValueError(
+                        f"H3 audio guide frame {start} is not a cached audio-latent boundary; "
+                        "target-derived audio guide starts must be multiples of 3 pixel frames"
+                    )
+                if audio_start + audio_length > audio.shape[-1]:
+                    raise ValueError(f"H3 {audio_length}-latent audio guide at frame {start} does not fit the target")
+            resolved.append((MiniMaxH3GuideGeometry(start, video_length, audio_length), video_start, audio_start))
+        return tuple(resolved)
 
     @staticmethod
     def _clean_latents(noisy, target, sigma):
@@ -2170,6 +2244,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             extension_kwargs["extension_video_context"] = self._clean_latents(
                 inputs.video, inputs.video_target, inputs.video_sigma
             ).index_select(-3, torch.tensor(anchor_indices, device=inputs.video.device))
+        resolved_guides = self._step_guides or ()
+        if resolved_guides:
+            clean_video = self._clean_latents(inputs.video, inputs.video_target, inputs.video_sigma)
+            clean_audio = (
+                self._clean_latents(inputs.audio, inputs.audio_target, inputs.audio_sigma) if inputs.audio is not None else None
+            )
+            extension_kwargs["guide_geometries"] = tuple(item[0] for item in resolved_guides)
+            extension_kwargs["guide_video_latents"] = tuple(
+                clean_video[:, :, video_start : video_start + geometry.num_video_latents]
+                for geometry, video_start, _ in resolved_guides
+                if geometry.num_video_latents
+            )
+            extension_kwargs["guide_audio_latents"] = tuple(
+                clean_audio[..., audio_start : audio_start + geometry.num_audio_latents]
+                for geometry, _, audio_start in resolved_guides
+                if geometry.num_audio_latents
+            )
         if self._step_mask is not None:
             if self._step_mask.video_rows is not None:
                 extension_kwargs["observed_video_rows"] = self._step_mask.video_rows
@@ -2552,6 +2643,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # base-preservation branches must condition on the same anchors as the
         # trainable branch, or the guidance correction inverts a different field.
         self._step_keyframes = self._resolve_keyframe_anchors(inputs.video)
+        self._step_guides = self._resolve_guide_specs(inputs.video, inputs.audio)
 
         # H3 trains one item per step, so caption dropout is a single draw rather
         # than a per-sample mask. A dropped step trains the unconditional branch,
@@ -2858,6 +2950,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_row_video_timestep = None
         self._step_spatial_density_scale = None
         self._step_keyframes = None
+        self._step_guides = None
         self._step_reference_modality = "av"
         self._step_qwen_control_dropout = False
         self._step_recipe = None
@@ -2876,6 +2969,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_loss_balance": args.h3_loss_balance,
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
+            "ss_h3_guide_specs": str(getattr(args, "h3_guide_specs", "") or "none"),
             "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
             "ss_h3_fused_indexed_adaln": str(args.h3_fused_indexed_adaln),
             "ss_h3_fused_swiglu": str(args.h3_fused_swiglu),
@@ -3169,6 +3263,18 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="draw this many distinct conditioning frames at random each step instead of listing them",
+    )
+    parser.add_argument(
+        "--h3_guide_specs",
+        type=str,
+        default="",
+        metavar="START:VIDEO_LATENTS:AUDIO_LATENTS[;...]",
+        help=(
+            "target-derived Ref2VA guide spans on the decoded pixel-frame timeline; for example '0:2:4;21:0:8' "
+            "adds one AV guide and one audio-only guide. Negative START counts from the end. Visual starts must "
+            "land on a cached VAE-window boundary and audio starts must be multiples of 3 pixel frames; zero selects "
+            "no guide for that stream"
+        ),
     )
     parser.add_argument(
         "--reference_image_short_edge",

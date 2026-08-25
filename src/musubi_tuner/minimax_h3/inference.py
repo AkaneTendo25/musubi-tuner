@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -41,6 +42,7 @@ from musubi_tuner.minimax_h3.architecture import (
 from musubi_tuner.minimax_h3.cache import H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_encoder, load_video_vae_encoder
 from musubi_tuner.minimax_h3.packing import (
+    MiniMaxH3GuideGeometry,
     MiniMaxH3ReferenceGeometry,
     build_ref2va_packed_sequence,
     build_row_timesteps,
@@ -67,6 +69,13 @@ class H3GeneratedMedia:
 @dataclass(frozen=True)
 class H3EncodedReferences:
     geometries: tuple[MiniMaxH3ReferenceGeometry, ...]
+    video_rows: torch.Tensor
+    audio_rows: torch.Tensor
+
+
+@dataclass(frozen=True)
+class H3EncodedGuides:
+    geometries: tuple[MiniMaxH3GuideGeometry, ...]
     video_rows: torch.Tensor
     audio_rows: torch.Tensor
 
@@ -336,6 +345,49 @@ def encode_reference_media(
     )
 
 
+@torch.no_grad()
+def encode_guide_media(
+    video_vae: Path,
+    audio_vae: Path,
+    guides: tuple[tuple[int, H3PreparedReference | None, H3PreparedReference | None], ...],
+    target_audio_latents: int,
+    device: torch.device,
+) -> H3EncodedGuides:
+    """Encode prepared visual/audio guides and merge paired streams by origin."""
+    geometries = []
+    video_rows = []
+    audio_rows = []
+    for frame_index, video_guide, audio_guide in guides:
+        prepared = tuple(value for value in (video_guide, audio_guide) if value is not None)
+        encoded = encode_reference_media(video_vae, audio_vae, prepared, device)
+        video_geometry = next((value for value in encoded.geometries if value.kind != int(H3ReferenceKind.AUDIO)), None)
+        audio_geometry = next((value for value in encoded.geometries if value.num_audio_latents), None)
+        num_audio_latents = 0 if audio_geometry is None else audio_geometry.num_audio_latents
+        max_audio_latents = max(0, math.floor(target_audio_latents - (5.0 / 3.0) * frame_index))
+        num_audio_latents = min(num_audio_latents, max_audio_latents)
+        if video_geometry is not None:
+            video_rows.append(encoded.video_rows)
+        if num_audio_latents:
+            audio_latent = unpack_audio_tokens(encoded.audio_rows[None], num_audio_latents=audio_geometry.num_audio_latents)
+            audio_rows.append(pack_audio_latents(audio_latent[..., :num_audio_latents])[0])
+        geometries.append(
+            MiniMaxH3GuideGeometry(
+                frame_index,
+                num_video_latents=0 if video_geometry is None else video_geometry.num_latent_frames,
+                num_audio_latents=num_audio_latents,
+            )
+        )
+    return H3EncodedGuides(
+        geometries=tuple(geometries),
+        video_rows=(
+            torch.cat(video_rows)
+            if video_rows
+            else torch.empty((0, VIDEO_LATENT_CHANNELS * int(np.prod(VIDEO_DIT_PATCH_SIZE))), dtype=torch.float32)
+        ),
+        audio_rows=torch.cat(audio_rows) if audio_rows else torch.empty((0, AUDIO_LATENT_CHANNELS), dtype=torch.float32),
+    )
+
+
 def _augment_reference_video_rows(
     rows: torch.Tensor,
     references: tuple[MiniMaxH3ReferenceGeometry, ...],
@@ -523,6 +575,11 @@ def denoise_ref2va(
     num_inference_steps: int,
     generator: torch.Generator,
     device: torch.device,
+    keyframe_rows: torch.Tensor | None = None,
+    keyframe_anchors: tuple[str | int, ...] = (),
+    guide_geometries: tuple[MiniMaxH3GuideGeometry, ...] = (),
+    guide_video_rows: torch.Tensor | None = None,
+    guide_audio_rows: torch.Tensor | None = None,
     condition_seed: int = 0,
     show_progress: bool = True,
     init_video: torch.Tensor | None = None,
@@ -537,8 +594,8 @@ def denoise_ref2va(
     larger canvas needs.
     """
     _validate_geometry(height, width, frame_count)
-    if not references.geometries:
-        raise ValueError("MiniMax H3 Ref2VA denoising requires at least one reference")
+    if not references.geometries and not guide_geometries:
+        raise ValueError("MiniMax H3 Ref2VA denoising requires a reference or guide")
     shape = temporal_shape(frame_count)
     config = transformer.config
     patch_size = tuple(config.patch_size)
@@ -570,20 +627,58 @@ def denoise_ref2va(
         latent_width=latent_width,
         num_audio_latents=shape.audio_latent_frames,
         patch_size=patch_size,
+        keyframe_anchors=keyframe_anchors,
+        guides=guide_geometries,
     )
     video_width = config.in_channels * patch_size[0] * patch_size[1] * patch_size[2]
-    expected_video_rows = layout.num_condition_video_rows
-    expected_audio_rows = layout.num_condition_audio_rows
-    if references.video_rows.shape != (expected_video_rows, video_width):
+    expected_reference_video_rows = sum(geometry.num_video_rows(patch_size) for geometry in references.geometries)
+    rows_per_anchor = (latent_height // patch_size[1]) * (latent_width // patch_size[2])
+    expected_keyframe_rows = len(keyframe_anchors) * rows_per_anchor
+    expected_reference_audio_rows = sum(geometry.num_audio_rows for geometry in references.geometries)
+    expected_guide_video_rows = sum(geometry.num_video_rows(rows_per_anchor) for geometry in guide_geometries)
+    expected_guide_audio_rows = sum(geometry.num_audio_rows for geometry in guide_geometries)
+    if references.video_rows.shape != (expected_reference_video_rows, video_width):
         raise ValueError(
             f"MiniMax H3 reference video rows have shape {tuple(references.video_rows.shape)}, "
-            f"expected {(expected_video_rows, video_width)}"
+            f"expected {(expected_reference_video_rows, video_width)}"
         )
-    if references.audio_rows.shape != (expected_audio_rows, config.audio_in_channels):
+    if references.audio_rows.shape != (expected_reference_audio_rows, config.audio_in_channels):
         raise ValueError(
             f"MiniMax H3 reference audio rows have shape {tuple(references.audio_rows.shape)}, "
-            f"expected {(expected_audio_rows, config.audio_in_channels)}"
+            f"expected {(expected_reference_audio_rows, config.audio_in_channels)}"
         )
+    if expected_keyframe_rows:
+        if keyframe_rows is None or keyframe_rows.shape != (expected_keyframe_rows, video_width):
+            actual = None if keyframe_rows is None else tuple(keyframe_rows.shape)
+            raise ValueError(f"MiniMax H3 keyframe rows have shape {actual}, expected {(expected_keyframe_rows, video_width)}")
+        keyframe_rows = _augment_keyframe_rows(keyframe_rows, rows_per_anchor, condition_seed).to(device)
+    elif keyframe_rows is not None:
+        raise ValueError("MiniMax H3 keyframe rows require keyframe anchors")
+    if expected_guide_video_rows:
+        if guide_video_rows is None or guide_video_rows.shape != (expected_guide_video_rows, video_width):
+            actual = None if guide_video_rows is None else tuple(guide_video_rows.shape)
+            raise ValueError(
+                f"MiniMax H3 guide video rows have shape {actual}, expected {(expected_guide_video_rows, video_width)}"
+            )
+        chunks = []
+        cursor = 0
+        for geometry in guide_geometries:
+            rows = geometry.num_video_rows(rows_per_anchor)
+            if rows:
+                chunks.append(_augment_keyframe_rows(guide_video_rows[cursor : cursor + rows], rows, condition_seed))
+                cursor += rows
+        guide_video_rows = torch.cat(chunks).to(device)
+    elif guide_video_rows is not None:
+        raise ValueError("MiniMax H3 guide video rows require visual guide geometry")
+    if expected_guide_audio_rows:
+        if guide_audio_rows is None or guide_audio_rows.shape != (expected_guide_audio_rows, config.audio_in_channels):
+            actual = None if guide_audio_rows is None else tuple(guide_audio_rows.shape)
+            raise ValueError(
+                f"MiniMax H3 guide audio rows have shape {actual}, expected {(expected_guide_audio_rows, config.audio_in_channels)}"
+            )
+        guide_audio_rows = guide_audio_rows.to(device)
+    elif guide_audio_rows is not None:
+        raise ValueError("MiniMax H3 guide audio rows require audio guide geometry")
     reference_video = _augment_reference_video_rows(
         references.video_rows,
         references.geometries,
@@ -623,8 +718,18 @@ def denoise_ref2va(
     for index, (video_timestep, audio_timestep) in enumerate(iterator):
         target_video_rows = patchify_video_latents(video, patch_size)
         target_audio_rows = pack_audio_latents(audio)
-        video_rows = torch.cat((reference_video[None], target_video_rows), dim=1)
-        audio_rows = torch.cat((reference_audio[None], target_audio_rows), dim=1)
+        video_parts = [reference_video[None]]
+        if keyframe_rows is not None:
+            video_parts.append(keyframe_rows[None])
+        if guide_video_rows is not None:
+            video_parts.append(guide_video_rows[None])
+        video_parts.append(target_video_rows)
+        video_rows = torch.cat(video_parts, dim=1)
+        audio_parts = [reference_audio[None]]
+        if guide_audio_rows is not None:
+            audio_parts.append(guide_audio_rows[None])
+        audio_parts.append(target_audio_rows)
+        audio_rows = torch.cat(audio_parts, dim=1)
         condition_video_timestep = torch.maximum(
             video_timestep.reshape(1),
             torch.tensor([0.999], device=device),

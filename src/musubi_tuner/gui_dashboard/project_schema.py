@@ -277,6 +277,7 @@ class TrainingConfig(BaseModel):
     h3_extension_probability: float = 1.0
     h3_keyframe_anchors: str = ""
     h3_keyframe_random_count: int = 0
+    h3_guide_specs: str = ""
     h3_mask_mode: Literal["off", "box", "border", "segment", "dataset"] = "off"
     h3_mask_audio: bool = False
     h3_mask_min_fraction: float = 0.25

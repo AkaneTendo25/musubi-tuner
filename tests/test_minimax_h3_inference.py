@@ -16,13 +16,15 @@ from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
     denoise_fl2va,
     denoise_ref2va,
+    encode_guide_media,
     prepare_keyframe_image,
     resolve_canvas_size,
     save_av_mp4,
     shifted_flow_schedule,
 )
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
-from musubi_tuner.minimax_h3.packing import MiniMaxH3ReferenceGeometry
+from musubi_tuner.minimax_h3.packing import MiniMaxH3GuideGeometry, MiniMaxH3ReferenceGeometry, pack_audio_latents
+from musubi_tuner.minimax_h3.references import H3PreparedReference, H3ReferenceKind
 from musubi_tuner.minimax_h3.video_vae import MiniMaxH3VideoViTDecoder3d
 
 
@@ -180,6 +182,134 @@ def test_tiny_ref2va_denoising_is_finite_and_returns_only_target_rows() -> None:
     assert audio.shape == (1, 2, 8, 8)
     assert torch.isfinite(video).all()
     assert torch.isfinite(audio).all()
+
+
+def test_tiny_ref2va_denoising_combines_reference_and_keyframe_rows() -> None:
+    transformer = _tiny_transformer()
+    conditioning = {
+        H3_TEXT_HIDDEN_KEY: torch.randn(3, 12),
+        H3_TEXT_TOKEN_TAGS_KEY: torch.tensor([1, 0, 1]),
+    }
+    references = H3EncodedReferences(
+        geometries=(MiniMaxH3ReferenceGeometry(kind=0, num_latent_frames=1, latent_height=2, latent_width=2),),
+        video_rows=torch.randn(1, 16),
+        audio_rows=torch.empty(0, 8),
+    )
+
+    video, audio = denoise_ref2va(
+        transformer,
+        conditioning,
+        references,
+        height=32,
+        width=32,
+        frame_count=5,
+        num_inference_steps=3,
+        generator=torch.Generator().manual_seed(1),
+        device=torch.device("cpu"),
+        keyframe_rows=torch.randn(1, 16),
+        keyframe_anchors=("first",),
+        condition_seed=7,
+        show_progress=False,
+    )
+
+    assert video.shape == (1, 4, 2, 2, 2)
+    assert audio.shape == (1, 2, 8, 8)
+    assert torch.isfinite(video).all()
+    assert torch.isfinite(audio).all()
+
+
+def test_tiny_ref2va_denoising_combines_reference_and_av_guide_rows() -> None:
+    transformer = _tiny_transformer()
+    conditioning = {
+        H3_TEXT_HIDDEN_KEY: torch.randn(3, 12),
+        H3_TEXT_TOKEN_TAGS_KEY: torch.tensor([1, 0, 1]),
+    }
+    references = H3EncodedReferences(
+        geometries=(MiniMaxH3ReferenceGeometry(kind=0, num_latent_frames=1, latent_height=2, latent_width=2),),
+        video_rows=torch.randn(1, 16),
+        audio_rows=torch.empty(0, 8),
+    )
+
+    video, audio = denoise_ref2va(
+        transformer,
+        conditioning,
+        references,
+        height=32,
+        width=32,
+        frame_count=5,
+        num_inference_steps=2,
+        generator=torch.Generator().manual_seed(1),
+        device=torch.device("cpu"),
+        guide_geometries=(MiniMaxH3GuideGeometry(0, num_video_latents=1, num_audio_latents=2),),
+        guide_video_rows=torch.randn(1, 16),
+        guide_audio_rows=torch.randn(4, 8),
+        condition_seed=7,
+        show_progress=False,
+    )
+
+    assert video.shape == (1, 4, 2, 2, 2)
+    assert audio.shape == (1, 2, 8, 8)
+    assert torch.isfinite(video).all()
+    assert torch.isfinite(audio).all()
+
+
+def test_tiny_ref2va_denoising_accepts_a_guide_without_ordinary_references() -> None:
+    transformer = _tiny_transformer()
+    conditioning = {
+        H3_TEXT_HIDDEN_KEY: torch.randn(3, 12),
+        H3_TEXT_TOKEN_TAGS_KEY: torch.tensor([1, 1, 1]),
+    }
+    references = H3EncodedReferences((), torch.empty(0, 16), torch.empty(0, 8))
+
+    video, audio = denoise_ref2va(
+        transformer,
+        conditioning,
+        references,
+        height=32,
+        width=32,
+        frame_count=5,
+        num_inference_steps=2,
+        generator=torch.Generator().manual_seed(1),
+        device=torch.device("cpu"),
+        guide_geometries=(MiniMaxH3GuideGeometry(0, num_video_latents=1),),
+        guide_video_rows=torch.randn(1, 16),
+        condition_seed=7,
+        show_progress=False,
+    )
+
+    assert video.shape == (1, 4, 2, 2, 2)
+    assert audio.shape == (1, 2, 8, 8)
+
+
+def test_encode_guide_media_merges_streams_and_crops_audio_to_remaining_timeline(monkeypatch) -> None:
+    video_rows = torch.ones(2, 16)
+    audio_latent = torch.arange(1 * 2 * 8 * 6, dtype=torch.float32).reshape(1, 2, 8, 6)
+    encoded_audio_rows = pack_audio_latents(audio_latent)[0]
+
+    def fake_encode(*_args, **_kwargs):
+        return H3EncodedReferences(
+            geometries=(
+                MiniMaxH3ReferenceGeometry(kind=1, num_latent_frames=2, latent_height=2, latent_width=2),
+                MiniMaxH3ReferenceGeometry(kind=2, num_audio_latents=6),
+            ),
+            video_rows=video_rows,
+            audio_rows=encoded_audio_rows,
+        )
+
+    monkeypatch.setattr("musubi_tuner.minimax_h3.inference.encode_reference_media", fake_encode)
+    prepared = (
+        (
+            2,
+            H3PreparedReference(H3ReferenceKind.VIDEO, frames=torch.zeros(5, 2, 2, 3).numpy()),
+            H3PreparedReference(H3ReferenceKind.AUDIO, waveform=torch.zeros(100)),
+        ),
+    )
+
+    encoded = encode_guide_media(Path("video"), Path("audio"), prepared, target_audio_latents=7, device=torch.device("cpu"))
+
+    assert encoded.geometries == (MiniMaxH3GuideGeometry(2, num_video_latents=2, num_audio_latents=3),)
+    torch.testing.assert_close(encoded.video_rows, video_rows)
+    assert encoded.audio_rows.shape == (6, 8)
 
 
 def test_keyframe_canvas_uses_stretch_for_first_and_cover_crop_for_last() -> None:

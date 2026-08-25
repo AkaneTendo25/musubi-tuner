@@ -13,7 +13,7 @@ from musubi_tuner.minimax_h3.references import (
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
 )
-from musubi_tuner.minimax_h3.request import SUPPORTED_RATIOS, H3GenerationRequest, make_references
+from musubi_tuner.minimax_h3.request import SUPPORTED_RATIOS, H3GenerationRequest, H3Guide, make_references
 from musubi_tuner.minimax_h3.weights import inspect_checkpoint
 
 
@@ -54,13 +54,34 @@ def create_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="INDEX:PATH",
         help=(
-            "condition latent frame INDEX on an image, repeatable. The transformer places the conditioning row at "
-            "that temporal position, which it honours for interior positions as well as for the first and the last"
+            "condition latent frame INDEX on an image, repeatable; negative indices count from the end. "
+            "May be combined with Ref2VA reference media"
         ),
     )
     parser.add_argument("--reference_image", action="append", default=[])
     parser.add_argument("--reference_video", action="append", default=[])
     parser.add_argument("--reference_audio", action="append", default=[])
+    parser.add_argument(
+        "--guide_image",
+        action="append",
+        default=[],
+        metavar="PIXEL_FRAME:PATH",
+        help="anchor an image at an arbitrary pixel frame; repeatable, negative frames count from the end",
+    )
+    parser.add_argument(
+        "--guide_video",
+        action="append",
+        default=[],
+        metavar="PIXEL_FRAME:PATH",
+        help="anchor a short 24-fps guide video at a pixel frame; repeatable, negative frames count from the end",
+    )
+    parser.add_argument(
+        "--guide_audio",
+        action="append",
+        default=[],
+        metavar="PIXEL_FRAME:PATH",
+        help="anchor guide audio at a pixel frame; pair with --guide_video at the same frame for an AV guide",
+    )
     parser.add_argument(
         "--reference_image_short_edge",
         type=int,
@@ -207,9 +228,24 @@ def create_parser() -> argparse.ArgumentParser:
 
 def _parse_keyframe(entry: str) -> tuple[int, str]:
     index, separator, path = entry.partition(":")
-    if not separator or not path or not index.strip().isdigit():
-        raise ValueError(f"--keyframe expects INDEX:PATH with a non-negative index, got {entry!r}")
-    return int(index), path
+    try:
+        parsed_index = int(index.strip())
+    except ValueError:
+        parsed_index = None
+    if not separator or not path or parsed_index is None:
+        raise ValueError(f"--keyframe expects INDEX:PATH with an integer index, got {entry!r}")
+    return parsed_index, path
+
+
+def _parse_guides(image_entries: list[str], video_entries: list[str], audio_entries: list[str]) -> tuple[H3Guide, ...]:
+    by_frame: dict[int, dict[str, Path]] = {}
+    for kind, entries in (("image", image_entries), ("video", video_entries), ("audio", audio_entries)):
+        for entry in entries:
+            frame, path = _parse_keyframe(entry)
+            if kind in by_frame.setdefault(frame, {}):
+                raise ValueError(f"--guide_{kind} lists pixel frame {frame} twice")
+            by_frame[frame][kind] = Path(path)
+    return tuple(H3Guide(frame, **media) for frame, media in by_frame.items())
 
 
 def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
@@ -240,6 +276,7 @@ def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
         references,
         args.h3_image_frame_count if args.h3_image_mode != "none" else None,
         args.h3_select_frame,
+        _parse_guides(args.guide_image, args.guide_video, args.guide_audio),
     )
 
 

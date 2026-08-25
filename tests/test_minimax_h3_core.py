@@ -1,5 +1,5 @@
-import json
 import itertools
+import json
 import math
 import os
 import re
@@ -27,7 +27,9 @@ from musubi_tuner.dataset.config_utils import (
 from musubi_tuner.dataset.datasources import ImageDirectoryDatasource, ImageJsonlDatasource, VideoJsonlDatasource
 from musubi_tuner.dataset.image_video_dataset import ItemInfo, _validate_h3_cache_pair
 from musubi_tuner.minimax_h3 import backend as h3_backend
+from musubi_tuner.minimax_h3 import dataset as h3_dataset
 from musubi_tuner.minimax_h3 import integration as h3_integration
+from musubi_tuner.minimax_h3 import packing as h3_packing
 from musubi_tuner.minimax_h3 import references as h3_references
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
@@ -55,6 +57,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
@@ -65,7 +68,6 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
-    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -80,7 +82,6 @@ from musubi_tuner.minimax_h3.cache import (
     resolve_keyframe_visuals,
     save_latent_cache_minimax_h3,
 )
-from musubi_tuner.minimax_h3 import dataset as h3_dataset
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.media import (
     AudioClip,
@@ -93,7 +94,6 @@ from musubi_tuner.minimax_h3.media import (
     fit_audio_length,
     slice_media_asset,
 )
-from musubi_tuner.minimax_h3 import packing as h3_packing
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.packing import (
     MiniMaxH3ReferenceGeometry,
@@ -112,8 +112,8 @@ from musubi_tuner.minimax_h3.references import (
     land_reference_frame_count,
     reference_modality_variant,
     resample_reference_frames,
-    resolve_reference_image_size,
     resolve_reference_image_area_size,
+    resolve_reference_image_size,
     resolve_reference_video_size,
     sample_reference_video_frames,
     subsample_reference_frames,
@@ -121,7 +121,7 @@ from musubi_tuner.minimax_h3.references import (
     validate_reference_image_short_edge,
     validate_reference_video_fps,
 )
-from musubi_tuner.minimax_h3.request import H3GenerationRequest, H3Reference, ReferenceKind, ReferenceRole
+from musubi_tuner.minimax_h3.request import H3GenerationRequest, H3Guide, H3Reference, ReferenceKind, ReferenceRole
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, inspect_checkpoint
 from musubi_tuner.minimax_h3_cache_latents import create_parser as create_cache_latents_parser
 from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_text_parser
@@ -224,7 +224,7 @@ def test_keyframe_conditioning_carries_its_latent_index(tmp_path):
     ("kwargs", "message"),
     [
         ({"role": ReferenceRole.KEYFRAME}, "requires a latent index"),
-        ({"role": ReferenceRole.KEYFRAME, "latent_index": -1}, "non-negative integer"),
+        ({"role": ReferenceRole.KEYFRAME, "latent_index": True}, "must be an integer"),
         ({"latent_index": 3}, "only to keyframe"),
     ],
 )
@@ -243,6 +243,37 @@ def test_keyframe_indices_must_be_distinct(tmp_path):
         H3GenerationRequest("prompt", tmp_path / "out.mp4", references=references)
 
 
+def test_guide_pixel_indices_resolve_and_must_be_distinct(tmp_path):
+    with pytest.raises(ValueError, match="only one guide"):
+        H3GenerationRequest(
+            "prompt",
+            tmp_path / "out.mp4",
+            frame_count_override=39,
+            guides=(H3Guide(38, image=tmp_path / "a.png"), H3Guide(-1, audio=tmp_path / "b.wav")),
+        )
+    with pytest.raises(ValueError, match="inside the 39-frame"):
+        H3GenerationRequest(
+            "prompt",
+            tmp_path / "out.mp4",
+            frame_count_override=39,
+            guides=(H3Guide(-40, image=tmp_path / "a.png"),),
+        )
+
+
+def test_negative_keyframe_indices_resolve_from_the_end(tmp_path):
+    from musubi_tuner.minimax_h3.request import make_references
+
+    request = H3GenerationRequest(
+        "prompt",
+        tmp_path / "out.mp4",
+        frame_count_override=39,
+        references=make_references(keyframes=[(-1, str(tmp_path / "last-window.png"))]),
+    )
+
+    assert request.temporal_shape.video_latent_frames == 12
+    assert request.resolve_keyframe_index(-1) == 11
+
+
 def test_keyframe_cli_parses_index_and_path(tmp_path):
     args = create_parser().parse_args(
         ["--model", str(tmp_path), "--prompt", "p", "--output", str(tmp_path / "o.mp4"), "--keyframe", "11:/k.png"]
@@ -250,11 +281,65 @@ def test_keyframe_cli_parses_index_and_path(tmp_path):
     request = request_from_args(args)
     assert [(ref.role, ref.latent_index) for ref in request.references] == [(ReferenceRole.KEYFRAME, 11)]
 
+    negative = create_parser().parse_args(
+        ["--model", str(tmp_path), "--prompt", "p", "--output", str(tmp_path / "o.mp4"), "--keyframe=-1:/k.png"]
+    )
+    assert request_from_args(negative).references[0].latent_index == -1
+
     bad = create_parser().parse_args(
         ["--model", str(tmp_path), "--prompt", "p", "--output", str(tmp_path / "o.mp4"), "--keyframe", "/k.png"]
     )
     with pytest.raises(ValueError, match="INDEX:PATH"):
         request_from_args(bad)
+
+
+def test_av_guide_cli_pairs_streams_by_pixel_frame(tmp_path):
+    args = create_parser().parse_args(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "p",
+            "--output",
+            str(tmp_path / "o.mp4"),
+            "--guide_video",
+            "0:clip.mp4",
+            "--guide_image",
+            "4:still.png",
+            "--guide_audio=-1:sound.wav",
+            "--guide_audio",
+            "0:clip.wav",
+        ]
+    )
+
+    request = request_from_args(args)
+
+    assert request.mode == "reference"
+    guides = {guide.frame_index: guide for guide in request.guides}
+    assert guides[0].video == Path("clip.mp4")
+    assert guides[0].audio == Path("clip.wav")
+    assert guides[4].image == Path("still.png")
+    assert guides[-1].video is None
+    assert guides[-1].audio == Path("sound.wav")
+
+
+def test_native_generator_prepares_an_arbitrary_image_guide_on_target_canvas(tmp_path):
+    image_path = tmp_path / "guide.png"
+    Image.new("RGB", (8, 4), "red").save(image_path)
+    request = H3GenerationRequest(
+        "prompt",
+        tmp_path / "out.mp4",
+        frame_count_override=39,
+        guides=(H3Guide(-1, image=image_path),),
+    )
+    generator = h3_integration._NativeGenerator.__new__(h3_integration._NativeGenerator)
+
+    prepared = generator._prepare_guides(request, 32, 64)
+
+    assert prepared[0][0] == 38
+    assert prepared[0][1].kind is h3_references.H3ReferenceKind.IMAGE
+    assert prepared[0][1].image.size == (64, 32)
+    assert prepared[0][2] is None
 
 
 def test_conditioned_image_cli_duplicates_first_control_and_uses_short_frame_grid(tmp_path):
@@ -335,11 +420,13 @@ def test_shipped_h3_dataset_examples_use_strict_schema_and_valid_frame_counts():
                 assert is_valid_frame_count(frame_count), (path.name, frame_count)
 
 
-def test_first_frame_cannot_be_mixed_with_reference_mode(tmp_path):
+def test_first_frame_can_be_mixed_with_reference_mode(tmp_path):
     first = H3Reference(tmp_path / "first.png", ReferenceKind.IMAGE, ReferenceRole.FIRST_FRAME)
     reference = H3Reference(tmp_path / "style.png", ReferenceKind.IMAGE)
-    with pytest.raises(ValueError, match="separate H3 modes"):
-        H3GenerationRequest("prompt", tmp_path / "out.mp4", references=(first, reference))
+    request = H3GenerationRequest("prompt", tmp_path / "out.mp4", references=(first, reference))
+
+    assert request.mode == "reference"
+    assert request.canvas_reference() == first.path
 
 
 def test_cli_maps_multimodal_references(tmp_path):

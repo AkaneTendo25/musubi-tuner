@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import tomllib
+import pytest
 
 from musubi_tuner.gui_dashboard.command_builder import (
     build_cache_latents_cmd,
@@ -133,6 +134,78 @@ def test_dashboard_rejects_custom_keyframes_with_endpoint_task_cache(tmp_path: P
     report = validate_training_config(config)
 
     assert "caching.h3_task" in report["field_errors"]
+
+
+@pytest.mark.parametrize("task", ["t2va", "ref2va", "ref2va_omni"])
+def test_dashboard_accepts_custom_keyframes_with_supported_task_cache(tmp_path: Path, task: str) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_task = task
+    config.training.h3_training_mode = task if task != "t2va" else "fl2va"
+    config.training.h3_keyframe_anchors = "first,last"
+
+    report = validate_training_config(config)
+
+    assert "caching.h3_task" not in report["field_errors"]
+    assert "training.h3_training_mode" not in report["field_errors"]
+
+
+def test_dashboard_accepts_valid_ref2va_av_guide_specs(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_task = "ref2va"
+    config.training.h3_training_mode = "ref2va"
+    config.training.h3_guide_specs = "0:2:4;21:0:8"
+
+    report = validate_training_config(config)
+
+    assert "training.h3_guide_specs" not in report["field_errors"]
+    assert "caching.h3_task" not in report["field_errors"]
+    assert "--h3_guide_specs" in build_training_cmd(config)
+
+
+def test_dashboard_rejects_malformed_or_non_ref2va_av_guides(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_task = "t2va"
+    config.training.h3_training_mode = "fl2va"
+    config.training.h3_guide_specs = "0:0:0"
+
+    report = validate_training_config(config)
+
+    assert "training.h3_guide_specs" in report["field_errors"]
+    assert "training.h3_training_mode" in report["field_errors"]
+    assert "caching.h3_task" in report["field_errors"]
+
+
+@pytest.mark.parametrize("mode", ["ref2va", "ref2va_omni"])
+def test_dashboard_accepts_ref2va_masking_and_per_row_extension(tmp_path: Path, mode: str) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_task = mode
+    config.training.h3_training_mode = mode
+    config.training.h3_extension_video_frames = 1
+    config.training.h3_extension_route = "per_row_sigma"
+
+    report = validate_training_config(config)
+
+    assert "training.h3_training_mode" not in report["field_errors"]
+    assert "training.h3_extension_route" not in report["field_errors"]
+    assert "caching.h3_task" not in report["field_errors"]
+
+    config.training.h3_extension_video_frames = 0
+    config.training.h3_mask_mode = "box"
+    report = validate_training_config(config)
+    assert "training.h3_training_mode" not in report["field_errors"]
+    assert "caching.h3_task" not in report["field_errors"]
+
+
+def test_dashboard_rejects_ref2va_condition_row_extension(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_task = "ref2va"
+    config.training.h3_training_mode = "ref2va"
+    config.training.h3_extension_video_frames = 1
+    config.training.h3_extension_route = "condition_rows"
+
+    report = validate_training_config(config)
+
+    assert "training.h3_extension_route" in report["field_errors"]
 
 
 def test_default_h3_workflow_never_builds_ltx_commands(tmp_path: Path) -> None:
@@ -668,6 +741,7 @@ def test_h3_native_conditioning_controls_round_trip_through_real_parser(tmp_path
     training.h3_extension_audio_latents = 4
     training.h3_extension_route = "per_row_sigma"
     training.h3_keyframe_anchors = "first,last"
+    training.h3_guide_specs = "0:2:4"
     training.reference_image_short_edge = 448
     training.reference_video_short_edge = 384
     training.reference_video_max_pixels = 384 * 672
@@ -695,6 +769,7 @@ def test_h3_native_conditioning_controls_round_trip_through_real_parser(tmp_path
     assert parsed.h3_extension_audio_latents == 4
     assert parsed.h3_extension_route == "per_row_sigma"
     assert parsed.h3_keyframe_anchors == "first,last"
+    assert parsed.h3_guide_specs == "0:2:4"
     assert parsed.reference_image_short_edge == 448
     assert parsed.reference_video_short_edge == 384
     assert parsed.reference_video_max_pixels == 384 * 672

@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from PIL import Image
 from safetensors import safe_open
 
-from musubi_tuner.minimax_h3.backend import H3PairedConditioningUnsupportedError
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_LATENT_CHANNELS,
     IMAGE_FRAME_COUNT,
@@ -26,6 +25,7 @@ from musubi_tuner.minimax_h3.audio import (
     load_audio_asset,
     target_audio_processing_spec,
 )
+from musubi_tuner.minimax_h3.backend import H3PairedConditioningUnsupportedError
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_AUDIO_LOSS_MASK_KEY,
@@ -34,23 +34,23 @@ from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
+    H3_KEYFRAME_VISUAL_LAST,
+    H3_KEYFRAME_VISUALS_KEY,
+    H3_MAX_CAPTION_TOKENS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
     H3_REFERENCE_AUDIO_ROWS_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
-    H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
-    H3_REFERENCE_VIDEO_FPS_KEY,
-    H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
-    H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
+    H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_KINDS_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
+    H3_REFERENCE_VIDEO_FPS_KEY,
+    H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
-    H3_KEYFRAME_VISUALS_KEY,
-    H3_KEYFRAME_VISUAL_LAST,
-    H3_MAX_CAPTION_TOKENS_KEY,
-    H3_QWEN_CONTROL_VISUALS_KEY,
+    H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -69,9 +69,11 @@ from musubi_tuner.minimax_h3.component_loader import (
 from musubi_tuner.minimax_h3.inference import (
     CANVAS_MULTIPLE,
     VIDEO_SPATIAL_COMPRESSION,
+    H3EncodedReferences,
     decode_latents_sequentially,
     denoise_fl2va,
     denoise_ref2va,
+    encode_guide_media,
     encode_keyframe_images,
     encode_reference_media,
     prepare_keyframe_image,
@@ -82,6 +84,7 @@ from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.packing import (
     AUDIO_CHANNELS,
+    MiniMaxH3GuideGeometry,
     MiniMaxH3ReferenceGeometry,
     build_ref2va_packed_sequence,
     build_row_timesteps,
@@ -97,6 +100,7 @@ from musubi_tuner.minimax_h3.references import (
     REFERENCE_VIDEO_FPS,
     REFERENCE_VIDEO_MAX_PIXELS,
     REFERENCE_VIDEO_SHORT_EDGE,
+    H3PreparedReference,
     H3ReferenceKind,
     prepare_references,
     trim_reference_frames,
@@ -567,7 +571,7 @@ class _NativeGenerator:
                 # packing treats an interior index exactly as it treats the ends.
                 with Image.open(reference.path) as image:
                     images.append(prepare_keyframe_image(image, height, width, stretch=False))
-                anchors.append(reference.latent_index)
+                anchors.append(request.resolve_keyframe_index(reference.latent_index))
         return images, tuple(anchors)
 
     def _prepare_references(self, request: H3GenerationRequest, height: int, width: int):
@@ -593,6 +597,65 @@ class _NativeGenerator:
             self.reference_video_short_edge,
             self.reference_video_max_pixels,
         )
+
+    def _prepare_guides(self, request: H3GenerationRequest, height: int, width: int):
+        """Decode request guides and place visual spans on the target canvas."""
+        prepared = []
+        frame_count = request.temporal_shape.frame_count
+        for guide in request.guides:
+            frame_index = guide.frame_index if guide.frame_index >= 0 else frame_count + guide.frame_index
+            video_guide = None
+            audio_guide = None
+            if guide.image is not None:
+                with Image.open(guide.image) as image:
+                    image = prepare_keyframe_image(image, height, width, stretch=False)
+                    video_guide = H3PreparedReference(H3ReferenceKind.IMAGE, image=image.copy())
+            elif guide.video is not None:
+                values = prepare_references(
+                    SimpleNamespace(
+                        h3_media_assets=(MediaAsset(guide.video, MediaModality.VIDEO, "reference"),),
+                        frame_count=frame_count,
+                        bucket_size=(width, height),
+                    ),
+                    self.reference_image_short_edge,
+                    self.reference_image_size_mode,
+                    self.reference_image_max_pixels,
+                    self.reference_video_short_edge,
+                    self.reference_video_max_pixels,
+                )
+                source = values[0]
+                if source.frames is None or not source.frames.shape[0]:
+                    raise ValueError(f"H3 guide video {guide.video} contains no frames")
+                remaining = frame_count - frame_index
+                frames = source.frames[:remaining]
+                if frames.shape[0] < 5:
+                    image = prepare_keyframe_image(Image.fromarray(frames[0]), height, width, stretch=False)
+                    video_guide = H3PreparedReference(H3ReferenceKind.IMAGE, image=image)
+                else:
+                    valid = trim_reference_frames(frames.shape[0])
+                    frames = np.stack(
+                        [
+                            np.asarray(prepare_keyframe_image(Image.fromarray(frame), height, width, stretch=False))
+                            for frame in frames[:valid]
+                        ]
+                    )
+                    video_guide = H3PreparedReference(H3ReferenceKind.VIDEO, frames=frames)
+            if guide.audio is not None:
+                values = prepare_references(
+                    SimpleNamespace(
+                        h3_media_assets=(MediaAsset(guide.audio, MediaModality.AUDIO, "reference"),),
+                        frame_count=frame_count,
+                        bucket_size=(width, height),
+                    ),
+                    self.reference_image_short_edge,
+                    self.reference_image_size_mode,
+                    self.reference_image_max_pixels,
+                    self.reference_video_short_edge,
+                    self.reference_video_max_pixels,
+                )
+                audio_guide = values[0]
+            prepared.append((frame_index, video_guide, audio_guide))
+        return tuple(prepared)
 
     def _load_transformer(self):
         from safetensors.torch import load_file
@@ -784,30 +847,90 @@ class _NativeGenerator:
         prepared_references = ()
         if request.mode == "reference":
             prepared_references = self._prepare_references(request, height, width)
+            prepared_guides = self._prepare_guides(request, height, width)
+            images, anchors = self._prepare_keyframes(request, height, width)
             conditioning = self._measure(
                 "text_conditioning",
                 lambda: self._encode_prompt(request.prompt, references=prepared_references),
                 metrics,
             )
-            references = self._measure(
-                "reference_encoding",
-                lambda: encode_reference_media(
-                    self.video_vae,
-                    self.audio_vae,
-                    prepared_references,
-                    self.device,
-                ),
-                metrics,
+            references = (
+                self._measure(
+                    "reference_encoding",
+                    lambda: encode_reference_media(
+                        self.video_vae,
+                        self.audio_vae,
+                        prepared_references,
+                        self.device,
+                    ),
+                    metrics,
+                )
+                if prepared_references
+                else H3EncodedReferences((), torch.empty(0, 96), torch.empty(0, 32))
+            )
+            guides = (
+                self._measure(
+                    "guide_encoding",
+                    lambda: encode_guide_media(
+                        self.video_vae,
+                        self.audio_vae,
+                        prepared_guides,
+                        shape.audio_latent_frames,
+                        self.device,
+                    ),
+                    metrics,
+                )
+                if prepared_guides
+                else None
+            )
+            keyframe_rows = (
+                self._measure(
+                    "keyframe_encoding",
+                    lambda: torch.cat(encode_keyframe_images(self.video_vae, images, self.device)),
+                    metrics,
+                )
+                if images
+                else None
             )
             if first_pass_size is not None:
                 small = self._prepare_references(request, *first_pass_size)
-                first_pass_kwargs["references"] = self._measure(
-                    "first_pass_reference_encoding",
-                    lambda: encode_reference_media(self.video_vae, self.audio_vae, small, self.device),
-                    metrics,
+                first_pass_kwargs["references"] = (
+                    self._measure(
+                        "first_pass_reference_encoding",
+                        lambda: encode_reference_media(self.video_vae, self.audio_vae, small, self.device),
+                        metrics,
+                    )
+                    if small
+                    else H3EncodedReferences((), torch.empty(0, 96), torch.empty(0, 32))
                 )
+                small_guides = self._prepare_guides(request, *first_pass_size)
+                if small_guides:
+                    encoded_small_guides = self._measure(
+                        "first_pass_guide_encoding",
+                        lambda: encode_guide_media(
+                            self.video_vae,
+                            self.audio_vae,
+                            small_guides,
+                            shape.audio_latent_frames,
+                            self.device,
+                        ),
+                        metrics,
+                    )
+                    first_pass_kwargs.update(
+                        guide_geometries=encoded_small_guides.geometries,
+                        guide_video_rows=encoded_small_guides.video_rows,
+                        guide_audio_rows=encoded_small_guides.audio_rows,
+                    )
+                if images:
+                    small_images, small_anchors = self._prepare_keyframes(request, *first_pass_size)
+                    first_pass_kwargs["keyframe_rows"] = self._measure(
+                        "first_pass_keyframe_encoding",
+                        lambda: torch.cat(encode_keyframe_images(self.video_vae, small_images, self.device)),
+                        metrics,
+                    )
+                    first_pass_kwargs["keyframe_anchors"] = small_anchors
+                    del small_images
                 del small
-            images, anchors, keyframe_rows = [], (), None
             reference_kinds = [reference.kind.name.lower() for reference in prepared_references]
             prepared_references = ()
             gc.collect()
@@ -851,7 +974,13 @@ class _NativeGenerator:
             condition_seed=request.seed,
         )
         if references is not None:
-            base_kwargs["references"] = references
+            base_kwargs.update(references=references, keyframe_rows=keyframe_rows, keyframe_anchors=anchors)
+            if guides is not None:
+                base_kwargs.update(
+                    guide_geometries=guides.geometries,
+                    guide_video_rows=guides.video_rows,
+                    guide_audio_rows=guides.audio_rows,
+                )
 
             # Overrides let a pass reuse this call with another canvas, another
             # step count, its own conditioning, and the latents of the pass before.
@@ -1144,7 +1273,10 @@ class _NativeTrainingBackend:
         qwen_control_dropout: bool = False,
         extension_video_frames: int = 0,
         extension_audio_latents: int = 0,
-        condition_video_anchors: tuple[int, ...] = (),
+        condition_video_anchors: tuple[str | int, ...] = (),
+        guide_geometries: tuple[MiniMaxH3GuideGeometry, ...] = (),
+        guide_video_latents: tuple[torch.Tensor, ...] = (),
+        guide_audio_latents: tuple[torch.Tensor, ...] = (),
         extension_video_context: torch.Tensor | None = None,
         extension_audio_context: torch.Tensor | None = None,
         extension_route: Literal["condition_rows", "per_row_sigma"] = "condition_rows",
@@ -1328,13 +1460,13 @@ class _NativeTrainingBackend:
         if task not in accepted_tasks:
             expected = ", ".join(f"--task {name}" for name in sorted(accepted_tasks))
             raise ValueError(f"MiniMax H3 {self.mode} training requires {expected} conditioning; re-cache text outputs")
-        if condition_video_anchors and task != "t2va":
-            raise ValueError("H3 custom keyframe anchors require --task t2va caches")
+        if condition_video_anchors and task not in ("t2va", "ref2va", "ref2va_omni"):
+            raise ValueError("H3 custom keyframe anchors require T2VA or Ref2VA conditioning caches")
         if task in ("ref2va", "ref2va_omni"):
             # Masked and per-row-sigma conditioning only pin rows inside the
             # target block, which the Ref2VA layout carries unchanged behind its
-            # reference prefix. Duplicating the observed span as extra clean rows
-            # would instead need reference-aware packer support.
+            # reference prefix. Arbitrary keyframe guides have their own
+            # reference-aware rows below; generic condition-row extension does not.
             if (extension_video_frames or extension_audio_latents) and extension_route != "per_row_sigma":
                 raise ValueError(
                     "H3 Ref2VA extension is only supported on the per_row_sigma route; "
@@ -1440,6 +1572,8 @@ class _NativeTrainingBackend:
                 latent_width=latent_width,
                 num_audio_latents=num_audio_latents,
                 patch_size=patch_size,
+                keyframe_anchors=condition_video_anchors,
+                guides=guide_geometries,
                 spatial_density_scale=spatial_density_scale,
             )
             condition_video_timestep = torch.maximum(
@@ -1449,8 +1583,47 @@ class _NativeTrainingBackend:
             if reference_video.numel():
                 reference_video = 0.999 * reference_video + 0.001 * torch.randn_like(reference_video)
                 video_rows = torch.cat((reference_video[None], video_rows), dim=1)
+            if condition_video_anchors:
+                if extension_video_context is None:
+                    raise ValueError("H3 keyframe conditioning requires the clean guide latents")
+                guide_video = patchify_video_latents(extension_video_context, patch_size)
+                expected_guide_rows = layout.num_condition_video_rows - int(reference_video.shape[0])
+                if guide_video.shape[1] != expected_guide_rows:
+                    raise ValueError(
+                        f"H3 keyframe conditioning produced {guide_video.shape[1]} rows, expected {expected_guide_rows}"
+                    )
+                guide_video = 0.999 * guide_video + 0.001 * torch.randn_like(guide_video)
+                reference_rows = int(reference_video.shape[0])
+                video_rows = torch.cat((video_rows[:, :reference_rows], guide_video, video_rows[:, reference_rows:]), dim=1)
+            explicit_video = [patchify_video_latents(value, patch_size) for value in guide_video_latents]
+            explicit_audio = [pack_audio_latents(value) for value in guide_audio_latents]
+            expected_video_streams = sum(geometry.num_video_latents > 0 for geometry in guide_geometries)
+            expected_audio_streams = sum(geometry.num_audio_latents > 0 for geometry in guide_geometries)
+            if len(explicit_video) != expected_video_streams or len(explicit_audio) != expected_audio_streams:
+                raise ValueError("H3 guide geometry and supplied guide streams do not match")
+            if explicit_video:
+                guide_video = torch.cat(explicit_video, dim=1)
+                rows_per_frame = (latent_height // patch_size[1]) * (latent_width // patch_size[2])
+                expected_rows = sum(geometry.num_video_rows(rows_per_frame) for geometry in guide_geometries)
+                if guide_video.shape[1] != expected_rows:
+                    raise ValueError(f"H3 guide video produced {guide_video.shape[1]} rows, expected {expected_rows}")
+                guide_video = 0.999 * guide_video + 0.001 * torch.randn_like(guide_video)
+                reference_rows = int(reference_video.shape[0])
+                legacy_rows = layout.num_condition_video_rows - reference_rows - expected_rows
+                insert_at = reference_rows + legacy_rows
+                video_rows = torch.cat((video_rows[:, :insert_at], guide_video, video_rows[:, insert_at:]), dim=1)
+            guide_audio_rows = torch.cat(explicit_audio, dim=1) if explicit_audio else None
+            if guide_audio_rows is not None:
+                expected_rows = sum(geometry.num_audio_rows for geometry in guide_geometries)
+                if guide_audio_rows.shape[1] != expected_rows:
+                    raise ValueError(f"H3 guide audio produced {guide_audio_rows.shape[1]} rows, expected {expected_rows}")
+            audio_parts = []
             if reference_audio.numel():
-                audio_rows = torch.cat((reference_audio[None], audio_rows), dim=1)
+                audio_parts.append(reference_audio[None])
+            if guide_audio_rows is not None:
+                audio_parts.append(guide_audio_rows)
+            audio_parts.append(audio_rows)
+            audio_rows = torch.cat(audio_parts, dim=1)
             # Every offset below is read from this step's layout: a per-step
             # reference-modality redraw changes how many conditioning rows the
             # sequence carries, and a zero-reference omni sample carries none at

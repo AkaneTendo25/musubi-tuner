@@ -1080,7 +1080,38 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
-        keyframes = bool(t.h3_keyframe_anchors or t.h3_keyframe_random_count)
+        guide_specs = getattr(t, "h3_guide_specs", "")
+        keyframes = bool(t.h3_keyframe_anchors or t.h3_keyframe_random_count or guide_specs)
+        if guide_specs:
+            malformed = []
+            for guide in guide_specs.split(";"):
+                fields = [field.strip() for field in guide.split(":")]
+                if len(fields) != 3 or any(not field.lstrip("-").isdigit() for field in fields):
+                    malformed.append(guide)
+                    continue
+                _, video_length, audio_length = (int(field) for field in fields)
+                if video_length < 0 or audio_length < 0 or not (video_length or audio_length):
+                    malformed.append(guide)
+            if malformed:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_guide_specs",
+                        "H3 guides must use START:VIDEO_LATENTS:AUDIO_LATENTS with non-negative, non-empty streams.",
+                        label="H3 Guide Spans",
+                        page="training",
+                    )
+                )
+            if t.h3_training_mode == "fl2va":
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_training_mode",
+                        "H3 video/audio guide spans require Ref2VA or Ref2VA-Omni training.",
+                        label="H3 Training Mode",
+                        page="training",
+                    )
+                )
         extension = bool(t.h3_extension_video_frames or t.h3_extension_audio_latents)
         masking = bool(t.h3_mask_mode != "off" or t.h3_mask_audio)
         if keyframes and extension:
@@ -1186,26 +1217,54 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
-        if (keyframes or extension or masking) and t.h3_training_mode != "fl2va":
+        if keyframes and t.h3_training_mode not in ("fl2va", "ref2va", "ref2va_omni"):
             errors.append(
                 _make_issue(
                     "error",
                     "training.h3_training_mode",
-                    "H3 keyframes, extension, and masked conditioning require FL2VA training mode.",
+                    "H3 keyframes require FL2VA or Ref2VA training mode.",
                     label="H3 Training Mode",
                     page="training",
                 )
             )
-        if (extension or masking) and config.caching.h3_task != "t2va":
+        if (extension or masking) and t.h3_training_mode not in ("fl2va", "ref2va", "ref2va_omni"):
             errors.append(
                 _make_issue(
                     "error",
-                    "caching.h3_task",
-                    "H3 extension and masked conditioning require T2VA caches.",
-                    label="H3 Conditioning Task",
-                    page="caching",
+                    "training.h3_training_mode",
+                    "H3 extension and masked conditioning require FL2VA or Ref2VA training mode.",
+                    label="H3 Training Mode",
+                    page="training",
                 )
             )
+        if extension and t.h3_training_mode in ("ref2va", "ref2va_omni") and t.h3_extension_route != "per_row_sigma":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_extension_route",
+                    "H3 Ref2VA extension requires the per_row_sigma route.",
+                    label="H3 Extension Route",
+                    page="training",
+                )
+            )
+        if extension or masking:
+            accepted_tasks = (
+                {"t2va"}
+                if t.h3_training_mode == "fl2va"
+                else {"ref2va", "ref2va_omni"}
+                if t.h3_training_mode in ("ref2va", "ref2va_omni")
+                else set()
+            )
+            if accepted_tasks and config.caching.h3_task not in accepted_tasks:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "caching.h3_task",
+                        "H3 extension and masked conditioning require a cache matching the selected training mode.",
+                        label="H3 Conditioning Task",
+                        page="caching",
+                    )
+                )
         if t.h3_frame_sigma_jitter > 0 and (keyframes or extension or masking or t.h3_observed_modality is not None):
             errors.append(
                 _make_issue(
@@ -1236,12 +1295,26 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
-        if (t.h3_keyframe_anchors or t.h3_keyframe_random_count) and config.caching.h3_task != "t2va":
+        if (t.h3_keyframe_anchors or t.h3_keyframe_random_count or guide_specs) and config.caching.h3_task not in (
+            "t2va",
+            "ref2va",
+            "ref2va_omni",
+        ):
             errors.append(
                 _make_issue(
                     "error",
                     "caching.h3_task",
-                    "Custom H3 keyframe anchors require T2VA caches.",
+                    "Custom H3 keyframe anchors require T2VA or Ref2VA caches.",
+                    label="H3 Conditioning Task",
+                    page="caching",
+                )
+            )
+        if guide_specs and config.caching.h3_task not in ("ref2va", "ref2va_omni"):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_task",
+                    "H3 video/audio guide spans require Ref2VA or Ref2VA-Omni caches.",
                     label="H3 Conditioning Task",
                     page="caching",
                 )

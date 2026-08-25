@@ -53,6 +53,7 @@ from musubi_tuner.minimax_h3.masking import (
 )
 from musubi_tuner.minimax_h3.model import MiniMaxH3Attention, MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.packing import (
+    MiniMaxH3GuideGeometry,
     MiniMaxH3ReferenceGeometry,
     build_ref2va_packed_sequence,
     build_row_timesteps,
@@ -763,7 +764,7 @@ def test_h3_keyframe_anchors_reject_duplicate_first_and_zero():
         _anchor_layout(("first", 0))
 
 
-@pytest.mark.parametrize("anchor", [7, -1, True, 1.5])
+@pytest.mark.parametrize("anchor", [7, -8, True, 1.5])
 def test_h3_keyframe_anchors_reject_invalid_indices(anchor):
     with pytest.raises(ValueError):
         _anchor_layout((anchor,))
@@ -1032,6 +1033,87 @@ def test_h3_ref2va_packing_preserves_reference_order_and_shared_rotary_clock():
     assert bool((indices[layout.audio_indices[:10]] == 3).all())
     assert bool((indices[layout.video_indices[12:]] == 0).all())
     assert bool((indices[layout.audio_indices[10:]] == 1).all())
+
+
+def test_h3_ref2va_guides_follow_references_and_share_the_target_timeline():
+    references = (MiniMaxH3ReferenceGeometry(kind=0, num_latent_frames=1, latent_height=4, latent_width=4),)
+    layout = build_ref2va_packed_sequence(
+        torch.ones(3, dtype=torch.long),
+        references,
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=1,
+        patch_size=(1, 2, 2),
+        keyframe_anchors=("first", "last"),
+    )
+
+    # Four reference rows, eight guide rows, then target audio and video.
+    assert layout.num_condition_video_rows == 12
+    torch.testing.assert_close(layout.video_indices[:4], torch.arange(3, 7))
+    torch.testing.assert_close(layout.video_indices[4:12], torch.arange(7, 15))
+    torch.testing.assert_close(layout.audio_indices, torch.arange(15, 17))
+    torch.testing.assert_close(layout.video_indices[12:], torch.arange(17, 25))
+    target_origin = 4.0
+    torch.testing.assert_close(layout.position_ids[7:11, 0], torch.full((4,), target_origin, dtype=torch.float64))
+    torch.testing.assert_close(
+        layout.position_ids[11:15, 0],
+        torch.full((4,), target_origin + 20.0 / 3.0, dtype=torch.float64),
+    )
+    torch.testing.assert_close(layout.position_ids[17:21, 0], layout.position_ids[7:11, 0])
+
+
+def test_h3_ref2va_video_audio_guide_spans_share_one_pixel_frame_origin():
+    layout = build_ref2va_packed_sequence(
+        torch.ones(3, dtype=torch.long),
+        (MiniMaxH3ReferenceGeometry(kind=0, num_latent_frames=1, latent_height=4, latent_width=4),),
+        num_latent_frames=3,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=20,
+        patch_size=(1, 2, 2),
+        guides=(MiniMaxH3GuideGeometry(frame_index=2, num_video_latents=2, num_audio_latents=4),),
+    )
+
+    # text[0:3], reference video[3:7], guide video[7:15], guide audio[15:23],
+    # target audio[23:63], target video[63:75].
+    assert layout.sequence_length == 75
+    assert layout.num_condition_video_rows == 12
+    assert layout.num_condition_audio_rows == 8
+    torch.testing.assert_close(layout.video_indices[4:12], torch.arange(7, 15))
+    torch.testing.assert_close(layout.audio_indices[:8], torch.arange(15, 23))
+    guide_origin = 4.0 + 10.0 / 3.0
+    torch.testing.assert_close(
+        layout.position_ids[7:15, 0],
+        torch.tensor([guide_origin] * 4 + [guide_origin + 5.0 / 3.0] * 4, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        layout.position_ids[15:23, 0],
+        torch.tensor([guide_origin + offset for offset in range(4)] * 2, dtype=torch.float64),
+    )
+
+
+@pytest.mark.parametrize(
+    "guide, message",
+    [
+        (MiniMaxH3GuideGeometry(0), "video or audio"),
+        (MiniMaxH3GuideGeometry(-1, num_video_latents=1), "outside"),
+        (MiniMaxH3GuideGeometry(4, num_video_latents=2), "does not fit"),
+        (MiniMaxH3GuideGeometry(4, num_audio_latents=2), "remaining"),
+    ],
+)
+def test_h3_ref2va_guide_geometry_rejects_invalid_or_overlong_spans(guide, message):
+    with pytest.raises(ValueError, match=message):
+        build_ref2va_packed_sequence(
+            torch.ones(3, dtype=torch.long),
+            (),
+            num_latent_frames=2,
+            latent_height=4,
+            latent_width=4,
+            num_audio_latents=8,
+            patch_size=(1, 2, 2),
+            guides=(guide,),
+        )
 
 
 def test_h3_ref2va_packing_accepts_text_only_presentation():
@@ -5032,17 +5114,15 @@ def test_h3_extension_keeps_the_condition_rows_route_under_fl2va():
     assert trainer._extension_route == "condition_rows"
 
 
-@pytest.mark.parametrize("mode", ["ref2va", "ref2va_omni"])
-def test_h3_keyframe_conditioning_stays_t2va_only(mode):
-    # Keyframes duplicate the observed frames as extra condition rows, which
-    # only the T2VA packer knows how to place.
-    args = create_parser().parse_args([])
+@pytest.mark.parametrize("mode", ["fl2va", "ref2va", "ref2va_omni"])
+def test_h3_keyframe_conditioning_accepts_video_conditioning_modes(mode):
+    args = create_parser().parse_args(["--sdpa"])
     args.h3_training_mode = mode
     args.h3_keyframe_anchors = "first,last"
     trainer = MiniMaxH3NetworkTrainer()
 
-    with pytest.raises(ValueError, match="requires --h3_training_mode fl2va"):
-        trainer.handle_model_specific_args(args)
+    trainer.handle_model_specific_args(args)
+    assert trainer._keyframe_anchors == ("first", "last")
 
 
 class _PackedRowRecorder:
@@ -5242,21 +5322,66 @@ def test_h3_ref2va_extension_rejects_the_condition_rows_route():
         )
 
 
-def test_h3_ref2va_still_rejects_custom_keyframe_anchors():
+def test_h3_ref2va_packs_custom_keyframe_guides_after_reference_rows():
     transformer = _PackedRowRecorder()
     backend = _NativeTrainingBackend(transformer, mode="ref2va")
 
-    with pytest.raises(ValueError, match="custom keyframe anchors require --task t2va caches"):
-        backend.predict_training(
-            transformer,
-            _ref2va_conditioning_batch(),
-            torch.zeros(1, 4, 2, 4, 4),
-            None,
-            torch.tensor([0.4]),
-            torch.tensor([0.7]),
-            condition_video_anchors=("first",),
-            extension_video_context=torch.ones(1, 4, 1, 4, 4),
-        )
+    torch.manual_seed(0)
+    prediction = backend.predict_training(
+        transformer,
+        _ref2va_conditioning_batch(),
+        torch.zeros(1, 4, 2, 4, 4),
+        None,
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+        condition_video_anchors=("first",),
+        extension_video_context=torch.ones(1, 4, 1, 4, 4),
+    )
+
+    packed = transformer.calls[-1]["video_hidden_states"]
+    assert packed.shape == (1, 13, 16)
+    assert prediction.video.shape == (1, 4, 2, 4, 4)
+    assert packed[:, :1].mean() > 4.9  # ordinary reference
+    assert packed[:, 1:5].mean() > 0.9  # clean target-frame guide
+    torch.testing.assert_close(packed[:, 5:], torch.zeros_like(packed[:, 5:]))
+    packed_video_sigma = transformer.row_sigma[torch.tensor([3, *range(6, 18)])]
+    assert bool((packed_video_sigma[:5] >= 0.999).all())
+    assert bool((packed_video_sigma[5:] == 0.4).all())
+
+
+def test_h3_ref2va_backend_packs_explicit_video_audio_guide_after_references():
+    transformer = _PackedRowRecorder()
+    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+
+    torch.manual_seed(0)
+    prediction = backend.predict_training(
+        transformer,
+        _ref2va_conditioning_batch(),
+        torch.zeros(1, 4, 3, 4, 4),
+        torch.zeros(1, 2, 6, 12),
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+        guide_geometries=(MiniMaxH3GuideGeometry(frame_index=1, num_video_latents=2, num_audio_latents=2),),
+        guide_video_latents=(torch.ones(1, 4, 2, 4, 4),),
+        guide_audio_latents=(torch.full((1, 2, 6, 2), 2.0),),
+    )
+
+    call = transformer.calls[-1]
+    packed_video = call["video_hidden_states"]
+    packed_audio = call["audio_hidden_states"]
+    assert packed_video.shape == (1, 21, 16)  # 1 reference + 8 guide + 12 target rows
+    assert packed_audio.shape == (1, 30, 6)  # 2 reference + 4 guide + 24 target rows
+    assert prediction.video.shape == (1, 4, 3, 4, 4)
+    assert prediction.audio.shape == (1, 2, 6, 12)
+    assert packed_video[:, :1].mean() > 4.9
+    assert packed_video[:, 1:9].mean() > 0.9
+    torch.testing.assert_close(packed_video[:, 9:], torch.zeros_like(packed_video[:, 9:]))
+    assert packed_audio[:, :2].mean() > 6.9
+    torch.testing.assert_close(packed_audio[:, 2:6], torch.full_like(packed_audio[:, 2:6], 2.0))
+    torch.testing.assert_close(packed_audio[:, 6:], torch.zeros_like(packed_audio[:, 6:]))
+    sigma = transformer.row_sigma
+    assert bool((sigma[call["video_indices"][:9]] >= 0.999).all())
+    assert bool((sigma[call["audio_indices"][:6]] == 1.0).all())
 
 
 def test_h3_ref2va_scores_an_audio_only_target_behind_its_reference_rows():
@@ -5398,6 +5523,13 @@ def test_h3_keyframe_spec_resolves_named_and_indexed_anchors():
     assert indices == (0, 11, 21)
 
 
+def test_h3_negative_keyframe_anchor_resolves_from_the_end():
+    trainer = _keyframe_trainer("-2")
+    video = torch.zeros(1, 24, 8, 2, 2)
+
+    assert trainer._resolve_keyframe_anchors(video) == ((6,), (6,))
+
+
 def test_h3_keyframe_anchors_are_sorted_and_deduplicated_against_the_clip():
     trainer = _keyframe_trainer("last,first")
     video = torch.zeros(1, 24, 8, 2, 2)
@@ -5445,6 +5577,40 @@ def test_h3_keyframe_anchors_are_absent_by_default():
     trainer = _keyframe_trainer()
 
     assert trainer._resolve_keyframe_anchors(torch.zeros(1, 24, 8, 2, 2)) == ((), ())
+
+
+def test_h3_guide_specs_parse_and_resolve_video_audio_spans():
+    assert h3_train_network._parse_guide_specs("0:2:4;-1:0:1") == ((0, 2, 4), (-1, 0, 1))
+    trainer = h3_train_network.MiniMaxH3NetworkTrainer.__new__(h3_train_network.MiniMaxH3NetworkTrainer)
+    trainer._guide_specs = ((0, 2, 3), (-3, 0, 1))
+    video = torch.zeros(1, 24, 3, 2, 2)  # pixel-frame boundaries 0, 1, 5; total 9
+    audio = torch.zeros(1, 2, 32, 15)
+
+    resolved = trainer._resolve_guide_specs(video, audio)
+
+    assert resolved[0] == (MiniMaxH3GuideGeometry(0, 2, 3), 0, 0)
+    assert resolved[1] == (MiniMaxH3GuideGeometry(6, 0, 1), None, 10)
+
+
+def test_h3_visual_guide_requires_a_cached_vae_window_boundary():
+    trainer = h3_train_network.MiniMaxH3NetworkTrainer.__new__(h3_train_network.MiniMaxH3NetworkTrainer)
+    trainer._guide_specs = ((2, 1, 0),)
+    with pytest.raises(ValueError, match="VAE-window boundary"):
+        trainer._resolve_guide_specs(torch.zeros(1, 24, 3, 2, 2), None)
+
+
+def test_h3_audio_guide_requires_a_cached_audio_window_boundary():
+    trainer = h3_train_network.MiniMaxH3NetworkTrainer.__new__(h3_train_network.MiniMaxH3NetworkTrainer)
+    trainer._guide_specs = ((1, 0, 1),)
+    with pytest.raises(ValueError, match="audio-latent boundary"):
+        trainer._resolve_guide_specs(torch.zeros(1, 24, 3, 2, 2), torch.zeros(1, 2, 32, 15))
+
+
+def test_h3_keyframe_conditioning_rejects_an_audio_only_target():
+    trainer = _keyframe_trainer("first")
+
+    with pytest.raises(ValueError, match="requires a video target"):
+        trainer._resolve_keyframe_anchors(None)
 
 
 @pytest.mark.parametrize("conflicting", ["extension", "mask"])
@@ -5657,7 +5823,7 @@ def test_native_h3_backend_accepts_named_and_indexed_condition_anchors(anchors):
     assert prediction.video.shape == video.shape
 
     batch[H3_CONDITIONING_TASK_KEY] = [torch.tensor(H3_CONDITIONING_TASK_IDS["i2va"])]
-    with pytest.raises(ValueError, match="custom keyframe anchors require --task t2va caches"):
+    with pytest.raises(ValueError, match="custom keyframe anchors require T2VA or Ref2VA conditioning caches"):
         backend.predict_training(
             transformer,
             batch,

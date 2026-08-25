@@ -80,7 +80,7 @@ Each training objective has a fixed dataset, conditioning-cache, and transformer
 | First-frame image-to-video+audio | [`i2va.toml`](../examples/minimax_h3/i2va.toml): video source; first frame comes from the target | FL2VA | `i2va` | None |
 | First+last-frame-to-video+audio | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml): video source; keyframes come from the target | FL2VA | `fl2va` | None |
 | Last-frame image-to-video+audio | [`l2va.toml`](../examples/minimax_h3/l2va.toml): video source; last frame comes from the target | FL2VA | `l2va` | None |
-| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; an audio target may carry references too; add `source_*_directory` fields, or per-record numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
+| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, [`ref2va_guides.toml`](../examples/minimax_h3/ref2va_guides.toml): references plus target-derived timeline guides, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; an audio target may carry references too; add `source_*_directory` fields, or per-record numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va`; add image guides with `--h3_keyframe_anchors` / `--h3_keyframe_random_count`, or AV spans with `--h3_guide_specs` |
 | Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): set `target_modalities` for the JSONL target; rows may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
 
 For observed-modality objectives, the option names the modality supplied as clean **conditioning**, not the prediction target:
@@ -1019,9 +1019,9 @@ non-blocking device copies, but consumes locked host RAM.
 
 ### Training modes
 
-Extension, keyframes, and masking add or pin conditioning rows, so they need a `t2va` cache except where the table below says
-otherwise: masking and `per_row_sigma` extension only pin rows inside the target block, so they also combine with
-`--h3_training_mode ref2va` / `ref2va_omni` and their reference caches. Observed-modality training and the two jitters place no
+Extension, keyframes, and masking add or pin conditioning rows. Keyframes, masking, and `per_row_sigma` extension also combine
+with `--h3_training_mode ref2va` / `ref2va_omni` and their reference caches; other target-derived conditioning needs a `t2va`
+cache. Observed-modality training and the two jitters place no
 conditioning rows and work with any cache. For observed-modality training,
 `target_modalities = ["video", "audio"]` is required and each target video must contain its synchronized soundtrack — an audio-only dataset has no
 video rows to observe, so `--h3_observed_modality` cannot be used with it. Conditioning an audio target on video is still
@@ -1034,7 +1034,8 @@ loss weight is forced to zero; this isolates direct supervision, not H3's shared
 | `--h3_observed_modality {video,audio,random}` | Video-to-audio, audio-to-video, or one adapter covering both plus joint |
 | `--h3_extension_video_frames N` / `--h3_extension_audio_latents N` | Continuation from an observed prefix. Counts are in **latent** units and each must be shorter than its target; the two are independent, so setting one leaves the other generated in full. Under Ref2VA only the `per_row_sigma` route is supported |
 | `--h3_extension_probability P` | Train the extension recipe on a synchronized random fraction of steps; the rest train the plain objective. Requires the extension flags. `1` (default) applies it every step |
-| `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary anchors. FL2VA/`t2va` caches only |
+| `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary target-frame guides. Supports FL2VA/`t2va` and Ref2VA/Ref2VA-Omni caches with video targets |
+| `--h3_guide_specs "0:2:4;21:0:8"` | Ref2VA target-derived video/audio guides as `pixel_start:video_latents:audio_latents`. Separate guides with `;`; negative starts count from the end. Visual starts must lie on a cached video VAE-window boundary and audio starts must be multiples of 3 pixel frames. Guide rows are pinned and excluded from loss |
 | `--h3_mask_mode {off,box,border,segment,dataset}` | Inpainting, outpainting, temporal infilling from a procedural mask, or the region the dataset authored. `off` is the default. Also available under Ref2VA |
 | `--h3_mask_probability P` | Train the masked recipe on a synchronized random fraction of steps; the rest train the plain objective. Requires `--h3_mask_mode` or `--h3_mask_audio`. `1` (default) applies it every step |
 | `--h3_frame_sigma_jitter 0.2` | Spreads target-frame noise levels across the schedule in one step. Supported by native T2VA/I2VA/FL2VA/L2VA/Ref2VA caches, including guidance-consistent loss, and skipped for images; cannot be combined with in-target observed-row options or sigma-dependent loss weighting; `0` disables it |
@@ -1059,13 +1060,26 @@ cost of intra-block noise levels the released weights have not seen. The observe
 `--h3_training_mode ref2va` / `ref2va_omni`, `condition_rows` is rejected: duplicating the context needs packer support the
 Ref2VA layout does not have, so pass `--h3_extension_route per_row_sigma`.
 
-**Keyframes.** Entries are `first`, `last`, or a latent frame index. Anchors stay in the loss, matching the released contract.
+**Keyframes.** Entries are `first`, `last`, or a latent frame index; negative indices count backward from the final latent
+window. Anchors stay in the loss, matching the released contract.
 `last` is the final *pixel* frame, not the same anchor as the integer `frames - 1`. A `t2va` cache is text-only, so the
 conditioner never sees the frames those anchors pin; cache with `--h3_keyframe_visuals first,11,last` (EXPERIMENTAL, `--task
 t2va` only, entries are decoded *target-video* frames) to present them to Qwen3-VL as picture spans ahead of any Qwen control
 spans, restoring the visibility the released `i2va`/`fl2va`/`l2va` presentations have. The list is part of the text-cache
 identity, so changing it rebuilds the cache under `--skip_existing`; latent caches and DiT rows are untouched, and a run whose
 anchors name other frames than the cache presents is only warned about, once.
+Under Ref2VA/Ref2VA-Omni, target-derived guide rows follow the ordinary reference rows and share the target timeline, while
+Qwen3-VL continues to see the cached ordinary references. This combines global references with timeline anchors without
+re-caching. It requires a video target; audio-only targets cannot supply guide frames.
+
+**Video/audio guides.** `--h3_guide_specs` extends the same Ref2VA layout to a short video span, an audio span, or both at one
+pixel-frame origin. In `0:2:4`, `0` is the decoded target frame, `2` is the number of clean target video latents, and `4` is the
+number of clean target audio latents. Use zero for an absent stream. Multiple `;`-separated guides are packed in order after
+ordinary references; visual rows use conditioning sigma `0.999`, audio rows use `1.0`, and only the original target rows are
+returned to the loss. A negative origin counts backward from the decoded target end. Since training reads pre-cached target
+latents rather than decoding and re-encoding a new subclip, a visual origin must be one of H3's VAE-window boundaries
+(`0,1,5,9,...`); an audio span must start on its cached 40-Hz boundary, which occurs every three 24-fps pixel frames. The total span must fit the target. This option requires AV caches
+when its audio length is non-zero and currently applies to `ref2va` / `ref2va_omni`, not FL2VA.
 
 **Masking.** Masks are drawn per step, so the occlusion distribution changes without re-caching. Masks combine with `t2va` and
 `ref2va`/`ref2va_omni` caches; `i2va`/`fl2va`/`l2va` caches reject observed rows. Under Ref2VA the observed rows are pinned
@@ -1232,7 +1246,8 @@ python minimax_h3_generate_video.py \
 | Option | Purpose |
 | --- | --- |
 | `--first_frame` / `--last_frame` | Keyframe conditioning at the ends. |
-| `--keyframe INDEX:PATH` | Keyframe at an arbitrary latent frame, repeatable. |
+| `--keyframe INDEX:PATH` | Image guide at an arbitrary latent frame, repeatable; negative indices count from the end. With the Ref2VA checkpoint it may be combined with ordinary image/video/audio references. |
+| `--guide_image PIXEL_FRAME:PATH` / `--guide_video PIXEL_FRAME:PATH` / `--guide_audio PIXEL_FRAME:PATH` | Comfy-style Ref2VA guides on the decoded 24-fps pixel timeline. Repeat them; image/video and audio entries with the same origin form one AV guide. Negative origins count from the end. Videos are cropped to the remaining target and to a valid `17k+5` length (batches shorter than five frames use their first image); audio is cropped to the remaining audio timeline. Ordinary references may be present or omitted. |
 | `--reference_image` / `--reference_video` / `--reference_audio` | Ref2VA references; audio must accompany an image or video. A reference video's own soundtrack is included automatically, so do not also pass it as `--reference_audio`. Requires the Ref2VA checkpoint. |
 | `--reference_image_size_mode` | Ref2VA image sizing: `short_edge` keeps the released behavior; `target_area` preserves aspect ratio and uses approximately the target output area. |
 | `--reference_image_short_edge` | Reference-image short edge in `short_edge` mode (default 2048). |

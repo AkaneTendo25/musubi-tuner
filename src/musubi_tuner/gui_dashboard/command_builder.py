@@ -654,6 +654,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_keyframe_anchors", t.h3_keyframe_anchors]
     if t.h3_keyframe_random_count:
         cmd += ["--h3_keyframe_random_count", str(t.h3_keyframe_random_count)]
+    if t.h3_guide_specs:
+        cmd += ["--h3_guide_specs", t.h3_guide_specs]
     if t.reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(t.reference_image_short_edge)]
     if t.reference_image_size_mode != "short_edge":
