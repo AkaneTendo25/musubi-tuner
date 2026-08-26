@@ -7,6 +7,7 @@
 	import PathInput from '$lib/components/PathInput.svelte';
 	import CheckpointInput from '$lib/components/CheckpointInput.svelte';
 	import ModelPathStatus from '$lib/components/ModelPathStatus.svelte';
+	import SliderTrainingPanel from '$lib/components/SliderTrainingPanel.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { defaultModelDir, describeExactModelScan, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
@@ -58,8 +59,8 @@
 	function updateRemoteStageLauncher(key, value) { updateSection('remote_stage_launcher', key, value); }
 	function updateRemoteStageServer(key, value) { updateSection('remote_stage_server', key, value); }
 	async function startTraining() {
-		await startProcess('training');
-		await goto('/training/dashboard');
+		await startProcess(activeTrainingProcessType);
+		if (activeTrainingProcessType === 'training') await goto('/training/dashboard');
 	}
 	async function startRemoteStageLauncher() {
 		await startProcess('remote_stage_launcher');
@@ -161,11 +162,13 @@
 	});
 	let rl = $derived($projectConfig?.remote_stage_launcher || {});
 	let rs = $derived($projectConfig?.remote_stage_server || {});
-	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
+	let sliderTrainingSelected = $derived(t.model_type === 'minimax_h3' && t.h3_training_type === 'slider');
+	let activeTrainingProcessType = $derived(sliderTrainingSelected ? 'slider_training' : 'training');
+	let trainingStatus = $derived($processStatuses[activeTrainingProcessType] || { state: 'idle', exit_code: null });
 	let remoteStageLauncherStatus = $derived($processStatuses.remote_stage_launcher || { state: 'idle', exit_code: null });
 	let remoteStageServerStatus = $derived($processStatuses.remote_stage_server || { state: 'idle', exit_code: null });
 	let remoteStageEnabled = $derived(Boolean(t.ltx2_remote_stage));
-	let trainingValidation = $derived($processValidation.training || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
+	let trainingValidation = $derived($processValidation[activeTrainingProcessType] || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
 	let remoteStageLauncherValidation = $derived($processValidation.remote_stage_launcher || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
 	let remoteStageServerValidation = $derived($processValidation.remote_stage_server || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
 	let hasValidationIssues = $derived((trainingValidation.errors?.length || 0) > 0 || (trainingValidation.warnings?.length || 0) > 0);
@@ -489,7 +492,10 @@
 		clearTimeout(validationTimer);
 		const configSnapshot = $projectConfig;
 		validationTimer = setTimeout(() => {
-			validateProcess('training', configSnapshot).catch(() => {});
+			const processType = configSnapshot.training?.model_type === 'minimax_h3' && configSnapshot.training?.h3_training_type === 'slider'
+				? 'slider_training'
+				: 'training';
+			validateProcess(processType, configSnapshot).catch(() => {});
 			if (configSnapshot.training?.ltx2_remote_stage) {
 				validateProcess('remote_stage_launcher', configSnapshot).catch(() => {});
 				validateProcess('remote_stage_server', configSnapshot).catch(() => {});
@@ -515,7 +521,7 @@
 						<div class="text-[12px] font-semibold" style="color: var(--text-primary);">MiniMax H3</div>
 						{#if t.model_type === 'minimax_h3'}
 							<PathInput fieldPath="training.h3_model" value={t.h3_model || ''} oninput={(e) => update('h3_model', e.target.value)} showFiles tooltip="MiniMax H3 DiT checkpoint" invalid={fieldInvalid('training.h3_model')} error={fieldError('training.h3_model')} />
-							<FormSelect label="Training method" fieldPath="training.h3_training_type" value={t.h3_training_type || 'lora'} options={[{value:'lora',label:'LoRA adapter'},{value:'learned_context',label:'Learned context'}]} onchange={(e) => update('h3_training_type', e.target.value)} tooltip="Train a normal H3 LoRA, or freeze H3 and learn a small ComfyUI-compatible Qwen context tensor." />
+							<FormSelect label="Training method" fieldPath="training.h3_training_type" value={t.h3_training_type || 'lora'} options={[{value:'lora',label:'LoRA adapter'},{value:'learned_context',label:'Learned context'},{value:'slider',label:'Slider LoRA'}]} onchange={(e) => update('h3_training_type', e.target.value)} tooltip="Train a normal H3 LoRA, freeze H3 and learn a Qwen context tensor, or train a controllable slider LoRA." />
 							<div class="grid grid-cols-2 gap-2">
 							<FormSelect fieldPath="training.h3_training_mode" value={t.h3_training_mode || 'fl2va'} options={['fl2va', 'ref2va', 'ref2va_omni']} onchange={(e) => update('h3_training_mode', e.target.value)} tooltip="FL2VA, strict reference conditioning, or experimental zero-or-more-reference training" />
 								<FormSelect fieldPath="training.h3_loss_balance" value={t.h3_loss_balance || 'modality'} options={['modality', 'token']} onchange={(e) => update('h3_loss_balance', e.target.value)} tooltip="Balance video and audio loss by modality or token count" />
@@ -660,7 +666,7 @@
 					</div>
 				</FormGroup>
 
-				<FormGroup title={t.model_type === 'minimax_h3' && t.h3_training_type === 'learned_context' ? 'Learned Context' : 'LoRA'}>
+				<FormGroup title={t.model_type === 'minimax_h3' && t.h3_training_type === 'learned_context' ? 'Learned Context' : t.model_type === 'minimax_h3' && t.h3_training_type === 'slider' ? 'Slider LoRA' : 'LoRA'}>
 					<div class="space-y-2 pt-2">
 						{#if t.model_type === 'minimax_h3' && t.h3_training_type === 'learned_context'}
 							<div class="text-[11px] px-3 py-2" style="color: var(--text-secondary); background: var(--bg-elevated); border-radius: var(--radius-sm);">
@@ -684,6 +690,8 @@
 									<FormToggle label="NVFP4 scaled GEMM" fieldPath="caching.h3_nvfp4_scaled_mm" checked={$projectConfig.caching?.h3_nvfp4_scaled_mm ?? false} onchange={(e) => updateSection('caching', 'h3_nvfp4_scaled_mm', e.target.checked)} disabled={$projectConfig.caching?.h3_text_encoder_quantization !== 'nvfp4_awq'} tooltip="Use scaled NVFP4 GEMM when supported by the GPU and checkpoint." />
 								</div>
 							{/if}
+						{:else if t.model_type === 'minimax_h3' && t.h3_training_type === 'slider'}
+							<SliderTrainingPanel />
 						{:else if t.model_type === 'minimax_h3'}
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="training.network_dim" value={t.network_dim ?? 32} oninput={(e) => update('network_dim', e.target.value ? Number(e.target.value) : null)} min={1} tooltip="MiniMax H3 LoRA rank" />
@@ -1639,7 +1647,7 @@
 			</div>
 		{/if}
 		<div class="py-4 flex items-center gap-4">
-			<ProcessControls processType="training" status={trainingStatus} onStart={startTraining} onStop={(options) => stopProcess('training', options)} />
+			<ProcessControls processType={activeTrainingProcessType} status={trainingStatus} onStart={startTraining} onStop={(options) => stopProcess(activeTrainingProcessType, options)} />
 			<div class="flex-1"></div>
 			{#if trainingStatus.state === 'running' || trainingStatus.state === 'stopping' || trainingStatus.state === 'finished'}
 				<a href="/training/dashboard" class="px-4 py-2 text-[13px] font-medium" style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);">Dashboard</a>
@@ -1647,7 +1655,7 @@
 		</div>
 
 		{#if $advancedMode}
-			<CommandPanel processType="training" defaultFilename="train.bat" />
+			<CommandPanel processType={activeTrainingProcessType} defaultFilename={sliderTrainingSelected ? 'slider_train.bat' : 'train.bat'} />
 		{/if}
 	</div>
 {/if}

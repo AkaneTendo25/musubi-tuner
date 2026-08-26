@@ -1,0 +1,21 @@
+mode = "text"
+target_modality = "video"
+guidance_strength = 1.0
+anchor_strength = 1.0
+anchor_cap_mult = 5.0
+sample_slider_range = [-2, -1, 0, 1, 2]
+
+# H3 latent dimensions. Use latent_frames = 1 for an image.
+latent_frames = 16
+latent_height = 30
+latent_width = 52
+audio_latent_frames = 81
+
+[[targets]]
+positive = "a vivid warm cinematic scene"
+negative = "a muted cold cinematic scene"
+target_class = "a cinematic scene"
+weight = 1.0
+
+[[anchors]]
+prompt = "a natural documentary scene"

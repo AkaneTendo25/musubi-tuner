@@ -18,18 +18,18 @@ from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
-    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
-    H3_REFERENCE_VIDEO_FPS_KEY,
-    H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
-    H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
+    H3_KEYFRAME_VISUALS_KEY,
+    H3_MAX_CAPTION_TOKENS_KEY,
+    H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
+    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
-    H3_KEYFRAME_VISUALS_KEY,
-    H3_MAX_CAPTION_TOKENS_KEY,
-    H3_QWEN_CONTROL_VISUALS_KEY,
+    H3_REFERENCE_VIDEO_FPS_KEY,
+    H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
+    H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -674,6 +674,11 @@ class MiniMaxH3ConditioningEncoder:
                 resized.append(image.resize(size, Image.Resampling.LANCZOS))
             images = resized
         hidden, tags = self._encode_prompt(prompt, images)
+        return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
+
+    def encode_null_prompt(self, prompt: str) -> dict[str, torch.Tensor]:
+        """Encode H3's layout-preserving null presentation for a text prompt."""
+        hidden, tags = self._encode_prompt(prompt, null_instruction=True)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
 
     def encode_reference_prompt(

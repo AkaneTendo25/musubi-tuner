@@ -34,6 +34,7 @@ Two released transformers, with different conditioning contracts:
 - [Training](#training)
   - [Train a learned context](#train-a-learned-context)
   - [Use a learned context](#use-a-learned-context)
+  - [Train a slider LoRA](#train-a-slider-lora)
   - [Start LoRA training](#start-lora-training)
   - [Optimizers](#optimizers)
   - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
@@ -719,6 +720,51 @@ context. Learned contexts can be used together with `--lora_weight`.
 
 The saved file also uses ComfyUI's H3 embedding format. Place it in a ComfyUI embeddings directory and use
 `embedding:my_context` in the prompt.
+
+### Train a slider LoRA
+
+A slider LoRA learns opposite behavior at positive and negative adapter multipliers. H3 provides three opt-in objectives:
+
+| Slider mode | Training signal | H3 family |
+| --- | --- | --- |
+| `text` | Frozen-model predictions for positive, neutral, and negative prompts | FL2VA |
+| `reference` | Filename-matched positive and negative target caches with one shared text presentation | FL2VA |
+| `ref2va` | Filename-matched targets with one separate shared Ref2VA conditioning cache | Ref2VA or Ref2VA Omni |
+
+Copy and edit [`slider_text.toml`](../examples/minimax_h3/slider_text.toml) for a prompt-defined slider, or
+[`slider_paired.toml`](../examples/minimax_h3/slider_paired.toml) for cached image, video, audio, or joint AV pairs. Then run:
+
+```shell
+accelerate launch minimax_h3_train_slider.py \
+  --slider_config examples/minimax_h3/slider_text.toml \
+  --dit /path/to/minimax_h3_fl2va_bf16.safetensors --h3_training_mode fl2va \
+  --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --network_module networks.lora_minimax_h3 --network_dim 16 --network_alpha 16 \
+  --h3_base_preservation_loss_weight 0.02 --h3_base_preservation_probability 0.25 \
+  --learning_rate 1e-4 --max_train_steps 500 \
+  --output_dir output --output_name h3_slider \
+  --sdpa --mixed_precision bf16 --gradient_checkpointing
+```
+
+`target_modality` is `video`, `audio`, or `av`. In text mode, `latent_frames = 1` selects the still-image route.
+`latent_height` and `latent_width` are latent dimensions, so divide pixel dimensions by 16; both must be even because H3 uses
+2×2 spatial patches.
+Text prompts are encoded once before H3 is loaded. Paired modes consume the ordinary H3 latent and text cache files directly;
+positive and negative files must have identical basenames and target shapes. For `ref2va`, `conditioning_cache_dir` supplies the
+shared text and reference rows while the positive and negative directories supply only the targets.
+
+Every text target requires `positive`, `negative`, and `target_class`. H3 derives the neutral teacher from a null-instruction
+version of `target_class`, preserving its text-row count and the media rotary layout; `target_class` is also the prompt used for
+the two gradient-bearing `+1` and `-1` passes.
+
+The slider objective composes with the regular H3 guidance-distillation and base-preservation options. Paired-media sliders use
+these options through the ordinary H3 velocity-loss path. Text sliders apply the same guidance formula to their teacher-prediction
+target, which can increase the effective direction strength; start with base preservation alone unless that extrapolation is
+intentional. The text null presentation is encoded online with the same text-row layout. `--h3_fuse_frozen_teachers` is not
+available for text sliders.
+Observed-modality, masking, extension, caption-dropout, and CREPA objectives remain unsupported. The trainer otherwise reuses the
+normal H3 LoRA targeting, quantization, checkpointing, block-swap, optimizer, validation-sampling, and save options. Sampling during
+training evaluates every value in `sample_slider_range`.
 
 ### Start LoRA training
 

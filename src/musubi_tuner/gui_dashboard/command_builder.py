@@ -3505,6 +3505,8 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     s = config.slider
     t = config.training
     slider_toml = _write_slider_toml(config, build_slider_toml_path(config))
+    if t.model_type == "minimax_h3":
+        return _build_h3_slider_training_cmd(config, slider_toml)
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors, t.gemma_root)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
@@ -3791,6 +3793,43 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--no_save_original_lora")
 
     cmd += _split_cli_args(s.extra_args)
+    return cmd
+
+
+def _set_cli_value(cmd: list[str], flag: str, value: str) -> None:
+    if flag in cmd:
+        index = cmd.index(flag)
+        cmd[index + 1] = value
+    else:
+        cmd += [flag, value]
+
+
+def _build_h3_slider_training_cmd(config: ProjectConfig, slider_toml: Path) -> list[str]:
+    """Adapt the established H3 training command to the opt-in slider driver."""
+    c = config.caching
+    s = config.slider
+    cmd = _build_h3_training_cmd(config)
+    script_index = next(
+        index
+        for index, value in enumerate(cmd)
+        if Path(value).name in {"minimax_h3_train_network.py", "minimax_h3_train_learned_context.py"}
+    )
+    cmd[script_index] = _find_script("minimax_h3_train_slider.py")
+    cmd += ["--slider_config", str(slider_toml)]
+    _set_cli_value(cmd, "--max_train_steps", str(s.max_train_steps))
+    _set_cli_value(cmd, "--output_name", s.output_name or "h3_slider")
+
+    if s.mode == "text":
+        if "--text_encoder" not in cmd:
+            cmd += ["--text_encoder", c.h3_text_encoder, "--tokenizer", c.h3_tokenizer]
+            if c.h3_text_encoder_quantization != "none":
+                cmd += ["--text_encoder_quantization", c.h3_text_encoder_quantization]
+            if c.h3_text_encoder_blocks_to_stream:
+                cmd += ["--h3_text_encoder_blocks_to_stream", str(c.h3_text_encoder_blocks_to_stream)]
+            if c.h3_nvfp4_scaled_mm:
+                cmd.append("--h3_nvfp4_scaled_mm")
+            if c.h3_text_visual_max_pixels:
+                cmd += ["--h3_text_visual_max_pixels", str(c.h3_text_visual_max_pixels)]
     return cmd
 
 

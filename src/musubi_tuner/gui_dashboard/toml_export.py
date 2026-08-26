@@ -519,9 +519,11 @@ def export_conditioning_toml(config: ProjectConfig, recipe, filename: str = "con
 def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
     """Generate slider_config.toml from project config and return path."""
     s = config.slider
+    h3 = config.training.model_type == "minimax_h3"
+    mode = "ref2va" if h3 and s.mode in {"ref2va", "ic_reference"} else s.mode
     doc: dict = {
-        "mode": s.mode,
-        "guidance_strength": s.guidance_strength,
+        "mode": mode,
+        "guidance_strength": s.h3_guidance_strength if h3 else s.guidance_strength,
     }
     # anchor settings only matter for text mode; emit when anchors are present
     if s.mode == "text" and any((a.prompt or "").strip() for a in s.anchors):
@@ -530,16 +532,22 @@ def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
     # batch_all_targets is text-mode only; emit when enabled
     if s.mode == "text" and s.batch_all_targets:
         doc["batch_all_targets"] = s.batch_all_targets
-    if s.reference_modality:
+    if h3:
+        doc["target_modality"] = s.target_modality
+        doc["latent_frames"] = s.latent_frames
+        doc["latent_height"] = max(2, s.latent_height // 16)
+        doc["latent_width"] = max(2, s.latent_width // 16)
+        doc["audio_latent_frames"] = s.h3_audio_latent_frames
+    elif s.reference_modality:
         doc["reference_modality"] = s.reference_modality
     if s.pos_cache_dir:
-        doc["pos_cache_dir"] = s.pos_cache_dir
+        doc["positive_cache_dir" if h3 else "pos_cache_dir"] = s.pos_cache_dir
     if s.neg_cache_dir:
-        doc["neg_cache_dir"] = s.neg_cache_dir
-    if s.text_cache_dir:
+        doc["negative_cache_dir" if h3 else "neg_cache_dir"] = s.neg_cache_dir
+    if s.text_cache_dir and not h3:
         doc["text_cache_dir"] = s.text_cache_dir
     if s.reference_cache_dir:
-        doc["reference_cache_dir"] = s.reference_cache_dir
+        doc["conditioning_cache_dir" if h3 else "reference_cache_dir"] = s.reference_cache_dir
 
     # Parse sample_slider_range
     try:
@@ -555,7 +563,7 @@ def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
         lines.append(f"{k} = {_toml_value(v)}")
     lines.append("")
 
-    if s.mode == "text":
+    if mode == "text":
         for target in s.targets:
             lines.append("[[targets]]")
             lines.append(f"positive = {_toml_value(target.positive)}")

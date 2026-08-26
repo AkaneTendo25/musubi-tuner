@@ -4905,6 +4905,139 @@ def validate_rl_config(config: ProjectConfig, phase: str | None = None) -> dict[
     return _build_report(errors, warnings)
 
 
+def validate_slider_config(config: ProjectConfig) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    t = config.training
+    s = config.slider
+    if t.model_type != "minimax_h3":
+        return _build_report(errors, warnings)
+
+    def error(field: str, message: str) -> None:
+        errors.append(_make_issue("error", field, message, page="training"))
+
+    if t.h3_training_type not in {"lora", "slider"}:
+        error("training.h3_training_type", "H3 sliders train a LoRA; select Slider LoRA or LoRA adapter.")
+    if not _has_text(t.h3_model):
+        error("training.h3_model", "Select an H3 DiT checkpoint for slider training.")
+    if s.mode == "text":
+        valid_targets = [
+            target
+            for target in s.targets
+            if _has_text(target.positive) and _has_text(target.negative) and _has_text(target.target_class)
+        ]
+        if not valid_targets:
+            error(
+                "slider.targets",
+                "Text H3 sliders require positive, negative, and target-class prompts.",
+            )
+        if not _has_text(config.caching.h3_text_encoder):
+            error("caching.h3_text_encoder", "Text H3 sliders require a Qwen3-VL text encoder checkpoint.")
+        if s.latent_frames <= 0:
+            error("slider.latent_frames", "H3 slider latent frames must be positive.")
+        if s.latent_height % 32 or s.latent_width % 32:
+            error("slider.latent_height", "H3 synthetic width and height must be divisible by 32.")
+        if s.target_modality in {"audio", "av"} and s.h3_audio_latent_frames <= 0:
+            error("slider.h3_audio_latent_frames", "H3 audio latent frames must be positive.")
+    else:
+        if not _has_text(s.pos_cache_dir):
+            error("slider.pos_cache_dir", "Paired H3 sliders require a positive cache directory.")
+        if not _has_text(s.neg_cache_dir):
+            error("slider.neg_cache_dir", "Paired H3 sliders require a negative cache directory.")
+        if s.mode in {"ref2va", "ic_reference"} and not _has_text(s.reference_cache_dir):
+            error("slider.reference_cache_dir", "Ref2VA sliders require a shared conditioning cache directory.")
+
+    ref2va = s.mode in {"ref2va", "ic_reference"}
+    if ref2va and t.h3_training_mode not in {"ref2va", "ref2va_omni"}:
+        error("training.h3_training_mode", "Ref2VA sliders require the Ref2VA or Ref2VA Omni H3 family.")
+    if not ref2va and t.h3_training_mode != "fl2va":
+        error("training.h3_training_mode", "Text and paired-media sliders use the FL2VA H3 family.")
+
+    conflicts = {
+        "training.h3_caption_dropout_rate": t.h3_caption_dropout_rate > 0,
+        "training.h3_observed_modality": t.h3_observed_modality is not None,
+        "training.h3_mask_mode": t.h3_mask_mode != "off",
+        "training.h3_mask_audio": t.h3_mask_audio,
+        "training.h3_extension_video_frames": t.h3_extension_video_frames > 0,
+        "training.h3_extension_audio_latents": t.h3_extension_audio_latents > 0,
+        "training.crepa": t.crepa,
+    }
+    for field, enabled in conflicts.items():
+        if enabled:
+            error(field, "This ordinary-training objective is not combined with the H3 slider objective.")
+
+    guidance_range: tuple[float, float] | None = None
+    if t.h3_guidance_scale_range:
+        pieces = [piece.strip() for piece in str(t.h3_guidance_scale_range).split(",")]
+        try:
+            bounds = tuple(float(piece) for piece in pieces)
+        except ValueError:
+            bounds = ()
+        if len(bounds) != 2 or not all(math.isfinite(bound) for bound in bounds):
+            error("training.h3_guidance_scale_range", "H3 guidance scale range must contain two finite numbers.")
+        elif bounds[0] <= 1.0 or bounds[0] > bounds[1]:
+            error("training.h3_guidance_scale_range", "H3 guidance scale range must satisfy 1 < LOWER <= UPPER.")
+        else:
+            guidance_range = (bounds[0], bounds[1])
+        if t.h3_guidance_distillation_scale is not None:
+            error(
+                "training.h3_guidance_scale_range",
+                "H3 guidance scale range replaces the single distillation scale; set one, not both.",
+            )
+    guidance_enabled = t.h3_guidance_distillation_scale is not None or guidance_range is not None
+    if t.h3_guidance_distillation_scale is not None:
+        scale = float(t.h3_guidance_distillation_scale)
+        if not math.isfinite(scale) or scale <= 1.0:
+            error(
+                "training.h3_guidance_distillation_scale",
+                "H3 guidance distillation scale must be finite and greater than 1.",
+            )
+    guidance_probability = float(t.h3_guidance_distillation_probability)
+    if not math.isfinite(guidance_probability) or not 0 < guidance_probability <= 1:
+        error(
+            "training.h3_guidance_distillation_probability",
+            "H3 guidance distillation probability must be finite and lie in (0, 1].",
+        )
+    elif guidance_probability < 1 and not guidance_enabled:
+        error(
+            "training.h3_guidance_distillation_probability",
+            "H3 guidance distillation probability requires a guidance scale.",
+        )
+    if t.h3_guidance_loss_form == "contrastive" and not guidance_enabled:
+        error("training.h3_guidance_loss_form", "Contrastive H3 guidance loss requires a guidance scale.")
+    if guidance_enabled and float(t.network_dropout or 0.0) > 0:
+        error("training.network_dropout", "H3 guidance training is incompatible with network dropout.")
+    preservation_weight = float(t.h3_base_preservation_loss_weight)
+    if not math.isfinite(preservation_weight) or preservation_weight < 0:
+        error(
+            "training.h3_base_preservation_loss_weight",
+            "H3 base preservation loss weight must be finite and non-negative.",
+        )
+    preservation_probability = float(t.h3_base_preservation_probability)
+    if not math.isfinite(preservation_probability) or not 0 < preservation_probability <= 1:
+        error(
+            "training.h3_base_preservation_probability",
+            "H3 base preservation probability must be finite and lie in (0, 1].",
+        )
+    if not guidance_enabled and t.h3_guidance_null_source != "live":
+        error("training.h3_guidance_null_source", "H3 guidance null source requires a guidance scale.")
+    if not guidance_enabled and t.h3_guidance_cfg_zero:
+        error("training.h3_guidance_cfg_zero", "H3 guidance CFG-Zero rescaling requires a guidance scale.")
+    if s.mode != "text" and guidance_enabled and not config.caching.h3_cache_guidance_empty:
+        error("caching.h3_cache_guidance_empty", "Paired H3 slider guidance requires cached empty-text conditioning.")
+    if s.mode == "text" and t.h3_fuse_frozen_teachers:
+        error(
+            "training.h3_fuse_frozen_teachers",
+            "Fused frozen teachers are not available for online text-slider conditioning.",
+        )
+    elif t.h3_fuse_frozen_teachers and (not guidance_enabled or t.h3_guidance_null_source != "frozen" or preservation_weight <= 0):
+        error(
+            "training.h3_fuse_frozen_teachers",
+            "Fused H3 teachers require frozen null guidance and active base preservation.",
+        )
+    return _build_report(errors, warnings)
+
+
 def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, Any]:
     if proc_type == "training":
         return validate_training_config(config)
@@ -4922,6 +5055,8 @@ def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, 
         return validate_cache_preview_config(config)
     if proc_type == "inference":
         return validate_inference_config(config)
+    if proc_type == "slider_training":
+        return validate_slider_config(config)
     if proc_type in ("rl", "rl_cache_rollouts", "rl_train"):
         phase = {"rl_cache_rollouts": "cache_rollouts", "rl_train": "train_rl"}.get(proc_type)
         return validate_rl_config(config, phase=phase)

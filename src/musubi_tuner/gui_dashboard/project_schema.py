@@ -256,7 +256,7 @@ class TrainingConfig(BaseModel):
     model_type: Literal["ltx2", "minimax_h3"] = "minimax_h3"
     ltx2_checkpoint: str = ""
     h3_model: str = ""
-    h3_training_type: Literal["lora", "learned_context"] = "lora"
+    h3_training_type: Literal["lora", "learned_context", "slider"] = "lora"
     h3_training_mode: Literal["fl2va", "ref2va", "ref2va_omni"] = "fl2va"
     h3_learned_context_init: str = ""
     h3_learned_context_init_prompt: str = ""
@@ -1438,8 +1438,9 @@ class SliderConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")  # old projects may have fields that moved to TrainingConfig
 
     # Mode
-    mode: Literal["text", "reference", "ic_reference"] = "text"
+    mode: Literal["text", "reference", "ic_reference", "ref2va"] = "text"
     reference_modality: Literal["video", "audio"] = "video"
+    target_modality: Literal["video", "audio", "av"] = "video"
     pos_cache_dir: str = ""
     neg_cache_dir: str = ""
     text_cache_dir: str = ""
@@ -1453,19 +1454,21 @@ class SliderConfig(BaseModel):
 
     # Text mode settings
     guidance_strength: float = 1.0
+    h3_guidance_strength: float = 1.0
     anchor_strength: float = 1.0
     anchor_cap_mult: float = 5.0
     batch_all_targets: bool = False
     latent_frames: int = 1
     latent_height: int = 512
     latent_width: int = 768
+    h3_audio_latent_frames: int = 81
 
     # Sampling
     sample_slider_range: str = "-2,-1,0,1,2"
 
     # Slider-specific overrides (empty = inherit from training config)
     max_train_steps: int = 500
-    output_name: str = "ltx2_slider"
+    output_name: str = "h3_slider"
     accelerate_extra_args: str = ""
     extra_args: str = ""
 

@@ -1,13 +1,18 @@
 import sys
 from pathlib import Path
 
-import tomllib
 import pytest
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 from musubi_tuner.gui_dashboard.command_builder import (
     build_cache_latents_cmd,
     build_cache_text_cmd,
     build_inference_cmd,
+    build_slider_training_cmd,
     build_training_cmd,
 )
 from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
@@ -15,14 +20,16 @@ from musubi_tuner.gui_dashboard.validation import (
     validate_cache_latents_config,
     validate_cache_text_config,
     validate_inference_config,
+    validate_slider_config,
     validate_training_config,
 )
 from musubi_tuner.minimax_h3.dataset import _normalize_explicit_modality_config
 from musubi_tuner.minimax_h3_cache_latents import create_parser as create_cache_latents_parser
 from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_text_parser
 from musubi_tuner.minimax_h3_generate_video import create_parser as create_inference_parser
-from musubi_tuner.minimax_h3_train_network import create_parser
 from musubi_tuner.minimax_h3_train_learned_context import create_parser as create_learned_context_parser
+from musubi_tuner.minimax_h3_train_network import create_parser
+from musubi_tuner.minimax_h3_train_slider import create_parser as create_slider_parser
 
 
 def _h3_config(tmp_path: Path) -> ProjectConfig:
@@ -44,6 +51,124 @@ def test_dashboard_project_defaults_are_h3_only() -> None:
     assert config.caching.model_type == "minimax_h3"
     assert config.training.model_type == "minimax_h3"
     assert config.inference.model_type == "minimax_h3"
+
+
+def test_dashboard_builds_h3_text_slider_command_and_toml(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.slider.mode = "text"
+    config.slider.target_modality = "av"
+    config.slider.targets[0].positive = "highly detailed"
+    config.slider.targets[0].negative = "soft and blurry"
+    config.slider.latent_frames = 2
+    config.slider.latent_height = 384
+    config.slider.latent_width = 640
+    config.slider.h3_audio_latent_frames = 81
+    config.slider.h3_guidance_strength = 2.5
+
+    command = build_slider_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_slider.py"))
+    parsed = create_slider_parser().parse_args(command[script_index + 1 :])
+    slider_toml = tomllib.loads(Path(parsed.slider_config).read_text(encoding="utf-8"))
+
+    assert parsed.text_encoder == config.caching.h3_text_encoder
+    assert parsed.tokenizer == Path(config.caching.h3_tokenizer)
+    assert parsed.output_name == "h3_slider"
+    assert slider_toml["mode"] == "text"
+    assert slider_toml["target_modality"] == "av"
+    assert slider_toml["latent_height"] == 24
+    assert slider_toml["latent_width"] == 40
+    assert slider_toml["audio_latent_frames"] == 81
+    assert slider_toml["guidance_strength"] == pytest.approx(2.5)
+    assert slider_toml["targets"][0]["positive"] == "highly detailed"
+
+
+def test_dashboard_h3_slider_training_method_routes_to_slider_process(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_training_type = "slider"
+    config.slider.mode = "text"
+    config.slider.targets[0].positive = "a dark nighttime scene"
+    config.slider.targets[0].negative = "a bright daytime scene"
+    config.slider.targets[0].target_class = "a cinematic scene"
+
+    report = validate_slider_config(config)
+    command = build_slider_training_cmd(config)
+
+    assert report["ok"] is True
+    assert any(value.endswith("minimax_h3_train_slider.py") for value in command)
+    assert "--slider_config" in command
+
+
+def test_h3_slider_direction_strength_defaults_to_one(tmp_path: Path) -> None:
+    assert _h3_config(tmp_path).slider.h3_guidance_strength == pytest.approx(1.0)
+
+
+def test_dashboard_builds_h3_ref2va_slider_with_shared_conditioning(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_training_mode = "ref2va"
+    config.slider.mode = "ref2va"
+    config.slider.target_modality = "video"
+    config.slider.pos_cache_dir = "cache/positive"
+    config.slider.neg_cache_dir = "cache/negative"
+    config.slider.reference_cache_dir = "cache/shared-reference"
+
+    command = build_slider_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_slider.py"))
+    parsed = create_slider_parser().parse_args(command[script_index + 1 :])
+    slider_toml = tomllib.loads(Path(parsed.slider_config).read_text(encoding="utf-8"))
+
+    assert parsed.h3_training_mode == "ref2va"
+    assert slider_toml["mode"] == "ref2va"
+    assert slider_toml["positive_cache_dir"] == "cache/positive"
+    assert slider_toml["negative_cache_dir"] == "cache/negative"
+    assert slider_toml["conditioning_cache_dir"] == "cache/shared-reference"
+
+
+def test_dashboard_validates_h3_slider_modes(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.slider.mode = "text"
+    invalid = validate_slider_config(config)
+    assert "slider.targets" in invalid["field_errors"]
+
+    config.slider.targets[0].positive = "warm lighting"
+    config.slider.targets[0].negative = "cold lighting"
+    config.slider.targets[0].target_class = "a scene"
+    assert validate_slider_config(config)["ok"]
+
+    config.slider.mode = "ref2va"
+    config.slider.pos_cache_dir = "positive"
+    config.slider.neg_cache_dir = "negative"
+    invalid_ref = validate_slider_config(config)
+    assert "slider.reference_cache_dir" in invalid_ref["field_errors"]
+    assert "training.h3_training_mode" in invalid_ref["field_errors"]
+
+
+def test_dashboard_allows_h3_slider_guidance_and_preservation(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.slider.mode = "text"
+    config.slider.targets[0].positive = "dark"
+    config.slider.targets[0].negative = "bright"
+    config.slider.targets[0].target_class = "a scene"
+    config.training.h3_guidance_distillation_scale = 3.5
+    config.training.h3_guidance_loss_form = "contrastive"
+    config.training.h3_base_preservation_loss_weight = 0.02
+    config.training.h3_base_preservation_probability = 0.25
+
+    report = validate_slider_config(config)
+    command = build_slider_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_slider.py"))
+    parsed = create_slider_parser().parse_args(command[script_index + 1 :])
+
+    assert report["ok"]
+    assert parsed.h3_guidance_distillation_scale == pytest.approx(3.5)
+    assert parsed.h3_guidance_loss_form == "contrastive"
+    assert parsed.h3_base_preservation_loss_weight == pytest.approx(0.02)
+    assert parsed.h3_base_preservation_probability == pytest.approx(0.25)
+
+
+def test_normal_h3_dashboard_training_does_not_enable_slider(tmp_path: Path) -> None:
+    command = build_training_cmd(_h3_config(tmp_path))
+    assert not any(value.endswith("minimax_h3_train_slider.py") for value in command)
+    assert "--slider_config" not in command
 
 
 def test_dashboard_builds_streamed_learned_context_prompt_training(tmp_path: Path) -> None:

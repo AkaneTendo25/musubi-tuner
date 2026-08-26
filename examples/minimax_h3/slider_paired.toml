@@ -1,0 +1,9 @@
+mode = "reference"
+target_modality = "av"
+positive_cache_dir = "/data/slider/positive_cache"
+negative_cache_dir = "/data/slider/negative_cache"
+sample_slider_range = [-2, -1, 0, 1, 2]
+
+# For a Ref2VA slider, use mode = "ref2va" and provide a third cache directory
+# containing the shared text and reference presentation for each matched basename:
+# conditioning_cache_dir = "/data/slider/conditioning_cache"
