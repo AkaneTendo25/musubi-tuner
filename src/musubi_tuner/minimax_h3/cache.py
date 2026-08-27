@@ -36,6 +36,10 @@ H3_MAX_CAPTION_TOKENS_KEY = "mmh3_max_caption_tokens"
 H3_TEXT_VISUAL_MAX_PIXELS_KEY = "mmh3_text_visual_max_pixels"
 H3_EMPTY_TEXT_HIDDEN_KEY = "mmh3_empty_hidden_states"
 H3_EMPTY_TEXT_TOKEN_TAGS_KEY = "mmh3_empty_token_tags"
+H3_DOP_TEXT_HIDDEN_KEY = "mmh3_dop_hidden_states"
+H3_DOP_TEXT_TOKEN_TAGS_KEY = "mmh3_dop_token_tags"
+H3_DOP_CONFIG_KEY = "mmh3_dop_config"
+H3_DOP_CONFIG_CACHE_KEY = f"{H3_DOP_CONFIG_KEY}_uint8"
 H3_CONDITIONING_TASK_KEY = "mmh3_conditioning_task"
 H3_REFERENCE_IMAGE_SHORT_EDGE_KEY = "mmh3_reference_image_short_edge"
 H3_REFERENCE_IMAGE_SIZE_MODE_KEY = "mmh3_reference_image_size_mode"
@@ -318,6 +322,9 @@ def save_text_encoder_output_cache_minimax_h3(
     empty_keys = {H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY}
     if logical_keys & empty_keys and not empty_keys <= logical_keys:
         raise ValueError("H3 empty conditioning cache must contain both hidden states and token tags")
+    dop_keys = {H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY, H3_DOP_CONFIG_KEY}
+    if logical_keys & dop_keys and not dop_keys <= logical_keys:
+        raise ValueError("H3 DOP conditioning cache must contain hidden states, token tags, and config identity")
 
     def tensor_for(logical_key: str) -> torch.Tensor:
         matches = [tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == logical_key]
@@ -446,6 +453,11 @@ def save_text_encoder_output_cache_minimax_h3(
             )
     if empty_keys <= logical_keys:
         validate_pair(H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
+    if dop_keys <= logical_keys:
+        validate_pair(H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY)
+        dop_config = tensor_for(H3_DOP_CONFIG_KEY)
+        if dop_config.dtype is not torch.uint8 or dop_config.shape != (32,):
+            raise ValueError(f"H3 {H3_DOP_CONFIG_KEY} must be a 32-byte uint8 identity")
     probability_matches = [
         tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == H3_REFERENCE_MODALITY_PROBABILITIES_KEY
     ]

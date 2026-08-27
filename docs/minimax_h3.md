@@ -44,6 +44,7 @@ Two released transformers, with different conditioning contracts:
   - [Memory and speed](#memory-and-speed)
   - [Training modes](#training-modes)
   - [Auxiliary objectives](#auxiliary-objectives)
+  - [Differential Output Preservation](#differential-output-preservation)
   - [Validation](#validation)
   - [Sampling during training](#sampling-during-training)
 - [Inference](#inference)
@@ -1231,12 +1232,38 @@ not add a complete H3 forward.
 | `--h3_guidance_cfg_zero` | CFG-Zero* rescale of the null branch before the guidance form is applied: per sample and per modality, `alpha = <conditional, null> / (‖null‖² + 1e-8)` projects the null field onto the conditional one, so a null branch orthogonal to the conditional field collapses instead of being extrapolated away from. |
 | `--h3_base_preservation_loss_weight 0.02` | Recommended starting value. Penalizes drift from the frozen base's prediction and anchors to whichever base is loaded, quantized or not. |
 | `--h3_base_preservation_probability 0.25` | Evaluate preservation on a synchronized random fraction of batches and scale active losses by `1 / probability`. `1` applies the objective every batch; `0.25`–`0.5` is a faster approximation whose rare scaled updates interact differently with clipping and adaptive optimizers. |
+| `--h3_dop_loss_weight 0.02` | Differential Output Preservation: penalizes LoRA drift from the frozen base under a trigger-free rewrite of each caption. |
+| `--h3_dop_probability 0.25` | Evaluate DOP on a synchronized random fraction of prompt-conditioned batches and inverse-probability scale its loss. |
 | `--crepa` | Temporal representation alignment for video training. |
 
 Treat `--h3_base_preservation_loss_weight 0.02` as an initial value rather than a universal setting. Its effect depends on
 training length, quantization, adapter rank, dataset, and learning rate. Higher values such as `0.05` can preserve the base very
 strongly but substantially slow concept learning. Monitor training and validation samples, and reduce or disable the objective
 when preservation dominates. The value can be changed when resuming training.
+
+#### Differential Output Preservation
+
+DOP is useful when a LoRA should specialize a trigger while retaining the base model's response to the surrounding class. For
+a caption such as `sks woman walking in a park`, caching with `--h3_dop_trigger sks --h3_dop_class_prompt woman` creates the
+alternate presentation `woman walking in a park`. Training then compares LoRA-on and LoRA-off predictions under that alternate
+presentation using the same noisy video/audio inputs, timesteps, generated-region masks, and modality weights. This differs from
+base preservation, which compares the models under the original trigger-bearing caption.
+
+Pass the trigger and class phrase to both text caching and training:
+
+```shell
+python minimax_h3_cache_text_encoder_outputs.py ... \
+  --h3_dop_trigger sks --h3_dop_class_prompt woman
+
+accelerate launch minimax_h3_train_network.py ... \
+  --h3_dop_trigger sks --h3_dop_class_prompt woman \
+  --h3_dop_loss_weight 0.02 --h3_dop_probability 0.25
+```
+
+The trigger must occur as a standalone term in every cached caption. The cache records an identity for the exact trigger/class
+pair and training rejects stale or mismatched caches. DOP is currently supported for the T2VA/FL2VA family, not Ref2VA. It adds
+one frozen and one trainable transformer pass on active steps; the trainable DOP pass is backpropagated before the ordinary pass
+so variable prompt lengths remain compatible with activation checkpointing and block swapping.
 
 CREPA aligns projected features from an earlier block with a later block (`mode=backbone`) or with frozen DINOv2 features
 (`mode=dino`). Only generated video rows participate; image, audio-only, and video-observed batches are skipped.

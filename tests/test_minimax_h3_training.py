@@ -23,6 +23,9 @@ from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_DOP_CONFIG_KEY,
+    H3_DOP_TEXT_HIDDEN_KEY,
+    H3_DOP_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
@@ -42,6 +45,7 @@ from musubi_tuner.minimax_h3.cache import (
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
+from musubi_tuner.minimax_h3.dop import dop_config_identity
 from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
 from musubi_tuner.minimax_h3.masking import (
     CONDITIONING_MASK_BATCH_KEY as H3_CONDITIONING_MASK_KEY,
@@ -3763,6 +3767,85 @@ def test_h3_sparse_base_preservation_uses_inverse_probability_weight():
 
     assert sparse["h3/base_preservation_active"] == 1.0
     assert sparse["loss/base_preservation"] == pytest.approx(4 * dense["loss/base_preservation"])
+
+
+def test_h3_dop_uses_trigger_free_teacher_and_student_before_primary_forward():
+    args = create_parser().parse_args([])
+    args.h3_dop_loss_weight = 0.1
+    args.h3_dop_trigger = "sks"
+    args.h3_dop_class_prompt = "woman"
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer._base_preservation_active = lambda accelerator, probability: True
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_DOP_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_DOP_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+        H3_DOP_CONFIG_KEY: [dop_config_identity("sks", "woman")],
+    }
+
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+
+    assert backend.calls == [("dop", False), ("dop", True), ("prompt", True)]
+    assert backend.random_draws[0] == pytest.approx(backend.random_draws[1])
+    assert network.events == [False, True]
+    assert metrics["h3/dop_active"] == 1.0
+    assert metrics["loss/dop"] > 0
+
+
+def test_h3_sparse_dop_skips_both_auxiliary_forwards():
+    args = create_parser().parse_args([])
+    args.h3_dop_loss_weight = 0.1
+    args.h3_dop_probability = 0.25
+    args.h3_dop_trigger = "sks"
+    args.h3_dop_class_prompt = "woman"
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer._base_preservation_active = lambda accelerator, probability: False
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        {"timesteps": [0.5]},
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+
+    assert backend.calls == [("prompt", True)]
+    assert metrics["h3/dop_active"] == 0.0
+    assert metrics["loss/dop"] == 0.0
 
 
 @pytest.mark.parametrize("probability", [0.0, -0.1, 1.1, float("nan")])

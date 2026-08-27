@@ -985,6 +985,59 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        dop_weight = float(t.h3_dop_loss_weight)
+        if not math.isfinite(dop_weight) or dop_weight < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_dop_loss_weight",
+                    "H3 DOP loss weight must be finite and non-negative.",
+                    label="H3 DOP Loss Weight",
+                    page="training",
+                )
+            )
+        dop_probability = float(t.h3_dop_probability)
+        if not math.isfinite(dop_probability) or not 0 < dop_probability <= 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_dop_probability",
+                    "H3 DOP probability must be finite and lie in (0, 1].",
+                    label="H3 DOP Probability",
+                    page="training",
+                )
+            )
+        if dop_weight > 0:
+            if not t.h3_dop_trigger.strip() or not t.h3_dop_class_prompt.strip():
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_dop_trigger",
+                        "H3 DOP requires both a trigger and class prompt.",
+                        label="H3 DOP Trigger",
+                        page="training",
+                    )
+                )
+            if t.h3_training_mode in {"ref2va", "ref2va_omni"}:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_dop_loss_weight",
+                        "H3 DOP is not supported for Ref2VA.",
+                        label="H3 DOP Loss Weight",
+                        page="training",
+                    )
+                )
+            if config.caching.h3_dop_trigger != t.h3_dop_trigger or config.caching.h3_dop_class_prompt != t.h3_dop_class_prompt:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "caching.h3_dop_trigger",
+                        "The H3 text-cache DOP trigger/class must match training.",
+                        label="H3 DOP Cache",
+                        page="caching",
+                    )
+                )
         guidance_probability = float(t.h3_guidance_distillation_probability)
         if not math.isfinite(guidance_probability) or not 0 < guidance_probability <= 1:
             errors.append(

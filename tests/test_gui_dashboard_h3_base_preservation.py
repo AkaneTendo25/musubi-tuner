@@ -525,6 +525,59 @@ def test_h3_base_preservation_rejects_invalid_probability(tmp_path: Path) -> Non
     assert "training.h3_base_preservation_probability" in report["field_errors"]
 
 
+def test_h3_dop_is_forwarded_to_cache_and_trainer(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_dop_trigger = "sks"
+    config.caching.h3_dop_class_prompt = "woman"
+    config.training.h3_dop_trigger = "sks"
+    config.training.h3_dop_class_prompt = "woman"
+    config.training.h3_dop_loss_weight = 0.02
+    config.training.h3_dop_probability = 0.25
+
+    cache_command = build_cache_text_cmd(config)
+    cache_script = next(
+        index for index, value in enumerate(cache_command) if value.endswith("minimax_h3_cache_text_encoder_outputs.py")
+    )
+    cache_args = create_cache_text_parser().parse_args(cache_command[cache_script + 1 :])
+    train_command = build_training_cmd(config)
+    train_script = next(index for index, value in enumerate(train_command) if value.endswith("minimax_h3_train_network.py"))
+    train_args = create_parser().parse_args(train_command[train_script + 1 :])
+
+    assert cache_args.h3_dop_trigger == "sks"
+    assert cache_args.h3_dop_class_prompt == "woman"
+    assert train_args.h3_dop_trigger == "sks"
+    assert train_args.h3_dop_class_prompt == "woman"
+    assert train_args.h3_dop_loss_weight == pytest.approx(0.02)
+    assert train_args.h3_dop_probability == pytest.approx(0.25)
+
+
+def test_h3_dop_validation_rejects_mismatched_cache_identity(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_dop_trigger = "other"
+    config.caching.h3_dop_class_prompt = "woman"
+    config.training.h3_dop_trigger = "sks"
+    config.training.h3_dop_class_prompt = "woman"
+    config.training.h3_dop_loss_weight = 0.02
+
+    report = validate_training_config(config)
+
+    assert "caching.h3_dop_trigger" in report["field_errors"]
+
+
+def test_h3_dop_validation_rejects_ref2va(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_dop_trigger = "sks"
+    config.caching.h3_dop_class_prompt = "woman"
+    config.training.h3_dop_trigger = "sks"
+    config.training.h3_dop_class_prompt = "woman"
+    config.training.h3_dop_loss_weight = 0.02
+    config.training.h3_training_mode = "ref2va"
+
+    report = validate_training_config(config)
+
+    assert "training.h3_dop_loss_weight" in report["field_errors"]
+
+
 def test_h3_exact_resume_controls_are_forwarded(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.training.save_state = True

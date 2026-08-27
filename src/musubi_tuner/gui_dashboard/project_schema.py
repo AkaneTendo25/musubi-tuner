@@ -158,6 +158,8 @@ class CachingConfig(BaseModel):
     h3_image_mode: Literal["none", "first", "first_last"] = "none"
     h3_image_frame_count: Optional[int] = None
     h3_cache_guidance_empty: bool = False
+    h3_dop_trigger: str = ""
+    h3_dop_class_prompt: str = ""
     h3_reference_image_short_edge: int = 2048
     h3_reference_image_size_mode: Literal["short_edge", "target_area"] = "short_edge"
     h3_reference_image_max_pixels: int = 0
@@ -305,6 +307,10 @@ class TrainingConfig(BaseModel):
     h3_fuse_frozen_teachers: bool = False
     h3_base_preservation_loss_weight: float = 0.0
     h3_base_preservation_probability: float = 1.0
+    h3_dop_loss_weight: float = 0.0
+    h3_dop_probability: float = 1.0
+    h3_dop_trigger: str = ""
+    h3_dop_class_prompt: str = ""
     h3_overlay_weights: str = ""
     h3_overlay_weights_multiplier: float = 1.0
     h3_attn_auto_dispatch: bool = False

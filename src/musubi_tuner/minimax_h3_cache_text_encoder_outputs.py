@@ -18,6 +18,10 @@ from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_DOP_CONFIG_CACHE_KEY,
+    H3_DOP_CONFIG_KEY,
+    H3_DOP_TEXT_HIDDEN_KEY,
+    H3_DOP_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
@@ -167,6 +171,8 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="also cache H3's empty-text conditioning for the optional guidance-consistent training objective",
     )
+    parser.add_argument("--h3_dop_trigger", type=str, default="", help="standalone trigger replaced in the cached DOP caption")
+    parser.add_argument("--h3_dop_class_prompt", type=str, default="", help="class phrase substituted for --h3_dop_trigger")
     add_image_training_arguments(parser, text_visual=True)
     return parser
 
@@ -184,6 +190,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--h3_text_visual_max_pixels must be non-negative")
     if args.h3_max_caption_tokens < 0:
         parser.error("--h3_max_caption_tokens must be non-negative")
+    if bool(args.h3_dop_trigger) != bool(args.h3_dop_class_prompt):
+        parser.error("--h3_dop_trigger and --h3_dop_class_prompt must be supplied together")
+    if args.h3_dop_trigger and args.task in {"ref2va", "ref2va_omni"}:
+        parser.error("H3 DOP is not supported for Ref2VA")
     try:
         keyframe_visuals = parse_keyframe_visuals(args.h3_keyframe_visuals)
     except ValueError as error:
@@ -228,6 +238,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 batch,
                 include_empty=args.cache_guidance_empty,
                 include_qwen_control_dropout=args.h3_qwen_control_dropout,
+                dop_trigger=args.h3_dop_trigger or None,
+                dop_class_prompt=args.h3_dop_class_prompt or None,
             ),
             len(batch),
             "conditioning encoder",
@@ -290,6 +302,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                         return False
                 if args.cache_guidance_empty and not {H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY} <= logical_keys:
                     return False
+                dop_keys = {H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY, H3_DOP_CONFIG_KEY}
+                if args.h3_dop_trigger:
+                    if not dop_keys <= logical_keys:
+                        return False
+                    from musubi_tuner.minimax_h3.dop import dop_config_identity
+
+                    if not torch.equal(
+                        handle.get_tensor(H3_DOP_CONFIG_CACHE_KEY),
+                        dop_config_identity(args.h3_dop_trigger, args.h3_dop_class_prompt),
+                    ):
+                        return False
                 # The control-free twin is part of the cache identity in one
                 # direction only: a run that asks for dropout needs it, while a
                 # cache that carries it serves a run that does not, because the

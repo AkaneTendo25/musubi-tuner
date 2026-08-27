@@ -46,10 +46,14 @@ from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_DOP_CONFIG_KEY,
+    H3_DOP_TEXT_HIDDEN_KEY,
+    H3_DOP_TEXT_TOKEN_TAGS_KEY,
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
 )
+from musubi_tuner.minimax_h3.dop import dop_config_identity
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_decoder, load_video_vae_decoder
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
@@ -1373,6 +1377,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
         if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
             raise ValueError("--h3_base_preservation_probability must be finite and lie in (0, 1]")
+        if not math.isfinite(args.h3_dop_loss_weight) or args.h3_dop_loss_weight < 0:
+            raise ValueError("--h3_dop_loss_weight must be finite and non-negative")
+        if not math.isfinite(args.h3_dop_probability) or not 0 < args.h3_dop_probability <= 1:
+            raise ValueError("--h3_dop_probability must be finite and lie in (0, 1]")
+        if args.h3_dop_loss_weight > 0:
+            if not args.h3_dop_trigger or not args.h3_dop_class_prompt:
+                raise ValueError("--h3_dop_loss_weight requires --h3_dop_trigger and --h3_dop_class_prompt")
+            if args.h3_training_mode in {"ref2va", "ref2va_omni"}:
+                raise ValueError("H3 DOP is not supported for Ref2VA")
         if args.h3_convrot_int8 and (args.fp8_base or args.int8_convrot_base):
             raise ValueError("--h3_convrot_int8 quantizes the BF16 checkpoint itself; drop --fp8_base/--int8_convrot_base")
         convrot_int8_active = args.h3_convrot_int8 or args.int8_convrot_base
@@ -1769,12 +1782,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return overlay
 
     def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):
-        if args is not None and args.h3_base_preservation_loss_weight > 0:
+        if args is not None and (args.h3_base_preservation_loss_weight > 0 or args.h3_dop_loss_weight > 0):
             if network is None:
-                raise ValueError("--h3_base_preservation_loss_weight requires a trainable network")
+                raise ValueError("H3 preservation losses require a trainable network")
             set_enabled = getattr(accelerator.unwrap_model(network), "set_enabled", None)
             if not callable(set_enabled):
-                raise TypeError("H3 base-preservation loss requires a network with set_enabled()")
+                raise TypeError("H3 preservation losses require a network with set_enabled()")
         if args is not None:
             self.install_overlay_weights(args, accelerator, transformer)
         del args, network, transformer
@@ -2595,6 +2608,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         preservation_active = args.h3_base_preservation_loss_weight > 0 and self._base_preservation_active(
             accelerator, args.h3_base_preservation_probability
         )
+        dop_active = args.h3_dop_loss_weight > 0 and self._base_preservation_active(accelerator, args.h3_dop_probability)
         guidance_active = args.h3_guidance_distillation_scale is not None and self._guidance_distillation_active(
             accelerator, args.h3_guidance_distillation_probability
         )
@@ -2623,6 +2637,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 vae,
                 global_step,
                 preservation_active_override=preservation_active,
+                dop_active_override=dop_active,
+                auxiliary_backward_scale=1.0,
                 guidance_active_override=guidance_active,
                 recipe_override=recipe,
                 qwen_control_dropout_override=qwen_control_dropout,
@@ -2659,6 +2675,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     vae,
                     global_step,
                     preservation_active_override=preservation_active,
+                    dop_active_override=dop_active,
+                    auxiliary_backward_scale=1.0 / batch_size,
                     guidance_active_override=guidance_active,
                     recipe_override=recipe,
                     qwen_control_dropout_override=qwen_control_dropout,
@@ -2749,6 +2767,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         global_step: int,
         *,
         preservation_active_override: bool | None = None,
+        dop_active_override: bool | None = None,
+        auxiliary_backward_scale: float = 1.0,
         guidance_active_override: bool | None = None,
         recipe_override: str | None = None,
         qwen_control_dropout_override: bool | None = None,
@@ -2919,12 +2939,39 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if preservation_active_override is None
             else preservation_active_override
         )
+        dop_active = (
+            args.h3_dop_loss_weight > 0
+            and conditioning == "prompt"
+            and (
+                self._base_preservation_active(accelerator, args.h3_dop_probability)
+                if dop_active_override is None
+                else dop_active_override
+            )
+        )
+        dop_reference_prediction = None
+        if dop_active:
+            missing_dop = [
+                key for key in (H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY, H3_DOP_CONFIG_KEY) if key not in batch
+            ]
+            if missing_dop:
+                raise KeyError(
+                    "H3 DOP requires text caches written with --h3_dop_trigger and --h3_dop_class_prompt; missing "
+                    + ", ".join(missing_dop)
+                )
+            cached_identity = batch[H3_DOP_CONFIG_KEY]
+            if isinstance(cached_identity, (list, tuple)):
+                cached_identity = cached_identity[0]
+            cached_identity = cached_identity.reshape(-1).cpu()
+            if not torch.equal(cached_identity, dop_config_identity(args.h3_dop_trigger, args.h3_dop_class_prompt)):
+                raise ValueError("H3 DOP cache identity does not match the requested trigger/class pair; re-cache conditioning")
         # H2D-only LoRA rings self-heal at same-direction forward boundaries.
         # Classic swap (and the dense trainable ring) instead expects backward
         # to restore the training layout and must explicitly enter forward-only
         # mode around no-grad teacher passes.
         auxiliary_block_swap = (
-            bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False) and (use_guidance or preservation_active)
+            bool(self.blocks_to_swap)
+            and not getattr(self, "_block_swap_h2d_only", False)
+            and (use_guidance or preservation_active or dop_active)
         )
         if auxiliary_block_swap:
             # Teacher branches have no backward pass. Classic block swap in
@@ -3035,9 +3082,57 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             )
                     finally:
                         set_enabled(True)
+            if dop_active:
+                set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_dop_loss_weight")
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                with torch.random.fork_rng(devices=fork_devices):
+                    set_enabled(False)
+                    try:
+                        int8_context = getattr(transformer, "int8_attention_context", None)
+                        with torch.no_grad(), int8_context(auxiliary=True) if callable(int8_context) else nullcontext():
+                            dop_reference_prediction = self._predict(accelerator, transformer, batch, inputs, conditioning="dop")
+                    finally:
+                        set_enabled(True)
         finally:
             if auxiliary_block_swap:
                 transformer.switch_block_swap_for_training()
+
+        dop_term = None
+        if dop_reference_prediction is not None:
+            # Backpropagate this auxiliary graph before constructing the primary
+            # graph. This keeps classic block swapping valid and bounds activation
+            # memory even when the rewritten prompt has a different packed length.
+            dop_prediction = self._predict(accelerator, transformer, batch, inputs, conditioning="dop")
+            dop_video_mask = self._mask_to_loss(
+                self._extension_masked(
+                    batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3
+                ),
+                inputs.video_target,
+                None if self._step_mask is None else self._step_mask.video_latent,
+                axis=-3,
+            )
+            dop_audio_mask = self._mask_to_loss(
+                self._extension_masked(
+                    batch.get("audio_loss_mask"), inputs.audio_target, self._active_extension_audio_latents, axis=-1
+                ),
+                inputs.audio_target,
+                None if self._step_mask is None else self._step_mask.audio_latent,
+                axis=-1,
+            )
+            dop_preservation = joint_prediction_loss(
+                dop_prediction,
+                dop_reference_prediction,
+                video_mask=dop_video_mask,
+                audio_mask=dop_audio_mask,
+                video_sample_weight=self._sample_weight(args, inputs.video_sigma) if has_video else None,
+                audio_sample_weight=self._sample_weight(args, inputs.audio_sigma) if has_audio else None,
+                balance=args.h3_loss_balance,
+                video_weight=0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight,
+                audio_weight=0.0 if observed == "audio" else args.h3_audio_loss_weight,
+            )
+            dop_term = (args.h3_dop_loss_weight / args.h3_dop_probability) * dop_preservation.loss
+            accelerator.backward(dop_term * auxiliary_backward_scale)
+            del dop_prediction
 
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
         if self._crepa is not None:
@@ -3111,6 +3206,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
             "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
         }
+        if args.h3_dop_loss_weight > 0:
+            metrics["h3/dop_active"] = float(dop_active)
+            metrics["loss/dop"] = 0.0 if dop_term is None else float(dop_term.detach())
         if result.video_elements == 0 and result.audio_elements == 0:
             metrics["h3/no_active_target"] = 1.0
         if args.h3_caption_dropout_rate > 0:
@@ -3177,7 +3275,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics.update(crepa_metrics)
         elif use_crepa:
             metrics.update(self._crepa.status_metrics())
-        if base_preservation_term is not None or guidance_rescaled:
+        if base_preservation_term is not None or guidance_rescaled or dop_term is not None:
             average_loss = loss
             if base_preservation_term is not None:
                 average_loss = average_loss - base_preservation_term
@@ -3265,6 +3363,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
+            "ss_h3_dop_loss_weight": str(args.h3_dop_loss_weight),
+            "ss_h3_dop_probability": str(args.h3_dop_probability),
+            "ss_h3_dop_trigger": args.h3_dop_trigger or "none",
+            "ss_h3_dop_class_prompt": args.h3_dop_class_prompt or "none",
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
             "ss_h3_sigma_sqrt_max_weight": str(args.h3_sigma_sqrt_max_weight),
@@ -3706,6 +3808,20 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "this probability to preserve the expected gradient, and the draw is synchronized across distributed ranks"
         ),
     )
+    parser.add_argument(
+        "--h3_dop_loss_weight",
+        type=float,
+        default=0.0,
+        help="optional Differential Output Preservation weight under trigger-free cached conditioning",
+    )
+    parser.add_argument(
+        "--h3_dop_probability",
+        type=float,
+        default=1.0,
+        help="probability of a DOP step; active loss is divided by this value",
+    )
+    parser.add_argument("--h3_dop_trigger", type=str, default="", help="trigger used to identify the matching DOP cache")
+    parser.add_argument("--h3_dop_class_prompt", type=str, default="", help="class phrase used to identify the matching DOP cache")
     parser.add_argument(
         "--crepa",
         nargs="*",

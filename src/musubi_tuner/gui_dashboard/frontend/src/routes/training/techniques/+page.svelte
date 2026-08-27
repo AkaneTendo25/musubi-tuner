@@ -639,6 +639,18 @@
 				</div>
 
 				<!-- DOP -->
+				{#if $projectConfig?.training?.model_type === 'minimax_h3'}
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[12px] font-semibold mb-1" style="color: var(--text-primary);">H3 Differential Output Preservation</div>
+					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">Keeps the LoRA close to the frozen base under the trigger-free version of each training caption. Cache the same trigger and class phrase first.</p>
+					<div class="grid grid-cols-2 gap-2">
+						<FormField fieldPath="training.h3_dop_trigger" value={$projectConfig?.training?.h3_dop_trigger || ''} oninput={(e) => updateTraining('h3_dop_trigger', e.target.value)} placeholder="sks" tooltip="Standalone trigger in each caption." />
+						<FormField fieldPath="training.h3_dop_class_prompt" value={$projectConfig?.training?.h3_dop_class_prompt || ''} oninput={(e) => updateTraining('h3_dop_class_prompt', e.target.value)} placeholder="woman" tooltip="Class phrase replacing the trigger." />
+						<FormField type="number" fieldPath="training.h3_dop_loss_weight" value={$projectConfig?.training?.h3_dop_loss_weight ?? 0.0} oninput={(e) => updateTraining('h3_dop_loss_weight', Number(e.target.value))} step="0.01" min={0} tooltip="Zero disables H3 DOP." />
+						<FormField type="number" fieldPath="training.h3_dop_probability" value={$projectConfig?.training?.h3_dop_probability ?? 1.0} oninput={(e) => updateTraining('h3_dop_probability', Number(e.target.value))} step="0.05" min={0.01} max={1} tooltip="Fraction of steps using DOP; active losses are inverse-probability scaled." />
+					</div>
+				</div>
+				{:else}
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">DOP (Differential Output Preservation)</span>
@@ -703,6 +715,7 @@
 						<FormField fieldPath="training.dop_args" value={$projectConfig?.training?.dop_args || ''} oninput={(e) => updateTraining('dop_args', e.target.value)} placeholder="class=person multiplier=1.0" tooltip="Additional values passed after --dop_args." />
 					</div>
 				</div>
+				{/if}
 
 				<!-- Prior Divergence -->
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">

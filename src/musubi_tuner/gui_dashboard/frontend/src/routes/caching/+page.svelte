@@ -437,6 +437,10 @@
 					<FormField type="number" fieldPath="caching.h3_reference_video_short_edge" value={caching.h3_reference_video_short_edge ?? 768} oninput={(e) => updateH3ReferenceVideoSizing('short_edge', Number(e.target.value || 768))} min={16} step={16} tooltip="Shared reference-video short edge. Lower values reduce Ref2VA compute and VRAM." />
 					<FormField type="number" fieldPath="caching.h3_reference_video_max_pixels" value={caching.h3_reference_video_max_pixels ?? 1032192} oninput={(e) => updateH3ReferenceVideoSizing('max_pixels', Number(e.target.value || 1032192))} min={256} step={256} tooltip="Shared maximum pixels per reference-video frame after aspect-preserving resize." />
 					<FormToggle fieldPath="caching.h3_cache_guidance_empty" checked={caching.h3_cache_guidance_empty ?? false} onchange={(e) => updateCaching('h3_cache_guidance_empty', e.target.checked)} tooltip="Also cache empty-text conditioning required by guidance training and caption dropout." />
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<FormField fieldPath="caching.h3_dop_trigger" value={caching.h3_dop_trigger || ''} oninput={(e) => updateCaching('h3_dop_trigger', e.target.value)} placeholder="sks" tooltip="Optional DOP trigger. Set together with the class prompt to cache trigger-free conditioning." />
+						<FormField fieldPath="caching.h3_dop_class_prompt" value={caching.h3_dop_class_prompt || ''} oninput={(e) => updateCaching('h3_dop_class_prompt', e.target.value)} placeholder="woman" tooltip="Class phrase substituted for the DOP trigger." />
+					</div>
 				</div>
 			{:else}
 			{#if modelStatus}

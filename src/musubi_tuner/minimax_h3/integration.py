@@ -33,6 +33,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_IDS,
     H3_CONDITIONING_TASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
+    H3_DOP_TEXT_HIDDEN_KEY,
+    H3_DOP_TEXT_TOKEN_TAGS_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
     H3_KEYFRAME_VISUAL_LAST,
@@ -1313,18 +1315,19 @@ class _NativeTrainingBackend:
             )
 
         conditionings = (conditioning,) if isinstance(conditioning, str) else tuple(conditioning)
-        if not conditionings or any(value not in ("prompt", "empty") for value in conditionings):
-            raise ValueError("H3 conditioning must contain only 'prompt' or 'empty'")
+        if not conditionings or any(value not in ("prompt", "empty", "dop") for value in conditionings):
+            raise ValueError("H3 conditioning must contain only 'prompt', 'empty', or 'dop'")
         if len(conditionings) > 2:
             raise ValueError("H3 paired conditioning supports at most two presentations")
 
         text_presentations: list[tuple[torch.Tensor, torch.Tensor, str, str]] = []
         for presentation in conditionings:
-            hidden_key, tags_key = (
-                (H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY)
-                if presentation == "prompt"
-                else (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
-            )
+            if presentation == "prompt":
+                hidden_key, tags_key = H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY
+            elif presentation == "empty":
+                hidden_key, tags_key = H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY
+            else:
+                hidden_key, tags_key = H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY
             if reference_modality != "av":
                 if self.mode not in ("ref2va", "ref2va_omni"):
                     raise ValueError("reference modality selection is only valid for Ref2VA training")
