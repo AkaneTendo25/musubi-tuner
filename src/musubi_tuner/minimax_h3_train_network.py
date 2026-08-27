@@ -492,7 +492,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # The frozen base's field is a property of the checkpoint and the validation
         # item, not of the training run, so it is measured once and kept.
         self._field_base_gaps: dict[tuple, float] = {}
+        self._field_base_branches: dict[tuple, tuple] = {}
         self._field_ratios: dict[int, list[float]] = {}
+        self._field_cosines: dict[int, list[float]] = {}
+        self._field_distances: dict[int, list[float]] = {}
+        self._null_field_ratios: dict[int, list[float]] = {}
+        self._velocity_errors: dict[int, list[float]] = {}
+        self._branch_drift: dict[int, list] = {}
         self._validation_network = None
         self._step_recipe: str | None = None
         self._step_qwen_control_dropout = False
@@ -658,6 +664,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
         self._validation_network = network
         self._field_ratios = {}
+        self._field_cosines = {}
+        self._field_distances = {}
+        self._null_field_ratios = {}
+        self._velocity_errors = {}
+        self._branch_drift = {}
 
         block_swap_active = bool(self.blocks_to_swap)
         transformer_was_training = transformer.training
@@ -730,6 +741,48 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         pooled = [ratio for ratios in self._field_ratios.values() for ratio in ratios]
         if pooled:
             metrics["val/field"] = sum(pooled) / len(pooled)
+        # The ratio is a length, and guidance is a vector. An adapter can hold the
+        # length exactly while turning the direction the field pushes in, which the
+        # ratio alone would report as a field left untouched, so the two are only
+        # meaningful read together: a field survives when both are near 1.
+        for bin_index, cosines in sorted(self._field_cosines.items()):
+            if cosines:
+                metrics[f"val/field_cos/bin{bin_index}"] = sum(cosines) / len(cosines)
+        pooled_cos = [cosine for cosines in self._field_cosines.values() for cosine in cosines]
+        if pooled_cos:
+            metrics["val/field_cos"] = sum(pooled_cos) / len(pooled_cos)
+        # Reported beside the two it combines, not instead of them: the pair says HOW a
+        # field was lost -- shortened, turned, or both -- while this says how far it went.
+        for bin_index, distances in sorted(self._field_distances.items()):
+            if distances:
+                metrics[f"val/field_dist/bin{bin_index}"] = sum(distances) / len(distances)
+        pooled_dist = [distance for distances in self._field_distances.values() for distance in distances]
+        if pooled_dist:
+            metrics["val/field_dist"] = sum(pooled_dist) / len(pooled_dist)
+        # Error against the raw data velocity, which every arm can be judged by no
+        # matter what it optimised. val/loss cannot do that job: a guidance loss, a
+        # teacher-matching loss and a rollout objective each report on their own
+        # scale, so two arms configured differently are only comparable through a
+        # separate offline evaluation. This comes from a forward the probe already
+        # ran, which lets any run be placed against any other from the log alone.
+        for bin_index, errors in sorted(self._velocity_errors.items()):
+            if errors:
+                metrics[f"val/velocity_err/bin{bin_index}"] = sum(errors) / len(errors)
+        pooled_err = [error for errors in self._velocity_errors.values() for error in errors]
+        if pooled_err:
+            metrics["val/velocity_err"] = sum(pooled_err) / len(pooled_err)
+        # What the field would be with the empty branch held where the base left it
+        # and the prompted branch wherever training took it. Ordinary training
+        # supervises the prompted branch only, yet the adapter is shared and moves
+        # the empty one anyway; if most of the loss is that unattended drift, then
+        # pinning the empty branch costs nothing in what is being learned.
+        counterfactual = [ratio for ratios in self._null_field_ratios.values() for ratio in ratios]
+        if counterfactual:
+            metrics["val/field_if_null_pinned"] = sum(counterfactual) / len(counterfactual)
+        drifts = [pair for pairs in self._branch_drift.values() for pair in pairs]
+        if drifts:
+            metrics["val/drift/prompted"] = sum(pair[0] for pair in drifts) / len(drifts)
+            metrics["val/drift/empty"] = sum(pair[1] for pair in drifts) / len(drifts)
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
@@ -991,6 +1044,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_recipe = None
 
     @staticmethod
+    def _masked_cosine(lhs, rhs, mask):
+        """Cosine between two fields over the authored elements only."""
+        left = lhs.float().flatten()
+        right = rhs.float().flatten()
+        if mask is not None:
+            valid = mask.to(device=lhs.device, dtype=torch.float32).expand_as(lhs).flatten()
+            left = left * valid
+            right = right * valid
+        denominator = float(left.norm()) * float(right.norm())
+        if denominator == 0.0:
+            return 0.0
+        return float(torch.dot(left, right)) / denominator
+
+    @staticmethod
     def _masked_rms(tensor, mask):
         """Root mean square over the authored elements only."""
         if mask is None:
@@ -1050,36 +1117,89 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
         int8_context = getattr(transformer, "int8_attention_context", None)
 
-        def gap() -> float:
+        def branches():
             # Both branches of one measurement must see the same stochastic
             # conditioning, or their difference reports the draw rather than the
             # prompt. Forking around each keeps the pair aligned and leaves the rest
             # of the validation's RNG stream untouched.
-            branches = {}
+            #
+            # The tensors are returned rather than reduced to a length here: the
+            # angle between two fields, the counterfactual and the per-branch drift
+            # all read them, and none of those can be recovered from a scalar.
+            out = {}
             for branch in ("prompt", "empty"):
                 with (
                     torch.random.fork_rng(devices=fork_devices),
                     int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
                 ):
-                    branches[branch] = self._predict(accelerator, transformer, batch, inputs, conditioning=branch)
-            prompted, empty = branches["prompt"].video, branches["empty"].video
-            if prompted is None or empty is None:
-                return 0.0
-            return self._masked_rms(prompted - empty, video_mask)
+                    out[branch] = self._predict(accelerator, transformer, batch, inputs, conditioning=branch).video
+            return out["prompt"], out["empty"]
 
         key = (dataset_index, sigma_bin.index, observed, self._step_reference_modality)
         if key not in self._field_base_gaps:
             set_enabled(False)
             try:
-                self._field_base_gaps[key] = gap()
+                base_prompted, base_empty = branches()
+                self._field_base_gaps[key] = (
+                    0.0 if base_prompted is None or base_empty is None else self._masked_rms(base_prompted - base_empty, video_mask)
+                )
+                # The base is fixed for the run, so keeping its two branches costs
+                # the same one-off pair of forwards the denominator already paid.
+                if base_prompted is not None and base_empty is not None:
+                    self._field_base_branches[key] = (base_prompted.detach().cpu(), base_empty.detach().cpu())
             finally:
                 set_enabled(True)
+
+        adapted_prompted, adapted_empty = branches()
+        adapted_pair = None
+        if adapted_prompted is not None and adapted_empty is not None:
+            adapted_pair = (adapted_prompted.detach().cpu(), adapted_empty.detach().cpu())
+        if adapted_prompted is not None and inputs.video_target is not None:
+            target = inputs.video_target.to(device=adapted_prompted.device, dtype=torch.float32)
+            error, _ = masked_squared_error_sum(adapted_prompted.float(), target, video_mask)
+            energy, _ = masked_squared_error_sum(target, torch.zeros_like(target), video_mask)
+            if float(energy) > 0.0:
+                self._velocity_errors.setdefault(sigma_bin.index, []).append(float(error) / float(energy))
+
+        base_pair = self._field_base_branches.get(key)
+        if base_pair is not None and adapted_pair is not None:
+            self._branch_drift.setdefault(sigma_bin.index, []).append(
+                (
+                    self._masked_rms(adapted_pair[0] - base_pair[0], video_mask),
+                    self._masked_rms(adapted_pair[1] - base_pair[1], video_mask),
+                )
+            )
         base_gap = self._field_base_gaps[key]
         if base_gap <= 0.0:
             # The base has no field to lose at this state, so a ratio would divide by
             # noise. Skipping keeps one degenerate item from dominating the average.
             return
-        self._field_ratios.setdefault(sigma_bin.index, []).append(gap() / base_gap)
+        if adapted_pair is None:
+            return
+        ratio = self._masked_rms(adapted_pair[0] - adapted_pair[1], video_mask) / base_gap
+        self._field_ratios.setdefault(sigma_bin.index, []).append(ratio)
+        if base_pair is not None:
+            cosine = self._masked_cosine(adapted_pair[0] - adapted_pair[1], base_pair[0] - base_pair[1], video_mask)
+            self._field_cosines.setdefault(sigma_bin.index, []).append(cosine)
+            # The two halves folded into the one number that orders arms correctly.
+            #
+            # Length and angle can each be flattered by an adapter that ruins the other,
+            # and reading either alone inverts the ranking. Measured on real runs: the
+            # arm carrying the LONGEST field of a dozen -- 0.74 of the base where the
+            # others sat near 0.55 -- was the FURTHEST from the base's field, because it
+            # had bought that length by turning 45 degrees. By the ratio it led the
+            # table; by this number it came last.
+            #
+            # ||F_arm - F_base|| / ||F_base|| = sqrt(1 + r^2 - 2 r cos), with r the ratio
+            # already reported. Zero means the field was left exactly where it was.
+            # Per item rather than from the pooled ratio and cosine, since the average of
+            # the distances is not the distance between the averages.
+            self._field_distances.setdefault(sigma_bin.index, []).append(
+                math.sqrt(max(0.0, 1.0 + ratio * ratio - 2.0 * ratio * cosine))
+            )
+            self._null_field_ratios.setdefault(sigma_bin.index, []).append(
+                self._masked_rms(adapted_pair[0] - base_pair[1], video_mask) / base_gap
+            )
 
     def handle_model_specific_args(self, args: argparse.Namespace):
         self.dit_dtype = (
@@ -3563,10 +3683,9 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_validation_field_probe",
         action="store_true",
         help=(
-            "report how much of the checkpoint's prompted-to-empty guidance field the adapter still carries, as a "
-            "fraction of the frozen base measured on the same validation items and noise; requires a validation set "
-            "and empty-text caches (--cache_guidance_empty). Costs two no-grad forwards per validation item and bin, "
-            "plus two more on the first validation only, since the base's field does not change during training"
+            "DEBUG. Report what the adapter has done to the guidance field, measured against the frozen base "
+            "on the validation items. Diagnostic only, subject to removal, and not part of any recommended "
+            "recipe. Requires a validation set and empty-text caches (--cache_guidance_empty)"
         ),
     )
     parser.add_argument(

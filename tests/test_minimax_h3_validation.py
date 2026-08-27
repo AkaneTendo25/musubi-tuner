@@ -1,3 +1,4 @@
+import math
 import random
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -607,3 +608,52 @@ def test_h3_validation_weights_each_modality_from_its_own_sigma_and_clears_keyfr
     assert len(sampled_sigmas) == 4
     assert sampled_sigmas[0] != pytest.approx(sampled_sigmas[1])
     assert sampled_sigmas[2] != pytest.approx(sampled_sigmas[3])
+
+
+def test_h3_field_cosine_is_masked_and_scale_invariant():
+    """The angle must ignore length and must ignore elements the mask excludes.
+
+    Scale invariance is what makes the cosine independent of the ratio reported
+    beside it; without it the two numbers would move together and the pair would
+    say no more than either alone. The mask matters because padded rows carry no
+    authored content, and letting them into the inner product would report the
+    padding's agreement rather than the field's.
+    """
+    cosine = h3_train_network.MiniMaxH3NetworkTrainer._masked_cosine
+    field = torch.tensor([[3.0, 4.0, 0.0]])
+    assert cosine(field, field * 7.0, None) == pytest.approx(1.0, abs=1e-6)
+    assert cosine(field, -field, None) == pytest.approx(-1.0, abs=1e-6)
+
+    # Third element disagrees violently, and the mask excludes it.
+    left = torch.tensor([[1.0, 0.0, 99.0]])
+    right = torch.tensor([[1.0, 0.0, -99.0]])
+    mask = torch.tensor([[1.0, 1.0, 0.0]])
+    assert cosine(left, right, mask) == pytest.approx(1.0, abs=1e-6)
+    assert cosine(left, right, None) < 0.0
+
+    # A field that vanished has no direction to report, and 0 is the honest answer
+    # rather than a division that would raise or return a nan the average swallows.
+    assert cosine(torch.zeros(1, 3), field, None) == 0.0
+
+
+def test_h3_field_distance_orders_a_rotated_field_below_a_shortened_one():
+    """Length and angle folded into one number, and why that number is needed.
+
+    Read as a length alone, an adapter that keeps its field long looks like the one
+    that preserved it best. This is the case that showed otherwise on real runs: a
+    field at 0.74 of the base turned 45 degrees sits FURTHER from the base's field
+    than one shortened to 0.55 while staying aligned, and the ratio ranks them the
+    other way round.
+    """
+
+    def distance(ratio: float, cosine: float) -> float:
+        return math.sqrt(max(0.0, 1.0 + ratio * ratio - 2.0 * ratio * cosine))
+
+    assert distance(1.0, 1.0) == pytest.approx(0.0, abs=1e-9)
+    # Same direction, half the length: exactly half the field is missing.
+    assert distance(0.5, 1.0) == pytest.approx(0.5, abs=1e-9)
+    long_but_turned = distance(0.74, 0.702)
+    short_but_aligned = distance(0.55, 0.94)
+    assert long_but_turned > short_but_aligned
+    # And the ratio on its own would have called the rotated one better.
+    assert 0.74 > 0.55
