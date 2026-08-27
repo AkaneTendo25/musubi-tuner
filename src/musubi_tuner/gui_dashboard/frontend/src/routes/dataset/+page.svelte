@@ -66,6 +66,7 @@
 				source_audio_directory: '',
 				source_video_audio_embedded: false,
 				source_video_audio_paired: false,
+				aligned_guide_indices: '',
 				control_modality: '',
 				control_modalities: '',
 				control_modality_probability_av: null,

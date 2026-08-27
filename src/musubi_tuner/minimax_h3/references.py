@@ -60,6 +60,7 @@ class H3PreparedReference:
     # released 24 fps grid; temporal subsampling instead keeps its own rate, and
     # the Qwen presentation needs it to label the frames with real source times.
     sample_fps: float = float(VIDEO_FPS)
+    aligned_to_target: bool = False
 
     @property
     def has_audio(self) -> bool:
@@ -108,6 +109,10 @@ def reference_fingerprint(assets: Sequence[MediaAsset]) -> str | None:
     entries: list[dict[str, Any]] = []
     for order, asset in enumerate(references):
         entry = {"order": order, "kind": int(_kind(asset)), **file_identity(asset.path)}
+        if asset.metadata.get("aligned_to_target", False):
+            # Omit false so ordinary-reference fingerprints remain byte-for-byte
+            # compatible with caches created before aligned guides existed.
+            entry["aligned_to_target"] = True
         audio_path = asset.metadata.get("audio_path")
         if audio_path:
             entry["audio"] = file_identity(Path(audio_path))
@@ -331,7 +336,20 @@ def _prepare_video(
     short_edge: int,
     max_pixels: int,
     sample_fps: float = REFERENCE_VIDEO_FPS,
+    aligned_size: tuple[int, int] | None = None,
 ) -> np.ndarray:
+    if aligned_size is not None:
+        frames, source_fps = _decode_video(asset.path)
+        frames = resample_reference_frames(frames, source_fps)
+        if frames.shape[0] < target_frames:
+            frames = np.concatenate((frames, np.repeat(frames[-1:], target_frames - frames.shape[0], axis=0)))
+        frames = frames[:target_frames]
+        height, width = aligned_size
+        if frames.shape[1:3] != (height, width):
+            frames = np.stack(
+                [np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS)) for frame in frames]
+            )
+        return frames
     if validate_reference_video_fps(sample_fps):
         # Subsampling conditions on the whole clip, so the decode cannot stop at
         # the target's worth of source frames the way the truncation path does.
@@ -477,8 +495,26 @@ def prepare_references(
                 H3PreparedReference(kind=kind, image=_prepare_image(asset, image_short_edge, image_size_mode, target_pixels))
             )
         elif kind is H3ReferenceKind.VIDEO:
+            aligned = bool(asset.metadata.get("aligned_to_target", False))
             include_audio = bool(asset.metadata.get("include_audio", True))
-            frames = _prepare_video(asset, target_frames, video_short_edge, video_max_pixels, video_sample_fps)
+            if aligned and include_audio:
+                raise ValueError("aligned H3 video references must be visual-only")
+            aligned_size = None
+            if aligned:
+                if target_size is None or len(target_size) < 2:
+                    raise ValueError("aligned H3 video references require the target bucket size")
+                aligned_size = (int(target_size[1]), int(target_size[0]))
+            if aligned_size is None:
+                frames = _prepare_video(asset, target_frames, video_short_edge, video_max_pixels, video_sample_fps)
+            else:
+                frames = _prepare_video(
+                    asset,
+                    target_frames,
+                    video_short_edge,
+                    video_max_pixels,
+                    video_sample_fps,
+                    aligned_size=aligned_size,
+                )
             # The H3 video VAE accepts only 17n+5 frames (or a single image).
             # Trim once at the shared preparation boundary so Qwen's visual
             # presentation, the DiT latent rows, and any paired soundtrack all
@@ -495,6 +531,7 @@ def prepare_references(
                     # is the same one the truncation path uses.
                     waveform=_prepare_audio(_reference_audio_asset(asset), frames.shape[0]) if include_audio else None,
                     sample_fps=video_sample_fps or float(VIDEO_FPS),
+                    aligned_to_target=aligned,
                 )
             )
         else:
@@ -532,6 +569,7 @@ def reference_modality_variant(references: tuple[H3PreparedReference, ...], moda
                         frames=reference.frames,
                         block_timestamps=reference.block_timestamps,
                         sample_fps=reference.sample_fps,
+                        aligned_to_target=reference.aligned_to_target,
                     )
                 )
         elif reference.kind is H3ReferenceKind.AUDIO:

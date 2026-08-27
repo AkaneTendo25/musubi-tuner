@@ -659,8 +659,44 @@ def _dataset_references(
         reference if isinstance(reference, MediaAsset) else MediaAsset(reference, _modality_for_path(reference), "reference")
         for reference in raw_references
     )
+    aligned_indices = _effective(source, general, "aligned_guide_indices")
+    if aligned_indices is not None:
+        if not isinstance(aligned_indices, list) or any(
+            isinstance(index, bool) or not isinstance(index, int) for index in aligned_indices
+        ):
+            raise ValueError("aligned_guide_indices must be a TOML array of integer source-reference indices")
+        if len(set(aligned_indices)) != len(aligned_indices) or any(index < 0 for index in aligned_indices):
+            raise ValueError("aligned_guide_indices must contain unique non-negative indices")
+        missing = sorted(set(aligned_indices) - set(range(len(references))))
+        if missing:
+            raise ValueError(f"aligned_guide_indices has no matching source-reference indices: {missing}")
+        updated = []
+        for index, reference in enumerate(references):
+            if index not in aligned_indices:
+                updated.append(reference)
+                continue
+            if reference.modality is not MediaModality.VIDEO:
+                raise ValueError(f"aligned_guide_indices entry {index} must select a video reference")
+            metadata = dict(reference.metadata)
+            metadata["aligned_to_target"] = True
+            metadata["include_audio"] = False
+            metadata.pop("audio_path", None)
+            updated.append(
+                MediaAsset(
+                    reference.path,
+                    reference.modality,
+                    reference.role,
+                    stream_index=reference.stream_index,
+                    start_seconds=reference.start_seconds,
+                    duration_seconds=reference.duration_seconds,
+                    metadata=metadata,
+                )
+            )
+        references = tuple(updated)
     modes = _dataset_reference_modes(source, general, len(references))
     probabilities = _dataset_reference_probabilities(source, general)
+    if aligned_indices and probabilities is not None:
+        raise ValueError("aligned_guide_indices cannot be combined with source_modality_probabilities")
     if probabilities is not None:
         _validate_reference_modality_probabilities(target, references, probabilities)
     references = tuple(
@@ -739,6 +775,7 @@ class H3DatasetAdapter:
             "source_video_audio_paired",
             "source_video_audio_embedded",
             "source_modality_probabilities",
+            "aligned_guide_indices",
         ):
             clean_general.pop(key, None)
 
@@ -751,6 +788,7 @@ class H3DatasetAdapter:
                 "source_video_audio_paired",
                 "source_video_audio_embedded",
                 "source_modality_probabilities",
+                "aligned_guide_indices",
                 *SOURCE_DIRECTORY_KEYS.values(),
                 *TARGET_DIRECTORY_KEYS.values(),
             ):

@@ -297,6 +297,12 @@ def _h3_dataset_entry_to_dict(entry) -> dict:
         d["source_video_audio_embedded"] = True
     if entry.source_video_audio_paired:
         d["source_video_audio_paired"] = True
+    aligned_guides = [part.strip() for part in entry.aligned_guide_indices.replace(";", ",").split(",") if part.strip()]
+    if aligned_guides:
+        try:
+            d["aligned_guide_indices"] = [int(value) for value in aligned_guides]
+        except ValueError as error:
+            raise ValueError("H3 aligned guide indices must be comma-separated integers") from error
     control_modalities = _split_path_list(entry.control_modalities)
     if entry.control_modality or control_modalities:
         raise ValueError(

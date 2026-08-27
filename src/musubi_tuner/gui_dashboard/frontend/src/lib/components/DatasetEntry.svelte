@@ -244,6 +244,13 @@
 						tooltip="Stem-matched Ref2VA source audio files."
 					/>
 				</div>
+				<FormField
+					label="Aligned Guide Indices"
+					value={entry.aligned_guide_indices || ''}
+					oninput={(e) => updateField('aligned_guide_indices', e.target.value)}
+					placeholder="Example: 1"
+					tooltip="Source-video reference indices to train on the target temporal/spatial grid. Directory sources are ordered image, video, then audio; JSONL sources follow control_path_N order."
+				/>
 				<div class="grid grid-cols-2 gap-3">
 					<FormToggle label="Embedded Video Audio" checked={entry.source_video_audio_embedded ?? false} onchange={(e) => updateField('source_video_audio_embedded', e.target.checked)} tooltip="Read the source video's own soundtrack. Do not also set a source audio directory." />
 					<FormToggle label="Paired Video + Audio" checked={entry.source_video_audio_paired ?? false} onchange={(e) => updateField('source_video_audio_paired', e.target.checked)} tooltip="Pair separate source video and audio files by stem." />

@@ -27,6 +27,7 @@ from musubi_tuner.minimax_h3.audio import (
 )
 from musubi_tuner.minimax_h3.backend import H3PairedConditioningUnsupportedError
 from musubi_tuner.minimax_h3.cache import (
+    H3_ALIGNED_GUIDE_COUNT_KEY,
     H3_AUDIO_LATENTS_KEY,
     H3_AUDIO_LOSS_MASK_KEY,
     H3_CONDITIONING_TASK_IDS,
@@ -39,6 +40,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
+    H3_REFERENCE_ALIGNED_KEY,
     H3_REFERENCE_AUDIO_ROWS_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
@@ -1526,7 +1528,10 @@ class _NativeTrainingBackend:
                 )
         if task in ("i2va", "fl2va", "l2va") and not has_vision:
             raise ValueError(f"MiniMax H3 {task.upper()} training requires keyframe vision rows; re-cache with --task {task}")
-        if task == "ref2va" and not has_vision:
+        aligned_guide_count = 0
+        if H3_ALIGNED_GUIDE_COUNT_KEY in batch:
+            aligned_guide_count = int(self._one_conditioning_item(batch, H3_ALIGNED_GUIDE_COUNT_KEY, expected_ndim=0))
+        if task == "ref2va" and not has_vision and not aligned_guide_count:
             # An audio-only reference set is presented to Qwen as text alone --
             # reference audio never reaches the vision tower -- so a text-only
             # presentation is legitimate exactly when the cached reference bundle
@@ -1564,6 +1569,11 @@ class _NativeTrainingBackend:
                 dtype=video_rows.dtype,
                 reference_modality=reference_modality,
             )
+            observed_aligned_guides = sum(reference.aligned_to_target for reference in references)
+            if observed_aligned_guides != aligned_guide_count:
+                raise ValueError(
+                    "H3 latent and text caches disagree about aligned external guides; re-cache both latents and conditioning"
+                )
             layout = build_ref2va_packed_sequence(
                 text_tags,
                 references,
@@ -2007,6 +2017,7 @@ class _NativeTrainingBackend:
         kinds_key = f"{H3_REFERENCE_KINDS_KEY}{suffix}"
         video_shapes_key = f"{H3_REFERENCE_VIDEO_SHAPES_KEY}{suffix}"
         audio_lengths_key = f"{H3_REFERENCE_AUDIO_LENGTHS_KEY}{suffix}"
+        aligned_key = f"{H3_REFERENCE_ALIGNED_KEY}{suffix}"
         video_rows_key = f"{H3_REFERENCE_VIDEO_ROWS_KEY}{suffix}"
         audio_rows_key = f"{H3_REFERENCE_AUDIO_ROWS_KEY}{suffix}"
         reference_keys = {kinds_key, video_shapes_key, audio_lengths_key, video_rows_key, audio_rows_key}
@@ -2027,11 +2038,21 @@ class _NativeTrainingBackend:
         audio_lengths = self._one_conditioning_item(batch, audio_lengths_key, expected_ndim=1).to(torch.long)
         video_rows = self._one_conditioning_item(batch, video_rows_key, expected_ndim=2)
         audio_rows = self._one_conditioning_item(batch, audio_rows_key, expected_ndim=2)
+        if aligned_key in batch:
+            aligned = self._one_conditioning_item(batch, aligned_key, expected_ndim=1).to(torch.bool)
+            if aligned.shape != kinds.shape:
+                raise ValueError("H3 Ref2VA cache has inconsistent aligned-reference metadata")
+        else:
+            # Caches created before aligned external guides existed are ordinary
+            # references by definition. Keeping this optional preserves their
+            # exact packing and avoids a needless recache.
+            aligned = torch.zeros_like(kinds, dtype=torch.bool)
         if video_shapes.shape != (kinds.numel(), 3) or audio_lengths.shape != kinds.shape:
             raise ValueError("H3 Ref2VA cache has inconsistent reference metadata")
         kind_values = kinds.detach().cpu().tolist()
         shape_values = video_shapes.detach().cpu().tolist()
         audio_length_values = audio_lengths.detach().cpu().tolist()
+        aligned_values = aligned.detach().cpu().tolist()
         references = tuple(
             MiniMaxH3ReferenceGeometry(
                 kind=int(kind),
@@ -2039,8 +2060,9 @@ class _NativeTrainingBackend:
                 latent_height=int(shape[1]),
                 latent_width=int(shape[2]),
                 num_audio_latents=int(audio_length),
+                aligned_to_target=bool(is_aligned),
             )
-            for kind, shape, audio_length in zip(kind_values, shape_values, audio_length_values)
+            for kind, shape, audio_length, is_aligned in zip(kind_values, shape_values, audio_length_values, aligned_values)
         )
         expected_video_rows = sum(reference.num_video_rows(patch_size) for reference in references)
         expected_audio_rows = sum(reference.num_audio_rows for reference in references)
@@ -2073,6 +2095,7 @@ class _NativeTrainingBackend:
                                 latent_height=reference.latent_height,
                                 latent_width=reference.latent_width,
                                 num_audio_latents=0,
+                                aligned_to_target=reference.aligned_to_target,
                             )
                         )
                         selected_video_rows.append(video_chunk)
@@ -2252,8 +2275,10 @@ class _NativeLatentEncoder:
         video_shapes: list[tuple[int, int, int]] = []
         audio_lengths: list[int] = []
         kinds: list[int] = []
+        aligned: list[bool] = []
         for reference in references:
             kinds.append(int(reference.kind))
+            aligned.append(bool(reference.aligned_to_target))
             if reference.kind is H3ReferenceKind.IMAGE:
                 if reference.image is None:
                     raise ValueError("H3 prepared image reference has no image")
@@ -2300,6 +2325,8 @@ class _NativeLatentEncoder:
                 torch.cat(audio_rows) if audio_rows else torch.empty((0, AUDIO_LATENT_CHANNELS), dtype=self.output_dtype)
             ),
         }
+        if any(aligned):
+            tensors[f"varlen_{H3_REFERENCE_ALIGNED_KEY}{suffix}_bool"] = torch.tensor(aligned, dtype=torch.bool)
         if any(reference.kind is H3ReferenceKind.VIDEO for reference in references):
             tensors[H3_REFERENCE_TEMPORAL_CONTRACT_KEY] = torch.tensor(H3_REFERENCE_TEMPORAL_CONTRACT_VERSION, dtype=torch.long)
         return tensors

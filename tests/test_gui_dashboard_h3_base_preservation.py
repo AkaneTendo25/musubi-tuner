@@ -1133,6 +1133,47 @@ def test_h3_dashboard_exports_source_modality_probabilities(tmp_path: Path) -> N
     _normalize_explicit_modality_config(document)
 
 
+def test_h3_dashboard_exports_and_validates_aligned_external_guides(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.dataset.datasets = [
+        DatasetEntry(
+            type="video",
+            directory="train",
+            target_frames=124,
+            source_image_directory="images",
+            source_video_directory="guides",
+            aligned_guide_indices="1",
+        )
+    ]
+
+    assert "dataset.datasets[0].aligned_guide_indices" not in validate_cache_latents_config(config)["field_errors"]
+    command = build_cache_latents_cmd(config)
+    document = tomllib.loads(Path(command[command.index("--dataset_config") + 1]).read_text(encoding="utf-8"))
+    assert document["datasets"][0]["aligned_guide_indices"] == [1]
+    _normalize_explicit_modality_config(document)
+
+    config.dataset.datasets = [DatasetEntry(type="video", jsonl_file="train.jsonl", target_frames=124, aligned_guide_indices="0")]
+    assert "dataset.datasets[0].aligned_guide_indices" not in validate_cache_latents_config(config)["field_errors"]
+    config.dataset.datasets[0].control_modality_probability_av = 1.0
+    config.dataset.datasets[0].control_modality_probability_video = 0.0
+    config.dataset.datasets[0].control_modality_probability_audio = 0.0
+    assert "dataset.datasets[0].aligned_guide_indices" in validate_cache_latents_config(config)["field_errors"]
+
+    config.dataset.datasets = [
+        DatasetEntry(
+            type="video",
+            directory="train",
+            target_frames=124,
+            source_video_directory="guides",
+            aligned_guide_indices="0",
+            control_modality_probability_av=1.0,
+        )
+    ]
+    config.dataset.datasets[0].control_modality_probability_video = 0.0
+    config.dataset.datasets[0].control_modality_probability_audio = 0.0
+    assert "dataset.datasets[0].aligned_guide_indices" in validate_cache_latents_config(config)["field_errors"]
+
+
 def test_h3_dashboard_rejects_removed_fixed_control_modality_fields(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.dataset.datasets = [DatasetEntry(type="video", directory="train", target_frames=124, control_modality="video")]

@@ -1,0 +1,24 @@
+# Paired external-guide training on the target video timeline.
+# Reference index 0 is an ordinary image reference; index 1 is the aligned
+# full-length external video. Cache text with --task ref2va and train with
+# --h3_training_mode ref2va.
+
+[general]
+resolution = [1344, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+target_video_directory = "/path/to/target_videos"
+target_modalities = ["video"]
+source_image_directory = "/path/to/reference_images"
+source_video_directory = "/path/to/aligned_guide_videos"
+source_modalities = ["image", "video"]
+aligned_guide_indices = [1]
+cache_directory = "/path/to/ref2va_aligned_guide_cache"
+source_fps = 24.0
+target_frames = [124]
+frame_extraction = "head"
+num_repeats = 1

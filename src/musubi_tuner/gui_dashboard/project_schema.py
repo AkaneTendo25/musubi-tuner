@@ -124,6 +124,8 @@ class DatasetEntry(BaseModel):
     source_audio_directory: str = ""
     source_video_audio_embedded: bool = False
     source_video_audio_paired: bool = False
+    # Comma-separated indices into the ordered source-reference bundle.
+    aligned_guide_indices: str = ""
     control_modality: Literal["", "av", "video", "audio"] = ""
     control_modalities: str = ""
     control_modality_probability_av: Optional[float] = None

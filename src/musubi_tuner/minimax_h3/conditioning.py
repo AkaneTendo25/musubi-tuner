@@ -16,6 +16,7 @@ from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLConfig, Qwen3
 from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_IDS,
     H3_CONDITIONING_TASK_KEY,
+    H3_ALIGNED_GUIDE_COUNT_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
@@ -702,7 +703,7 @@ class MiniMaxH3ConditioningEncoder:
         dtype_name = dtype_to_str(self.output_dtype)
         results = []
         for item in batch:
-            references = (
+            all_references = (
                 prepare_references(
                     item,
                     self.reference_image_short_edge,
@@ -715,8 +716,13 @@ class MiniMaxH3ConditioningEncoder:
                 if self.task in ("ref2va", "ref2va_omni")
                 else None
             )
-            if self.task == "ref2va" and not references:
+            if self.task == "ref2va" and not all_references:
                 raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
+            # Aligned external guides are DiT conditioning attached after prompt
+            # encoding. They must not also be presented through Qwen as ordinary
+            # visual references or the two paths would use different contracts.
+            aligned_guide_count = sum(reference.aligned_to_target for reference in all_references or ())
+            references = tuple(reference for reference in all_references or () if not reference.aligned_to_target)
             qwen_controls = prepare_qwen_controls(item, self.reference_video_fps)
             # EXPERIMENTAL per-step control dropout is a cache-side dual
             # presentation, mirroring the reference-modality variants: every
@@ -730,6 +736,8 @@ class MiniMaxH3ConditioningEncoder:
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
                 H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
+            if aligned_guide_count:
+                tensors[H3_ALIGNED_GUIDE_COUNT_KEY] = torch.tensor(aligned_guide_count, dtype=torch.long)
             if self.keyframe_visuals:
                 # The marker doubles as the cache identity: the tags alone cannot
                 # tell a keyframe span apart from a control span or a stale cache.
@@ -790,7 +798,7 @@ class MiniMaxH3ConditioningEncoder:
                 tensors[H3_REFERENCE_VIDEO_SHORT_EDGE_KEY] = torch.tensor(self.reference_video_short_edge, dtype=torch.long)
                 tensors[H3_REFERENCE_VIDEO_MAX_PIXELS_KEY] = torch.tensor(self.reference_video_max_pixels, dtype=torch.long)
                 tensors[H3_REFERENCE_VIDEO_FPS_KEY] = torch.tensor(float(self.reference_video_fps), dtype=torch.float64)
-                if references and any(reference.kind is H3ReferenceKind.VIDEO for reference in references):
+                if all_references and any(reference.kind is H3ReferenceKind.VIDEO for reference in all_references):
                     tensors[H3_REFERENCE_TEMPORAL_CONTRACT_KEY] = torch.tensor(
                         H3_REFERENCE_TEMPORAL_CONTRACT_VERSION, dtype=torch.long
                     )

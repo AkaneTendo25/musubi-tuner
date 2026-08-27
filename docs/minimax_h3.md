@@ -81,7 +81,7 @@ Each training objective has a fixed dataset, conditioning-cache, and transformer
 | First-frame image-to-video+audio | [`i2va.toml`](../examples/minimax_h3/i2va.toml): video source; first frame comes from the target | FL2VA | `i2va` | None |
 | First+last-frame-to-video+audio | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml): video source; keyframes come from the target | FL2VA | `fl2va` | None |
 | Last-frame image-to-video+audio | [`l2va.toml`](../examples/minimax_h3/l2va.toml): video source; last frame comes from the target | FL2VA | `l2va` | None |
-| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, [`ref2va_guides.toml`](../examples/minimax_h3/ref2va_guides.toml): references plus target-derived timeline guides, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; an audio target may carry references too; add `source_*_directory` fields, or per-record numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va`; add image guides with `--h3_keyframe_anchors` / `--h3_keyframe_random_count`, or AV spans with `--h3_guide_specs` |
+| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, [`ref2va_guides.toml`](../examples/minimax_h3/ref2va_guides.toml): target-derived timeline guides, [`ref2va_aligned_guide.toml`](../examples/minimax_h3/ref2va_aligned_guide.toml): external paired video guide, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; an audio target may carry references too | Ref2VA | `ref2va` | `--h3_training_mode ref2va`; use `source_*_directory`, optionally `aligned_guide_indices`, target-derived keyframes, or `--h3_guide_specs` |
 | Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): set `target_modalities` for the JSONL target; rows may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
 
 For observed-modality objectives, the option names the modality supplied as clean **conditioning**, not the prediction target:
@@ -360,6 +360,41 @@ this way runs off the base model's reference statistics and needs careful valida
 
 Both caches record which reference files produced them, so swapping, reordering, or editing a reference rebuilds that item under
 `--skip_existing`.
+
+### External aligned video guides
+
+To train a LoRA with an external video aligned to the target timeline, select one or more source-video references with
+`aligned_guide_indices`. The selected video is sampled on H3's 24-fps timeline, padded or cropped to the target duration,
+and resized to the target bucket before VAE encoding. Its latent rows are packed as clean video conditioning with sigma
+`0.999`; they are not included in the loss. The guide is omitted from the Qwen3-VL input, so it contributes only DiT-side
+video rows.
+
+```toml
+[[datasets]]
+target_video_directory = "/data/targets"
+target_modalities = ["video"]
+source_image_directory = "/data/reference_images" # reference index 0: ordinary Ref2VA reference
+source_video_directory = "/data/aligned_guides"   # reference index 1: aligned guide
+source_modalities = ["image", "video"]
+aligned_guide_indices = [1]
+cache_directory = "/data/cache"
+target_frames = [124]
+```
+
+For directory datasets, indices follow the packed source order: images, then videos, then audio; numbered basename matches
+retain their order within each modality. For JSONL datasets, indices follow `control_path_N` order. An aligned entry must
+select a visual-only video; its soundtrack is ignored. After VAE encoding, its `(frames, height, width)` latent geometry must
+equal the target latent geometry exactly. Re-cache both latents and text outputs after changing the list.
+`source_modality_probabilities` is incompatible with aligned guides because the latent and text cache presentations must carry
+the same aligned-guide count.
+
+Ordinary video references start at the current reference-media RoPE time and advance that clock. An aligned guide does not
+advance the reference clock. Instead, every guide latent at `(t, y, x)` receives the same three-dimensional position ID as the
+target latent at `(t, y, x)`. Token values, token tags, conditioning timesteps, and the attention graph are otherwise unchanged.
+Relative to packing the same video as an ordinary reference, this removes only the positional offset between the two streams;
+it does not add a loss term or expose additional target data. Measure its effect against an ordinary-reference run with the
+same data and training parameters. The equivalent inference layout is a full-length guide beginning at pixel frame zero:
+`--guide_video 0:/path/to/guide.mp4`.
 
 For modality dropout, provide probabilities in `[av, video, audio]` order:
 
@@ -1134,6 +1169,10 @@ latents rather than decoding and re-encoding a new subclip, a visual origin must
 (`0,1,5,9,...`); an audio span must start on its cached 40-Hz boundary, which occurs every three 24-fps pixel frames. The total span must fit the target. This option requires AV caches
 when its audio length is non-zero and currently applies to `ref2va` / `ref2va_omni`, not FL2VA.
 
+`--h3_guide_specs` extracts sparse video and/or audio spans from the cached target. `aligned_guide_indices` instead reads an
+external visual-only video, normalizes it to the complete target geometry, and assigns it the complete target position grid.
+Aligned external guides currently begin at target frame zero and cannot carry audio.
+
 **Masking.** Masks are drawn per step, so the occlusion distribution changes without re-caching. Masks combine with `t2va` and
 `ref2va`/`ref2va_omni` caches; `i2va`/`fl2va`/`l2va` caches reject observed rows. Under Ref2VA the observed rows are pinned
 inside the target block, the reference rows keep their own conditioning noise level, and neither is scored.
@@ -1192,7 +1231,6 @@ not add a complete H3 forward.
 | `--h3_guidance_cfg_zero` | CFG-Zero* rescale of the null branch before the guidance form is applied: per sample and per modality, `alpha = <conditional, null> / (‖null‖² + 1e-8)` projects the null field onto the conditional one, so a null branch orthogonal to the conditional field collapses instead of being extrapolated away from. |
 | `--h3_base_preservation_loss_weight 0.02` | Recommended starting value. Penalizes drift from the frozen base's prediction and anchors to whichever base is loaded, quantized or not. |
 | `--h3_base_preservation_probability 0.25` | Evaluate preservation on a synchronized random fraction of batches and scale active losses by `1 / probability`. `1` applies the objective every batch; `0.25`–`0.5` is a faster approximation whose rare scaled updates interact differently with clipping and adaptive optimizers. |
-| `--h3_validation_field_probe` | Reports `val/field`: how much of the checkpoint's prompted-to-empty guidance field the adapter still carries, as a fraction of the frozen base measured on the same held-out items at the same noise. `1.0` is untouched, `0` erased, and it is also reported per timestep bin, because the high-noise end decides composition and prompt following and is the first to go. The training loss falls whether or not the field survives, so nothing else in a run reveals this while it is still cheap to act on. Requires `--validation_dataset_config` and empty-text caches (`--cache_guidance_empty`); costs two no-grad forwards per validation item and bin, and two more on the first validation only, since the base's field is fixed. |
 | `--crepa` | Temporal representation alignment for video training. |
 
 Treat `--h3_base_preservation_loss_weight 0.02` as an initial value rather than a universal setting. Its effect depends on

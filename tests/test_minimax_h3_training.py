@@ -162,6 +162,31 @@ def test_ref2va_reference_cache_selects_matching_video_and_audio_variants():
     assert audio_video.shape == (1, 4) and audio_rows.shape == (4, 2)
 
 
+def test_ref2va_reference_cache_restores_optional_alignment_metadata():
+    from musubi_tuner.minimax_h3.cache import H3_REFERENCE_ALIGNED_KEY
+
+    backend = _NativeTrainingBackend(SimpleNamespace(), mode="ref2va")
+    batch = {
+        H3_REFERENCE_KINDS_KEY: [torch.tensor([1])],
+        H3_REFERENCE_VIDEO_SHAPES_KEY: [torch.tensor([[2, 2, 2]])],
+        H3_REFERENCE_AUDIO_LENGTHS_KEY: [torch.tensor([0])],
+        H3_REFERENCE_ALIGNED_KEY: [torch.tensor([True])],
+        H3_REFERENCE_VIDEO_ROWS_KEY: [torch.zeros(2, 4)],
+        H3_REFERENCE_AUDIO_ROWS_KEY: [torch.empty(0, 2)],
+    }
+
+    references, _, _ = backend._reference_cache(
+        batch,
+        patch_size=(1, 2, 2),
+        video_width=4,
+        audio_width=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert references[0].aligned_to_target is True
+
+
 class _CREPABlock(nn.Module):
     def __init__(self, scale: float):
         super().__init__()
@@ -1061,6 +1086,97 @@ def test_h3_ref2va_guides_follow_references_and_share_the_target_timeline():
         torch.full((4,), target_origin + 20.0 / 3.0, dtype=torch.float64),
     )
     torch.testing.assert_close(layout.position_ids[17:21, 0], layout.position_ids[7:11, 0])
+
+
+def test_h3_aligned_external_video_reuses_complete_target_rope_grid_without_advancing_clock():
+    ordinary = MiniMaxH3ReferenceGeometry(kind=0, num_latent_frames=1, latent_height=4, latent_width=4)
+    aligned = MiniMaxH3ReferenceGeometry(
+        kind=1,
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        aligned_to_target=True,
+    )
+    layout = build_ref2va_packed_sequence(
+        torch.ones(3, dtype=torch.long),
+        (ordinary, aligned),
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=1,
+        patch_size=(1, 2, 2),
+    )
+
+    # text[0:3], ordinary image[3:7], aligned video[7:15], target audio[15:17], target video[17:25].
+    torch.testing.assert_close(layout.position_ids[7:15], layout.position_ids[17:25])
+    assert float(layout.position_ids[17, 0]) == 4.0
+
+
+def test_h3_aligned_external_video_matches_full_length_inference_guide_layout():
+    text_tags = torch.ones(3, dtype=torch.long)
+    aligned = build_ref2va_packed_sequence(
+        text_tags,
+        (
+            MiniMaxH3ReferenceGeometry(
+                kind=1,
+                num_latent_frames=2,
+                latent_height=4,
+                latent_width=4,
+                aligned_to_target=True,
+            ),
+        ),
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=1,
+        patch_size=(1, 2, 2),
+    )
+    inference_guide = build_ref2va_packed_sequence(
+        text_tags,
+        (),
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=1,
+        patch_size=(1, 2, 2),
+        guides=(MiniMaxH3GuideGeometry(frame_index=0, num_video_latents=2),),
+    )
+
+    assert aligned.sequence_length == inference_guide.sequence_length
+    assert aligned.num_condition_video_rows == inference_guide.num_condition_video_rows
+    assert aligned.num_condition_audio_rows == inference_guide.num_condition_audio_rows
+    torch.testing.assert_close(aligned.position_ids, inference_guide.position_ids)
+    torch.testing.assert_close(aligned.token_tags, inference_guide.token_tags)
+    torch.testing.assert_close(aligned.video_indices, inference_guide.video_indices)
+    torch.testing.assert_close(aligned.audio_indices, inference_guide.audio_indices)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        MiniMaxH3ReferenceGeometry(kind=0, num_latent_frames=1, latent_height=4, latent_width=4, aligned_to_target=True),
+        MiniMaxH3ReferenceGeometry(kind=1, num_latent_frames=1, latent_height=4, latent_width=4, aligned_to_target=True),
+        MiniMaxH3ReferenceGeometry(
+            kind=1,
+            num_latent_frames=2,
+            latent_height=4,
+            latent_width=4,
+            num_audio_latents=1,
+            aligned_to_target=True,
+        ),
+    ],
+)
+def test_h3_aligned_external_video_rejects_nonvideo_mismatched_or_audio_geometry(reference):
+    with pytest.raises(ValueError, match="aligned|only H3 video"):
+        build_ref2va_packed_sequence(
+            torch.ones(3, dtype=torch.long),
+            (reference,),
+            num_latent_frames=2,
+            latent_height=4,
+            latent_width=4,
+            num_audio_latents=1,
+            patch_size=(1, 2, 2),
+        )
 
 
 def test_h3_ref2va_video_audio_guide_spans_share_one_pixel_frame_origin():

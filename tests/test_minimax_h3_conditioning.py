@@ -9,12 +9,15 @@ from musubi_tuner.cache_text_encoder_outputs import process_text_encoder_batches
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3 import conditioning as h3_conditioning
 from musubi_tuner.minimax_h3.cache import (
+    H3_ALIGNED_GUIDE_COUNT_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
+    H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
+    H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -341,6 +344,29 @@ def test_ref2va_video_conditioning_records_reference_temporal_contract(monkeypat
     cached = encoder.encode_conditioning([item])[0]
 
     assert int(cached["mmh3_reference_temporal_contract"]) == 1
+
+
+def test_aligned_external_guide_is_cached_but_not_presented_to_qwen(monkeypatch):
+    encoder = MiniMaxH3ConditioningEncoder(_RefProcessor(), _TextModel(), torch.bfloat16, "ref2va")
+    ordinary = H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (4, 4)))
+    guide = H3PreparedReference(
+        kind=H3ReferenceKind.VIDEO,
+        frames=np.zeros((5, 4, 4, 3), dtype=np.uint8),
+        aligned_to_target=True,
+    )
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_references", lambda *_args, **_kwargs: (ordinary, guide))
+    observed = {}
+
+    def encode(_caption, _images=(), references=(), **_kwargs):
+        observed["references"] = references
+        return torch.zeros(2, 5120, dtype=torch.bfloat16), torch.ones(2, dtype=torch.long)
+
+    monkeypatch.setattr(encoder, "_encode_prompt", encode)
+    cached = encoder.encode_conditioning([SimpleNamespace(caption="prompt")])[0]
+
+    assert observed["references"] == (ordinary,)
+    assert int(cached[H3_ALIGNED_GUIDE_COUNT_KEY]) == 1
+    assert int(cached[H3_REFERENCE_TEMPORAL_CONTRACT_KEY]) == H3_REFERENCE_TEMPORAL_CONTRACT_VERSION
 
 
 def test_content_conditioning_populates_video_text_cache_path(tmp_path):

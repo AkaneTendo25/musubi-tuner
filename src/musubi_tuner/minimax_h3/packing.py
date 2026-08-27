@@ -57,6 +57,7 @@ class MiniMaxH3ReferenceGeometry:
     latent_height: int = 0
     latent_width: int = 0
     num_audio_latents: int = 0
+    aligned_to_target: bool = False
 
     def num_video_rows(self, patch_size: tuple[int, int, int]) -> int:
         if self.kind == 2:
@@ -397,6 +398,17 @@ def build_ref2va_packed_sequence(
             raise ValueError(f"invalid H3 visual reference geometry: {reference}")
         if reference.num_audio_latents < 0:
             raise ValueError(f"invalid H3 audio reference geometry: {reference}")
+        if reference.aligned_to_target:
+            if reference.kind != 1:
+                raise ValueError("only H3 video references can be aligned to the target timeline")
+            if num_latent_frames <= 0:
+                raise ValueError("aligned H3 video references require a video target")
+            if reference.num_audio_latents:
+                raise ValueError("aligned H3 video references must be visual-only")
+            expected = (num_latent_frames, latent_height, latent_width)
+            observed = (reference.num_latent_frames, reference.latent_height, reference.latent_width)
+            if observed != expected:
+                raise ValueError(f"aligned H3 video reference geometry {observed} must match target geometry {expected}")
     density_scale = _validated_density_scale(spatial_density_scale)
     if (keyframe_anchors or guides) and num_latent_frames == 0:
         raise ValueError("H3 keyframe conditioning requires a video target")
@@ -481,6 +493,17 @@ def build_ref2va_packed_sequence(
     cursor = num_text_rows
     rotary_time = float(num_text_rows)
     for reference in references:
+        if reference.aligned_to_target:
+            continue
+        if reference.kind == 0:
+            rotary_time += 1.0
+        elif reference.kind == 2:
+            rotary_time += float(reference.num_audio_latents)
+        else:
+            rotary_time += max(float(reference.num_audio_latents), _temporal_position_span(reference.num_latent_frames))
+    target_time = rotary_time
+    rotary_time = float(num_text_rows)
+    for reference in references:
         if reference.kind == 0:
             rows = slice(cursor, cursor + reference.num_video_rows(patch_size))
             cursor = rows.stop
@@ -520,22 +543,14 @@ def build_ref2va_packed_sequence(
                 patch_w,
                 density_scale,
             )
-            _fill_audio_positions(
-                position_ids,
-                audio_rows,
-                reference.num_audio_latents,
-                rotary_time,
-                width_grid,
-            )
-            frame_time = _temporal_position_grid(reference.num_latent_frames, rotary_time)
+            _fill_audio_positions(position_ids, audio_rows, reference.num_audio_latents, rotary_time, width_grid)
+            reference_time = target_time if reference.aligned_to_target else rotary_time
+            frame_time = _temporal_position_grid(reference.num_latent_frames, reference_time)
             position_ids[video_rows, 0] = frame_time.repeat_interleave(frame_grid.shape[0])
             position_ids[video_rows, 1:] = frame_grid.repeat(reference.num_latent_frames, 1)
-            rotary_time += max(
-                float(reference.num_audio_latents),
-                _temporal_position_span(reference.num_latent_frames),
-            )
+            if not reference.aligned_to_target:
+                rotary_time += max(float(reference.num_audio_latents), _temporal_position_span(reference.num_latent_frames))
 
-    target_time = rotary_time
     target_frame_time = _temporal_position_grid(num_latent_frames, target_time)
     for guide in all_guides:
         anchor_time = target_time + _ROPE_FRAME_RESCALE * guide.frame_index

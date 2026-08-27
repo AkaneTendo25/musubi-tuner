@@ -58,6 +58,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_KEYFRAME_VIDEO_ROWS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
+    H3_REFERENCE_ALIGNED_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
@@ -1417,6 +1418,42 @@ def test_h3_toml_paired_reference_directories_select_modality(tmp_path, mode, ex
     assert not hasattr(group.datasets[0], "control_video_directory")
 
 
+def test_h3_toml_marks_only_selected_external_video_reference_as_target_aligned(tmp_path):
+    targets = tmp_path / "targets"
+    images = tmp_path / "images"
+    videos = tmp_path / "videos"
+    for directory in (targets, images, videos):
+        directory.mkdir()
+    target = targets / "scene.mp4"
+    target.write_bytes(b"target")
+    (images / "scene.png").write_bytes(b"image")
+    (videos / "scene.mp4").write_bytes(b"guide")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "target_video_directory": str(targets),
+                "target_modalities": ["video"],
+                "source_image_directory": str(images),
+                "source_video_directory": str(videos),
+                "source_modalities": ["image", "video"],
+                "aligned_guide_indices": [1],
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    adapter = h3_dataset.H3DatasetAdapter(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512, 22), frame_count=22)
+    references = adapter.attach(item)[1:]
+
+    assert "aligned_to_target" not in references[0].metadata
+    assert references[1].metadata["aligned_to_target"] is True
+    assert references[1].metadata["include_audio"] is False
+    assert "aligned_guide_indices" not in adapter.musubi_config["datasets"][0]
+
+
 def test_h3_toml_explicit_source_modalities_apply_per_reference(tmp_path):
     videos = tmp_path / "videos"
     image_refs = tmp_path / "image_refs"
@@ -1930,6 +1967,24 @@ def test_h3_reference_video_is_trimmed_before_text_and_paired_audio_preparation(
 
     assert reference.frames.shape[0] == 22
     assert audio_frame_counts == [22]
+
+
+def test_h3_aligned_reference_video_matches_target_frames_and_canvas(monkeypatch):
+    asset = MediaAsset(
+        Path("guide.mp4"),
+        MediaModality.VIDEO,
+        "reference",
+        metadata={"aligned_to_target": True, "include_audio": False},
+    )
+    item = SimpleNamespace(h3_media_assets=(asset,), frame_count=22, bucket_size=(96, 64))
+    source = np.zeros((10, 20, 30, 3), dtype=np.uint8)
+    monkeypatch.setattr(h3_references, "_decode_video", lambda _path: (source, 24.0))
+
+    (reference,) = h3_references.prepare_references(item)
+
+    assert reference.aligned_to_target is True
+    assert reference.frames.shape == (22, 64, 96, 3)
+    assert reference.waveform is None
 
 
 @pytest.mark.parametrize("source_fps", [12.0, 24.0, 25.0, 30.0, 60.0])
@@ -2767,6 +2822,7 @@ def test_h3_reference_video_latents_record_temporal_contract(monkeypatch):
     cached = encoder._encode_references(SimpleNamespace())
 
     assert int(cached[H3_REFERENCE_TEMPORAL_CONTRACT_KEY]) == H3_REFERENCE_TEMPORAL_CONTRACT_VERSION
+    assert not any(H3_REFERENCE_ALIGNED_KEY in key for key in cached)
 
 
 def test_native_cache_io_accepts_one_frame_image_without_audio(tmp_path):

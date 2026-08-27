@@ -280,6 +280,42 @@ def _validate_h3_dataset_entry(
         entry.control_modality_probability_audio,
     )
     numeric_probabilities = None
+    aligned_guide_values = [part.strip() for part in entry.aligned_guide_indices.replace(";", ",").split(",") if part.strip()]
+    aligned_guide_indices = None
+    if aligned_guide_values:
+        try:
+            aligned_guide_indices = tuple(int(value) for value in aligned_guide_values)
+        except ValueError:
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.aligned_guide_indices",
+                    f"{label}: aligned guide indices must be comma-separated integers.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+        else:
+            if any(value < 0 for value in aligned_guide_indices) or len(set(aligned_guide_indices)) != len(aligned_guide_indices):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"{field_base}.aligned_guide_indices",
+                        f"{label}: aligned guide indices must be unique and non-negative.",
+                        label=label,
+                        page="dataset",
+                    )
+                )
+            if "video" not in source_modalities and not _has_text(entry.jsonl_file):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"{field_base}.aligned_guide_indices",
+                        f"{label}: aligned guides require a source video directory or JSONL video reference.",
+                        label=label,
+                        page="dataset",
+                    )
+                )
     if any(value is not None for value in probabilities):
         if any(value is None for value in probabilities):
             errors.append(
@@ -316,6 +352,16 @@ def _validate_h3_dataset_entry(
                     page="dataset",
                 )
             )
+    if numeric_probabilities is not None and aligned_guide_indices:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.aligned_guide_indices",
+                f"{label}: aligned guides cannot be combined with stochastic source-modality probabilities.",
+                label=label,
+                page="dataset",
+            )
+        )
     if numeric_probabilities is not None and source_modalities:
         has_visual_source = bool(source_modalities.intersection({"image", "video"}))
         has_audio_source = bool(source_modalities.intersection({"image", "audio"})) or entry.source_video_audio_embedded
