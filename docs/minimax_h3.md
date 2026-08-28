@@ -459,7 +459,14 @@ baseline before relying on the recipe.
 To restrict video or image loss to selected regions, set `loss_mask_directory` to a directory of masks with matching target
 basenames, or set `default_loss_mask_path` as a fallback. A JSONL item may override either with `loss_mask_path` (the alias
 `video_loss_mask_path` is also accepted). A mask may be a still image, video, or frame directory; still images repeat across the
-clip and shorter mask sequences repeat their last frame. White pixels contribute to loss and black pixels do not.
+clip and shorter mask sequences repeat their last frame. White pixels contribute at full strength, black pixels do not,
+and grayscale values provide continuous weights between 0 and 1. The weighted loss is normalized by the sum of mask
+weights, so softening a mask changes the spatial emphasis without also changing the effective learning rate.
+During latent caching, `--h3_loss_mask_pooling max|average|nearest` controls how pixel weights are reduced to the H3 latent
+grid. `max` preserves small selected regions, `average` preserves their fractional coverage, and `nearest` samples without
+mixing neighboring values. Training defaults to `--h3_loss_mask_normalization weighted`; select `full` to divide by the full
+latent element count so reducing mask coverage also proportionally reduces total gradient strength. Changing the pooling
+mode invalidates matching masked latent caches automatically.
 Mask images with alpha use that channel automatically; `loss_mask_use_alpha = true` instead uses a target image's alpha when no
 external mask is available. `loss_mask_invert = true` reverses the mask. Masks are aligned
 with the target crop during caching and pooled over H3's 5/17-frame latent windows.

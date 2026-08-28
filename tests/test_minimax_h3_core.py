@@ -3185,7 +3185,7 @@ def test_native_latent_encoder_pools_pixel_loss_masks_to_h3_latent_windows():
             return torch.zeros(1, 24, 1, 2, 2)
 
     mask = np.zeros((39, 32, 32), dtype=np.uint8)
-    mask[0, 0, 0] = 255
+    mask[0, 0, 0] = 128
     mask[5, -1, -1] = 255
     mask[22, 16, 16] = 255
     item = SimpleNamespace(
@@ -3201,11 +3201,25 @@ def test_native_latent_encoder_pools_pixel_loss_masks_to_h3_latent_windows():
     (tensors,) = encoder.encode_latents([item])
 
     cached = tensors["video_loss_mask"]
-    assert cached.shape == (12, 2, 2) and cached.dtype == torch.bool
-    assert cached[0, 0, 0]
+    assert cached.shape == (12, 2, 2) and cached.dtype == torch.float32
+    torch.testing.assert_close(cached[0, 0, 0], torch.tensor(128 / 255))
     assert cached[2:7, 1, 1].any()
     assert cached[7:].any()
-    assert int(cached.sum()) == 3
+    torch.testing.assert_close(cached.sum(), torch.tensor(2 + 128 / 255))
+
+
+def test_native_latent_encoder_supports_configurable_soft_mask_pooling():
+    mask = np.zeros((1, 4, 4), dtype=np.uint8)
+    mask[0, 1, 1] = 255
+    item = SimpleNamespace(loss_mask_content=mask)
+
+    maximum = h3_integration._NativeLatentEncoder(None, None, torch.float32, loss_mask_pooling="max")
+    average = h3_integration._NativeLatentEncoder(None, None, torch.float32, loss_mask_pooling="average")
+    nearest = h3_integration._NativeLatentEncoder(None, None, torch.float32, loss_mask_pooling="nearest")
+
+    torch.testing.assert_close(maximum._video_loss_mask(item, (1, 2, 2)), torch.tensor([[[1.0, 0.0], [0.0, 0.0]]]))
+    torch.testing.assert_close(average._video_loss_mask(item, (1, 2, 2)), torch.tensor([[[0.25, 0.0], [0.0, 0.0]]]))
+    torch.testing.assert_close(nearest._video_loss_mask(item, (1, 2, 2)), torch.tensor([[[1.0, 0.0], [0.0, 0.0]]]))
 
 
 def test_h3_training_uses_crop_specific_text_cache_identity(tmp_path):

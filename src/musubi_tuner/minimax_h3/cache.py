@@ -304,8 +304,14 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
     if target_mode == "audio" and (geometry is None or geometry.dtype is not torch.long or geometry.shape != (2,)):
         raise ValueError(f"H3 audio-only cache requires int64 {H3_VIDEO_GEOMETRY_KEY} with shape [2]")
     video_mask = cache_tensors.get("video_loss_mask")
-    if video_mask is not None and (video is None or video_mask.dtype is not torch.bool or video_mask.shape != video.shape[-3:]):
-        raise ValueError(f"H3 video_loss_mask must be bool with shape {tuple(video.shape[-3:])}")
+    if video_mask is not None:
+        valid_dtype = video_mask.dtype is torch.bool or video_mask.is_floating_point()
+        if video is None or not valid_dtype or video_mask.shape != video.shape[-3:]:
+            raise ValueError(f"H3 video_loss_mask must be bool or floating point with shape {tuple(video.shape[-3:])}")
+        if video_mask.is_floating_point() and (
+            not bool(torch.isfinite(video_mask).all()) or bool((video_mask < 0).any()) or bool((video_mask > 1).any())
+        ):
+            raise ValueError("H3 floating-point video_loss_mask values must be finite and lie in [0, 1]")
     save_latent_cache_common(item_info, cache_tensors, ARCHITECTURE_MINIMAX_H3_FULL)
 
 

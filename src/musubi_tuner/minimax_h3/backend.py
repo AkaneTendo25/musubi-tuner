@@ -125,12 +125,14 @@ def create_latent_encoder(
     reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     reference_video_fps: float = REFERENCE_VIDEO_FPS,
+    loss_mask_pooling: str = "max",
 ) -> H3LatentEncoder:
     """Load the video VAE and, for video datasets, the audio VAE used by latent caching."""
     _validate_dtype(dtype)
     validate_reference_image_short_edge(reference_image_short_edge)
     from musubi_tuner.minimax_h3.integration import create_latent_encoder as create_integrated_latent_encoder
 
+    pooling_kwargs = {} if loss_mask_pooling == "max" else {"loss_mask_pooling": loss_mask_pooling}
     return create_integrated_latent_encoder(
         video_vae=video_vae,
         audio_vae=audio_vae,
@@ -140,6 +142,7 @@ def create_latent_encoder(
         **_reference_sizing_kwargs(reference_image_size_mode, reference_image_max_pixels),
         **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
         **_reference_video_fps_kwargs(reference_video_fps),
+        **pooling_kwargs,
     )
 
 

@@ -321,7 +321,8 @@ def contrastive_guidance_target(
 def _broadcast_mask(mask: torch.Tensor | None, target: torch.Tensor) -> torch.Tensor:
     if mask is None:
         return torch.ones_like(target, dtype=torch.bool)
-    mask = mask.to(device=target.device, dtype=torch.bool)
+    dtype = torch.float32 if mask.is_floating_point() else torch.bool
+    mask = mask.to(device=target.device, dtype=dtype)
     if mask.shape == target.shape:
         return mask
     if mask.ndim < 2 or mask.shape[0] != target.shape[0] or mask.shape[1:] != target.shape[-(mask.ndim - 1) :]:
@@ -348,6 +349,7 @@ def _modality_loss(
     target: torch.Tensor,
     mask: torch.Tensor | None,
     sample_weight: torch.Tensor | None,
+    mask_normalization: str = "weighted",
 ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | float]:
     """Return ``(mean, weighted sum, valid element count, mean denominator)``.
 
@@ -361,21 +363,28 @@ def _modality_loss(
     """
     if prediction.shape != target.shape:
         raise ValueError(f"H3 prediction shape {tuple(prediction.shape)} does not match target {tuple(target.shape)}")
-    valid = None if mask is None else _broadcast_mask(mask, target)
-    if valid is None:
+    mask_weights = None if mask is None else _broadcast_mask(mask, target)
+    if mask_weights is None:
         per_item_valid = None
         elements = target.numel()
     else:
         # One reduction serves both the count and the per-item weight sum, so
         # masked steps keep the single host round-trip they already paid.
-        per_item_valid = valid.sum(dim=tuple(range(1, valid.ndim)))
-        elements = int(per_item_valid.sum().item())
+        positive = mask_weights > 0
+        per_item_valid = mask_weights.to(dtype=torch.float32).sum(dim=tuple(range(1, mask_weights.ndim)))
+        elements = int(positive.sum().item())
     if elements == 0:
         zero = prediction.sum() * 0.0
         return zero, zero, 0, 0.0
 
     squared = (prediction - target).float().square()
-    denominator: torch.Tensor | float = float(elements)
+    if mask_normalization not in {"weighted", "full"}:
+        raise ValueError(f"unsupported H3 loss mask normalization: {mask_normalization}")
+    denominator: torch.Tensor | float = (
+        float(target.numel())
+        if mask_normalization == "full"
+        else (float(elements) if mask_weights is None else per_item_valid.sum())
+    )
     if sample_weight is not None:
         if sample_weight.shape != (target.shape[0],):
             raise ValueError("H3 sample weighting must contain one value per batch item")
@@ -383,14 +392,14 @@ def _modality_loss(
         squared = squared * _expand_batch_values(weights, squared)
         # Kept as a device tensor: every consumer is tensor arithmetic, so no
         # extra synchronization is introduced by the weighted denominator.
-        if per_item_valid is None:
+        if per_item_valid is None or mask_normalization == "full":
             denominator = weights.sum() * float(target.numel() // target.shape[0])
         else:
             denominator = (per_item_valid.to(dtype=torch.float32) * weights).sum()
     # Avoid ``masked_select`` here: its data-dependent output allocates a second
     # dense loss buffer and introduces an additional synchronization point.
     # Multiplication preserves the exact masked sum while keeping a static shape.
-    total = squared.sum() if valid is None else (squared * valid).sum()
+    total = squared.sum() if mask_weights is None else (squared * mask_weights).sum()
     return _safe_divide(total, denominator), total, elements, denominator
 
 
@@ -406,6 +415,7 @@ def _joint_loss(
     balance: LossBalance = "token",
     video_weight: float = 1.0,
     audio_weight: float = 1.0,
+    mask_normalization: str = "weighted",
 ) -> H3JointLoss:
     if balance not in {"token", "modality"}:
         raise ValueError(f"unsupported H3 loss balance: {balance}")
@@ -429,16 +439,18 @@ def _joint_loss(
             raise ValueError("H3 video prediction and target presence differ")
         video_mean, video_total, video_elements, video_denominator = zero, zero, 0, 0.0
     else:
-        video_mean, video_total, video_elements, video_denominator = _modality_loss(
-            prediction.video, target.video, video_mask, video_sample_weight
+        loss_args = (prediction.video, target.video, video_mask, video_sample_weight)
+        video_mean, video_total, video_elements, video_denominator = (
+            _modality_loss(*loss_args) if mask_normalization == "weighted" else _modality_loss(*loss_args, mask_normalization)
         )
     if prediction.audio is None or target.audio is None or audio_weight == 0:
         if (prediction.audio is None) != (target.audio is None):
             raise ValueError("H3 audio prediction and target presence differ")
         audio_mean, audio_total, audio_elements, audio_denominator = zero, zero, 0, 0.0
     else:
-        audio_mean, audio_total, audio_elements, audio_denominator = _modality_loss(
-            prediction.audio, target.audio, audio_mask, audio_sample_weight
+        loss_args = (prediction.audio, target.audio, audio_mask, audio_sample_weight)
+        audio_mean, audio_total, audio_elements, audio_denominator = (
+            _modality_loss(*loss_args) if mask_normalization == "weighted" else _modality_loss(*loss_args, mask_normalization)
         )
 
     active_video_weight = video_weight if video_elements else 0.0
@@ -470,6 +482,7 @@ def joint_velocity_loss(
     balance: LossBalance = "token",
     video_weight: float = 1.0,
     audio_weight: float = 1.0,
+    mask_normalization: str = "weighted",
 ) -> H3JointLoss:
     """Reduce video and audio velocity errors with explicit modality balancing."""
     return _joint_loss(
@@ -483,6 +496,7 @@ def joint_velocity_loss(
         balance=balance,
         video_weight=video_weight,
         audio_weight=audio_weight,
+        mask_normalization=mask_normalization,
     )
 
 
@@ -498,6 +512,7 @@ def joint_prediction_loss(
     balance: LossBalance = "token",
     video_weight: float = 1.0,
     audio_weight: float = 1.0,
+    mask_normalization: str = "weighted",
 ) -> H3JointLoss:
     """Measure drift from a detached base-model prediction.
 
@@ -519,4 +534,5 @@ def joint_prediction_loss(
         balance=balance,
         video_weight=video_weight,
         audio_weight=audio_weight,
+        mask_normalization=mask_normalization,
     )

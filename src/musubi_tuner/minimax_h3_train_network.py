@@ -2371,7 +2371,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         keep = generated.to(device=target.device).view(shape).expand_as(target)
         if mask is None:
             return keep
-        return keep & mask.to(device=target.device, dtype=torch.bool)
+        mask = mask.to(device=target.device)
+        return torch.where(keep, mask, torch.zeros((), device=mask.device, dtype=mask.dtype))
 
     @staticmethod
     def _clean_context(noisy, target, sigma, context_length: int, *, axis: int):
@@ -2406,7 +2407,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         keep = keep.view(shape).expand_as(target)
         if mask is None:
             return keep
-        return keep & mask.to(device=target.device, dtype=torch.bool)
+        mask = mask.to(device=target.device)
+        return torch.where(keep, mask, torch.zeros((), device=mask.device, dtype=mask.dtype))
 
     def _sample_weight(self, args: argparse.Namespace, sigma: torch.Tensor) -> torch.Tensor | None:
         if args.weighting_scheme == "sigma_sqrt":
@@ -3158,6 +3160,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video_sample_weight=self._sample_weight(args, inputs.video_sigma) if has_video else None,
                 audio_sample_weight=self._sample_weight(args, inputs.audio_sigma) if has_audio else None,
                 balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
                 video_weight=0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight,
                 audio_weight=0.0 if observed == "audio" else args.h3_audio_loss_weight,
             )
@@ -3221,6 +3224,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video_sample_weight=video_sample_weight,
                 audio_sample_weight=audio_sample_weight,
                 balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
                 # The observed modality is conditioning, not a target.
                 video_weight=video_weight,
                 audio_weight=audio_weight,
@@ -3287,6 +3291,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video_sample_weight=video_sample_weight,
                 audio_sample_weight=audio_sample_weight,
                 balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
                 video_weight=video_weight,
                 audio_weight=audio_weight,
             )
@@ -3341,6 +3346,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_lora_targets": str(args.h3_lora_targets or "default"),
             "ss_h3_audio_only_spatial_tokens": str(args.h3_audio_only_spatial_tokens),
             "ss_h3_loss_balance": args.h3_loss_balance,
+            "ss_h3_loss_mask_normalization": args.h3_loss_mask_normalization,
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
             "ss_h3_guide_specs": str(getattr(args, "h3_guide_specs", "") or "none"),
@@ -3481,6 +3487,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=("token", "modality"),
         default="modality",
         help="combine joint AV loss over all valid latent elements or equally by modality means",
+    )
+    parser.add_argument(
+        "--h3_loss_mask_normalization",
+        choices=("weighted", "full"),
+        default="weighted",
+        help=(
+            "soft-mask reduction: weighted divides by the sum of mask weights to keep loss scale stable; "
+            "full divides by every latent element so lower coverage also lowers total gradient strength"
+        ),
     )
     parser.add_argument("--h3_video_loss_weight", type=float, default=1.0)
     parser.add_argument("--h3_audio_loss_weight", type=float, default=1.0)

@@ -200,6 +200,7 @@ def create_latent_encoder(
     reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     reference_video_fps: float = REFERENCE_VIDEO_FPS,
+    loss_mask_pooling: str = "max",
 ):
     """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
@@ -216,6 +217,7 @@ def create_latent_encoder(
         reference_video_short_edge,
         reference_video_max_pixels,
         reference_video_fps,
+        loss_mask_pooling=loss_mask_pooling,
     )
 
 
@@ -2156,6 +2158,7 @@ class _NativeLatentEncoder:
         reference_video_short_edge: int = REFERENCE_VIDEO_SHORT_EDGE,
         reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
         reference_video_fps: float = REFERENCE_VIDEO_FPS,
+        loss_mask_pooling: str = "max",
     ) -> None:
         self.video_encoder = video_encoder
         self.audio_encoder = audio_encoder
@@ -2166,6 +2169,9 @@ class _NativeLatentEncoder:
         self.reference_video_short_edge = reference_video_short_edge
         self.reference_video_max_pixels = reference_video_max_pixels
         self.reference_video_fps = reference_video_fps
+        if loss_mask_pooling not in {"max", "average", "nearest"}:
+            raise ValueError(f"unsupported H3 loss mask pooling: {loss_mask_pooling}")
+        self.loss_mask_pooling = loss_mask_pooling
 
     @staticmethod
     def _target_asset(item: Any):
@@ -2199,8 +2205,7 @@ class _NativeLatentEncoder:
             encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
             return encode(pixels)[0].to(self.output_dtype)
 
-    @staticmethod
-    def _video_loss_mask(item: Any, latent_shape: tuple[int, int, int]) -> torch.Tensor | None:
+    def _video_loss_mask(self, item: Any, latent_shape: tuple[int, int, int]) -> torch.Tensor | None:
         content = getattr(item, "loss_mask_content", None)
         if content is None:
             return None
@@ -2230,13 +2235,19 @@ class _NativeLatentEncoder:
         for start, end, output_frames in chunks:
             if end <= start:
                 raise ValueError("H3 loss mask contains no frames")
-            spatial = F.adaptive_max_pool2d(mask[start:end, None], (latent_height, latent_width))
-            temporal = F.adaptive_max_pool1d(
-                spatial[:, 0].permute(1, 2, 0).reshape(1, latent_height * latent_width, end - start),
-                output_frames,
-            )
-            pooled.append(temporal.reshape(latent_height, latent_width, output_frames).permute(2, 0, 1))
-        return torch.cat(pooled).to(dtype=torch.bool)
+            source = mask[start:end][None, None]
+            size = (output_frames, latent_height, latent_width)
+            if self.loss_mask_pooling == "nearest":
+                reduced = F.interpolate(source, size=size, mode="nearest-exact")
+            elif self.loss_mask_pooling == "average":
+                reduced = F.adaptive_avg_pool3d(source, size)
+            else:
+                reduced = F.adaptive_max_pool3d(source, size)
+            pooled.append(reduced[0, 0])
+        # Keep authored grayscale values as continuous loss weights.  Binary
+        # masks remain exactly 0/1, while grey pixels can softly suppress a
+        # region without turning every non-zero value into full-strength loss.
+        return torch.cat(pooled).clamp_(0.0, 1.0).to(dtype=torch.float32)
 
     def _encode_reference_video(self, content: np.ndarray, *, image: bool) -> torch.Tensor:
         if self.video_encoder is None:

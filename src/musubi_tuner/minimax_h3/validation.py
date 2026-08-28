@@ -63,29 +63,31 @@ def masked_squared_error_sum(
     if prediction.shape != target.shape:
         raise ValueError("H3 validation prediction and target shapes differ")
     if mask is None:
-        valid = torch.ones_like(target, dtype=torch.bool)
+        mask_weights = torch.ones_like(target, dtype=torch.bool)
     else:
-        mask = mask.to(device=target.device, dtype=torch.bool)
+        dtype = torch.float32 if mask.is_floating_point() else torch.bool
+        mask = mask.to(device=target.device, dtype=dtype)
         if mask.shape == target.shape:
-            valid = mask
+            mask_weights = mask
         else:
             if mask.ndim < 2 or mask.shape[0] != target.shape[0] or mask.shape[1:] != target.shape[-(mask.ndim - 1) :]:
                 raise ValueError(f"H3 validation mask shape {tuple(mask.shape)} cannot broadcast to {tuple(target.shape)}")
             shape = (mask.shape[0], *([1] * (target.ndim - mask.ndim)), *mask.shape[1:])
-            valid = mask.view(shape).expand_as(target)
+            mask_weights = mask.view(shape).expand_as(target)
+    valid = mask_weights > 0
     count = int(valid.sum().item())
     if count == 0:
         return prediction.new_zeros((), dtype=torch.float32), 0.0
     squared = (prediction - target).float().square()
-    denominator = float(count)
+    denominator = float(mask_weights.float().sum().item())
     if sample_weight is not None:
         if sample_weight.shape != (target.shape[0],):
             raise ValueError("H3 validation sample weighting must contain one value per batch item")
         weight_shape = (target.shape[0], *([1] * (target.ndim - 1)))
         weights = sample_weight.to(device=squared.device, dtype=torch.float32).view(weight_shape)
         squared = squared * weights
-        denominator = float((valid * weights).sum().item())
-    return squared.masked_select(valid).sum(), denominator
+        denominator = float((mask_weights * weights).sum().item())
+    return (squared * mask_weights).sum(), denominator
 
 
 @dataclass(frozen=True)

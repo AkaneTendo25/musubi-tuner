@@ -31,6 +31,8 @@ from musubi_tuner.minimax_h3.references import (
 )
 
 logger = logging.getLogger(__name__)
+H3_LOSS_MASK_POOLING_KEY = "loss_mask_pooling_mode"
+H3_LOSS_MASK_POOLING_CODES = {"max": 0, "average": 1, "nearest": 2}
 
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -39,6 +41,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--audio_vae",
         type=Path,
         help="H3 audio VAE checkpoint or Comfy model directory (required whenever a target or reference includes audio)",
+    )
+    parser.add_argument(
+        "--h3_loss_mask_pooling",
+        choices=("max", "average", "nearest"),
+        default="max",
+        help="reduce pixel masks to H3 latents with conservative max, smooth average, or nearest sampling",
     )
     parser.add_argument(
         "--reference_image_size_mode",
@@ -127,12 +135,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         reference_video_short_edge=args.reference_video_short_edge,
         reference_video_max_pixels=args.reference_video_max_pixels,
         reference_video_fps=args.reference_video_fps,
+        loss_mask_pooling=args.h3_loss_mask_pooling,
     )
 
     def encode(batch: list[ItemInfo]) -> None:
         attach_h3_media(batch, dataset_adapter)
         results = normalize_batch_tensors(encoder.encode_latents(batch), len(batch), "latent encoder")
         for item, tensors in zip(batch, results):
+            if "video_loss_mask" in tensors:
+                tensors[f"{H3_LOSS_MASK_POOLING_KEY}_int64"] = torch.tensor(
+                    H3_LOSS_MASK_POOLING_CODES[args.h3_loss_mask_pooling], dtype=torch.long
+                )
             save_latent_cache_minimax_h3(item, tensors)
 
     def existing_cache_valid(item: ItemInfo, path: str) -> bool:
@@ -143,6 +156,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         if target_audio_fingerprint is not None and not cache_matches_fingerprint(
             path, target_audio_fingerprint, TARGET_AUDIO_FINGERPRINT_KEY
         ):
+            return False
+        try:
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                keys = set(handle.keys())
+                if "video_loss_mask" in keys:
+                    key = f"{H3_LOSS_MASK_POOLING_KEY}_int64"
+                    if key not in keys or int(handle.get_tensor(key)) != H3_LOSS_MASK_POOLING_CODES[args.h3_loss_mask_pooling]:
+                        return False
+        except (OSError, RuntimeError, ValueError):
             return False
         if not reference_assets(item):
             return True

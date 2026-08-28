@@ -2214,6 +2214,31 @@ def test_joint_loss_mask_preserves_reference_gradient():
     torch.testing.assert_close(prediction.grad, torch.tensor([[[[[1.0, 0.0, 3.0, 0.0]]]]]))
 
 
+def test_joint_loss_supports_soft_mask_weights_without_rescaling_learning_rate():
+    prediction = torch.tensor([[[[[1.0, 2.0, 3.0, 4.0]]]]], requires_grad=True)
+    target = torch.zeros_like(prediction)
+    mask = torch.tensor([[[[1.0, 0.5, 0.0, 0.0]]]])
+
+    result = joint_prediction_loss(
+        H3ModelPrediction(video=prediction, audio=None),
+        H3ModelPrediction(video=target, audio=None),
+        video_mask=mask,
+    )
+    result.loss.backward()
+
+    # Weighted mean: (1^2 * 1 + 2^2 * .5) / 1.5 = 2.
+    torch.testing.assert_close(result.loss, torch.tensor(2.0))
+    torch.testing.assert_close(prediction.grad, torch.tensor([[[[[4 / 3, 4 / 3, 0.0, 0.0]]]]]))
+
+    full = joint_prediction_loss(
+        H3ModelPrediction(video=prediction.detach(), audio=None),
+        H3ModelPrediction(video=target, audio=None),
+        video_mask=mask,
+        mask_normalization="full",
+    )
+    torch.testing.assert_close(full.loss, torch.tensor(0.75))
+
+
 def test_joint_loss_applies_modality_specific_sample_weights():
     video = torch.zeros(2, 1, 1, 1, 1)
     audio = torch.zeros(2, 1, 1, 1)
