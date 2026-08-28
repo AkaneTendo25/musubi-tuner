@@ -108,8 +108,6 @@ class H3GenerationRequest:
     def validate(self, *, check_files: bool = False) -> None:
         if not self.prompt.strip():
             raise ValueError("prompt must not be empty")
-        if len(self.prompt) > 7000:
-            raise ValueError("prompt must contain at most 7000 characters")
         if self.frame_count_override is None and (
             not isinstance(self.duration, int) or isinstance(self.duration, bool) or not 5 <= self.duration <= 15
         ):

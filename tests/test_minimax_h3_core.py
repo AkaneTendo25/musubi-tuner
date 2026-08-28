@@ -209,6 +209,12 @@ def test_public_request_modes_and_limits(tmp_path):
         H3GenerationRequest("prompt", tmp_path / "out.mp4", duration=16)
 
 
+def test_public_request_has_no_arbitrary_character_limit(tmp_path):
+    request = H3GenerationRequest("word " * 2000, tmp_path / "out.mp4")
+
+    assert len(request.prompt) > 7000
+
+
 def test_keyframe_conditioning_carries_its_latent_index(tmp_path):
     # Measured on the release: an interior anchor is honoured about as strongly
     # as the trained ends, so the index has to survive to the packing.
