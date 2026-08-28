@@ -502,6 +502,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._field_distances: dict[int, list[float]] = {}
         self._null_field_ratios: dict[int, list[float]] = {}
         self._velocity_errors: dict[int, list[float]] = {}
+        self._velocity_error_ratios: dict[int, list[float]] = {}
         self._branch_drift: dict[int, list] = {}
         self._validation_network = None
         self._step_recipe: str | None = None
@@ -672,6 +673,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._field_distances = {}
         self._null_field_ratios = {}
         self._velocity_errors = {}
+        self._velocity_error_ratios = {}
         self._branch_drift = {}
 
         block_swap_active = bool(self.blocks_to_swap)
@@ -752,6 +754,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         for bin_index, cosines in sorted(self._field_cosines.items()):
             if cosines:
                 metrics[f"val/field_cos/bin{bin_index}"] = sum(cosines) / len(cosines)
+        for bin_index, ratios in sorted(self._velocity_error_ratios.items()):
+            if ratios:
+                metrics[f"val/velocity_err_rel/bin{bin_index}"] = sum(ratios) / len(ratios)
+        pooled_rel = [ratio for ratios in self._velocity_error_ratios.values() for ratio in ratios]
+        if pooled_rel:
+            metrics["val/velocity_err_rel"] = sum(pooled_rel) / len(pooled_rel)
         pooled_cos = [cosine for cosines in self._field_cosines.values() for cosine in cosines]
         if pooled_cos:
             metrics["val/field_cos"] = sum(pooled_cos) / len(pooled_cos)
@@ -1158,14 +1166,37 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         adapted_pair = None
         if adapted_prompted is not None and adapted_empty is not None:
             adapted_pair = (adapted_prompted.detach().cpu(), adapted_empty.detach().cpu())
+        base_pair = self._field_base_branches.get(key)
         if adapted_prompted is not None and inputs.video_target is not None:
             target = inputs.video_target.to(device=adapted_prompted.device, dtype=torch.float32)
             error, _ = masked_squared_error_sum(adapted_prompted.float(), target, video_mask)
             energy, _ = masked_squared_error_sum(target, torch.zeros_like(target), video_mask)
             if float(energy) > 0.0:
                 self._velocity_errors.setdefault(sigma_bin.index, []).append(float(error) / float(energy))
+            # The same error carried by the untouched checkpoint, and the ratio between
+            # them.
+            #
+            # The absolute number is unreadable on its own: 0.10 is a good fit on one
+            # dataset and a bad one on another, because it is measured against whatever
+            # velocities that data happens to contain. The ratio is not -- 1.0 means the
+            # adapter predicts the data no better than the checkpoint it started from,
+            # and 0 would mean perfectly. That turns "did this run learn anything" into
+            # a number readable from its own log, with no second run to compare against.
+            #
+            # It matters because an adapter can look excellent on every preservation
+            # metric for the trivial reason that it barely moved. Measured: an arm that
+            # scored best of its group on how little it disturbed the base had covered
+            # about a seventh of the distance ordinary training covers, and the two facts
+            # are the same fact. Reported beside the preservation numbers so that reading
+            # cannot be made by accident.
+            #
+            # Free: the base prediction is already cached for the field comparison, so
+            # this costs one more masked reduction and no forward.
+            if base_pair is not None:
+                base_error, _ = masked_squared_error_sum(base_pair[0].to(target.device).float(), target, video_mask)
+                if float(base_error) > 0.0:
+                    self._velocity_error_ratios.setdefault(sigma_bin.index, []).append(float(error) / float(base_error))
 
-        base_pair = self._field_base_branches.get(key)
         if base_pair is not None and adapted_pair is not None:
             self._branch_drift.setdefault(sigma_bin.index, []).append(
                 (

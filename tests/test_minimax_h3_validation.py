@@ -657,3 +657,34 @@ def test_h3_field_distance_orders_a_rotated_field_below_a_shortened_one():
     assert long_but_turned > short_but_aligned
     # And the ratio on its own would have called the rotated one better.
     assert 0.74 > 0.55
+
+
+def test_h3_relative_velocity_error_reads_1_when_an_adapter_learned_nothing():
+    """The ratio that makes a preservation score readable.
+
+    Every preservation metric here is flattered by an adapter that barely moved, and
+    on real runs the arm that disturbed the base least had covered about a seventh of
+    the distance ordinary training covers. Dividing the adapter's error by the
+    untouched checkpoint's turns that into a number: 1.0 says the run learned nothing,
+    and only a value well below 1 makes a low field distance mean anything.
+
+    Exercised on the same masked reduction the metric is built from, so the mask
+    exclusion the rest of the probe relies on is covered here too.
+    """
+    target = torch.tensor([[2.0, 2.0, 50.0]])
+    base = torch.tensor([[0.0, 0.0, 0.0]])
+    mask = torch.tensor([[1.0, 1.0, 0.0]])
+
+    def ratio(adapted: torch.Tensor) -> float:
+        error, _ = masked_squared_error_sum(adapted, target, mask)
+        base_error, _ = masked_squared_error_sum(base, target, mask)
+        return float(error) / float(base_error)
+
+    # An adapter that reproduces the base exactly has learned nothing.
+    assert ratio(base) == pytest.approx(1.0, abs=1e-6)
+    # One that reaches the target has learned everything.
+    assert ratio(target) == pytest.approx(0.0, abs=1e-9)
+    # Halving the residual quarters the ratio, because both sides are energies.
+    assert ratio(target / 2.0) == pytest.approx(0.25, abs=1e-6)
+    # The masked-out element disagrees enormously and must not enter either side.
+    assert ratio(torch.tensor([[2.0, 2.0, -999.0]])) == pytest.approx(0.0, abs=1e-9)
