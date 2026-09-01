@@ -1545,6 +1545,12 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     )
 
 
+def _should_cache_audio_dataset_video_latents(
+    *, audio_only: bool, audio_video: bool, audio_datasets: Sequence[AudioDataset]
+) -> bool:
+    return bool(audio_only or (audio_video and audio_datasets))
+
+
 def main() -> None:
     parser = cache_latents.setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -1682,7 +1688,14 @@ def main() -> None:
         elif shard_world > 1:
             logger.info("rank %d: skipping reference/guide caching (rank-0 only under sharding)", shard_rank)
 
-    if audio_only:
+    # AudioDataset items still need a visual token sequence when they are mixed with
+    # image/video datasets in AV mode. Use the same duration-aware virtual video
+    # latent as pure audio mode; otherwise only *_ltx2_audio.safetensors is written
+    # and AudioDataset.prepare_for_training drops every item because the sibling
+    # *_ltx2.safetensors cache is absent.
+    if _should_cache_audio_dataset_video_latents(
+        audio_only=audio_only, audio_video=audio_video, audio_datasets=audio_datasets
+    ):
         if getattr(args, "ltx2_checkpoint", None) is None:
             raise ValueError("--ltx2_checkpoint is required when --ltx2_mode audio is used")
 
@@ -1702,7 +1715,7 @@ def main() -> None:
             raise ValueError(f"audio_only_target_fps must be > 0, got {target_fps}")
 
         # Validate datasets (use variables defined during auto-detection)
-        if non_audio_datasets:
+        if audio_only and non_audio_datasets:
             raise ValueError("Audio-only caching only supports audio datasets in the dataset config")
         if not audio_datasets:
             raise ValueError("Audio-only caching requires at least one audio dataset")
@@ -1810,7 +1823,7 @@ def main() -> None:
         for ds in datasets:
             if not isinstance(ds, (VideoDataset, AudioDataset)):
                 continue
-            if audio_only:
+            if isinstance(ds, AudioDataset):
                 ds_target_fps = target_fps
             else:
                 ds_target_fps = getattr(ds, "target_fps", VideoDataset.TARGET_FPS_LTX2)
@@ -1828,7 +1841,7 @@ def main() -> None:
                         continue
                     if isinstance(ds, AudioDataset):
                         audio_path = getattr(item_info, "audio_path", None) or item_info.item_key
-                        if audio_only:
+                        if isinstance(ds, AudioDataset):
                             frame_count = _estimate_video_frame_count_from_audio(audio_path, target_fps=ds_target_fps)
                             if frame_count is None:
                                 raise ValueError(
@@ -1851,7 +1864,7 @@ def main() -> None:
                             audio_path=audio_path,
                             dtype=audio_dtype,
                             target_fps=ds_target_fps,
-                            audio_only=audio_only,
+                            audio_only=isinstance(ds, AudioDataset),
                             preserve_audio_timing=bool(getattr(args, "preserve_audio_timing", False)),
                             atomic_cache_writes=bool(getattr(args, "atomic_cache_writes", False)),
                         )
