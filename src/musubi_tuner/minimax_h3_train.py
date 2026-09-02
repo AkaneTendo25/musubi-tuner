@@ -4,11 +4,15 @@ import argparse
 import logging
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
 
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
+from musubi_tuner.minimax_h3.adaln_lowrank import ADALN_INFIX, TABLE_KEY
+from musubi_tuner.minimax_h3.model_loader import infer_transformer_config, resolve_transformer_checkpoint
+from musubi_tuner.minimax_h3.weights import CheckpointInspectionError
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer
 from musubi_tuner.minimax_h3_train_network import setup_parser as setup_h3_parser
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
@@ -84,9 +88,7 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
                 "MiniMax H3 full fine-tuning requires ordinary BF16 weights; FP8 and INT8 bases are frozen-weight paths"
             )
         if args.h3_adaln_rank is not None:
-            raise ValueError(
-                "MiniMax H3 full fine-tuning cannot use --h3_adaln_rank because it changes the checkpoint architecture"
-            )
+            self._validate_adaln_rank_source(args)
         if args.h3_convrot_int8_lora_fused:
             raise ValueError("--h3_convrot_int8_lora_fused is a LoRA-only option")
         if args.h3_lora_token_refiner:
@@ -99,6 +101,14 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
             raise ValueError("MiniMax H3 full fine-tuning does not accept LoRA initialization or merge weights")
         if args.network_args or args.network_dropout is not None or args.scale_weight_norms:
             raise ValueError("MiniMax H3 full fine-tuning does not accept LoRA network/dropout/max-norm options")
+        if int(getattr(args, "h3_validation_rollout_probe", 0) or 0) > 0:
+            # The field probe works here through a step-zero reference; the rollout
+            # probe cannot, because its base field is read at the state the trained
+            # model walked to, and a full fine-tune keeps no frozen base to read it with.
+            raise ValueError(
+                "--h3_validation_rollout_probe is not supported by MiniMax H3 full fine-tuning; "
+                "--h3_validation_field_probe with --validate_at_start is"
+            )
         if args.h3_base_preservation_loss_weight > 0:
             raise ValueError("--h3_base_preservation_loss_weight is not supported by MiniMax H3 full fine-tuning")
         if getattr(args, "h3_rollout_supervision", False):
@@ -147,6 +157,29 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
         if args.block_swap_trainable_ring and not (args.blocks_to_swap or 0):
             raise ValueError("--block_swap_trainable_ring requires --blocks_to_swap")
 
+    @staticmethod
+    def _validate_adaln_rank_source(args: argparse.Namespace) -> None:
+        """``--h3_adaln_rank`` reduces the released full-rank AdaLN; it cannot apply twice.
+
+        The loader raises the same rejection, but only after the transformer
+        checkpoint has been opened and validated. Read the header here so a
+        pruned source fails before any model memory is touched.
+        """
+        if args.int8_convrot_base:
+            raise ValueError("MiniMax H3 INT8 ConvRot checkpoints ship pre-pruned; --h3_adaln_rank cannot apply")
+        if not args.dit:
+            return
+        try:
+            checkpoint_path = resolve_transformer_checkpoint(Path(args.dit), args.h3_training_mode)
+            config = infer_transformer_config(checkpoint_path)
+        except (FileNotFoundError, CheckpointInspectionError):
+            return  # the loader reports missing or malformed checkpoints itself
+        if config.adaln_t_table_size is not None:
+            raise ValueError(
+                f"MiniMax H3 checkpoint {checkpoint_path.name!r} is already pruned; --h3_adaln_rank cannot apply again. "
+                "Continue training a pruned dense checkpoint by omitting the flag."
+            )
+
     def _validate_args_and_init(self, args) -> bool:
         self._validate_full_finetune_args(args)
         return super()._validate_args_and_init(args)
@@ -160,8 +193,22 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
 
     def _build_network(self, args, accelerator, transformer, vae, weight_dtype):
         del accelerator, vae, weight_dtype
+        # ``requires_grad_`` reaches parameters only. Under ``--h3_adaln_rank``
+        # the transformer carries the reduced ``adaln_proj`` weights as ordinary
+        # parameters and the timestep table (the basis coefficients the loader
+        # fitted) as a buffer, so the projections train while the basis stays
+        # frozen; the basis itself is never stored, only its coefficients.
         transformer.requires_grad_(True)
         transformer.train()
+        self._adaln_reduced = getattr(transformer, TABLE_KEY, None) is not None
+        if self._adaln_reduced:
+            reduced = [p for n, p in transformer.named_parameters() if ADALN_INFIX in n and p.requires_grad]
+            logger.info(
+                "MiniMax H3 dense training updates %d rank-reduced AdaLN parameters across %d tensors; "
+                "the timestep table is a frozen buffer and the checkpoint is written in the pruned layout",
+                sum(p.numel() for p in reduced),
+                len(reduced),
+            )
         if args.gradient_checkpointing:
             transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
         return MiniMaxH3FullFinetuneModule(
@@ -289,6 +336,13 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
                 "ss_block_swap_trainable_ring": str(args.block_swap_trainable_ring),
             }
         )
+        if getattr(self, "_adaln_reduced", args.h3_adaln_rank is not None):
+            # The saved checkpoint carries ``adaln_t_table`` plus rank-reduced
+            # projections in float32, loaded like the released pruned checkpoints
+            # without ``--h3_adaln_rank``. The key is what lets the loader admit
+            # F32 there; a run without the reduction writes exactly what it wrote
+            # before this option existed.
+            metadata["ss_h3_adaln_layout"] = "pruned"
         return metadata
 
 

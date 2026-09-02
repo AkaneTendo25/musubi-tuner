@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 from accelerate import init_empty_weights
+from safetensors import safe_open
 
 from musubi_tuner.minimax_h3.adaln_lowrank import (
     DEFAULT_TABLE_POINTS,
@@ -24,10 +25,10 @@ from musubi_tuner.minimax_h3.int8_convrot import (
 from musubi_tuner.minimax_h3.model import MiniMaxH3TimeEmbedder, MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.training import H3TrainingMode
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, tensor_metadata
-from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, apply_convrot_int8_monkey_patch
 from musubi_tuner.modules.convrot_int8_kernels import dequantize_int8_convrot_weight, quantize_int8_convrot_weight
-from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, apply_convrot_int8_monkey_patch
 from musubi_tuner.modules.custom_offloading_utils import compute_offload_block_indices
+from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.utils.safetensors_utils import WeightTransformHooks
 
@@ -250,10 +251,25 @@ def resolve_transformer_checkpoint(source: Path, mode: H3TrainingMode, *, int8_c
     return matches[0]
 
 
-def _expected_checkpoint_dtype(name: str, *, pruned: bool = False) -> str:
+def _expected_checkpoint_dtypes(name: str, *, pruned: bool = False, dense_reduced: bool = False) -> tuple[str, ...]:
     if pruned and ".adaln_proj.linear." in name:
-        return "F16"
-    return "F32" if name.startswith(_FP32_PREFIXES) else "BF16"
+        # The released pruned checkpoints store the reduced projections in F16 and
+        # stay F16-strict. A dense fine-tune saves them in the float32 the reduction
+        # keeps them in, since that dtype rather than the rank bounds the modulation
+        # error -- and says so in its metadata, which is what admits F32 here.
+        return ("F16", "F32") if dense_reduced else ("F16",)
+    return ("F32",) if name.startswith(_FP32_PREFIXES) else ("BF16",)
+
+
+def _checkpoint_file_metadata(checkpoint_path: Path) -> dict[str, str]:
+    """The safetensors header metadata of one file, or empty for sharded sources."""
+    if not checkpoint_path.is_file():
+        return {}
+    try:
+        with safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
+            return dict(handle.metadata() or {})
+    except Exception:  # noqa: BLE001 - the tensor validation below reports the real problem
+        return {}
 
 
 def infer_transformer_config(
@@ -294,6 +310,7 @@ def validate_transformer_checkpoint(
     expected = {name: tuple(tensor.shape) for name, tensor in model.state_dict().items()}
     actual_tensors = tensor_metadata(checkpoint_path)
     actual = {tensor.name: tensor for tensor in actual_tensors}
+    dense_reduced = _checkpoint_file_metadata(checkpoint_path).get("ss_h3_adaln_layout") == "pruned"
 
     marker_bases, scale_bases, quantized_bases = _int8_checkpoint_bases(actual)
     if (marker_bases or scale_bases or quantized_bases) and (
@@ -320,11 +337,13 @@ def validate_transformer_checkpoint(
         if tensor.shape != expected_shape:
             disagreements.append(f"{name}: shape {tensor.shape}, expected {expected_shape}")
         base = name[: -len(".weight")] if name.endswith(".weight") else ""
-        expected_dtype = (
-            "I8" if base in quantized_bases else _expected_checkpoint_dtype(name, pruned=config.adaln_t_table_size is not None)
+        expected_dtypes = (
+            ("I8",)
+            if base in quantized_bases
+            else _expected_checkpoint_dtypes(name, pruned=config.adaln_t_table_size is not None, dense_reduced=dense_reduced)
         )
-        if tensor.dtype != expected_dtype:
-            disagreements.append(f"{name}: dtype {tensor.dtype}, expected {expected_dtype}")
+        if tensor.dtype not in expected_dtypes:
+            disagreements.append(f"{name}: dtype {tensor.dtype}, expected {' or '.join(expected_dtypes)}")
     for base in sorted(marker_bases):
         marker = actual[f"{base}.comfy_quant"]
         scale = actual[f"{base}.weight_scale"]

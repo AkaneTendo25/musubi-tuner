@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import hashlib
 import json
 import logging
+import os
 import math
 import time
 from collections.abc import Sequence
@@ -656,6 +658,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # item, not of the training run, so it is measured once and kept.
         self._field_base_gaps: dict[tuple, float] = {}
         self._field_base_branches: dict[tuple, tuple] = {}
+        # The optimizer step the running validation belongs to, and whether the
+        # base reference of a full fine-tune has already been read from its file.
+        self._validation_global_step: int | None = None
+        self._field_probe_snapshot_loaded = False
         self._field_ratios: dict[int, list[float]] = {}
         self._field_cosines: dict[int, list[float]] = {}
         self._field_distances: dict[int, list[float]] = {}
@@ -881,6 +887,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         }
         validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
         self._validation_network = network
+        self._validation_global_step = int(global_step)
+        if (
+            getattr(args, "h3_validation_field_probe", False)
+            and int(global_step) > 0
+            and self._probe_base_is_the_live_model(accelerator, network)
+        ):
+            # A resumed full fine-tune: its weights are no longer the checkpoint, so
+            # the step-zero reference has to come from the file. At step 0 nothing is
+            # read -- the reference is taken live and the file rewritten -- so a run
+            # that reuses an output name cannot inherit a previous run's reference.
+            if accelerator.num_processes != 1:
+                raise ValueError(
+                    "--h3_validation_field_probe on a full fine-tune keeps its step-zero reference in one process's "
+                    "file; validation items are sharded per process, so it supports a single process only"
+                )
+            self._load_field_probe_snapshot(self._field_probe_snapshot_path(args), self._field_probe_fingerprint(args))
         self._field_ratios = {}
         self._field_cosines = {}
         self._field_distances = {}
@@ -1039,6 +1061,97 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
+        if (
+            getattr(args, "h3_validation_field_probe", False)
+            and int(global_step) == 0
+            and self._field_base_branches
+            and self._probe_base_is_the_live_model(accelerator, network)
+            and accelerator.num_processes == 1
+        ):
+            self._save_field_probe_snapshot(self._field_probe_snapshot_path(args), self._field_probe_fingerprint(args))
+
+    @staticmethod
+    def _probe_base_is_the_live_model(accelerator, network) -> bool:
+        """True when nothing can be switched off to reach the frozen base.
+
+        A LoRA run reaches the checkpoint by disabling its network for one forward.
+        A full fine-tune trains the checkpoint itself: its "network" is the dense
+        module, which has no ``set_enabled``, and the only moment its weights ARE
+        the base is step zero.
+        """
+        if network is None:
+            return True
+        unwrap = getattr(accelerator, "unwrap_model", None)
+        module = unwrap(network) if callable(unwrap) else network
+        return not callable(getattr(module, "set_enabled", None))
+
+    @staticmethod
+    def _field_probe_snapshot_path(args) -> str:
+        return os.path.join(args.output_dir, f"{args.output_name}_field_probe_base.pt")
+
+    @staticmethod
+    def _field_probe_fingerprint(args) -> dict[str, str]:
+        """What the stored reference is a reference FOR.
+
+        The cache keys name an item by its position in the validation set and a sigma
+        by its bin, and both are meaningless under another validation config, seed,
+        item cap or checkpoint. The fingerprint records those so a file left by a
+        different configuration is refused rather than read as if it matched.
+        """
+
+        def file_digest(path):
+            if not path or not os.path.exists(path):
+                return str(path)
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        def file_identity(path):
+            if not path or not os.path.exists(path):
+                return str(path)
+            stat = os.stat(path)
+            return f"{os.path.abspath(path)}:{stat.st_size}:{stat.st_mtime_ns}"
+
+        return {
+            "dit": file_identity(getattr(args, "dit", None)),
+            "validation_dataset_config": file_digest(getattr(args, "validation_dataset_config", None)),
+            "validation_seed": str(args.validation_seed if getattr(args, "validation_seed", None) is not None else args.seed),
+            "max_validation_items": str(getattr(args, "max_validation_items", None)),
+            "h3_training_mode": str(getattr(args, "h3_training_mode", None)),
+        }
+
+    def _save_field_probe_snapshot(self, path: str, fingerprint: dict[str, str]) -> None:
+        """Keep the step-zero base reference beside the checkpoints, for resumes."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(
+            {"fingerprint": dict(fingerprint), "gaps": dict(self._field_base_gaps), "branches": dict(self._field_base_branches)},
+            path,
+        )
+        logger.info("MiniMax H3 field probe: saved the frozen-base reference of %d items to %s", len(self._field_base_gaps), path)
+
+    def _load_field_probe_snapshot(self, path: str, fingerprint: dict[str, str]) -> None:
+        if self._field_probe_snapshot_loaded or self._field_base_gaps:
+            return
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"--h3_validation_field_probe on a resumed full fine-tune needs the step-zero reference {path}, "
+                "which this run did not write; start it over with --validate_at_start, or drop the probe"
+            )
+        # Tensors, strings, numbers and tuple keys only, so the safe unpickler suffices.
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        stored = payload.get("fingerprint", {})
+        mismatched = sorted(name for name in set(stored) | set(fingerprint) if stored.get(name) != fingerprint.get(name))
+        if mismatched:
+            raise ValueError(
+                f"the field-probe reference {path} was taken under a different {', '.join(mismatched)}; "
+                "its per-item pairs do not describe this validation, so it is refused"
+            )
+        self._field_base_gaps.update(payload["gaps"])
+        self._field_base_branches.update(payload["branches"])
+        self._field_probe_snapshot_loaded = True
+        logger.info("MiniMax H3 field probe: read the frozen-base reference of %d items from %s", len(self._field_base_gaps), path)
 
     def _validate_batch(
         self,
@@ -1383,7 +1496,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._rollout_probe_done.add(key)
         network = self._validation_network
         if network is None:
-            raise ValueError("--h3_validation_rollout_probe requires a trainable network")
+            raise ValueError(
+                "--h3_validation_rollout_probe requires a trainable network: it evaluates the frozen base at the state "
+                "the adapted model walked to, which a full fine-tune has no frozen base to evaluate"
+            )
         merged = getattr(self, "_merged_base_weight_paths", None)
         if merged:
             # Same reason as the data-state probe: the base rollout is produced by
@@ -1536,8 +1652,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "requires --cache_guidance_empty; missing " + ", ".join(missing_empty)
             )
         network = self._validation_network
-        if network is None:
-            raise ValueError("--h3_validation_field_probe requires a trainable network")
+        # A full fine-tune has no network to switch off: the checkpoint it started from
+        # exists only at step zero, so the base pair is taken then and kept (and written
+        # beside the checkpoints, see _save_field_probe_snapshot). Later validations
+        # reuse it, and an item without a stored pair cannot be measured at all.
         merged = getattr(self, "_merged_base_weight_paths", None)
         if merged:
             # Every number this probe reports is a ratio against the checkpoint, formed
@@ -1552,7 +1670,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 + ", ".join(merged)
                 + " into it and a merge cannot be undone for one forward. Drop --base_weights, or drop the probe"
             )
-        set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_validation_field_probe")
+        live_base = self._probe_base_is_the_live_model(accelerator, network)
+        key = (dataset_index, sigma_bin.index, observed, self._step_reference_modality)
+        if live_base and key not in self._field_base_gaps and int(getattr(self, "_validation_global_step", 0) or 0) != 0:
+            raise ValueError(
+                "--h3_validation_field_probe on a full fine-tune measures against a reference taken at step 0, and "
+                f"none covers validation item {dataset_index} at sigma bin {sigma_bin.index}; start the run with "
+                "--validate_at_start from the untouched checkpoint, or resume beside its <output_name>_field_probe_base.pt"
+            )
+        if live_base:
+
+            def set_enabled(enabled: bool) -> None:
+                del enabled
+
+        else:
+            set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_validation_field_probe")
         fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
         int8_context = getattr(transformer, "int8_attention_context", None)
 
@@ -1574,7 +1706,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     out[branch] = self._predict(accelerator, transformer, batch, inputs, conditioning=branch).video
             return out["prompt"], out["empty"]
 
-        key = (dataset_index, sigma_bin.index, observed, self._step_reference_modality)
+        fresh_base = None
         if key not in self._field_base_gaps:
             set_enabled(False)
             try:
@@ -1586,10 +1718,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # the same one-off pair of forwards the denominator already paid.
                 if base_prompted is not None and base_empty is not None:
                     self._field_base_branches[key] = (base_prompted.detach().cpu(), base_empty.detach().cpu())
+                fresh_base = (base_prompted, base_empty)
             finally:
                 set_enabled(True)
 
-        adapted_prompted, adapted_empty = branches()
+        if live_base and fresh_base is not None:
+            # Step zero of a full fine-tune: the live model IS the base, so the pair
+            # just taken is also the adapted pair, and two forwards are saved.
+            adapted_prompted, adapted_empty = fresh_base
+        else:
+            adapted_prompted, adapted_empty = branches()
         adapted_pair = None
         if adapted_prompted is not None and adapted_empty is not None:
             adapted_pair = (adapted_prompted.detach().cpu(), adapted_empty.detach().cpu())

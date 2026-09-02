@@ -744,3 +744,130 @@ def test_h3_null_anchor_weight_must_not_be_negative():
     args.h3_guidance_null_anchor_weight = float("nan")
     with pytest.raises(ValueError, match="finite"):
         trainer.handle_model_specific_args(args)
+
+
+def _dense_probe_trainer(step: int):
+    """A trainer whose validation network is the dense module: nothing to switch off."""
+    trainer = MiniMaxH3NetworkTrainer.__new__(MiniMaxH3NetworkTrainer)
+    trainer._validation_network = nn.Linear(1, 1)  # no set_enabled(): the full fine-tune shape
+    trainer._validation_global_step = step
+    trainer._merged_base_weight_paths = None
+    trainer._step_reference_modality = "av"
+    for name in (
+        "_field_base_gaps",
+        "_field_base_branches",
+        "_velocity_errors",
+        "_velocity_error_ratios",
+        "_branch_drift",
+        "_prompted_drift_ratios",
+        "_field_ratios",
+        "_field_cosines",
+        "_field_distances",
+        "_null_field_ratios",
+    ):
+        setattr(trainer, name, {})
+    calls = []
+
+    def predict(accelerator, transformer, batch, inputs, conditioning):
+        calls.append(conditioning)
+        return SimpleNamespace(video=torch.full((1, 4), 2.0 if conditioning == "prompt" else 1.0))
+
+    trainer._predict = predict
+    return trainer, calls
+
+
+def _run_dense_probe(trainer, dataset_index=0):
+    inputs = SimpleNamespace(video=torch.zeros(1, 4), video_target=None)
+    batch = {H3_EMPTY_TEXT_HIDDEN_KEY: torch.zeros(1), H3_EMPTY_TEXT_TOKEN_TAGS_KEY: torch.zeros(1)}
+    MiniMaxH3NetworkTrainer._probe_guidance_field(
+        trainer,
+        SimpleNamespace(device=torch.device("cpu"), unwrap_model=lambda module: module),
+        SimpleNamespace(),
+        nn.Linear(1, 1),
+        batch,
+        inputs,
+        None,
+        dataset_index=dataset_index,
+        sigma_bin=SimpleNamespace(index=0),
+        observed="video",
+    )
+
+
+def test_h3_field_probe_on_a_full_finetune_takes_its_reference_at_step_zero():
+    """With no network to switch off, step zero is the only time the weights are the
+    base: the pair taken then is stored, and is also the adapted pair of that step."""
+    trainer, calls = _dense_probe_trainer(step=0)
+
+    _run_dense_probe(trainer)
+
+    key = (0, 0, "video", "av")
+    assert key in trainer._field_base_branches
+    assert calls == ["prompt", "empty"], "one pair of forwards, not two"
+    assert trainer._field_ratios[0] == [pytest.approx(1.0)]
+    assert trainer._field_distances[0] == [pytest.approx(0.0)]
+
+
+def test_h3_field_probe_on_a_full_finetune_refuses_an_item_without_a_reference():
+    trainer, _ = _dense_probe_trainer(step=250)
+
+    with pytest.raises(ValueError, match="reference taken at step 0"):
+        _run_dense_probe(trainer)
+
+
+def test_h3_field_probe_reference_survives_a_round_trip_through_its_file(tmp_path):
+    source, _ = _dense_probe_trainer(step=0)
+    _run_dense_probe(source)
+    path = str(tmp_path / "run_field_probe_base.pt")
+    fingerprint = {"dit": "base.safetensors", "validation_seed": "7"}
+    MiniMaxH3NetworkTrainer._save_field_probe_snapshot(source, path, fingerprint)
+
+    resumed, calls = _dense_probe_trainer(step=250)
+    resumed._field_probe_snapshot_loaded = False
+    MiniMaxH3NetworkTrainer._load_field_probe_snapshot(resumed, path, dict(fingerprint))
+    _run_dense_probe(resumed)
+
+    # The resumed run measured its live weights against the stored base, with
+    # exactly one pair of forwards and no refusal.
+    assert calls == ["prompt", "empty"]
+    assert resumed._field_ratios[0] == [pytest.approx(1.0)]
+
+
+def test_h3_field_probe_reference_is_refused_under_another_configuration(tmp_path):
+    """The stored pairs are indexed by validation position and sigma bin, which name
+    nothing under a different validation set, seed or checkpoint."""
+    source, _ = _dense_probe_trainer(step=0)
+    _run_dense_probe(source)
+    path = str(tmp_path / "run_field_probe_base.pt")
+    MiniMaxH3NetworkTrainer._save_field_probe_snapshot(source, path, {"dit": "base.safetensors", "validation_seed": "7"})
+
+    resumed, _ = _dense_probe_trainer(step=250)
+    resumed._field_probe_snapshot_loaded = False
+    with pytest.raises(ValueError, match="different validation_seed"):
+        MiniMaxH3NetworkTrainer._load_field_probe_snapshot(resumed, path, {"dit": "base.safetensors", "validation_seed": "8"})
+    assert not resumed._field_base_gaps
+
+
+def test_h3_field_probe_resume_without_its_reference_file_is_refused(tmp_path):
+    resumed, _ = _dense_probe_trainer(step=250)
+    resumed._field_probe_snapshot_loaded = False
+    with pytest.raises(FileNotFoundError, match="validate_at_start"):
+        MiniMaxH3NetworkTrainer._load_field_probe_snapshot(resumed, str(tmp_path / "missing.pt"), {})
+
+
+def test_h3_field_probe_fingerprint_reads_the_validation_config_content(tmp_path):
+    config = tmp_path / "holdout.toml"
+    config.write_text("[general]\n", encoding="utf-8")
+    args = SimpleNamespace(
+        dit="base.safetensors",
+        validation_dataset_config=str(config),
+        validation_seed=None,
+        seed=3,
+        max_validation_items=None,
+        h3_training_mode="fl2va",
+    )
+    first = MiniMaxH3NetworkTrainer._field_probe_fingerprint(args)
+    config.write_text("[general]\nresolution = [1, 1]\n", encoding="utf-8")
+    second = MiniMaxH3NetworkTrainer._field_probe_fingerprint(args)
+
+    assert first["validation_seed"] == "3"
+    assert first["validation_dataset_config"] != second["validation_dataset_config"]

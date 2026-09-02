@@ -986,8 +986,11 @@ established on Ref2VA; on FL2VA it has not been.
 ### Full-parameter BF16 training
 
 `minimax_h3_train.py` updates the entire transformer and writes a native MiniMax H3 BF16 checkpoint. It is separate from the
-LoRA entry point in [Start LoRA training](#start-lora-training). Full training requires the ordinary BF16 FL2VA or Ref2VA checkpoint; FP8, ConvRot INT8, pruned AdaLN,
-LoRA initialization/merge weights, and architecture-changing options are rejected.
+LoRA entry point in [Start LoRA training](#start-lora-training). Full training requires the ordinary BF16 FL2VA or Ref2VA checkpoint; FP8, ConvRot INT8,
+LoRA initialization/merge weights, and architecture-changing options are rejected. `--h3_adaln_rank 16` is the one
+architectural option it accepts: it trains the rank-reduced AdaLN projections (~77M parameters in place of 13.0B, in float32)
+against a frozen timestep table and writes the checkpoint in the pruned layout, which loads like the released pruned
+checkpoints without the flag and cannot be reduced a second time.
 
 ```shell
 PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch \
@@ -1016,6 +1019,7 @@ manual-learning-rate Adafactor arguments; if you replace `--optimizer_args`, inc
 | `--blocks_to_swap N` | Use backward-capable block swap for trainable weights. Increase `N` when the model weights do not fit; activations are a separate budget, served by gradient checkpointing and activation offload. Unlike LoRA block swap, do not add `--block_swap_h2d_only`. |
 | `--block_swap_trainable_ring` | Use coalesced bidirectional block transfers and write updated weights back to pinned CPU masters. Requires block swap, gradient checkpointing, fused backward, and `--use_pinned_memory_for_block_swap`. |
 | `--block_swap_ring_size N` | Number of reusable GPU block buffers for the trainable ring; `2` enables double buffering. |
+| `--h3_adaln_rank 16` | Train the rank-reduced AdaLN projections instead of the full 13.0B AdaLN weights; the saved checkpoint carries `adaln_t_table` and the reduced weights (metadata `ss_h3_adaln_layout=pruned`). Rejected on already-pruned and INT8 ConvRot sources. |
 | `--gradient_checkpointing_cpu_offload` | Offload checkpoint activations when long packed sequences still exceed VRAM. |
 | `--mem_eff_save` | Stream native transformer tensors during `.safetensors` output; enabled by default. |
 | `--no_mem_eff_save` | Write checkpoints with the ordinary safetensors writer instead of the streaming one; needs the whole checkpoint contiguous in host memory. |
@@ -1404,8 +1408,8 @@ only and subject to removal, and neither should appear in a command line you int
 
 | Option | Purpose |
 | --- | --- |
-| `--h3_validation_field_probe` | Report what the adapter did to the guidance field, measured against the frozen base on the validation items. Requires a validation set and `--cache_guidance_empty`, and is incompatible with `--base_weights`, which merges an adapter into the checkpoint it measures against. `val/velocity_err` is an energy ratio, so interpolate on its square root rather than on it. `val/drift/prompted_rel` reports how far the PROMPTED prediction moved from the frozen base's, relative to the base field, and is the one number here that the empty-branch anchor cannot hold still by construction. |
-| `--h3_validation_rollout_probe N` | Roll the adapter and the frozen base from the same noise for `N` Euler steps and report, at the states reached, the adapter's clean-clip error and the surviving field. The field probe measures on noised data states, which generation never visits. Costs `2N+4` no-grad forwards per validation. `0` (default) disables. Incompatible with `--base_weights` for the same reason as the field probe. |
+| `--h3_validation_field_probe` | Report what the adapter did to the guidance field, measured against the frozen base on the validation items. Requires a validation set and `--cache_guidance_empty`, and is incompatible with `--base_weights`, which merges an adapter into the checkpoint it measures against. `val/velocity_err` is an energy ratio, so interpolate on its square root rather than on it. On a full fine-tune the reference is taken at step 0, when the weights still are the checkpoint, and written to `<output_name>_field_probe_base.pt` beside the checkpoints: start such a run with `--validate_at_start`. A resumed run reads the file back and refuses it when the checkpoint, validation config, seed or item cap differ from the ones it was taken under; single process only. `val/drift/prompted_rel` reports how far the PROMPTED prediction moved from the frozen base's, relative to the base field, and is the one number here that the empty-branch anchor cannot hold still by construction. |
+| `--h3_validation_rollout_probe N` | Roll the adapter and the frozen base from the same noise for `N` Euler steps and report, at the states reached, the adapter's clean-clip error and the surviving field. The field probe measures on noised data states, which generation never visits. Costs `2N+4` no-grad forwards per validation. `0` (default) disables. Incompatible with `--base_weights` for the same reason as the field probe. Not available on a full fine-tune, which keeps no frozen base to evaluate at the walked-to state. |
 
 ### Validation
 
