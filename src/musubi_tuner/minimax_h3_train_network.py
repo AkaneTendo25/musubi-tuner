@@ -504,6 +504,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._velocity_errors: dict[int, list[float]] = {}
         self._velocity_error_ratios: dict[int, list[float]] = {}
         self._branch_drift: dict[int, list] = {}
+        self._prompted_drift_ratios: dict[int, list[float]] = {}
         self._validation_network = None
         self._step_recipe: str | None = None
         self._step_qwen_control_dropout = False
@@ -675,6 +676,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._velocity_errors = {}
         self._velocity_error_ratios = {}
         self._branch_drift = {}
+        self._prompted_drift_ratios = {}
 
         block_swap_active = bool(self.blocks_to_swap)
         transformer_was_training = transformer.training
@@ -784,10 +786,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if pooled_err:
             metrics["val/velocity_err"] = sum(pooled_err) / len(pooled_err)
         # What the field would be with the empty branch held where the base left it
-        # and the prompted branch wherever training took it. Ordinary training
-        # supervises the prompted branch only, yet the adapter is shared and moves
-        # the empty one anyway; if most of the loss is that unattended drift, then
-        # pinning the empty branch costs nothing in what is being learned.
+        # and the prompted branch wherever training took it.
+        #
+        # Read it as an amplitude and nothing more. It is a distance from a fixed point,
+        # so it cannot separate "the prompted branch stayed put" from "it went somewhere
+        # else and happened to land equally far away" -- and measured on real arms it
+        # does invert: ordinary training scores HIGHER here than an arm whose prompted
+        # branch demonstrably moved less. For the question "does this adapter still
+        # answer prompts the way the checkpoint did", read val/drift/prompted_rel.
         counterfactual = [ratio for ratios in self._null_field_ratios.values() for ratio in ratios]
         if counterfactual:
             metrics["val/field_if_null_pinned"] = sum(counterfactual) / len(counterfactual)
@@ -795,6 +801,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if drifts:
             metrics["val/drift/prompted"] = sum(pair[0] for pair in drifts) / len(drifts)
             metrics["val/drift/empty"] = sum(pair[1] for pair in drifts) / len(drifts)
+        for bin_index, ratios in sorted(self._prompted_drift_ratios.items()):
+            if ratios:
+                metrics[f"val/drift/prompted_rel/bin{bin_index}"] = sum(ratios) / len(ratios)
+        pooled_drift = [ratio for ratios in self._prompted_drift_ratios.values() for ratio in ratios]
+        if pooled_drift:
+            metrics["val/drift/prompted_rel"] = sum(pooled_drift) / len(pooled_drift)
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
@@ -1125,6 +1137,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         network = self._validation_network
         if network is None:
             raise ValueError("--h3_validation_field_probe requires a trainable network")
+        merged = getattr(self, "_merged_base_weight_paths", None)
+        if merged:
+            # Every number this probe reports is a ratio against the checkpoint, formed
+            # by disabling the trainable network for one pair of forwards. --base_weights
+            # is folded into the transformer at load time and cannot be switched off, so
+            # the reference silently becomes "the checkpoint plus that adapter" and the
+            # ratios land on a scale no other run shares -- while looking entirely
+            # ordinary. Refusing is the only honest option: there is nothing to warn
+            # about that a reader of the numbers could act on later.
+            raise ValueError(
+                "--h3_validation_field_probe measures against the checkpoint, but --base_weights merged "
+                + ", ".join(merged)
+                + " into it and a merge cannot be undone for one forward. Drop --base_weights, or drop the probe"
+            )
         set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_validation_field_probe")
         fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
         int8_context = getattr(transformer, "int8_attention_context", None)
@@ -1197,14 +1223,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if float(base_error) > 0.0:
                     self._velocity_error_ratios.setdefault(sigma_bin.index, []).append(float(error) / float(base_error))
 
-        if base_pair is not None and adapted_pair is not None:
-            self._branch_drift.setdefault(sigma_bin.index, []).append(
-                (
-                    self._masked_rms(adapted_pair[0] - base_pair[0], video_mask),
-                    self._masked_rms(adapted_pair[1] - base_pair[1], video_mask),
-                )
-            )
         base_gap = self._field_base_gaps[key]
+        if base_pair is not None and adapted_pair is not None:
+            prompted_drift = self._masked_rms(adapted_pair[0] - base_pair[0], video_mask)
+            self._branch_drift.setdefault(sigma_bin.index, []).append(
+                (prompted_drift, self._masked_rms(adapted_pair[1] - base_pair[1], video_mask))
+            )
+            # The same drift as a share of the base's own field, which is the form that
+            # can be compared across datasets and across runs -- the raw value is in the
+            # units of whatever velocities the data happened to contain.
+            #
+            # This is the number to read when asking whether an adapter still answers
+            # prompts the way the checkpoint did. It is the only one here that no
+            # preservation term can flatter: the empty branch cancels out of it exactly,
+            # since (prompted_adapter - base_empty) - (base_prompted - base_empty) is
+            # just prompted_adapter - base_prompted. A method that holds the empty
+            # branch still scores nothing here for doing so.
+            if base_gap > 0.0:
+                self._prompted_drift_ratios.setdefault(sigma_bin.index, []).append(prompted_drift / base_gap)
         if base_gap <= 0.0:
             # The base has no field to lose at this state, so a ratio would divide by
             # noise. Skipping keeps one degenerate item from dominating the average.
@@ -1406,6 +1442,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_distillation_probability requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
+        anchor_weight = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0)
+        if not math.isfinite(anchor_weight) or anchor_weight < 0:
+            # Every gate on this feature reads "> 0", so a negative weight would
+            # configure the anchor and then quietly train without it.
+            raise ValueError("--h3_guidance_null_anchor_weight must be finite and non-negative; 0 disables it")
         if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
             raise ValueError("--h3_base_preservation_probability must be finite and lie in (0, 1]")
         if not math.isfinite(args.h3_dop_loss_weight) or args.h3_dop_loss_weight < 0:
@@ -2087,6 +2128,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if base_weight_paths:
             args.base_weights = None
             args.base_weights_multiplier = None
+            # Remembered because the argument is cleared here and nothing downstream can
+            # tell afterwards that the model it was handed is no longer the checkpoint.
+            self._merged_base_weight_paths = list(base_weight_paths)
             accelerator.print("all H3 base weights merged during model loading: " + ", ".join(base_weight_paths))
         return transformer
 
@@ -2967,6 +3011,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 else guidance_active_override
             )
         reference_prediction = None
+        null_anchor_student = None
+        null_anchor_reference = None
         preservation_active = args.h3_base_preservation_loss_weight > 0 and (
             self._base_preservation_active(accelerator, args.h3_base_preservation_probability)
             if preservation_active_override is None
@@ -3093,6 +3139,44 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     finally:
                         if null_set_enabled is not None:
                             null_set_enabled(True)
+            null_anchor_weight = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0)
+            if null_anchor_weight > 0 and conditioning == "prompt":
+                # Hold the EMPTY-prompt prediction where the checkpoint had it, and
+                # leave the prompted one entirely free.
+                #
+                # Why the empty branch and not the prompted one: preserving the
+                # PROMPTED branch fights the data term directly -- it says "do not change
+                # your answer to the prompt", which is the thing training is for --
+                # whereas the empty branch is a degree of freedom that learning a concept
+                # does not need, so constraining it is nearly free of that conflict.
+                #
+                # What the evidence does and does not say. It was adopted on the strength
+                # of a field-distance metric built from (prompted - empty), which this
+                # term directly holds still; that reading was circular and is withdrawn.
+                # What survives is measured where the empty branch cancels out of the
+                # arithmetic -- prompted-branch drift against the checkpoint -- where the
+                # anchored arm sits about 0.03 closer across five matched points, and a
+                # six-pair blind render comparison at matched learning that went 6-0.
+                # One seed, small corpora.
+                #
+                # Costs one grad forward and one no-grad forward, about 1.8x a step.
+                # Skipped on a caption-dropout step, where the data objective is already
+                # training the empty branch toward the clip and two instructions would
+                # be aimed at one prediction.
+                null_anchor_toggle = self._runtime_network_toggle(accelerator, network, "--h3_guidance_null_anchor_weight")
+                anchor_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                anchor_int8 = getattr(transformer, "int8_attention_context", None)
+                null_anchor_student = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                with (
+                    torch.random.fork_rng(devices=anchor_devices),
+                    torch.no_grad(),
+                    anchor_int8(auxiliary=True) if callable(anchor_int8) else nullcontext(),
+                ):
+                    null_anchor_toggle(False)
+                    try:
+                        null_anchor_reference = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                    finally:
+                        null_anchor_toggle(True)
             if preservation_active and not fused_teachers_completed:
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_base_preservation_loss_weight")
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
@@ -3303,6 +3387,28 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.h3_base_preservation_loss_weight > 0:
             metrics["h3/base_preservation_active"] = float(preservation_active)
             metrics.setdefault("loss/base_preservation", 0.0)
+        if null_anchor_student is not None and null_anchor_reference is not None:
+            null_anchor = (
+                float(args.h3_guidance_null_anchor_weight)
+                * joint_prediction_loss(
+                    null_anchor_student,
+                    null_anchor_reference,
+                    video_mask=effective_video_mask,
+                    audio_mask=effective_audio_mask,
+                    video_sample_weight=video_sample_weight,
+                    audio_sample_weight=audio_sample_weight,
+                    balance=args.h3_loss_balance,
+                    mask_normalization=args.h3_loss_mask_normalization,
+                    video_weight=video_weight,
+                    audio_weight=audio_weight,
+                ).loss
+            )
+            loss = loss + null_anchor
+            metrics["loss/guidance_null_anchor"] = float(null_anchor.detach())
+        elif float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0:
+            # Present every step once the flag is on, so a run whose anchor never fired
+            # is visible as a flat zero rather than as a missing tag nobody looks for.
+            metrics["loss/guidance_null_anchor"] = 0.0
         if use_crepa and self._crepa.active:
             crepa_loss, crepa_metrics = self._crepa.loss(
                 batch.get("h3_dino_features"), update_similarity_threshold=crepa_update_similarity_threshold
@@ -3399,6 +3505,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_mask_mode": args.h3_mask_mode,
             "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
+            "ss_h3_guidance_null_anchor_weight": str(getattr(args, "h3_guidance_null_anchor_weight", 0.0)),
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
             "ss_h3_dop_loss_weight": str(args.h3_dop_loss_weight),
             "ss_h3_dop_probability": str(args.h3_dop_probability),
@@ -3831,9 +3938,30 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_validation_field_probe",
         action="store_true",
         help=(
-            "DEBUG. Report what the adapter has done to the guidance field, measured against the frozen base "
+            "DEBUG. Reported against the frozen base checkpoint, so it is incompatible with --base_weights, which "
+            "merges an adapter into that checkpoint. val/velocity_err is an ENERGY ratio (squared error over squared "
+            "target), so two runs are comparable at equal values but the axis is not linear -- interpolate on its "
+            "square root, not on it. "
+            "Report what the adapter has done to the guidance field, measured against the frozen base "
             "on the validation items. Diagnostic only, subject to removal, and not part of any recommended "
             "recipe. Requires a validation set and empty-text caches (--cache_guidance_empty)"
+        ),
+    )
+    parser.add_argument(
+        "--h3_guidance_null_anchor_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "DEBUG. Penalise movement of the EMPTY-prompt prediction away from the base checkpoint's, weighted by "
+            "this value, while leaving the prompted prediction free. Unlike "
+            "--h3_base_preservation_loss_weight it does not constrain the prompted branch, so it does not fight the "
+            "data term directly; it constrains a degree of freedom that learning a concept does not need. Measured "
+            "on one corpus pair, at matched amounts of learning, it left the PROMPTED prediction about 0.03 closer "
+            "to the checkpoint's on val/drift/prompted_rel, and won a six-pair blind render comparison 6-0 against "
+            "ordinary training. Read val/drift/prompted_rel to judge it: val/field and its relatives are built on "
+            "the prompted-minus-empty difference, which this term directly holds, so they flatter it. Costs one "
+            "extra grad forward and one no-grad forward, about 1.8x a step, and reaches a given fit in more steps. "
+            "Skipped on caption-dropout steps. One seed, small corpora; treat as experimental. 0 disables"
         ),
     )
     parser.add_argument(

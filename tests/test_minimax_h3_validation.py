@@ -688,3 +688,59 @@ def test_h3_relative_velocity_error_reads_1_when_an_adapter_learned_nothing():
     assert ratio(target / 2.0) == pytest.approx(0.25, abs=1e-6)
     # The masked-out element disagrees enormously and must not enter either side.
     assert ratio(torch.tensor([[2.0, 2.0, -999.0]])) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_h3_field_probe_refuses_a_checkpoint_with_merged_base_weights():
+    """The probe's reference must be the checkpoint, and a merge destroys it.
+
+    Every number the probe reports is a ratio against the checkpoint, formed by
+    disabling the trainable network for one pair of forwards. ``--base_weights`` is
+    folded into the transformer at load time and cannot be switched off again, so the
+    reference silently becomes "the checkpoint plus that adapter" and every ratio lands
+    on a scale no other run shares -- while looking completely ordinary in the log.
+
+    That is not hypothetical: an arm measured this way reported a field of 1.0 at step
+    zero, meaning "untouched", when the adapter it was being compared against had
+    already lost two thirds of the base's field.
+    """
+    trainer = MiniMaxH3NetworkTrainer.__new__(MiniMaxH3NetworkTrainer)
+    trainer._validation_network = nn.Linear(1, 1)
+    trainer._merged_base_weight_paths = ["collapsed.safetensors"]
+    inputs = SimpleNamespace(video=torch.zeros(1, 1))
+    batch = {H3_EMPTY_TEXT_HIDDEN_KEY: torch.zeros(1), H3_EMPTY_TEXT_TOKEN_TAGS_KEY: torch.zeros(1)}
+
+    with pytest.raises(ValueError, match="merged"):
+        MiniMaxH3NetworkTrainer._probe_guidance_field(
+            trainer,
+            SimpleNamespace(device=torch.device("cpu")),
+            SimpleNamespace(),
+            nn.Linear(1, 1),
+            batch,
+            inputs,
+            None,
+            dataset_index=0,
+            sigma_bin=SimpleNamespace(index=0),
+            observed="video",
+        )
+
+
+def test_h3_null_anchor_weight_must_not_be_negative():
+    """A negative weight would configure the anchor and then train without it.
+
+    Every gate on the feature reads ``> 0``, so a negative value silently disables the
+    thing the launch line asked for. That failure mode has already cost this codebase a
+    long run: an arm trained for an hour and a half believing it was anchored, and only
+    the missing ``loss/guidance_null_anchor`` tag gave it away afterwards.
+    """
+    trainer = MiniMaxH3NetworkTrainer.__new__(MiniMaxH3NetworkTrainer)
+    args = create_parser().parse_args([])
+
+    assert args.h3_guidance_null_anchor_weight == 0.0
+
+    args.h3_guidance_null_anchor_weight = -1.0
+    with pytest.raises(ValueError, match="non-negative"):
+        trainer.handle_model_specific_args(args)
+
+    args.h3_guidance_null_anchor_weight = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        trainer.handle_model_specific_args(args)
