@@ -2491,3 +2491,187 @@ def test_the_null_anchor_alone_keeps_classic_block_swap_on_its_contract(tmp_path
     # into it, and the training layout restored before the main forward.
     assert transformer.swap_events == ["inference", "training", "inference", "training"]
     assert transformer.swap_mode == "training"
+
+
+# ---------------------------------------------------------------------------
+# --h3_rollout_field_floor: a LENGTH floor on the guidance field at the
+# supervised states, taken against the FROZEN empty branch
+# ---------------------------------------------------------------------------
+
+_FLOOR_FLAGS = (*_ROLLOUT_FLAGS, "--h3_rollout_field_floor", "1.0")
+
+# With the stub field the adapter scales the 0.25 velocity by 0.5 and the frozen
+# base by 1.0, so at every supervised state the student's prompted-minus-frozen-
+# empty field is (0.125 + 0.25) - (0.25 + 0.0) = 0.125 against the base's
+# (0.25 + 0.25) - (0.25 + 0.0) = 0.25: a length ratio of one half.
+_STUB_FIELD_RATIO = ((0.5 * 0.25 + 0.25) - (1.0 * 0.25 + 0.0)) / ((1.0 * 0.25 + 0.25) - (1.0 * 0.25 + 0.0))
+
+
+def _graph_parameters(loss):
+    """The leaf parameters a loss depends on, found by walking its graph."""
+    seen, leaves, stack = set(), [], [loss.grad_fn]
+    while stack:
+        node = stack.pop()
+        if node is None or node in seen:
+            continue
+        seen.add(node)
+        variable = getattr(node, "variable", None)
+        if variable is not None:
+            leaves.append(variable)
+        stack.extend(child for child, _ in node.next_functions)
+    return leaves
+
+
+def test_field_floor_requires_the_switch():
+    with pytest.raises(ValueError, match="requires --h3_rollout_supervision"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(_flag_args("--h3_rollout_field_floor", "1.0"))
+
+
+def test_field_floor_rejects_a_negative_weight(tmp_path):
+    args = _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_field_floor", "-1", teacher=_teacher_file(tmp_path))
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(args)
+
+
+def test_field_floor_adds_two_frozen_forwards_per_supervised_state(tmp_path):
+    backend, loss, _, _ = _run_step(
+        *_FLOOR_FLAGS, "--h3_rollout_steps", "2", "--h3_rollout_window", "2", teacher=_teacher_file(tmp_path)
+    )
+    loss.backward()
+
+    # One data forward, two no-grad rollout steps, then per supervised state the
+    # graded student, the teacher, and the frozen base's prompted and empty arms.
+    assert len(backend.calls) == 1 + 2 + 2 * 4
+    window = backend.calls[3:]
+    assert [call["grad"] for call in window] == [True, False, False, False] * 2
+    assert [call["adapter"] for call in window] == [True, False, False, False] * 2
+    assert [call["conditioning"] for call in window] == ["prompt", "prompt", "prompt", "empty"] * 2
+    student_signature = float(torch.full((4, 8), 0.25).mean())
+    teacher_signature = float(torch.full((4, 8), 0.75).mean())
+    assert [call["signature"] for call in window[:4]] == [student_signature, teacher_signature, student_signature, 0.0]
+    # All four arms of a sub-step describe one and the same state.
+    for sub_step in (window[:4], window[4:]):
+        assert all(torch.equal(call["video_state"], sub_step[0]["video_state"]) for call in sub_step)
+
+
+def test_field_floor_penalises_a_shortened_field_and_leaves_the_reported_loss_alone(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, plain_loss, plain_metrics, _ = _run_step(*_ROLLOUT_FLAGS, teacher=teacher)
+    _, floored_loss, metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+
+    assert metrics["h3/rollout_field_ratio"] == pytest.approx(_STUB_FIELD_RATIO)
+    assert metrics["loss/rollout_field_floor"] == pytest.approx((1.0 - _STUB_FIELD_RATIO) ** 2)
+    assert float(floored_loss.detach()) == pytest.approx(float(plain_loss.detach()) + (1.0 - _STUB_FIELD_RATIO) ** 2)
+    # An auxiliary term: the running average is still the data loss of a run
+    # without the flag.
+    assert metrics[LOSS_FOR_AVERAGE_KEY] == pytest.approx(plain_metrics[LOSS_FOR_AVERAGE_KEY])
+
+
+def test_field_floor_pulls_the_field_longer_not_shorter(tmp_path):
+    """The adapter's scale is its only parameter and a larger scale is a longer
+    field, so the floor's gradient on it must point down: more scale, less loss."""
+    teacher = _teacher_file(tmp_path)
+    _, plain_loss, _, _ = _run_step(*_ROLLOUT_FLAGS, teacher=teacher)
+    _, floored_loss, _, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+    (plain_scale,) = _graph_parameters(plain_loss)
+    (floored_scale,) = _graph_parameters(floored_loss)
+    plain_loss.backward()
+    floored_loss.backward()
+    assert float(floored_scale.grad) < float(plain_scale.grad)
+
+
+def test_field_floor_is_zero_when_the_field_is_no_shorter(tmp_path, monkeypatch):
+    class _LongFieldTransformer(_ScaleTransformer):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.5))
+
+    monkeypatch.setitem(globals(), "_ScaleTransformer", _LongFieldTransformer)
+    teacher = _teacher_file(tmp_path)
+    _, plain_loss, _, _ = _run_step(*_ROLLOUT_FLAGS, teacher=teacher)
+    _, floored_loss, metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+
+    assert metrics["h3/rollout_field_ratio"] == pytest.approx(1.5)
+    assert metrics["loss/rollout_field_floor"] == 0.0
+    assert float(floored_loss.detach()) == pytest.approx(float(plain_loss.detach()))
+
+
+def test_field_floor_rides_the_fused_pass(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    naive_backend, naive_loss, naive_metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher, backend=_FusedRolloutBackend())
+    fused_backend, fused_loss, fused_metrics, _ = _run_step(
+        *_FLOOR_FLAGS, "--h3_rollout_fused_teacher", teacher=teacher, backend=_FusedRolloutBackend()
+    )
+
+    assert naive_backend.fused_calls == 0
+    # One fused call per supervised state carries all four arms.
+    assert fused_backend.fused_calls == 1
+    torch.testing.assert_close(fused_loss, naive_loss, rtol=0, atol=0)
+    assert fused_metrics == naive_metrics
+    for key in ("signature", "grad", "adapter", "conditioning"):
+        assert [call[key] for call in fused_backend.calls] == [call[key] for call in naive_backend.calls]
+
+
+def test_field_floor_reports_zero_on_an_inactive_step(tmp_path):
+    _, _, metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=_teacher_file(tmp_path), active=False)
+    assert metrics["loss/rollout_field_floor"] == 0.0
+    assert metrics["h3/rollout_field_ratio"] == 0.0
+
+
+def test_field_floor_needs_the_empty_presentation(tmp_path):
+    video, batch = _rollout_batch()
+    batch.pop(H3_EMPTY_TEXT_HIDDEN_KEY)
+    batch.pop(H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
+    with pytest.raises(ValueError, match="cache_guidance_empty"):
+        _run_step(*_FLOOR_FLAGS, teacher=_teacher_file(tmp_path), batch=(video, batch))
+
+
+def test_field_floor_is_recorded_in_adapter_metadata(tmp_path):
+    args = _flag_args(*_FLOOR_FLAGS, teacher=_teacher_file(tmp_path))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_rollout_field_floor"] == "1.0"
+    assert MiniMaxH3NetworkTrainer().extra_metadata(_flag_args())["ss_h3_rollout_field_floor"] == "0.0"
+
+
+def test_field_floor_has_a_finite_gradient_at_an_exactly_zero_field(tmp_path, monkeypatch):
+    """The floor bites hardest where the student's field has vanished, and that is
+    where sqrt(mean(x^2)) would have handed back NaN."""
+
+    class _ZeroFieldTransformer(_ScaleTransformer):
+        def __init__(self):
+            super().__init__()
+            # 0 * 0.25 + 0.25 (prompted) == 1.0 * 0.25 + 0.0 (frozen empty): g' == e.
+            self.scale = torch.nn.Parameter(torch.tensor(0.0))
+
+    monkeypatch.setitem(globals(), "_ScaleTransformer", _ZeroFieldTransformer)
+    _, loss, metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=_teacher_file(tmp_path))
+    assert metrics["h3/rollout_field_ratio"] == 0.0
+    assert metrics["loss/rollout_field_floor"] == pytest.approx(1.0)
+    (scale,) = _graph_parameters(loss)
+    loss.backward()
+    assert torch.isfinite(scale.grad)
+
+
+def test_field_length_ratio_drops_a_sample_with_no_authored_element():
+    adapted = torch.ones(2, 3, 4)
+    base = torch.full((2, 3, 4), 2.0)
+    mask = torch.stack([torch.ones(3, 4), torch.zeros(3, 4)])
+    ratio, valid = MiniMaxH3NetworkTrainer._field_length_ratio(adapted, base, mask)
+    assert ratio[0].item() == pytest.approx(0.5)
+    assert valid.tolist() == [True, False]
+    # And with no mask every sample is scored.
+    _, all_valid = MiniMaxH3NetworkTrainer._field_length_ratio(adapted, base, None)
+    assert all_valid.tolist() == [True, True]
+
+
+def test_field_floor_warns_without_the_null_anchor(tmp_path, caplog):
+    args = _flag_args(*_FLOOR_FLAGS, teacher=_teacher_file(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(args)
+    assert any("null_anchor" in record.getMessage() for record in caplog.records)
+    caplog.clear()
+    anchored = _flag_args(*_FLOOR_FLAGS, "--h3_guidance_null_anchor_weight", "1.0", teacher=_teacher_file(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(anchored)
+    assert not any("null_anchor" in record.getMessage() for record in caplog.records)

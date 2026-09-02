@@ -3710,6 +3710,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_rollout_stop_shifted": bool(getattr(args, "h3_rollout_stop_shifted", False)),
             "--h3_rollout_teacher_privilege": getattr(args, "h3_rollout_teacher_privilege", "auto") != "auto",
             "--h3_rollout_fused_teacher": bool(getattr(args, "h3_rollout_fused_teacher", False)),
+            "--h3_rollout_field_floor": float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) != 0.0,
         }
         if not rollout:
             for flag, changed in flags.items():
@@ -3732,6 +3733,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_rollout_probability must be finite and lie in (0, 1]")
         if args.h3_video_loss_weight <= 0:
             raise ValueError("--h3_rollout_supervision trains the video field and therefore needs --h3_video_loss_weight > 0")
+        field_floor = float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)
+        if not math.isfinite(field_floor) or field_floor < 0:
+            # Gated on "> 0" below, so a negative weight would configure the floor
+            # and then quietly train without it.
+            raise ValueError("--h3_rollout_field_floor must be finite and non-negative; 0 disables it")
+        if field_floor > 0 and float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) <= 0:
+            # The floor measures the student's prompted prediction against the
+            # FROZEN empty branch. What inference amplifies is the gap to the
+            # student's OWN empty branch, and nothing in the floor stops that
+            # branch from drifting toward the prompted one; the anchor is what
+            # holds it. Without the anchor the floor is a displacement floor on
+            # the prompted branch alone, which is a weaker statement.
+            logger.warning(
+                "--h3_rollout_field_floor holds the prompted prediction's distance from the FROZEN empty branch; the "
+                "field inference amplifies is the distance to the student's own empty branch, which only "
+                "--h3_guidance_null_anchor_weight holds. Without the anchor the floor does not bound that field"
+            )
         if getattr(args, "h3_rollout_fused_teacher", False) and getattr(args, "h3_int8_attention", "off") == "aux":
             # Fusing puts the student and the teacher inside one pass over the
             # blocks, where the attention kernel is chosen per block and not per
@@ -3905,8 +3923,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         conditioning: str,
         set_enabled,
         fork_devices: list,
-    ) -> tuple[H3ModelPrediction, H3ModelPrediction]:
+        frozen_base: bool = False,
+    ) -> list[H3ModelPrediction]:
         """One supervised sub-step evaluated in a single pass over the blocks.
+
+        Returns ``[student, teacher]``, followed by the frozen base's prompted and
+        empty predictions at the same state when ``frozen_base`` is set: the two
+        arms ``--h3_rollout_field_floor`` reads, riding the same block loop.
 
         The student and the teacher pack different sequences -- the privileged
         presentation is the longer one, which is the entire point of it -- so they
@@ -3945,7 +3968,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             build=lambda: _forked_frozen_build(fork_devices, set_enabled),
             run=run,
         )
-        return tuple(self._predict_fused(accelerator, transformer, [student, teacher]))
+        arms = [student, teacher]
+        if frozen_base:
+            arms.extend(
+                H3FusedArm(
+                    call=self._predict_call(accelerator, batch, state, conditioning=branch),
+                    build=lambda: _forked_frozen_build(fork_devices, set_enabled),
+                    run=run,
+                )
+                for branch in ("prompt", "empty")
+            )
+        return self._predict_fused(accelerator, transformer, arms)
 
     def _teacher_presentation(self, batch: dict) -> dict:
         """The privileged teacher's conditioning, presented through this batch.
@@ -3979,13 +4012,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         audio_shift: float,
         conditioning: str,
         auxiliary_block_swap: bool,
-    ) -> tuple[list[tuple[H3ModelPrediction, H3ModelPrediction]], float, list[torch.Tensor]]:
+    ) -> tuple[
+        list[tuple[H3ModelPrediction, H3ModelPrediction]],
+        float,
+        list[torch.Tensor],
+        list[tuple[H3ModelPrediction, H3ModelPrediction]] | None,
+    ]:
         """Roll the student's own sampler out from noise and supervise the tail.
 
         Returns one ``(student, teacher)`` prediction pair per supervision
-        sub-step, the unshifted base sigma the rollout stopped at, and each
+        sub-step, the unshifted base sigma the rollout stopped at, each
         sub-step's shifted video sigma so the loss can weight on the noise level
-        it was actually taken at rather than the data step's.
+        it was actually taken at rather than the data step's, and -- under
+        ``--h3_rollout_field_floor`` -- one ``(base_prompted, base_empty)`` pair
+        of frozen predictions per sub-step at that same state, else ``None``.
         Both branches of every pair are evaluated at the SAME state:
         the student with the ordinary conditioning it trains under, the teacher --
         the frozen base, adapter disabled -- with the privileged presentation that
@@ -4007,6 +4047,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_rollout_supervision")
         int8_context = getattr(transformer, "int8_attention_context", None)
         fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+        field_floor = float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0
+        if field_floor:
+            missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+            if missing_empty:
+                raise ValueError(
+                    "--h3_rollout_field_floor evaluates the frozen base's EMPTY branch at every supervised state and "
+                    "needs the empty presentation in the student's text cache; re-cache with --cache_guidance_empty "
+                    f"(missing {', '.join(missing_empty)})"
+                )
 
         stop_sigma = self._draw_rollout_stop_sigma(args, video_shift)
         base = torch.tensor(rollout_base_sigmas(stop_sigma, args.h3_rollout_steps, args.h3_rollout_window), dtype=torch.float32)
@@ -4053,10 +4102,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         fused = bool(getattr(args, "h3_rollout_fused_teacher", False))
         pairs: list[tuple[H3ModelPrediction, H3ModelPrediction]] = []
+        bases: list[tuple[H3ModelPrediction, H3ModelPrediction]] = []
         for index in range(args.h3_rollout_steps, base.shape[0]):
             state = state_at(index)
             if fused:
-                student, teacher = self._fused_rollout_pair(
+                student, teacher, *frozen = self._fused_rollout_pair(
                     accelerator,
                     transformer,
                     batch,
@@ -4065,7 +4115,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     conditioning=conditioning,
                     set_enabled=set_enabled,
                     fork_devices=fork_devices,
+                    frozen_base=field_floor,
                 )
+                if field_floor:
+                    bases.append((frozen[0], frozen[1]))
             else:
                 # Captured BEFORE the student runs, then replayed for the teacher.
                 # ``fork_rng`` alone would only restore the state the student left
@@ -4101,6 +4154,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             # the caller, which skips a caption-dropout step).
                             conditioning="prompt",
                         )
+                        if field_floor:
+                            # The floor's two frozen arms describe the same state
+                            # as the pair above, so each replays the entry RNG the
+                            # way the teacher did rather than continuing its draws.
+                            frozen = []
+                            for branch in ("prompt", "empty"):
+                                torch.set_rng_state(entry_cpu_rng)
+                                for device, rng_state in zip(fork_devices, entry_cuda_rng):
+                                    torch.cuda.set_rng_state(rng_state, device)
+                                frozen.append(self._predict(accelerator, transformer, batch, state, conditioning=branch))
+                            bases.append((frozen[0], frozen[1]))
                     finally:
                         set_enabled(True)
             pairs.append((student, teacher))
@@ -4115,7 +4179,36 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 ),
             )
         window = slice(args.h3_rollout_steps, base.shape[0])
-        return pairs, stop_sigma, [video_sigmas[window][index : index + 1] for index in range(len(pairs))]
+        return (
+            pairs,
+            stop_sigma,
+            [video_sigmas[window][index : index + 1] for index in range(len(pairs))],
+            bases if field_floor else None,
+        )
+
+    @staticmethod
+    def _field_length_ratio(adapted: torch.Tensor, base: torch.Tensor, mask) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-sample ``||adapted|| / ||base||`` over the authored elements, graph kept.
+
+        Returns the ratio and a per-sample validity flag: a sample with no
+        authored element has no field to measure and must not be scored.
+        ``vector_norm`` rather than ``sqrt(mean(x^2))`` because the floor bites
+        hardest at an exactly zero field, where the latter's derivative is
+        singular and the former's is defined (zero).
+        """
+
+        def length(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            flat = tensor.float().flatten(1)
+            if mask is None:
+                count = torch.full((flat.shape[0],), float(flat.shape[1]), device=flat.device)
+                return torch.linalg.vector_norm(flat, dim=1) / count.sqrt(), count > 0
+            valid = mask.to(device=tensor.device, dtype=torch.float32).expand_as(tensor).flatten(1)
+            count = valid.sum(dim=1)
+            return torch.linalg.vector_norm(flat * valid, dim=1) / count.clamp_min(1.0).sqrt(), count > 0
+
+        adapted_length, adapted_valid = length(adapted)
+        base_length, base_valid = length(base.detach())
+        return adapted_length / base_length.clamp_min(1e-6), adapted_valid & base_valid
 
     def _configured_guidance_scale(self, args, accelerator, inputs):
         """Resolve the guidance scale this step distills towards.
@@ -5082,6 +5175,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # loss differs from it.
         dense_loss = result.loss
         rollout_replaced = False
+        rollout_field_floor = None
         if rollout_active:
             # On-policy supervision REPLACES the video half of the data objective
             # and leaves the audio half alone. The two halves are reduced in one
@@ -5091,7 +5185,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # is exactly "the audio data loss plus the averaged rollout video
             # loss": the audio term is identical across sub-steps and both
             # balances are linear in the video numerator at a fixed denominator.
-            rollout_pairs, rollout_stop_sigma, rollout_video_sigmas = self._rollout_supervision(
+            rollout_pairs, rollout_stop_sigma, rollout_video_sigmas, rollout_bases = self._rollout_supervision(
                 args,
                 accelerator,
                 transformer,
@@ -5146,11 +5240,37 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             rollout_replaced = True
             metrics["loss/rollout_video"] = float(sum(term.video_loss.detach() for term in rollout_terms) / window)
             metrics["h3/rollout_stop_sigma"] = rollout_stop_sigma
+            if rollout_bases is not None:
+                # A LENGTH floor on the guidance field at the supervised states.
+                # The teacher term above sets the field's direction; this holds
+                # its length at no less than the checkpoint's, and nothing more.
+                # Both fields are taken against the FROZEN empty branch: with the
+                # student's own null in the difference, the cheapest way to lengthen
+                # the field would be to move that null, which is the degeneracy the
+                # frozen-null forms exist to remove.
+                measured = [
+                    self._field_length_ratio(
+                        student.video - base_empty.video.detach(),
+                        base_prompted.video - base_empty.video,
+                        effective_video_mask,
+                    )
+                    for (student, _teacher), (base_prompted, base_empty) in zip(rollout_pairs, rollout_bases, strict=True)
+                ]
+                ratios = torch.stack([ratio for ratio, _valid in measured])
+                valid = torch.stack([flag for _ratio, flag in measured]).to(ratios.dtype)
+                scored = valid.sum().clamp_min(1.0)
+                rollout_field_floor = float(args.h3_rollout_field_floor) * (torch.relu(1.0 - ratios).pow(2) * valid).sum() / scored
+                loss = loss + rollout_field_floor
+                metrics["loss/rollout_field_floor"] = float(rollout_field_floor.detach())
+                metrics["h3/rollout_field_ratio"] = float((ratios.detach() * valid).sum() / scored)
         if getattr(args, "h3_rollout_supervision", False):
             # Only reported when the feature is on, so an existing run's metric
             # set is unchanged.
             metrics["h3/rollout_active"] = float(rollout_active)
             metrics.setdefault("loss/rollout_video", 0.0)
+            if float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0:
+                metrics.setdefault("loss/rollout_field_floor", 0.0)
+                metrics.setdefault("h3/rollout_field_ratio", 0.0)
         guidance_rescaled = False
         # A rollout-active step has already swapped its objective wholesale, and
         # nothing about a swapped objective is divided by a probability (the same
@@ -5238,6 +5358,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # Report the dense guidance objective so the running average stays
                 # comparable across a sparse and a dense run.
                 average_loss = average_loss - rescaled_velocity_loss + dense_loss
+            if rollout_field_floor is not None:
+                # An auxiliary term like the anchor: the reported average stays the
+                # ordinary data loss a run without the flag would have logged.
+                average_loss = average_loss - rollout_field_floor
             if rollout_replaced:
                 # The rollout SWAPS the objective on a drawn subset of steps
                 # rather than estimating one objective sparsely, so nothing is
@@ -5342,6 +5466,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # knob that changes how the step is executed rather than what it
             # optimizes, and a reader comparing two runs' throughput needs it.
             "ss_h3_rollout_fused_teacher": str(bool(getattr(args, "h3_rollout_fused_teacher", False))),
+            "ss_h3_rollout_field_floor": str(float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)),
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
             "ss_h3_dop_loss_weight": str(args.h3_dop_loss_weight),
             "ss_h3_dop_probability": str(args.h3_dop_probability),
@@ -5905,6 +6030,25 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "longer one -- so they are interleaved block by block rather than batched, which leaves every arm's "
             "attention exactly what it was and makes --blocks_to_swap stream each swapped block once per sub-step "
             "instead of twice. Off by default so the two paths stay A/B comparable"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_field_floor",
+        type=float,
+        default=0.0,
+        help=(
+            "weight of a LENGTH floor on the guidance field at each supervised rollout state: with the frozen "
+            "base's empty-prompt prediction e and prompted prediction g evaluated at the same state, the student's "
+            "prompted prediction g' is penalised by weight * relu(1 - ||g' - e|| / ||g - e||)^2, so the "
+            "prompted-to-empty gap may not shrink below the checkpoint's but is free to grow and free to turn. The "
+            "direction of the field belongs to the concept being learned and is left to the teacher term; only its "
+            "length, which belongs to the distillation, is held. The null branch in both fields is the FROZEN one, "
+            "so the floor cannot be satisfied by moving the student's own empty branch -- and, by the same token, it "
+            "does not bound the gap to that branch: pair it with --h3_guidance_null_anchor_weight, which holds the "
+            "student's empty branch at the frozen one, or the floor is only a displacement floor on the prompted "
+            "prediction. Costs two no-grad frozen "
+            "forwards per supervised sub-step (folded into the fused pass under --h3_rollout_fused_teacher). "
+            "Requires --h3_rollout_supervision and a text cache built with --cache_guidance_empty. 0 disables"
         ),
     )
     parser.add_argument(
