@@ -50,6 +50,19 @@ MINIMAX_H3_MODALITY_COUNT = 3
 _CUDNN_AUTO_WORK_THRESHOLD = 1 << 28
 _CUDNN_AUTO_MIN_SEQUENCE = 1024
 
+
+def h3_profile_scope(name: str) -> AbstractContextManager:
+    """A ``torch.profiler.record_function`` label while a profiler is collecting, else a no-op.
+
+    Outside profiling this returns ``nullcontext``, so a block pays a flag read and a null
+    context enter per label -- negligible next to its compute. Inside a ``torch.compile``
+    region Dynamo treats both as null contexts, and a checkpointed block simply re-enters the
+    label on recompute."""
+    if getattr(torch.autograd.profiler, "_is_profiler_enabled", False):
+        return torch.profiler.record_function(name)
+    return nullcontext()
+
+
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -236,11 +249,21 @@ class MiniMaxH3Attention(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
+        with h3_profile_scope("h3.qkv"):
+            query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
         query = query.unflatten(-1, (self.heads, self.head_dim))
         key = key.unflatten(-1, (self.heads, self.head_dim))
         value = value.unflatten(-1, (self.heads, self.head_dim))
 
+        with h3_profile_scope("h3.rope"):
+            query, key = self._norm_and_rotate(query, key, rotary_emb)
+        hidden_states = self._attention_core(query, key, value, attention_mask)
+        with h3_profile_scope("h3.out"):
+            return self.out_proj(hidden_states)
+
+    def _norm_and_rotate(
+        self, query: torch.Tensor, key: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor] | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         fused_qk = None
         if self.fused_qk_norm_rope and rotary_emb is not None:
             fused_qk = try_fused_qk_norm_rope(
@@ -253,14 +276,18 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm.eps,
             )
         if fused_qk is not None:
-            query, key = fused_qk
-        else:
-            query = self.q_norm(query)
-            key = self.k_norm(key)
-            if rotary_emb is not None:
-                query = _apply_rotary_emb(query, *rotary_emb)
-                key = _apply_rotary_emb(key, *rotary_emb)
+            return fused_qk
+        query = self.q_norm(query)
+        key = self.k_norm(key)
+        if rotary_emb is not None:
+            query = _apply_rotary_emb(query, *rotary_emb)
+            key = _apply_rotary_emb(key, *rotary_emb)
+        return query, key
 
+    def _attention_core(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """``[B, S, heads, head_dim]`` Q/K/V to the ``[B, S, heads * head_dim]`` attention output."""
         if self.block_sparse_config is not None and attention_mask is None:
             # A padding mask is a pairwise condition block selection cannot
             # express, so masked calls fall through to the dense path.
@@ -302,7 +329,7 @@ class MiniMaxH3Attention(nn.Module):
                     is_causal=False,
                 )
             hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
-        return self.out_proj(hidden_states)
+        return hidden_states
 
 
 class MiniMaxH3FeedForward(nn.Module):
@@ -315,12 +342,14 @@ class MiniMaxH3FeedForward(nn.Module):
 
     def _forward_rows(self, hidden_states: torch.Tensor) -> torch.Tensor:
         projected = self.fc1(hidden_states)
-        if self.fused_swiglu:
-            fused = try_fused_swiglu(projected)
-            if fused is not None:
-                return self.fc2(fused)
-        gate, value = projected.chunk(2, dim=-1)
-        return self.fc2(F.silu(gate) * value)
+        with h3_profile_scope("h3.swiglu"):
+            activated = None
+            if self.fused_swiglu:
+                activated = try_fused_swiglu(projected)
+            if activated is None:
+                gate, value = projected.chunk(2, dim=-1)
+                activated = F.silu(gate) * value
+        return self.fc2(activated)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.chunk_rows <= 0 or hidden_states.shape[-2] <= self.chunk_rows:
@@ -417,16 +446,34 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        modulation = self.adaln_proj(timestep_embedding).view(-1, 6 * self.hidden_size).to(hidden_states.dtype)
+        with h3_profile_scope("h3.block"):
+            return self._forward(hidden_states, timestep_embedding, adaln_indices, rotary_emb, attention_mask)
+
+    def _forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep_embedding: torch.Tensor,
+        adaln_indices: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        with h3_profile_scope("h3.adaln"):
+            modulation = self.adaln_proj(timestep_embedding).view(-1, 6 * self.hidden_size).to(hidden_states.dtype)
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
 
-        norm_hidden_states = self._norm_and_modulate(self.norm1, hidden_states, shift_attn, scale_attn, adaln_indices)
-        attention = self.attn(norm_hidden_states, rotary_emb, attention_mask)
-        hidden_states = hidden_states + gate_attn.index_select(0, adaln_indices) * attention
+        with h3_profile_scope("h3.norm"):
+            norm_hidden_states = self._norm_and_modulate(self.norm1, hidden_states, shift_attn, scale_attn, adaln_indices)
+        with h3_profile_scope("h3.attn"):
+            attention = self.attn(norm_hidden_states, rotary_emb, attention_mask)
+        with h3_profile_scope("h3.gate"):
+            hidden_states = hidden_states + gate_attn.index_select(0, adaln_indices) * attention
 
-        norm_hidden_states = self._norm_and_modulate(self.norm2, hidden_states, shift_mlp, scale_mlp, adaln_indices)
-        feed_forward = self.mlp(norm_hidden_states)
-        return hidden_states + gate_mlp.index_select(0, adaln_indices) * feed_forward
+        with h3_profile_scope("h3.norm"):
+            norm_hidden_states = self._norm_and_modulate(self.norm2, hidden_states, shift_mlp, scale_mlp, adaln_indices)
+        with h3_profile_scope("h3.mlp"):
+            feed_forward = self.mlp(norm_hidden_states)
+        with h3_profile_scope("h3.gate"):
+            return hidden_states + gate_mlp.index_select(0, adaln_indices) * feed_forward
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -766,13 +813,14 @@ class MiniMaxH3Transformer(nn.Module):
         hidden_states = state.hidden_states
         if self.activation_cpu_offloading:
             hidden_states = hidden_states.to(self.final_layer.norm.weight.device)
-        return self.final_layer(
-            hidden_states,
-            state.timestep_embedding,
-            state.timestep_indices,
-            state.video_indices,
-            state.audio_indices,
-        )
+        with h3_profile_scope("h3.final"):
+            return self.final_layer(
+                hidden_states,
+                state.timestep_embedding,
+                state.timestep_indices,
+                state.video_indices,
+                state.audio_indices,
+            )
 
     def _begin_backward_arms(self) -> Callable[[int], None] | None:
         """Open this traversal's announcement group, and return the announcer.
@@ -907,6 +955,35 @@ class MiniMaxH3Transformer(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> MiniMaxH3PackedState:
         """Embed one packed sequence into the state the block loop advances."""
+        with h3_profile_scope("h3.pack"):
+            return self._prepare_packed(
+                video_hidden_states,
+                audio_hidden_states,
+                encoder_hidden_states,
+                timestep,
+                timestep_indices,
+                token_tags,
+                position_ids,
+                video_indices,
+                audio_indices,
+                text_indices,
+                attention_mask,
+            )
+
+    def _prepare_packed(
+        self,
+        video_hidden_states: torch.Tensor,
+        audio_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        timestep_indices: torch.Tensor,
+        token_tags: torch.Tensor,
+        position_ids: torch.Tensor,
+        video_indices: torch.Tensor,
+        audio_indices: torch.Tensor,
+        text_indices: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> MiniMaxH3PackedState:
         sequence_length = position_ids.shape[0]
         if position_ids.shape != (sequence_length, 3):
             raise ValueError(f"position_ids must have shape (sequence_length, 3), got {tuple(position_ids.shape)}")
@@ -918,7 +995,8 @@ class MiniMaxH3Transformer(nn.Module):
         video = self.video_patch_proj(video_hidden_states.to(self.video_patch_proj.weight.dtype))
         audio = self.audio_patch_proj(audio_hidden_states.to(self.audio_patch_proj.weight.dtype))
         text = self.condition_proj(encoder_hidden_states.to(self.condition_proj.weight.dtype))
-        text = self.token_refiner(text, self.gradient_checkpointing)
+        with h3_profile_scope("h3.refiner"):
+            text = self.token_refiner(text, self.gradient_checkpointing)
 
         hidden_states = text.new_zeros((text.shape[0], sequence_length, text.shape[-1]))
         hidden_states.index_copy_(1, text_indices, text)

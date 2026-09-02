@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import copy
 import gc
 import hashlib
@@ -8,6 +9,7 @@ import json
 import logging
 import os
 import math
+import re
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
@@ -76,6 +78,7 @@ from musubi_tuner.minimax_h3.masking import (
     sample_video_mask,
     video_mask_to_rows,
 )
+from musubi_tuner.minimax_h3.model import h3_profile_scope
 from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS, MiniMaxH3GuideGeometry
 from musubi_tuner.minimax_h3.rollout import (
     MAX_ROLLOUT_WINDOW,
@@ -151,6 +154,573 @@ _H3_BASE_TIMESTEP_SAMPLING = {"sigma", "uniform", "sigmoid", "shift", "logsnr"}
 
 _H3_LORA_TARGETS = ("attention", "mlp", "audio", "video", "token_refiner")
 _H3_TRANSFORMER_BLOCKS = 50
+
+# Kernel-name patterns that sort profiler rows into the categories of the ``--h3_profile_steps``
+# table. Attention is matched first: cutlass-built fused attention kernels ("fmha_cutlassF...")
+# also match the GEMM pattern and belong to attention, not to the projections around it. GEMM
+# covers cuBLAS on Hopper ("nvjet_tst_...", "sm90_xmma_gemm_..."), Ampere ("ampere_bf16_...gemm",
+# "gemmSN_..."), cutlass, gemv and hipBLASLt ("Cijk_..."); attention covers FA2/FA3 ("flash_fwd_kernel",
+# "flash::...", "flash_bwd..."), cutlass/cuDNN fused attention and this repo's int8 and block-sparse
+# kernels. The profile file lists the top kernels by name so a miss can be fixed from the artifact.
+H3_PROFILE_CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "attention",
+        re.compile(r"flash|fmha|fwd_kernel|bwd_kernel|cudnn.*attn|sdp|attention|block_sparse", re.IGNORECASE),
+    ),
+    ("gemm", re.compile(r"gemm|xmma|cutlass|matmul|nvjet|gemv|Cijk_", re.IGNORECASE)),
+    ("swap", re.compile(r"Memcpy HtoD|Memcpy DtoH")),
+)
+H3_PROFILE_OTHER = "elementwise/other"
+H3_PROFILE_IDLE = "idle"
+H3_PROFILE_TOP_KERNELS = 30
+H3_PROFILE_WAIT_STEPS = 2
+H3_PROFILE_WARMUP_STEPS = 1
+
+
+def h3_profile_category(name: str) -> str:
+    for candidate, pattern in H3_PROFILE_CATEGORIES:
+        if pattern.search(name):
+            return candidate
+    return H3_PROFILE_OTHER
+
+
+def categorize_h3_profile_rows(rows) -> dict[str, tuple[float, int]]:
+    """Aggregate ``(kernel_name, device_time_us[, launches])`` rows into ``{category: (time_us, kernels)}``.
+
+    Every category of ``H3_PROFILE_CATEGORIES`` plus ``H3_PROFILE_OTHER`` is present in the
+    result, in that order, even when it received nothing. The kernel count is of distinct rows."""
+    totals: dict[str, list] = {name: [0.0, 0] for name, _ in H3_PROFILE_CATEGORIES}
+    totals[H3_PROFILE_OTHER] = [0.0, 0]
+    for row in rows:
+        name, time_us = row[0], row[1]
+        category = h3_profile_category(name)
+        totals[category][0] += float(time_us)
+        totals[category][1] += 1
+    return {name: (time_us, count) for name, (time_us, count) in totals.items()}
+
+
+def collect_h3_profile_rows(events, device_type: str) -> tuple[list[tuple[str, float, int]], float]:
+    """Reduce a profiler's ``events()`` to ``(name, time_us, launches)`` kernel rows and the busy time.
+
+    Only leaf device kernels count. ``record_function`` labels and the ``ProfilerStep#`` markers
+    show up on the device timeline as *user annotations* spanning every kernel beneath them, and
+    CPU-side ops (``aten::mm``, autograd nodes) carry the device time of the kernels they launch:
+    either would count each kernel several times over, which is why ``key_averages()`` is not
+    used here. Rows come back sorted by time, descending; the busy time is the union of the
+    kernel intervals (``device_busy_us``). Without a device the ops' self CPU time stands in."""
+    cuda_type = getattr(torch.autograd.DeviceType, "CUDA", None)
+    totals: dict[str, list] = {}
+    intervals = []
+    for event in events:
+        if getattr(event, "is_user_annotation", False) or getattr(event, "is_async", False):
+            continue
+        name = str(event.name)
+        if name.startswith("ProfilerStep#"):
+            continue
+        time_range = getattr(event, "time_range", None)
+        if device_type == "cuda":
+            if getattr(event, "device_type", None) != cuda_type or time_range is None:
+                continue
+            time_us = float(time_range.end) - float(time_range.start)
+        else:
+            time_us = float(event.self_cpu_time_total)
+        if time_range is not None:
+            intervals.append((time_range.start, time_range.end))
+        entry = totals.setdefault(name, [0.0, 0])
+        entry[0] += time_us
+        entry[1] += 1
+    rows = sorted(((name, time_us, count) for name, (time_us, count) in totals.items()), key=lambda row: -row[1])
+    return rows, device_busy_us(intervals)
+
+
+def format_h3_profile_top_kernels(rows, limit: int = H3_PROFILE_TOP_KERNELS) -> str:
+    """List the heaviest kernels with the category each was filed under, for fixing a miss offline."""
+    ordered = sorted(rows, key=lambda row: -float(row[1]))[:limit]
+    lines = [
+        f"top {len(ordered)} kernels by device time (of {len(rows)} distinct)",
+        f"{'total ms':>10} {'launches':>8}  {'category':<18} name",
+    ]
+    for row in ordered:
+        name, time_us = row[0], float(row[1])
+        count = int(row[2]) if len(row) > 2 else 1
+        lines.append(f"{time_us / 1000.0:>10.1f} {count:>8d}  {h3_profile_category(name):<18} {name}")
+    return "\n".join(lines)
+
+
+def device_busy_us(intervals) -> float:
+    """Length of the union of ``(start_us, end_us)`` intervals.
+
+    Kernels and host<->device copies run concurrently on different streams, so their
+    durations sum to more than the time the device was busy; the union is the busy time."""
+    busy = 0.0
+    current_start = current_end = None
+    for start, end in sorted((float(start), float(end)) for start, end in intervals):
+        if current_end is None or start > current_end:
+            if current_end is not None:
+                busy += current_end - current_start
+            current_start, current_end = start, end
+        elif end > current_end:
+            current_end = end
+    if current_end is not None:
+        busy += current_end - current_start
+    return busy
+
+
+H3_PROFILE_SCOPE_PREFIX = "h3."
+H3_PROFILE_ROLE_PREFIX = "h3.forward."
+H3_PROFILE_NO_SCOPE = "(no h3 scope)"
+H3_PROFILE_PHASE_RECOMPUTE = "recompute"
+H3_PROFILE_PHASE_BACKWARD = "backward"
+H3_PROFILE_PHASE_BACKWARD_UNATTRIBUTED = "backward (unattributed)"
+H3_PROFILE_PHASE_FORWARD_UNROLED = "forward (unroled)"
+H3_PROFILE_PHASE_OTHER = "other"
+H3_PROFILE_STEP_PREFIX = "ProfilerStep#"
+H3_PROFILE_OPTIMIZER_PREFIX = "Optimizer.step"
+_H3_PROFILE_BACKWARD_SCOPE = 1  # torch RecordScope.BACKWARD_FUNCTION, ``FunctionEvent.scope``
+
+
+def _enclosing_annotations(annotations, intervals):
+    """For every ``(start, end)`` in ``intervals`` the indices of the ``annotations`` enclosing it, outermost first.
+
+    ``annotations`` are ``(start, end, name)``. One sweep in start order keeps a stack of the labels
+    still open; a label is pushed once and popped once, and every interval filters the open stack
+    for the labels that also end after it (a label that only partially overlaps an interval is not
+    an enclosing one). Cost: the sort, O((n + m) log(n + m)) for n labels and m intervals, plus
+    O(m * depth) for the per-interval filter, where depth is the label nesting (about six here)."""
+    items = [(start, 0, -end, index) for index, (start, end, _) in enumerate(annotations)]
+    items.extend((start, 1, -end, index) for index, (start, end) in enumerate(intervals))
+    items.sort()
+    stack: list[int] = []
+    result: list[list[int]] = [[] for _ in intervals]
+    for start, kind, negative_end, index in items:
+        while stack and annotations[stack[-1]][1] <= start:
+            stack.pop()
+        if kind == 0:
+            stack.append(index)
+        else:
+            end = -negative_end
+            result[index] = [candidate for candidate in stack if annotations[candidate][1] >= end]
+    return result
+
+
+def _scope_and_role(annotations, enclosing) -> tuple[str | None, str | None]:
+    """The innermost non-role ``h3.*`` label and the outermost ``h3.forward.<role>`` label."""
+    scope = None
+    role = None
+    for index in enclosing:
+        name = annotations[index][2]
+        if name.startswith(H3_PROFILE_ROLE_PREFIX):
+            if role is None:
+                role = name[len(H3_PROFILE_ROLE_PREFIX) :]
+        else:
+            scope = name
+    return scope, role
+
+
+def _backward_node(event):
+    """The autograd node (``scope == BACKWARD_FUNCTION``) a CPU op runs under, or ``None``."""
+    seen = 0
+    while event is not None and seen < 64:
+        if getattr(event, "scope", 0) == _H3_PROFILE_BACKWARD_SCOPE:
+            return event
+        event = getattr(event, "cpu_parent", None)
+        seen += 1
+    return None
+
+
+def attribute_h3_profile_scopes(events, device_type: str) -> dict:
+    """Attribute every leaf kernel to the innermost ``h3.*`` label enclosing it, per phase.
+
+    ``record_function`` labels show up on the device timeline as user annotations spanning the
+    kernels launched under them; a kernel belongs to the innermost such label. The enclosing
+    ``h3.forward.<role>`` label names the phase (``student``, ``teacher``, ``rollout``, ...).
+
+    Everything outside a role is placed by the *backward window* of its step: from the end of the
+    step's last role label to the start of its optimizer label (``Optimizer.step#...``) or, failing
+    that, the end of the ``ProfilerStep#`` label (the whole trace when there is none). A labelled
+    kernel inside the window ran in a checkpoint recompute, which re-enters the labels from inside
+    backward; a labelled kernel outside every role and every window is ``forward (unroled)``. Both
+    are time-window heuristics.
+
+    An unlabelled kernel is a backward kernel when its launching CPU op runs under an autograd
+    node, and is then charged to the label of the forward op that node differentiates (the node's
+    ``(sequence_nr, fwd_thread)`` names that op). The launch link is the kernel's
+    ``linked_correlation_id`` (torch >= 2.10) or the CPU runtime record sharing the kernel's
+    correlation ``id`` (whose parent is the op); when no kernel of the trace links at all, the
+    per-scope backward attribution is reported unavailable and the unlabelled kernels of every
+    backward window go to one ``backward (unattributed)`` row instead of being guessed. What is
+    left -- loss, optimizer, data movement -- is ``(no h3 scope)`` / ``other``.
+
+    Returns ``{"rows": {(scope, phase): (time_us, launches, {category: time_us})}, "forwards":
+    {role: count}, "labels": {(scope, phase): count}, "linked": bool}``; ``labels`` counts the
+    annotations themselves, so ``launches / labels`` is the launch count per labelled region.
+    Without a device the CPU ops stand in for kernels and the CPU-side labels for the device ones."""
+    cuda_type = getattr(torch.autograd.DeviceType, "CUDA", None)
+    on_device = device_type == "cuda"
+    annotations: list[tuple[float, float, str]] = []
+    cpu_annotations: dict[int, list[tuple[float, float, str]]] = {}
+    step_spans: list[tuple[float, float]] = []
+    optimizer_starts: list[float] = []
+    kernels = []
+    cpu_events: dict[int, object] = {}
+    forward_ops: dict[tuple[int, int], object] = {}
+    forwards: dict[str, int] = {}
+    for event in events:
+        name = str(event.name)
+        time_range = getattr(event, "time_range", None)
+        if time_range is None:
+            continue
+        span = (float(time_range.start), float(time_range.end))
+        is_device = getattr(event, "device_type", None) == cuda_type
+        if getattr(event, "is_user_annotation", False) or name.startswith(H3_PROFILE_STEP_PREFIX):
+            if is_device != on_device:
+                if not is_device and name.startswith(H3_PROFILE_SCOPE_PREFIX):
+                    cpu_annotations.setdefault(int(getattr(event, "thread", 0) or 0), []).append((*span, name))
+                continue
+            if name.startswith(H3_PROFILE_STEP_PREFIX):
+                step_spans.append(span)
+            elif name.startswith(H3_PROFILE_OPTIMIZER_PREFIX):
+                optimizer_starts.append(span[0])
+            elif name.startswith(H3_PROFILE_SCOPE_PREFIX):
+                annotations.append((*span, name))
+                if name.startswith(H3_PROFILE_ROLE_PREFIX):
+                    role = name[len(H3_PROFILE_ROLE_PREFIX) :]
+                    forwards[role] = forwards.get(role, 0) + 1
+                if not is_device:
+                    cpu_annotations.setdefault(int(getattr(event, "thread", 0) or 0), []).append((*span, name))
+            continue
+        if not is_device:
+            identifier = getattr(event, "id", None)
+            if identifier is not None:
+                cpu_events[int(identifier)] = event
+        if getattr(event, "is_async", False):
+            continue
+        if not is_device:
+            sequence_nr = int(getattr(event, "sequence_nr", -1) or -1)
+            if sequence_nr >= 0 and getattr(event, "scope", 0) != _H3_PROFILE_BACKWARD_SCOPE:
+                forward_ops.setdefault((sequence_nr, int(getattr(event, "thread", 0) or 0)), event)
+        if on_device:
+            if not is_device:
+                continue
+            time_us = span[1] - span[0]
+        else:
+            time_us = float(event.self_cpu_time_total)
+        kernels.append((span, name, time_us, event))
+
+    windows = _backward_windows(
+        step_spans, [span for *span, name in annotations if name.startswith(H3_PROFILE_ROLE_PREFIX)], optimizer_starts
+    )
+    window_starts = [start for start, _ in windows]
+
+    def in_backward_window(time_us: float) -> bool:
+        index = bisect.bisect_right(window_starts, time_us) - 1
+        return index >= 0 and time_us < windows[index][1]
+
+    # Phase of every label: the role enclosing it, else recompute inside a backward window (a label
+    # re-entered from inside backward), else forward (unroled). Counted per (scope, phase).
+    labels: dict[tuple[str, str], int] = {}
+    label_spans = [(start, end) for start, end, _ in annotations]
+    for index, enclosed in enumerate(_enclosing_annotations(annotations, label_spans)):
+        start, _, name = annotations[index]
+        if name.startswith(H3_PROFILE_ROLE_PREFIX):
+            continue
+        _, role = _scope_and_role(annotations, [candidate for candidate in enclosed if candidate != index])
+        if role is not None:
+            phase = role
+        else:
+            phase = H3_PROFILE_PHASE_RECOMPUTE if in_backward_window(start) else H3_PROFILE_PHASE_FORWARD_UNROLED
+        labels[(name, phase)] = labels.get((name, phase), 0) + 1
+
+    enclosing = _enclosing_annotations(annotations, [span for span, *_ in kernels])
+    # Forward ops referenced by backward nodes, labelled by their CPU-side annotations per thread.
+    referenced: dict[int, list] = {}
+    pending = []
+    linked = not on_device and bool(kernels)
+    for (span, name, time_us, event), enclosed in zip(kernels, enclosing):
+        scope, role = _scope_and_role(annotations, enclosed)
+        launcher = _kernel_launcher(event, cpu_events) if on_device else event
+        linked = linked or launcher is not None
+        node = _backward_node(launcher) if role is None and launcher is not None else None
+        forward_op = None
+        if node is not None and scope is None:
+            key = (int(getattr(node, "sequence_nr", -1) or -1), int(getattr(node, "fwd_thread", 0) or 0))
+            forward_op = forward_ops.get(key)
+            if forward_op is not None:
+                referenced.setdefault(int(getattr(forward_op, "thread", 0) or 0), []).append(forward_op)
+        pending.append(
+            (name, time_us, scope, role, launcher is not None, node is not None, in_backward_window(span[0]), forward_op)
+        )
+    forward_scopes: dict[int, str | None] = {}
+    for thread, ops in referenced.items():
+        thread_annotations = cpu_annotations.get(thread, [])
+        spans = [(float(op.time_range.start), float(op.time_range.end)) for op in ops]
+        for op, enclosed in zip(ops, _enclosing_annotations(thread_annotations, spans)):
+            forward_scopes[id(op)] = _scope_and_role(thread_annotations, enclosed)[0]
+
+    rows: dict[tuple[str, str], list] = {}
+    for name, time_us, scope, role, has_launcher, under_node, in_window, forward_op in pending:
+        if role is not None:
+            phase = role
+        elif scope is not None:
+            phase = H3_PROFILE_PHASE_RECOMPUTE if (under_node or in_window) else H3_PROFILE_PHASE_FORWARD_UNROLED
+        elif under_node:
+            phase = H3_PROFILE_PHASE_BACKWARD
+            if forward_op is not None:
+                scope = forward_scopes.get(id(forward_op))
+        elif in_window and not has_launcher:
+            phase = H3_PROFILE_PHASE_BACKWARD_UNATTRIBUTED
+        else:
+            phase = H3_PROFILE_PHASE_OTHER
+        entry = rows.setdefault((scope or H3_PROFILE_NO_SCOPE, phase), [0.0, 0, {}])
+        entry[0] += time_us
+        entry[1] += 1
+        category = h3_profile_category(name)
+        entry[2][category] = entry[2].get(category, 0.0) + time_us
+    return {
+        "rows": {key: (time_us, launches, categories) for key, (time_us, launches, categories) in rows.items()},
+        "forwards": forwards,
+        "labels": labels,
+        "linked": linked,
+        "optimizer_labelled": bool(optimizer_starts),
+    }
+
+
+def _kernel_launcher(kernel, cpu_events: dict[int, object]):
+    """The CPU-side event a device kernel was launched from, or ``None`` when the trace has no link.
+
+    torch >= 2.10 stamps ``linked_correlation_id`` (the launching op's ``id``) on the kernel event;
+    older releases only give the kernel the CUPTI correlation ``id`` it shares with the CPU runtime
+    record (``cudaLaunchKernel``), which the profiler nests under the op, so that record's parent
+    chain leads to the op. Either way the caller walks ``cpu_parent`` upwards from here."""
+    linked = getattr(kernel, "linked_correlation_id", 0) or 0
+    if linked:
+        launcher = cpu_events.get(int(linked))
+        if launcher is not None:
+            return launcher
+    identifier = getattr(kernel, "id", None)
+    if identifier is None:
+        return None
+    runtime = cpu_events.get(int(identifier))
+    if runtime is None or runtime is kernel:
+        return None
+    # A CPU event sharing the kernel's correlation id is its CUDA runtime launch
+    # record only if it looks like one and is nested under a launching op; an id
+    # that merely collides with an unrelated CPU op must not name a launcher.
+    if not _LAUNCH_RECORD.search(str(getattr(runtime, "name", ""))):
+        return None
+    if getattr(runtime, "cpu_parent", None) is None:
+        return None
+    return runtime
+
+
+_LAUNCH_RECORD = re.compile(r"LaunchKernel|LaunchCooperativeKernel|cuLaunch|launch_kernel", re.IGNORECASE)
+
+
+def _backward_windows(step_spans, role_spans, optimizer_starts) -> list[tuple[float, float]]:
+    """Per step, the window after its last forward role and before its optimizer label (else its end).
+
+    Steps are the ``ProfilerStep#`` spans, or one span over everything when the trace has none; a
+    step with no role label has no backward window."""
+    if not role_spans:
+        return []
+    if not step_spans:
+        step_spans = [(float("-inf"), float("inf"))]
+    role_ends = sorted(end for _, end in role_spans)
+    optimizer_starts = sorted(optimizer_starts)
+    windows = []
+    for step_start, step_end in sorted(step_spans):
+        index = bisect.bisect_right(role_ends, step_end) - 1
+        if index < 0 or role_ends[index] < step_start:
+            continue
+        start = role_ends[index]
+        optimizer_index = bisect.bisect_right(optimizer_starts, start)
+        end = step_end
+        if optimizer_index < len(optimizer_starts) and optimizer_starts[optimizer_index] < step_end:
+            end = optimizer_starts[optimizer_index]
+        if end > start:
+            windows.append((start, end))
+    return windows
+
+
+def format_h3_profile_scopes(scopes: dict, wall_us: float, steps: int) -> str:
+    """Render the per-scope table of :func:`attribute_h3_profile_scopes`."""
+    steps = max(int(steps), 1)
+    rows = sorted(scopes["rows"].items(), key=lambda item: -item[1][0])
+    forwards = ", ".join(f"{role} {count}" for role, count in sorted(scopes["forwards"].items())) or "none labelled"
+    header = (
+        f"{'scope':<16} {'phase':<10} {'total ms':>10} {'ms/step':>9} {'share':>7} {'launches':>9} {'labels':>7} "
+        f"{'gemm ms':>9} {'attn ms':>9} {'elem ms':>9} {'swap ms':>8}"
+    )
+    if scopes.get("linked", True):
+        backward_note = "backward = charged to the label of the forward op its autograd node differentiates"
+    else:
+        backward_note = (
+            "per-scope backward attribution is UNAVAILABLE on this torch (kernel events carry no launch link), so "
+            "unlabelled kernels of each backward window are one 'backward (unattributed)' row"
+        )
+        if not scopes.get("optimizer_labelled", True):
+            backward_note += (
+                "; no Optimizer.step label was found, so each window runs to the end of its step and that row "
+                "INCLUDES the optimizer's kernels"
+            )
+    lines = [
+        (
+            "device time by innermost h3.* scope and phase (a kernel belongs to the innermost label enclosing it on the "
+            "device timeline; the phase is the enclosing h3.forward.<role> label; recompute detection is time-window "
+            "based: a label re-entered after a step's last forward role and before its optimizer label is a recompute, "
+            "one outside every role and window is 'forward (unroled)'; "
+            f"{backward_note}; labels = entries of the label in that phase, so launches/labels is the launch count per "
+            "labelled region)"
+        ),
+        f"forwards in the window: {forwards}",
+        header,
+    ]
+    for (scope, phase), (time_us, launches, categories) in rows:
+        share = time_us / wall_us if wall_us > 0 else 0.0
+        label_count = scopes["labels"].get((scope, phase), 0)
+        lines.append(
+            f"{scope:<16} {phase:<10} {time_us / 1000.0:>10.1f} {time_us / 1000.0 / steps:>9.1f} {share:>6.1%} {launches:>9d} "
+            f"{label_count:>7d} {categories.get('gemm', 0.0) / 1000.0:>9.1f} {categories.get('attention', 0.0) / 1000.0:>9.1f} "
+            f"{categories.get(H3_PROFILE_OTHER, 0.0) / 1000.0:>9.1f} {categories.get('swap', 0.0) / 1000.0:>8.1f}"
+        )
+    return "\n".join(lines)
+
+
+def format_h3_profile_table(
+    categories: dict[str, tuple[float, int]], wall_us: float, steps: int, busy_us: float | None = None, note: str = ""
+) -> str:
+    """Render the per-category table.
+
+    ``busy_us`` is the union of the kernel intervals (``device_busy_us``); idle is the wall time
+    outside it. Category shares are of the wall time and can sum to more than the busy share,
+    because kernels overlap across streams. Without ``busy_us`` the plain kernel-time sum stands
+    in, which overstates busy time wherever streams overlap."""
+    kernel_us = sum(time_us for time_us, _ in categories.values())
+    if busy_us is None:
+        busy_us = kernel_us
+    rows = list(categories.items()) + [(H3_PROFILE_IDLE, (max(wall_us - busy_us, 0.0), 0))]
+    steps = max(int(steps), 1)
+    header = (
+        f"profile of {steps} optimizer step(s){note}, wall {wall_us / 1000.0:.1f} ms ({wall_us / 1000.0 / steps:.1f} ms/step), "
+        f"device busy {busy_us / 1000.0:.1f} ms as the union of kernel intervals, kernel durations sum to "
+        f"{kernel_us / 1000.0:.1f} ms (the excess is cross-stream overlap)"
+    )
+    lines = [header, f"{'category':<18} {'total ms':>10} {'ms/step':>10} {'share':>7} {'kernels':>8}"]
+    for name, (time_us, count) in rows:
+        share = time_us / wall_us if wall_us > 0 else 0.0
+        lines.append(f"{name:<18} {time_us / 1000.0:>10.1f} {time_us / 1000.0 / steps:>10.1f} {share:>6.1%} {count:>8d}")
+    return "\n".join(lines)
+
+
+class H3StepProfiler:
+    """Profile ``active_steps`` optimizer steps with ``torch.profiler`` and report one table.
+
+    ``step()`` is called once per optimizer step. The first ``H3_PROFILE_WAIT_STEPS`` steps are
+    skipped (the first one carries lazy initialisation and compilation), the next
+    ``H3_PROFILE_WARMUP_STEPS`` run the profiler with the trace discarded, and the following
+    ``active_steps`` are recorded. The wall time of the recorded window is measured between
+    device synchronisations at its two ends, and the idle row is the wall time outside the
+    union of the kernel intervals. Once the table has been written the profiler is stopped and
+    ``finished`` is set; ``abort()`` writes whatever the window holds when training ends first."""
+
+    def __init__(self, active_steps: int, device: torch.device, output_path: Path) -> None:
+        if active_steps <= 0:
+            raise ValueError("H3StepProfiler needs a positive number of steps")
+        self.active_steps = int(active_steps)
+        self.device = device
+        self.output_path = Path(output_path)
+        self.finished = False
+        self.table: str | None = None
+        self._steps = 0
+        self._window_start: float | None = None
+        self._window_end: float | None = None
+        self._rows: list[tuple[str, float, int]] | None = None
+        self._scopes: dict | None = None
+        self._busy_us: float = 0.0
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        self._profiler = torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(
+                wait=H3_PROFILE_WAIT_STEPS, warmup=H3_PROFILE_WARMUP_STEPS, active=self.active_steps, repeat=1
+            ),
+            on_trace_ready=self._on_trace_ready,
+            record_shapes=False,
+        )
+
+    @property
+    def _first_active_step(self) -> int:
+        return H3_PROFILE_WAIT_STEPS + H3_PROFILE_WARMUP_STEPS
+
+    def start(self) -> None:
+        self._profiler.start()
+
+    def _synchronize(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @property
+    def active_steps_done(self) -> int:
+        return min(max(self._steps - self._first_active_step, 0), self.active_steps)
+
+    def _on_trace_ready(self, profiler) -> None:
+        events = profiler.events()
+        self._rows, self._busy_us = collect_h3_profile_rows(events, self.device.type)
+        self._scopes = attribute_h3_profile_scopes(events, self.device.type)
+
+    def step(self) -> None:
+        self._steps += 1
+        if self._steps == self._first_active_step + self.active_steps:
+            self._synchronize()
+            self._window_end = time.perf_counter()
+        self._profiler.step()
+        if self._steps == self._first_active_step:
+            self._synchronize()
+            self._window_start = time.perf_counter()
+        if self._rows is None:
+            return
+        self._finish("")
+
+    def _wall_us(self) -> float:
+        if self._window_start is None or self._window_end is None:
+            return 0.0
+        return max(self._window_end - self._window_start, 0.0) * 1e6
+
+    def _finish(self, note: str) -> None:
+        steps = self.active_steps_done if note else self.active_steps
+        self.table = format_h3_profile_table(categorize_h3_profile_rows(self._rows), self._wall_us(), steps, self._busy_us, note)
+        self._profiler.stop()
+        sections = [self.table]
+        if self._scopes is not None:
+            sections.append(format_h3_profile_scopes(self._scopes, self._wall_us(), steps))
+        sections.append(format_h3_profile_top_kernels(self._rows))
+        self._write("\n\n".join(sections))
+        logger.info("--h3_profile_steps table (also written to %s):\n%s", self.output_path, self.table)
+
+    def _write(self, text: str) -> None:
+        self.finished = True
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path.write_text(text + "\n", encoding="utf-8")
+
+    def abort(self) -> None:
+        """Training ended before the window completed: report what the window holds."""
+        if self.finished:
+            return
+        if self._window_start is not None and self._window_end is None:
+            self._synchronize()
+            self._window_end = time.perf_counter()
+        # Stopping inside the active phase delivers the partial trace to _on_trace_ready.
+        self._profiler.stop()
+        if self._rows is not None and self.active_steps_done > 0:
+            self._finish(f" of the {self.active_steps} requested, INCOMPLETE")
+            return
+        message = (
+            f"--h3_profile_steps {self.active_steps}: the profiling window never opened; training ended after "
+            f"{self._steps} optimizer step(s) and the window starts after {self._first_active_step}"
+        )
+        self._write(message)
+        logger.warning(message)
 
 
 def _parse_block_sparse_block_shape(spec: str | None) -> tuple[int, int, int] | None:
@@ -654,6 +1224,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._recipe_probability_generator: torch.Generator | None = None
         self._qwen_control_dropout_generator: torch.Generator | None = None
         self._overlay_network = None
+        self._h3_profiler: H3StepProfiler | None = None
         # The frozen base's field is a property of the checkpoint and the validation
         # item, not of the training run, so it is measured once and kept.
         self._field_base_gaps: dict[tuple, float] = {}
@@ -1821,6 +2392,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # set it would report how well the adapter reproduces the field where it
             # was fitted, which is the one place the number cannot be trusted.
             raise ValueError("--h3_validation_field_probe requires --validation_dataset_config")
+        profile_steps = int(getattr(args, "h3_profile_steps", 0) or 0)
+        if profile_steps < 0:
+            raise ValueError("--h3_profile_steps must be non-negative")
+        if profile_steps > 0 and getattr(args, "max_train_epochs", None) is None:
+            self._check_h3_profile_window(profile_steps, args.max_train_steps)
         if args.h3_swiglu_chunk_rows < 0:
             raise ValueError("--h3_swiglu_chunk_rows must be non-negative")
         if args.h3_swiglu_chunk_rows and args.compile:
@@ -2230,6 +2806,50 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             missing = [name for name, value in required.items() if value is None]
             if missing:
                 raise ValueError("MiniMax H3 sampling during training requires " + ", ".join(missing))
+
+    @staticmethod
+    def _check_h3_profile_window(profile_steps: int, max_train_steps: int) -> None:
+        needed = H3_PROFILE_WAIT_STEPS + H3_PROFILE_WARMUP_STEPS + profile_steps
+        if int(max_train_steps) < needed:
+            raise ValueError(
+                f"--h3_profile_steps {profile_steps} records optimizer steps "
+                f"{H3_PROFILE_WAIT_STEPS + H3_PROFILE_WARMUP_STEPS + 1}..{needed}, but the run has only "
+                f"{max_train_steps}; raise --max_train_steps or lower --h3_profile_steps"
+            )
+
+    def train(self, args):
+        try:
+            return super().train(args)
+        finally:
+            self._finalize_h3_profiler()
+
+    def _finalize_h3_profiler(self) -> None:
+        profiler, self._h3_profiler = self._h3_profiler, None
+        if profiler is not None:
+            profiler.abort()
+
+    def on_train_start(self, args, accelerator, network, transformer, optimizer) -> None:
+        super().on_train_start(args, accelerator, network, transformer, optimizer)
+        self._h3_profiler = None
+        steps = int(getattr(args, "h3_profile_steps", 0) or 0)
+        if steps <= 0:
+            return
+        # max_train_steps is final here (an epoch count has been converted by now).
+        self._check_h3_profile_window(steps, args.max_train_steps)
+        if not accelerator.is_main_process:
+            return
+        output_name = getattr(args, "output_name", None) or "h3"
+        output_path = Path(args.output_dir) / f"{output_name}_profile.txt"
+        self._h3_profiler = H3StepProfiler(steps, accelerator.device, output_path)
+        self._h3_profiler.start()
+
+    def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step) -> None:
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        if self._h3_profiler is None or not sync_gradients:
+            return
+        self._h3_profiler.step()
+        if self._h3_profiler.finished:
+            self._h3_profiler = None
 
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
         transformer.set_gradient_checkpointing_blocks(args.h3_gradient_checkpointing_blocks)
@@ -3368,7 +3988,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
         ):
             for index in range(args.h3_rollout_steps):
-                advance(index, self._predict(accelerator, transformer, batch, state_at(index), conditioning=conditioning))
+                advance(
+                    index,
+                    self._predict(accelerator, transformer, batch, state_at(index), conditioning=conditioning, role="rollout"),
+                )
 
         fused = bool(getattr(args, "h3_rollout_fused_teacher", False))
         pairs: list[tuple[H3ModelPrediction, H3ModelPrediction]] = []
@@ -3614,9 +4237,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         inputs,
         *,
         conditioning: str | tuple[str, ...],
+        role: str | None = None,
     ) -> H3ModelPrediction:
+        """One forward. ``role`` names it in the ``--h3_profile_steps`` scope table (``h3.forward.<role>``):
+        by default a graph-carrying forward is the ``student`` and a no-grad one a ``teacher``."""
         call = self._predict_call(accelerator, batch, inputs, conditioning=conditioning)
-        with accelerator.autocast():
+        if role is None:
+            role = "student" if torch.is_grad_enabled() else "teacher"
+        with accelerator.autocast(), h3_profile_scope(f"h3.forward.{role}"):
             # Positional for the five arguments every backend has carried since
             # the first one, so a backend that named its parameters differently
             # keeps working.
@@ -3643,7 +4271,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "--h3_rollout_fused_teacher requires a training backend implementing predict_training_fused(); "
                 "drop the flag to use the ordinary two-forward path"
             )
-        with accelerator.autocast():
+        with accelerator.autocast(), h3_profile_scope("h3.forward.fused"):
             predictions = fused(transformer, arms)
         if len(predictions) != len(arms) or not all(isinstance(item, H3ModelPrediction) for item in predictions):
             raise TypeError("H3 backend predict_training_fused() must return one H3ModelPrediction per arm")
@@ -5115,6 +5743,19 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "unshifted sigma the validation rollout walks down to (default 0.5); lower goes further along the "
             "trajectory and costs the same, higher stays nearer the noise the walk started from"
+        ),
+    )
+    parser.add_argument(
+        "--h3_profile_steps",
+        type=int,
+        default=0,
+        help=(
+            "profile this many optimizer steps with torch.profiler once three warm-up steps have passed and report "
+            "one table of device time per kernel category (attention, GEMM, host<->device swap, elementwise/other) "
+            "plus the idle time outside the union of all kernel intervals, to the log and to "
+            "<output_dir>/<output_name>_profile.txt. Category shares can add up to more than the busy time because "
+            "streams overlap. The run must be at least 3 + N optimizer steps long. Profiling stops afterwards and "
+            "training continues. Diagnostic only. 0 disables"
         ),
     )
     parser.add_argument(

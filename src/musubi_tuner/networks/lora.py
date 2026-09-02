@@ -7,6 +7,7 @@ import ast
 import math
 import os
 import re
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Type, Union
 from transformers import CLIPTextModel
 import torch
@@ -18,6 +19,13 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
+
+
+def _profile_scope(name: str):
+    """A ``torch.profiler.record_function`` label while a profiler collects, else a null context."""
+    if getattr(torch.autograd.profiler, "_is_profiler_enabled", False):
+        return torch.profiler.record_function(name)
+    return nullcontext()
 
 
 class LoRAModule(torch.nn.Module):
@@ -173,7 +181,10 @@ class LoRAModule(torch.nn.Module):
     def forward(self, x):
         if not self.enabled:
             return self.org_forward(x)
+        with _profile_scope("h3.lora"):
+            return self._lora_forward(x)
 
+    def _lora_forward(self, x):
         base_module = getattr(self.org_forward, "__self__", None)
         if (
             getattr(base_module, "_convrot_lora_fused", False)
