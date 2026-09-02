@@ -1035,6 +1035,39 @@ ratio over the step's scored samples, `h3/rollout_field_ratio`; the averaged los
 judge it by `val/rollout/field_cos`, `val/drift/prompted_rel` and blind renders rather than by `val/rollout/field`, whose
 length it directly pushes on when the anchor holds.
 
+#### Stability
+
+The frozen-base objectives above remove the *systematic* collapse of the guidance field. What remains is variance and
+competition between terms, and three of those have analytic remedies that cost no extra forwards.
+
+- **Target dispersion.** The guidance target `e + S(y - e)` carries `S^2` times the noise of the data target, and that
+  noise depends on sigma. `--h3_measured_variance_weighting` reads a `probe_g_curve` report and weights each sample by the
+  inverse of `raw^2 - g^2` at its shifted sigma, normalised to mean 1 over the buckets and capped. That quantity is a
+  dispersion *proxy*, not a variance: `raw` is a mean of residual norms rather than a root mean square and `g` the norm of
+  the mean residual, both divided by the target norm, so the difference orders the buckets by how noisy the one-draw
+  target is there and no more. The weighting is therefore a heuristic sigma reweighting that changes the objective --
+  noisy noise levels count for less -- rather than a variance-reduced estimate of the same objective, and the mean-1
+  normalisation over buckets preserves the effective step only approximately under the sampled sigma distribution and the
+  cap. It reallocates the step; it does not create information, so where gradient accumulation is affordable it is a
+  complement, not a substitute.
+- **The empty branch.** `--h3_adapter_prompt_only` switches the adapter off on every empty-prompt forward, so the student's
+  empty branch is the frozen one exactly and `--h3_guidance_null_source live` becomes the frozen source in effect. The
+  null anchor becomes identically zero and its two forwards a step disappear; the live-null degeneracy (an empty branch
+  that chases the clip so the field vanishes with the loss satisfied) becomes structurally impossible. Nothing changes at
+  inference, where a guidance-distilled checkpoint only ever runs its prompted branch. Caption dropout is rejected with
+  it, since a dropped step would train nothing. The wrapper asks the network whether the adapter is already off (LoRA
+  networks report it) and leaves an existing frozen bracket alone.
+- **Two masters on one state.** The data term and the rollout term otherwise claim the same noise levels with different
+  targets. Without `--h3_rollout_stop_shifted`, `--h3_timestep_focus_max` (with `--h3_timestep_focus_probability 1` and
+  uniform sampling) and `--h3_rollout_stop_min` are both unshifted base sigmas, and `focus_max <= stop_min` gives the two
+  terms disjoint bands so each noise level has one term. With the shifted stop the two bounds live on different
+  coordinates and must be converted before any such claim; audio rides its own shift either way.
+
+What these do not remove: the information per sample about the new content is one draw of `y`, and no reformulation
+with the same fixed point changes its signal-to-noise ratio -- the normalised form is the contrastive gradient scaled by
+`1/S^2`, and mixing the model's own or an EMA prediction into the target scales it by the mixing weight. That part is a
+learning-rate-against-steps trade, or gradient accumulation.
+
 ### Full-parameter BF16 training
 
 `minimax_h3_train.py` updates the entire transformer and writes a native MiniMax H3 BF16 checkpoint. It is separate from the
@@ -1389,6 +1422,9 @@ Every objective here is off unless its flag is given, and a run without them tra
 | `--h3_rollout_field_floor 0.0` | Experimental. Length floor on a frozen-null proxy of the guidance field at the supervised rollout states: `W * relu(1 - ‖g' - e‖ / ‖g - e‖)^2` with the frozen base's prompted `g` and empty `e` and the student's prompted `g'` at the same state. In the default `self` mode holds `‖g' - e‖` at no less than the checkpoint's field length and leaves the direction to the teacher term (see `--h3_rollout_field_floor_direction`); it does not bound the gap to the student's own empty branch, so pair it with `--h3_guidance_null_anchor_weight`. Requires `--h3_rollout_supervision` and `--cache_guidance_empty`; two extra no-gradient frozen forwards per supervised state. `0` disables. See [Field length floor](#field-length-floor). |
 | `--h3_rollout_field_floor_direction {self,teacher}` | Which direction the floor measures the student's field along. `self` (default) floors the plain length, whose gradient lengthens the field along the student's own current direction. `teacher` floors the projection of the student's field onto the privileged teacher's field at the same state, so lengthening in a wrong direction earns nothing and the gradient turns the field toward the teacher as it lengthens it. No extra forward. Needs the floor above `0`. |
 | `--h3_rollout_field_floor_sigma_max 1.0` | Apply the floor only at supervised states whose shifted video sigma is at most this value; states above it drop out of the floor's mean. Needs the floor above `0`. |
+| `--h3_rollout_stop_min 0.0` | Lower bound of the rollout stop draw, on the coordinate the draw is made on (unshifted base, or the shifted video sigma under `--h3_rollout_stop_shifted`). Without the shifted stop, `--h3_timestep_focus_max` at or below it gives the data term and the rollout term disjoint base-sigma bands. `0` draws the whole range. |
+| `--h3_adapter_prompt_only` | Run every empty-prompt forward with the adapter off, so the student's empty branch is the frozen checkpoint's by construction. A guidance-distilled checkpoint never evaluates its empty branch at inference. Makes the live-null degeneracy impossible and `--h3_guidance_null_anchor_weight` redundant (the two are rejected together, as is `--h3_caption_dropout_rate` above `0`). See [Stability](#stability). |
+| `--h3_measured_variance_weighting curve.json` | Weight each sample's loss by the inverse of the target dispersion proxy measured at its shifted sigma, read off a `probe_g_curve` report (`raw^2 - g^2` per bucket and modality; a proxy, not a variance), normalised to mean 1 and capped by `--h3_measured_variance_weight_max` (default `4.0`). A heuristic sigma reweighting that changes the objective; composes multiplicatively with `--weighting_scheme`. See [Stability](#stability). |
 | `--h3_dop_loss_weight 0.0` | Differential Output Preservation, off at the default: penalizes LoRA drift from the frozen base under a trigger-free rewrite of each caption. |
 | `--h3_dop_probability 1.0` | Evaluate DOP on a synchronized random fraction of prompt-conditioned batches and inverse-probability scale its loss. |
 | `--crepa` | Temporal representation alignment for video training. |

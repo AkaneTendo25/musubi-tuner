@@ -1,5 +1,6 @@
 """Truncated on-policy rollout supervision (D-OPSD) for MiniMax H3."""
 
+import json
 import logging
 from contextlib import nullcontext
 
@@ -599,6 +600,9 @@ class _ToggleNetwork:
     def set_enabled(self, enabled):
         self.events.append(enabled)
         self.transformer.adapter_enabled = enabled
+
+    def is_enabled(self):
+        return getattr(self.transformer, "adapter_enabled", True)
 
 
 class _RolloutBackend:
@@ -2759,3 +2763,187 @@ def test_field_floor_shape_is_recorded_in_adapter_metadata(tmp_path):
     metadata = trainer.extra_metadata(args)
     assert metadata["ss_h3_rollout_field_floor_direction"] == "teacher"
     assert metadata["ss_h3_rollout_field_floor_sigma_max"] == "0.9"
+
+
+# ---------------------------------------------------------------------------
+# Stability trio: prompt-only adapter, measured-variance weighting, stop band
+# ---------------------------------------------------------------------------
+
+_NORMALIZED_FLAGS = (
+    "--h3_guidance_distillation_scale",
+    "3.0",
+    "--h3_guidance_loss_form",
+    "normalized",
+    "--h3_guidance_null_source",
+    "live",
+)
+
+
+def test_prompt_only_adapter_runs_the_empty_forward_frozen():
+    """With the flag, the 'live' empty branch IS the frozen one: the empty forward
+    is made with the adapter off and the adapter is back on afterwards."""
+    live_backend, live_loss, _, _ = _run_step(*_NORMALIZED_FLAGS)
+    only_backend, only_loss, _, trainer = _run_step(*_NORMALIZED_FLAGS, "--h3_adapter_prompt_only")
+    live_empty = [c for c in live_backend.calls if c["conditioning"] == "empty"]
+    only_empty = [c for c in only_backend.calls if c["conditioning"] == "empty"]
+    assert len(live_empty) == len(only_empty) == 1
+    assert live_empty[0]["adapter"] is True
+    assert only_empty[0]["adapter"] is False
+    # The prompted forward keeps the adapter, and it is live again on the way out.
+    assert [c["adapter"] for c in only_backend.calls if c["conditioning"] == "prompt"] == [True]
+    assert getattr(trainer._adapter_network.transformer, "adapter_enabled", True) is True
+    # And the objective changed, because the empty branch did.
+    assert float(only_loss.detach()) != pytest.approx(float(live_loss.detach()))
+
+
+def test_prompt_only_adapter_equals_the_frozen_null_source():
+    _, frozen_loss, _, _ = _run_step(*_NORMALIZED_FLAGS[:4], "--h3_guidance_null_source", "frozen")
+    _, only_loss, _, _ = _run_step(*_NORMALIZED_FLAGS, "--h3_adapter_prompt_only")
+    assert float(only_loss.detach()) == pytest.approx(float(frozen_loss.detach()))
+
+
+def test_prompt_only_adapter_leaves_an_already_frozen_bracket_alone(tmp_path):
+    """Inside a frozen bracket (the teacher, the floor's base_empty arm) the
+    adapter is already off; the wrapper must not switch it back on in between."""
+    backend, loss, _, _ = _run_step(*_FLOOR_FLAGS, "--h3_adapter_prompt_only", teacher=_teacher_file(tmp_path))
+    loss.backward()
+    window = backend.calls[3:]
+    # student (prompt, on), teacher (prompt, off), base prompt (off), base empty (off)
+    assert [c["adapter"] for c in window] == [True, False, False, False]
+    assert [c["conditioning"] for c in window] == ["prompt", "prompt", "prompt", "empty"]
+
+
+def test_prompt_only_adapter_rejects_the_anchor_and_caption_dropout():
+    with pytest.raises(ValueError, match="identically zero"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args("--h3_adapter_prompt_only", "--h3_guidance_null_anchor_weight", "1.0")
+        )
+    with pytest.raises(ValueError, match="caption_dropout_rate 0"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args("--h3_adapter_prompt_only", "--h3_caption_dropout_rate", "0.1")
+        )
+
+
+def _curve_file(tmp_path):
+    rows = []
+    for modality, points in (
+        ("video", [(0.2, 0.30, 0.20), (0.6, 0.60, 0.40), (0.9, 1.00, 0.60)]),
+        ("audio", [(0.3, 0.50, 0.40), (0.8, 0.80, 0.50)]),
+    ):
+        for sigma, raw, g in points:
+            rows.append({"modality": modality, "sigma": sigma, "raw_mean": raw, "g_mean": g, "base_sigma": sigma})
+    path = tmp_path / "gcurve.json"
+    path.write_text(json.dumps({"summary": rows}), encoding="utf-8")
+    return path
+
+
+def test_measured_variance_weights_are_inverse_variance_normalised_and_capped(tmp_path):
+    from musubi_tuner.minimax_h3_train_network import interpolate_curve, load_measured_variance_curve
+
+    curve = load_measured_variance_curve(str(_curve_file(tmp_path)), weight_max=4.0)
+    sigmas, weights = curve["video"]
+    variance = torch.tensor([0.30**2 - 0.20**2, 0.60**2 - 0.40**2, 1.00**2 - 0.60**2])
+    expected = 1.0 / variance
+    expected = expected / expected.mean()
+    torch.testing.assert_close(weights, expected)
+    assert weights.mean().item() == pytest.approx(1.0)
+    # Flat beyond the ends, linear between.
+    torch.testing.assert_close(interpolate_curve(sigmas, weights, torch.tensor([0.0, 0.2])), weights[:1].repeat(2))
+    mid = interpolate_curve(sigmas, weights, torch.tensor([0.4]))
+    torch.testing.assert_close(mid, ((weights[0] + weights[1]) / 2).reshape(1))
+    # A bucket that would dominate is capped and the rest renormalised to mean 1.
+    tight = load_measured_variance_curve(str(_curve_file(tmp_path)), weight_max=1.2)
+    assert tight["video"][1].max().item() <= 1.2 + 1e-6
+    assert tight["video"][1].mean().item() < 1.0
+
+
+def test_measured_variance_weighting_reaches_the_sample_weight_per_modality(tmp_path):
+    args = _flag_args("--h3_measured_variance_weighting", str(_curve_file(tmp_path)))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    video = trainer._sample_weight(args, torch.tensor([0.2, 0.9]))
+    audio = trainer._sample_weight(args, torch.tensor([0.3, 0.8]), modality="audio")
+    assert video is not None and audio is not None
+    # Video: the least noisy bucket weighs most.
+    assert video[0] > video[1]
+    # Audio reads its own rows, which order the other way round here.
+    assert audio[0] > audio[1]
+    # Composes with a scheme instead of replacing it.
+    cosmap = _flag_args("--h3_measured_variance_weighting", str(_curve_file(tmp_path)), "--weighting_scheme", "cosmap")
+    trainer.handle_model_specific_args(cosmap)
+    plain = MiniMaxH3NetworkTrainer()._sample_weight(_flag_args("--weighting_scheme", "cosmap"), torch.tensor([0.2, 0.9]))
+    torch.testing.assert_close(trainer._sample_weight(cosmap, torch.tensor([0.2, 0.9])), plain * video)
+
+
+def test_measured_variance_weighting_rejects_a_missing_or_videoless_file(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args("--h3_measured_variance_weighting", str(tmp_path / "nope.json"))
+        )
+    bad = tmp_path / "audio_only.json"
+    bad.write_text(json.dumps({"summary": [{"modality": "audio", "sigma": 0.5, "raw_mean": 1.0, "g_mean": 0.5}]}))
+    with pytest.raises(ValueError, match="no video rows"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_measured_variance_weighting", str(bad)))
+
+
+def test_rollout_stop_min_bounds_the_stop_draw(tmp_path):
+    args = _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_stop_min", "0.7", teacher=_teacher_file(tmp_path))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    torch.manual_seed(0)
+    draws = [trainer._draw_rollout_stop_sigma(args) for _ in range(200)]
+    assert min(draws) >= 0.7
+    assert max(draws) > 0.9
+    plain = _flag_args(*_ROLLOUT_FLAGS, teacher=_teacher_file(tmp_path))
+    other = MiniMaxH3NetworkTrainer()
+    other.handle_model_specific_args(plain)
+    torch.manual_seed(0)
+    assert min(other._draw_rollout_stop_sigma(plain) for _ in range(200)) < 0.7
+
+
+def test_rollout_stop_min_is_validated_and_recorded(tmp_path):
+    with pytest.raises(ValueError, match="requires --h3_rollout_supervision"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(_flag_args("--h3_rollout_stop_min", "0.5"))
+    with pytest.raises(ValueError, match="stop_min"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(
+            _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_stop_min", "1.0", teacher=_teacher_file(tmp_path))
+        )
+    args = _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_stop_min", "0.7", "--h3_adapter_prompt_only", teacher=_teacher_file(tmp_path))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    metadata = trainer.extra_metadata(args)
+    assert metadata["ss_h3_rollout_stop_min"] == "0.7"
+    assert metadata["ss_h3_adapter_prompt_only"] == "True"
+    assert metadata["ss_h3_measured_variance_weighting"] == "none"
+
+
+def test_prompt_only_adapter_respects_a_raw_set_enabled_bracket():
+    """A frozen bracket made with the network's own set_enabled(False), not the
+    tracking toggle, must still be left alone by the wrapper."""
+    _, _, _, trainer = _run_step(*_NORMALIZED_FLAGS, "--h3_adapter_prompt_only")
+    network = trainer._adapter_network
+    backend = trainer.backend
+    video, batch = _rollout_batch()
+    inputs = trainer._rollout_state(
+        video=video,
+        audio=None,
+        video_sigma=torch.tensor([0.5]),
+        audio_sigma=torch.tensor([0.5]),
+    )
+    calls_before = len(backend.calls)
+    network.set_enabled(False)
+    try:
+        with torch.no_grad():
+            trainer._predict(_FakeAccelerator(), network.transformer, batch, inputs, conditioning="empty")
+        # Still off after the empty forward: the wrapper did not restore it.
+        assert network.is_enabled() is False
+    finally:
+        network.set_enabled(True)
+    assert backend.calls[calls_before]["adapter"] is False
+
+
+def test_measured_variance_weight_max_is_recorded(tmp_path):
+    args = _flag_args("--h3_measured_variance_weighting", str(_curve_file(tmp_path)), "--h3_measured_variance_weight_max", "2.5")
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_measured_variance_weight_max"] == "2.5"

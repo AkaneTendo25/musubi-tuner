@@ -597,7 +597,7 @@ def test_h3_validation_weights_each_modality_from_its_own_sigma_and_clears_keyfr
     trainer._step_keyframes = (("last",), (1,))
     sampled_sigmas = []
 
-    def record_weight(_args, sigma):
+    def record_weight(_args, sigma, modality="video"):
         sampled_sigmas.append(float(sigma))
         return torch.ones_like(sigma)
 

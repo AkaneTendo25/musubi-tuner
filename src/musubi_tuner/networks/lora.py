@@ -920,6 +920,11 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
 
+    def is_enabled(self) -> bool:
+        """Whether the adapter is live on every module (the state set_enabled left)."""
+        modules = self.text_encoder_loras + self.unet_loras
+        return all(getattr(lora, "enabled", True) for lora in modules) if modules else True
+
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file

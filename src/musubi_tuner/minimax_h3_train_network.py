@@ -790,6 +790,65 @@ def _parse_h3_lora_targets(spec: str | None) -> dict[str, tuple[int, ...] | None
     return selected
 
 
+def load_measured_variance_curve(path: str, weight_max: float) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Per-modality loss weights from the target dispersion a ``probe_g_curve`` report measured.
+
+    The report holds, per sigma bucket and modality, ``g`` = ||mean over noise
+    draws of the residual|| / ||target|| and ``raw`` = mean over draws of
+    ||residual|| / ||target||. ``raw^2 - g^2`` is a dimensionless DISPERSION
+    PROXY for the target at that noise level -- not its variance: ``raw`` is a
+    mean of norms rather than a root mean square (Jensen makes the difference
+    an underestimate), and the target-norm scaling is divided out. It orders the
+    buckets by how noisy the one-draw target is there, which is all the
+    weighting uses it for.
+
+    Weighting samples by the inverse of that proxy is a HEURISTIC sigma
+    reweighting: the per-sigma gradients estimate different conditional
+    updates, so this changes the objective (noisy noise levels count for less)
+    rather than reducing the variance of one fixed estimator. Weights are
+    normalised to mean 1 over the buckets -- not over the sigma distribution
+    actually sampled, so the effective step scale is only approximately
+    preserved -- then capped at ``weight_max`` so a nearly noise-free bucket
+    cannot dominate the step (a binding cap leaves the mean slightly below 1).
+    """
+    report = json.loads(Path(path).read_text(encoding="utf-8"))
+    rows = report.get("summary") if isinstance(report, dict) else None
+    if not rows:
+        raise ValueError(f"--h3_measured_variance_weighting: {path} has no 'summary' rows")
+    curves: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for modality in ("video", "audio"):
+        subset = sorted((r for r in rows if r.get("modality") == modality), key=lambda r: float(r["sigma"]))
+        if not subset:
+            continue
+        sigmas = torch.tensor([float(r["sigma"]) for r in subset], dtype=torch.float32)
+        variance = torch.tensor(
+            [max(float(r["raw_mean"]) ** 2 - float(r["g_mean"]) ** 2, 1e-8) for r in subset], dtype=torch.float32
+        )
+        weights = 1.0 / variance
+        weights = weights / weights.mean()
+        # The cap is final: renormalising after it would lift the capped bucket
+        # straight back over the line. A binding cap therefore lowers the mean
+        # a little below 1, which is a slightly smaller effective step, never a
+        # larger one.
+        weights = weights.clamp_max(float(weight_max))
+        curves[modality] = (sigmas, weights)
+    if "video" not in curves:
+        raise ValueError(f"--h3_measured_variance_weighting: {path} carries no video rows")
+    return curves
+
+
+def interpolate_curve(sigmas: torch.Tensor, weights: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    """Piecewise-linear lookup of ``weights`` at ``query``, flat beyond the ends."""
+    grid = sigmas.to(device=query.device, dtype=torch.float32)
+    values = weights.to(device=query.device, dtype=torch.float32)
+    q = query.to(dtype=torch.float32).clamp(min=float(grid[0]), max=float(grid[-1]))
+    upper = torch.searchsorted(grid, q).clamp(1, grid.numel() - 1)
+    lower = upper - 1
+    span = (grid[upper] - grid[lower]).clamp_min(1e-8)
+    t = (q - grid[lower]) / span
+    return values[lower] + t * (values[upper] - values[lower])
+
+
 def _apply_timestep_focus(base: torch.Tensor, low: float, high: float, probability: float) -> torch.Tensor:
     """Map one uniform draw to a uniform/background mixture without another RNG draw."""
     if probability <= 0.0:
@@ -1140,6 +1199,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if buckets is not None and buckets > 1:
             index = int(torch.randint(0, int(buckets), (), device="cpu", generator=generator))
             draw = (index + draw) / float(buckets)
+        # The band lower bound lives on the same coordinate the draw is on, so
+        # under --h3_rollout_stop_shifted it is a shifted sigma and otherwise a
+        # base one; a data band capped with --h3_timestep_focus_max below it
+        # gives every noise level exactly one master term.
+        stop_min = float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0)
+        if stop_min > 0:
+            draw = stop_min + (1.0 - stop_min) * draw
         floor = ROLLOUT_SIGMA_FLOOR
         if getattr(args, "h3_rollout_stop_shifted", False) and video_shift != 1.0:
             # The draw *is* the shifted stop; clamp it there so the supervised
@@ -1242,6 +1308,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._branch_drift: dict[int, list] = {}
         self._prompted_drift_ratios: dict[int, list[float]] = {}
         self._validation_network = None
+        self._adapter_network = None
+        self._adapter_prompt_only = False
+        self._measured_variance_curve = None
         self._step_recipe: str | None = None
         self._step_qwen_control_dropout = False
         self._crepa: H3CREPA | None = None
@@ -1458,6 +1527,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         }
         validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
         self._validation_network = network
+        self._adapter_prompt_only = bool(getattr(args, "h3_adapter_prompt_only", False))
         self._validation_global_step = int(global_step)
         if (
             getattr(args, "h3_validation_field_probe", False)
@@ -1944,7 +2014,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             loss_inputs = inputs
 
         video_sample_weight = self._sample_weight(args, inputs.video_sigma) if video_latents is not None else None
-        audio_sample_weight = self._sample_weight(args, inputs.audio_sigma) if audio_latents is not None else None
+        audio_sample_weight = self._sample_weight(args, inputs.audio_sigma, modality="audio") if audio_latents is not None else None
         if prediction.video is not None and loss_inputs.video_target is not None and video_weight > 0:
             total, count = masked_squared_error_sum(
                 prediction.video,
@@ -2559,6 +2629,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
         anchor_weight = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0)
+        if getattr(args, "h3_adapter_prompt_only", False):
+            if anchor_weight > 0:
+                raise ValueError(
+                    "--h3_adapter_prompt_only makes the student's empty branch the frozen one by construction, so "
+                    "--h3_guidance_null_anchor_weight would hold a difference that is identically zero at the cost "
+                    "of two forwards a step; drop one of the two"
+                )
+            if args.h3_caption_dropout_rate > 0:
+                raise ValueError(
+                    "--h3_adapter_prompt_only switches the adapter off on empty-prompt forwards, so a caption-dropout "
+                    "step would train nothing; set --h3_caption_dropout_rate 0"
+                )
+        self._measured_variance_curve = None
+        curve_path = getattr(args, "h3_measured_variance_weighting", None)
+        weight_max = float(getattr(args, "h3_measured_variance_weight_max", 4.0))
+        if not math.isfinite(weight_max) or weight_max < 1.0:
+            raise ValueError("--h3_measured_variance_weight_max must be finite and at least 1")
+        if curve_path:
+            if not Path(curve_path).is_file():
+                raise FileNotFoundError(f"--h3_measured_variance_weighting file not found: {curve_path}")
+            self._measured_variance_curve = load_measured_variance_curve(curve_path, weight_max)
         if not math.isfinite(anchor_weight) or anchor_weight < 0:
             # Every gate on this feature reads "> 0", so a negative weight would
             # configure the anchor and then quietly train without it.
@@ -3672,16 +3763,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         mask = mask.to(device=target.device)
         return torch.where(keep, mask, torch.zeros((), device=mask.device, dtype=mask.dtype))
 
-    def _sample_weight(self, args: argparse.Namespace, sigma: torch.Tensor) -> torch.Tensor | None:
+    def _sample_weight(self, args: argparse.Namespace, sigma: torch.Tensor, modality: str = "video") -> torch.Tensor | None:
+        """Per-sample loss weight at this modality's SHIFTED sigma; ``None`` means uniform."""
+        weight = None
         if args.weighting_scheme == "sigma_sqrt":
             # H3 samples a continuous base coordinate, so the generic
             # sigma^-2 weighting has no finite upper bound. Clamp sigma at
             # the equivalent configured maximum before taking the inverse.
             sigma_floor = float(args.h3_sigma_sqrt_max_weight) ** -0.5
-            return sigma.clamp_min(sigma_floor).pow(-2.0)
-        if args.weighting_scheme == "cosmap":
-            return 2.0 / (math.pi * (1.0 - 2.0 * sigma + 2.0 * sigma.square()))
-        return None
+            weight = sigma.clamp_min(sigma_floor).pow(-2.0)
+        elif args.weighting_scheme == "cosmap":
+            weight = 2.0 / (math.pi * (1.0 - 2.0 * sigma + 2.0 * sigma.square()))
+        curve = getattr(self, "_measured_variance_curve", None)
+        if curve and modality in curve:
+            sigmas, weights = curve[modality]
+            measured = interpolate_curve(sigmas, weights, sigma)
+            weight = measured if weight is None else weight * measured
+        return weight
 
     def _validate_rollout_args(self, args: argparse.Namespace) -> None:
         """Reject every incoherent rollout-supervision configuration before loading.
@@ -3713,6 +3811,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_rollout_field_floor": float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) != 0.0,
             "--h3_rollout_field_floor_direction": getattr(args, "h3_rollout_field_floor_direction", "self") != "self",
             "--h3_rollout_field_floor_sigma_max": float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0)) != 1.0,
+            "--h3_rollout_stop_min": float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0) != 0.0,
         }
         if not rollout:
             for flag, changed in flags.items():
@@ -3740,6 +3839,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Gated on "> 0" below, so a negative weight would configure the floor
             # and then quietly train without it.
             raise ValueError("--h3_rollout_field_floor must be finite and non-negative; 0 disables it")
+        stop_min = float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0)
+        if not math.isfinite(stop_min) or not 0 <= stop_min < 1:
+            raise ValueError("--h3_rollout_stop_min must be finite and lie in [0, 1)")
         floor_sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
         if not math.isfinite(floor_sigma_max) or not 0 < floor_sigma_max <= 1:
             raise ValueError("--h3_rollout_field_floor_sigma_max must be finite and lie in (0, 1]")
@@ -3830,7 +3932,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         set_enabled = getattr(unwrapped_network, "set_enabled", None)
         if not callable(set_enabled):
             raise TypeError(f"{requirement} requires a network with set_enabled()")
-        return set_enabled
+
+        # Every frozen-base forward in this trainer takes its toggle from here, so
+        # recording the requested state on the network is enough for the
+        # prompt-only wrapper in ``_predict`` to know whether the adapter is
+        # already off and leave it alone.
+        def tracked(enabled: bool) -> None:
+            unwrapped_network._h3_adapter_enabled = bool(enabled)
+            set_enabled(enabled)
+
+        return tracked
 
     @staticmethod
     @contextmanager
@@ -4431,19 +4542,39 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         call = self._predict_call(accelerator, batch, inputs, conditioning=conditioning)
         if role is None:
             role = "student" if torch.is_grad_enabled() else "teacher"
-        with accelerator.autocast(), h3_profile_scope(f"h3.forward.{role}"):
-            # Positional for the five arguments every backend has carried since
-            # the first one, so a backend that named its parameters differently
-            # keeps working.
-            prediction = self.backend.predict_training(
-                transformer,
-                call["batch"],
-                call["video_hidden_states"],
-                call["audio_hidden_states"],
-                call["video_timestep"],
-                call["audio_timestep"],
-                **{key: value for key, value in call.items() if key not in _PREDICT_POSITIONAL_KEYS},
-            )
+        # --h3_adapter_prompt_only: an empty-prompt forward is the frozen base's.
+        # Left alone when the adapter is already off (a frozen bracket around
+        # this call), so the restore below never re-enables it inside one.
+        restore = None
+        if getattr(self, "_adapter_prompt_only", False) and conditioning == "empty":
+            network = getattr(self, "_adapter_network", None) or getattr(self, "_validation_network", None)
+            if network is not None:
+                unwrapped = accelerator.unwrap_model(network)
+                # Ask the network when it can say (LoRA networks can); fall back to
+                # the state the tracking toggle recorded, so a bracket made with the
+                # raw set_enabled() is still respected wherever the network reports.
+                is_enabled = getattr(unwrapped, "is_enabled", None)
+                enabled = bool(is_enabled()) if callable(is_enabled) else getattr(unwrapped, "_h3_adapter_enabled", True)
+                if enabled:
+                    restore = self._runtime_network_toggle(accelerator, network, "--h3_adapter_prompt_only")
+                    restore(False)
+        try:
+            with accelerator.autocast(), h3_profile_scope(f"h3.forward.{role}"):
+                # Positional for the five arguments every backend has carried since
+                # the first one, so a backend that named its parameters differently
+                # keeps working.
+                prediction = self.backend.predict_training(
+                    transformer,
+                    call["batch"],
+                    call["video_hidden_states"],
+                    call["audio_hidden_states"],
+                    call["video_timestep"],
+                    call["audio_timestep"],
+                    **{key: value for key, value in call.items() if key not in _PREDICT_POSITIONAL_KEYS},
+                )
+        finally:
+            if restore is not None:
+                restore(True)
         if not isinstance(prediction, H3ModelPrediction):
             raise TypeError("H3 backend predict_training() must return H3ModelPrediction")
         return prediction
@@ -4500,6 +4631,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         self._batch_backward_performed = False
+        self._adapter_network = network
+        self._adapter_prompt_only = bool(getattr(args, "h3_adapter_prompt_only", False))
         # The block-swap arm gate is balanced by construction -- one hook firing
         # per announced invocation -- but a step that raises between forward and
         # backward leaves announcements nothing will consume. An H2D-only ring
@@ -5099,7 +5232,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video_mask=dop_video_mask,
                 audio_mask=dop_audio_mask,
                 video_sample_weight=self._sample_weight(args, inputs.video_sigma) if has_video else None,
-                audio_sample_weight=self._sample_weight(args, inputs.audio_sigma) if has_audio else None,
+                audio_sample_weight=self._sample_weight(args, inputs.audio_sigma, modality="audio") if has_audio else None,
                 balance=args.h3_loss_balance,
                 mask_normalization=args.h3_loss_mask_normalization,
                 video_weight=0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight,
@@ -5132,7 +5265,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
 
         video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
-        audio_sample_weight = self._sample_weight(args, inputs.audio_sigma) if has_audio else None
+        audio_sample_weight = self._sample_weight(args, inputs.audio_sigma, modality="audio") if has_audio else None
         video_weight = 0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight
         audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
         effective_video_mask = self._mask_to_loss(
@@ -5512,6 +5645,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_rollout_steps": str(args.h3_rollout_steps),
             "ss_h3_rollout_window": str(args.h3_rollout_window),
             "ss_h3_rollout_stop_shifted": str(bool(getattr(args, "h3_rollout_stop_shifted", False))),
+            "ss_h3_rollout_stop_min": str(float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0)),
+            "ss_h3_adapter_prompt_only": str(bool(getattr(args, "h3_adapter_prompt_only", False))),
+            "ss_h3_measured_variance_weighting": str(getattr(args, "h3_measured_variance_weighting", None) or "none"),
+            "ss_h3_measured_variance_weight_max": str(float(getattr(args, "h3_measured_variance_weight_max", 4.0))),
             "ss_h3_rollout_teacher": str(getattr(args, "h3_rollout_teacher_config", None) or "none"),
             "ss_h3_rollout_teacher_privilege": str(getattr(args, "h3_rollout_teacher_privilege", "auto")),
             # Recorded although it defines no objective: it is the one rollout
@@ -6103,6 +6240,48 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "prediction. Costs two no-grad frozen "
             "forwards per supervised sub-step (folded into the fused pass under --h3_rollout_fused_teacher). "
             "Requires --h3_rollout_supervision and a text cache built with --cache_guidance_empty. 0 disables"
+        ),
+    )
+    parser.add_argument(
+        "--h3_adapter_prompt_only",
+        action="store_true",
+        help=(
+            "run every EMPTY-prompt forward with the adapter switched off, so the student's empty branch is the "
+            "frozen checkpoint's by construction. A guidance-distilled checkpoint never evaluates its empty branch at "
+            "inference, so nothing is lost there; in training the live-null degeneracy (empty branch chasing the "
+            "clip) becomes impossible and --h3_guidance_null_anchor_weight has nothing left to hold, which saves its "
+            "two forwards a step. Rejected with the anchor and with --h3_caption_dropout_rate above 0, whose "
+            "dropped steps would train nothing"
+        ),
+    )
+    parser.add_argument(
+        "--h3_measured_variance_weighting",
+        type=str,
+        default=None,
+        help=(
+            "path to a probe_g_curve JSON report; weight every sample's loss by the inverse of the target DISPERSION "
+            "PROXY measured at its shifted sigma (raw^2 - g^2 per bucket, per modality; a proxy, not a variance), "
+            "normalised to mean 1 over the buckets and capped by --h3_measured_variance_weight_max. A heuristic "
+            "sigma reweighting that counts noisy noise levels for less and so changes the objective; composes "
+            "multiplicatively with --weighting_scheme"
+        ),
+    )
+    parser.add_argument(
+        "--h3_measured_variance_weight_max",
+        type=float,
+        default=4.0,
+        help="cap on a measured inverse-variance weight after normalisation to mean 1 (default 4.0)",
+    )
+    parser.add_argument(
+        "--h3_rollout_stop_min",
+        type=float,
+        default=0.0,
+        help=(
+            "lower bound of the rollout stop draw, on the coordinate the draw is made on (unshifted base, or the "
+            "shifted video sigma under --h3_rollout_stop_shifted). Without --h3_rollout_stop_shifted both this and "
+            "--h3_timestep_focus_max are unshifted base sigmas, and focus_max <= stop_min gives the data term and the "
+            "rollout term disjoint noise bands; with it the two live on different coordinates and must be converted "
+            "before any such claim. 0 (default) draws the whole range"
         ),
     )
     parser.add_argument(
