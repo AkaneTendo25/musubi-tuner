@@ -20,6 +20,43 @@ logging.basicConfig(level=logging.INFO)
 
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
 
+#: ``.lora_down.weight`` or the split_dims form ``.lora_down.<i>.weight`` at the end of a state-dict key.
+_DOWN_WEIGHT_KEY = re.compile(r"\.lora_down(?:\.\d+)?\.weight$")
+
+#: ``nora`` network argument (Normalized Low-Rank Adaptation, Kang et al. 2026, arXiv:2608.31036).
+#: ``off`` is plain LoRA, ``forward`` re-normalises ``lora_down`` on every forward with gradients
+#: flowing through the normalisation, ``init`` normalises once after initialisation.
+NORA_MODES = ("off", "forward", "init")
+#: ``init`` network argument: ``default`` is Kaiming-uniform ``lora_down`` / zero ``lora_up``;
+#: ``bimi`` tiles ``r x r`` identity blocks along ``lora_down`` (columns orthonormal within each block).
+LORA_INITS = ("default", "bimi")
+
+
+def normalize_lora_down(weight: torch.Tensor) -> torch.Tensor:
+    """Unit-norm columns of a ``lora_down`` weight along the rank axis (dim 0).
+
+    ``weight`` is ``(rank, in)`` for Linear and ``(rank, in, *kernel)`` for Conv; in both
+    cases every input position holds one rank-length vector that is scaled to unit norm, so
+    the conv case is the per-column normalisation over the flattened input dims. Uses the
+    ``torch.nn.functional.normalize`` epsilon (1e-12), i.e. an all-zero column stays zero.
+    """
+    return torch.nn.functional.normalize(weight, p=2, dim=0)
+
+
+def bimi_init_(weight: torch.Tensor) -> None:
+    """Block-identity initialisation: ``A[:, k*r:(k+1)*r] = I_r`` over the flattened input dims.
+
+    The trailing block is a truncated identity when the flattened input size is not a
+    multiple of the rank; every column still holds exactly one 1, so the columns are
+    unit-norm and, within a block, mutually orthogonal.
+    """
+    rank = weight.shape[0]
+    flat = weight.detach().reshape(rank, -1)
+    repeats = -(-flat.shape[1] // rank)
+    tiled = torch.eye(rank, dtype=weight.dtype, device=weight.device).repeat(1, repeats)[:, : flat.shape[1]]
+    with torch.no_grad():
+        weight.copy_(tiled.reshape(weight.shape))
+
 
 def _profile_scope(name: str):
     """A ``torch.profiler.record_function`` label while a profiler collects, else a null context."""
@@ -44,14 +81,25 @@ class LoRAModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         split_dims: Optional[List[int]] = None,
+        nora: str = "off",
+        init: str = "default",
     ):
         """
         if alpha == 0 or None, alpha is rank (no scaling).
 
         split_dims is used to mimic the split qkv of multi-head attention.
+
+        nora / init: see ``NORA_MODES`` and ``LORA_INITS``. With ``nora="forward"`` the
+        parameter ``lora_down.weight`` is the raw direction; the effective weight the
+        forward and the saved adapter use is ``normalize_lora_down`` of it.
         """
         super().__init__()
         self.lora_name = lora_name
+        if nora not in NORA_MODES:
+            raise ValueError(f"nora must be one of {NORA_MODES}, got {nora!r}")
+        if init not in LORA_INITS:
+            raise ValueError(f"init must be one of {LORA_INITS}, got {init!r}")
+        self.nora = nora
 
         if org_module.__class__.__name__ in ("Conv2d", "Conv3d"):
             in_dim = org_module.in_channels
@@ -96,6 +144,14 @@ class LoRAModule(torch.nn.Module):
             for lora_up in self.lora_up:
                 torch.nn.init.zeros_(lora_up.weight)
 
+        if init == "bimi":
+            for down in self._down_modules():
+                bimi_init_(down.weight)
+        if nora == "init":
+            with torch.no_grad():
+                for down in self._down_modules():
+                    down.weight.copy_(normalize_lora_down(down.weight))
+
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
@@ -109,6 +165,49 @@ class LoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+
+    def _down_modules(self):
+        return [self.lora_down] if self.split_dims is None else list(self.lora_down)
+
+    def effective_down_weight(self, down: torch.nn.Module) -> torch.Tensor:
+        """The ``lora_down`` weight the delta is computed with: normalised under ``nora=forward``."""
+        if self.nora == "forward":
+            return normalize_lora_down(down.weight)
+        return down.weight
+
+    def _down_forward(self, down: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        if self.nora != "forward":
+            return down(x)  # the module call itself, so ``nora=off`` stays bit-identical
+        weight = normalize_lora_down(down.weight)
+        if isinstance(down, torch.nn.Linear):
+            return torch.nn.functional.linear(x, weight, down.bias)
+        return down._conv_forward(x, weight, down.bias)
+
+    def export_state_dict(self, destination=None, prefix: str = ""):
+        """State dict for the adapter file: a standard LoRA that merges and infers without NoRA.
+
+        Under ``nora=forward`` the saved ``lora_down`` is the normalised weight, so
+        ``lora_up @ lora_down_saved`` is the training-time delta up to the save dtype's
+        rounding (bf16 moves column norms by about 1e-3, fp32 is exact). ``state_dict``
+        itself is left raw, so a resumed training state keeps the parameters the optimizer
+        moments were accumulated on.
+        """
+        sd = self.state_dict(destination=destination, prefix=prefix)
+        if self.nora == "forward":
+            if self.split_dims is None:
+                sd[prefix + "lora_down.weight"] = normalize_lora_down(self.lora_down.weight).detach()
+            else:
+                for i, down in enumerate(self.lora_down):
+                    sd[prefix + f"lora_down.{i}.weight"] = normalize_lora_down(down.weight).detach()
+        return sd
+
+    def down_column_norm_deviation(self) -> float:
+        """Largest ``| ||column|| - 1 |`` over the raw ``lora_down`` columns; 0 for a NoRA-saved adapter."""
+        deviation = 0.0
+        for down in self._down_modules():
+            norms = down.weight.detach().float().flatten(1).norm(dim=0)
+            deviation = max(deviation, float((norms - 1.0).abs().max()))
+        return deviation
 
     def _autocast_enabled_for(self, x):
         if not x.is_floating_point():
@@ -199,7 +298,7 @@ class LoRAModule(torch.nn.Module):
             return convrot_int8_lora_forward(
                 base_module,
                 x,
-                self.lora_down.weight,
+                self.effective_down_weight(self.lora_down),
                 self.lora_up.weight,
                 self.multiplier * self.scale,
             )
@@ -212,7 +311,7 @@ class LoRAModule(torch.nn.Module):
 
         lora_input = self._lora_input(x)
         if self.split_dims is None:
-            lx = self.lora_down(lora_input)
+            lx = self._down_forward(self.lora_down, lora_input)
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -239,7 +338,7 @@ class LoRAModule(torch.nn.Module):
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
             return self._match_org_dtype(self._fuse_delta(org_forwarded, lx, scale), org_forwarded)
         else:
-            lxs = [lora_down(lora_input) for lora_down in self.lora_down]
+            lxs = [self._down_forward(lora_down, lora_input) for lora_down in self.lora_down]
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -520,6 +619,24 @@ def create_network(
     if module_class is None:
         module_class = LoRAModule
 
+    # NoRA column normalisation and bimi initialisation. Only forwarded to the module when
+    # set, so module classes without these keyword arguments keep working with defaults.
+    nora = str(kwargs.get("nora", "off")).lower()
+    init = str(kwargs.get("init", "default")).lower()
+    if nora not in NORA_MODES:
+        raise ValueError(f"network_args nora must be one of {NORA_MODES}, got {nora!r}")
+    if init not in LORA_INITS:
+        raise ValueError(f"network_args init must be one of {LORA_INITS}, got {init!r}")
+    if nora != "off" or init != "default":
+        module_kwargs = dict(module_kwargs or {})
+        module_kwargs.update(nora=nora, init=init)
+        logger.info(f"NoRA: nora={nora}, init={init}")
+    if nora != "off" and float(network_alpha) != float(network_dim):
+        logger.warning(
+            f"NoRA is intended for network_alpha == network_dim (scaling 1); got alpha={network_alpha}, dim={network_dim}. "
+            "With unit-norm lora_down columns the alpha/dim factor only rescales lora_up's learning signal."
+        )
+
     # too many arguments ( ^ω^)･･･
     network = LoRANetwork(
         target_replace_modules,
@@ -780,7 +897,35 @@ class LoRANetwork(torch.nn.Module):
             weights_sd = torch.load(file, map_location="cpu")
 
         info = self.load_state_dict(weights_sd, False)
+        self._check_loaded_nora_columns(file)
         return info
+
+    def _check_loaded_nora_columns(self, file):
+        """Warn when a NoRA run continues from an adapter whose ``lora_down`` columns are not unit-norm.
+
+        Adapters saved by a NoRA run carry normalised columns, so re-normalising under
+        ``nora=forward`` reproduces the saved delta exactly (up to the save dtype), and
+        ``nora=init`` continues with them unchanged. A plain-LoRA adapter has arbitrary
+        column norms: ``forward`` mode would rescale its delta on the first step, ``init``
+        mode would train from non-unit directions.
+        """
+        worst = 0.0
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if getattr(lora, "nora", "off") != "off":
+                worst = max(worst, lora.down_column_norm_deviation())
+        if worst > 1e-2:
+            logger.warning(
+                f"{file}: lora_down columns deviate from unit norm by up to {worst:.3g}; the adapter was not saved by a "
+                "NoRA run. nora=forward re-normalises them (its delta changes), nora=init keeps them as loaded."
+            )
+
+    def export_state_dict(self):
+        """The adapter-file state dict: ``state_dict()`` with NoRA modules' normalised ``lora_down``."""
+        sd = self.state_dict()
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if getattr(lora, "nora", "off") == "forward":
+                sd.update(lora.export_state_dict(prefix=lora.lora_name + "."))
+        return sd
 
     def apply_to(
         self,
@@ -916,7 +1061,9 @@ class LoRANetwork(torch.nn.Module):
         """
         from musubi_tuner.utils import async_save
 
-        return async_save.snapshot_state_dict(self.state_dict(), dtype)
+        # Duck-typed consumers borrow this method without export_state_dict; plain state then.
+        export = getattr(self, "export_state_dict", None)
+        return async_save.snapshot_state_dict(export() if export is not None else self.state_dict(), dtype)
 
     def save_weights(self, file, dtype, metadata):
         from musubi_tuner.utils import async_save
@@ -974,11 +1121,23 @@ class LoRANetwork(torch.nn.Module):
             logger.warning("max_norm_regularization is only supported for LoRA")
             return 0, 0.0, 0.0
 
+        # Under nora=forward the delta uses the normalised lora_down, and scaling the raw
+        # parameter would be undone by the normalisation: measure with the effective weight
+        # and put the whole correction on lora_up.
+        nora_forward = {
+            lora.lora_name for lora in self.text_encoder_loras + self.unet_loras if getattr(lora, "nora", "off") == "forward"
+        }
+
+        lora_names = []
         for key in state_dict.keys():
-            if "lora_down" in key and "weight" in key:
+            # ``<name>.lora_down.weight`` or, for split_dims, ``<name>.lora_down.<i>.weight``;
+            # alpha is one buffer per module either way.
+            match = _DOWN_WEIGHT_KEY.search(key)
+            if match is not None:
                 downkeys.append(key)
                 upkeys.append(key.replace("lora_down", "lora_up"))
-                alphakeys.append(key.replace("lora_down.weight", "alpha"))
+                lora_names.append(key[: match.start()])
+                alphakeys.append(key[: match.start()] + ".alpha")
 
         for i in range(len(downkeys)):
             down = state_dict[downkeys[i]].to(device)
@@ -986,6 +1145,9 @@ class LoRANetwork(torch.nn.Module):
             alpha = state_dict[alphakeys[i]].to(device)
             dim = down.shape[0]
             scale = alpha / dim
+            normalised = lora_names[i] in nora_forward
+            if normalised:
+                down = normalize_lora_down(down)
 
             if up.shape[2:] == (1, 1) and down.shape[2:] == (1, 1):
                 updown = (up.squeeze(2).squeeze(2) @ down.squeeze(2).squeeze(2)).unsqueeze(2).unsqueeze(3)
@@ -1002,8 +1164,11 @@ class LoRANetwork(torch.nn.Module):
             sqrt_ratio = ratio**0.5
             if ratio != 1:
                 keys_scaled += 1
-                state_dict[upkeys[i]] *= sqrt_ratio
-                state_dict[downkeys[i]] *= sqrt_ratio
+                if normalised:
+                    state_dict[upkeys[i]] *= ratio
+                else:
+                    state_dict[upkeys[i]] *= sqrt_ratio
+                    state_dict[downkeys[i]] *= sqrt_ratio
             scalednorm = updown.norm() * ratio
             norms.append(scalednorm.item())
 

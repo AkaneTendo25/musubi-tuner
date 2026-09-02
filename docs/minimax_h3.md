@@ -724,6 +724,23 @@ numbered main blocks. Named targets deliberately cannot be mixed with raw `inclu
 regex network arguments; those patterns are matched against complete module paths with `fullmatch`, and an include pattern is
 an exception to exclusions rather than a universal standalone allow-list.
 
+NoRA (Normalized Low-Rank Adaptation, [Kang et al. 2026, arXiv:2608.31036](https://arxiv.org/abs/2608.31036)) is available
+through `--network_args`. It keeps every column of `lora_down` (one rank-length vector per input feature) at unit norm, so
+`lora_down` carries directions and all magnitude lives in `lora_up`; set `--network_alpha` equal to `--network_dim` (scaling 1),
+which the paper assumes and the trainer warns about otherwise.
+
+| `--network_args` value | Behaviour |
+| --- | --- |
+| `nora=off` (default) | Plain LoRA, bit-identical to a run without the argument. |
+| `nora=forward` | `lora_down` is re-normalised on every forward and gradients flow through the normalisation. The saved adapter stores the normalised `lora_down`, so it is an ordinary LoRA whose `lora_up @ lora_down` is the training-time delta up to the save dtype's rounding (exact in fp32; bf16 shifts column norms by about 1e-3); it merges and infers without NoRA code, and `--network_weights` from such a file re-normalises to the same delta. |
+| `nora=init` | `lora_down` is normalised once after initialisation and trained as an ordinary parameter afterwards. |
+| `init=bimi` | Block-identity initialisation: `lora_down` is `r x r` identity blocks tiled along the input axis (columns orthonormal within each `r x r` block and repeated across blocks; the last block is truncated when the input size is not a multiple of `r`), `lora_up` is zero. Combine with `nora=forward` or `nora=init`. |
+
+The normalisation runs over the rank axis, so `conv_dim` adapters on convolutions get the same per-column treatment over their
+flattened input dims. Loading an adapter that was not saved by a NoRA run into a `nora=` run logs a warning because its column
+norms are not unit; with `nora=forward` its delta would change. Resume states (`--save_state`) keep the raw parameters the
+optimizer moments belong to; only the adapter `.safetensors` is normalised.
+
 LoHa/LoKr are unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally
 `--compile_auto_cache_size_limit`, `--compile_fallback_to_eager`, or `--inductor_config KEY=VALUE ...`. GPU compilation requires
 a working Triton installation; on Windows, install a `triton-windows` build compatible with the installed PyTorch and Python
