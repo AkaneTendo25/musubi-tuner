@@ -8,7 +8,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from multiprocessing import Value
 from pathlib import Path
@@ -75,6 +75,19 @@ from musubi_tuner.minimax_h3.masking import (
     video_mask_to_rows,
 )
 from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS, MiniMaxH3GuideGeometry
+from musubi_tuner.minimax_h3.rollout import (
+    MAX_ROLLOUT_WINDOW,
+    SIGMA_FLOOR as ROLLOUT_SIGMA_FLOOR,
+    TEACHER_PRIVILEGE_CHANNELS,
+    H3RolloutTeacherCache,
+    batch_item_key,
+    enable_item_keys,
+    euler_advance,
+    item_key_latent_caches,
+    item_key_text_caches,
+    rollout_base_sigmas,
+    teacher_batch,
+)
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
@@ -85,6 +98,8 @@ from musubi_tuner.minimax_h3.references import (
     validate_reference_video_sizing,
 )
 from musubi_tuner.minimax_h3.training import (
+    H3FusedArm,
+    H3JointNoisyInputs,
     H3ModelPrediction,
     cfg_zero_rescaled_empty,
     contrastive_guidance_target,
@@ -94,6 +109,7 @@ from musubi_tuner.minimax_h3.training import (
     joint_velocity_loss,
     prepare_joint_noisy_inputs,
     shift_sigma,
+    unshift_sigma,
 )
 from musubi_tuner.minimax_h3.validation import (
     H3ValidationAccumulator,
@@ -270,6 +286,37 @@ def _parse_keyframe_anchors(spec: str) -> tuple[int | str, ...]:
     return tuple(anchors)
 
 
+# The cheapest configuration that was not measured worse than a longer rollout: every
+# supervised state adds a trainable forward and a teacher forward, so the window is what
+# the objective is charged for.
+_ROLLOUT_PROBABILITY_DEFAULT = 0.5
+_ROLLOUT_STEPS_DEFAULT = 2
+_ROLLOUT_WINDOW_DEFAULT = 1
+
+# The arguments every H3 training backend has taken positionally since the first
+# one. A described forward is a dict, and these are the entries that go back on
+# the wire in order rather than by name.
+_PREDICT_POSITIONAL_KEYS = frozenset(("batch", "video_hidden_states", "audio_hidden_states", "video_timestep", "audio_timestep"))
+
+
+@contextmanager
+def _forked_frozen_build(fork_devices: list, set_enabled):
+    """Build one frozen arm's packed sequence without disturbing the others.
+
+    Entered once per fused forward, around the stage that draws: the conditioning
+    rows a Ref2VA or keyframe presentation jitters come out of the global stream,
+    and a frozen arm must not consume the draws the trainable arm would have made.
+    The adapter is off here too, because a token refiner carrying LoRA is part of
+    the build rather than of the block loop.
+    """
+    with torch.random.fork_rng(devices=fork_devices), torch.no_grad():
+        set_enabled(False)
+        try:
+            yield
+        finally:
+            set_enabled(True)
+
+
 def _parse_guide_specs(spec: str) -> tuple[tuple[int, int, int], ...]:
     """Parse ``START:VIDEO_LATENTS:AUDIO_LATENTS`` guide recipes."""
     if not spec:
@@ -366,10 +413,34 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             torch.distributed.broadcast(selected, src=0)
         return int(selected.item())
 
-    @staticmethod
-    def _base_preservation_active(accelerator: Accelerator, probability: float) -> bool:
-        """Draw one preservation decision shared by every distributed rank."""
-        return MiniMaxH3NetworkTrainer._sparse_branch_active(accelerator, probability)
+    def _base_preservation_active(self, accelerator: Accelerator, probability: float) -> bool:
+        """Draw one preservation decision shared by every distributed rank.
+
+        On its own stream, for the reason the guidance branch already is: drawn
+        off the ambient CPU stream it would advance it once per step before the
+        rollout generators are lazily seeded FROM that stream, so enabling sparse
+        preservation silently reseeded them and changed which steps a seeded
+        rollout run selected.
+        """
+        if probability >= 1.0:
+            return True
+        generator = self._preservation_probability_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._preservation_probability_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
+
+    def _dop_probability_active(self, accelerator: Accelerator, probability: float) -> bool:
+        """The same, for differential output preservation's own sparse draw."""
+        if probability >= 1.0:
+            return True
+        generator = self._dop_probability_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._dop_probability_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
 
     def _guidance_distillation_active(self, accelerator: Accelerator, probability: float) -> bool:
         """Draw one guidance-distillation decision shared by every distributed rank."""
@@ -435,6 +506,94 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
             self._qwen_control_dropout_generator = generator
         return self._sparse_branch_active(accelerator, probability, generator)
+
+    def _rollout_supervision_active(self, accelerator: Accelerator, probability: float) -> bool:
+        """Draw one rollout-supervision decision shared by every distributed rank.
+
+        A dedicated stream, independent of the guidance-sparsity, scale, recipe,
+        preservation and control-dropout ones and of the global CPU stream that
+        caption dropout, the observed-modality draw and the jitters consume:
+        enabling rollout supervision must not shift any of them, so a run that
+        only adds the flag keeps every other branch decision it had. Only the
+        one-time seed comes from the global stream, so a seeded run stays
+        reproducible.
+
+        The decision itself is broadcast because it changes which objective the
+        step optimizes: two ranks reducing gradients of different objectives is
+        not the sparse estimator, it is a silent mixture.
+        """
+        if probability >= 1.0:
+            return True
+        generator = self._rollout_probability_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._rollout_probability_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
+
+    def _draw_rollout_stop_sigma(self, args: argparse.Namespace, video_shift: float = 1.0) -> float:
+        """Draw the *unshifted* base sigma the rollout stops at.
+
+        Uniform on the same base coordinate the data steps sample, and stratified
+        over ``--num_timestep_buckets`` when bucketing is on, so the rollout visits
+        the schedule with the same coverage the ordinary objective does rather
+        than piling supervision at one noise level. The value is clamped away from
+        both ends: sigma 1 is the noise state the rollout starts from and would
+        make the rollout empty, and sigma 0 is a clean latent no sampler
+        evaluates.
+
+        ``--h3_rollout_stop_shifted`` draws that uniform on the *shifted* video
+        coordinate instead and inverts the shift to get the base stop. The base
+        grid is the wrong coordinate to be uniform on when the shift is 12: it maps
+        almost the whole unit interval into shifted sigmas above 0.9, so a uniform
+        base draw supervises only the noisiest band and never visits the mid band
+        at all. Round 1 measured both halves of that -- the field was preserved
+        where the rollout supervised and eroded at shifted sigma .6 -- while the
+        D-OPSD preflight measured the teacher to be *strongest* exactly there
+        (-50% relative velocity error at .6, -44% at .8). Audio is untouched: it
+        keeps riding its own shift off whatever base value comes out, so the joint
+        rollout stays synchronized.
+
+        Its own dedicated stream, for the same reason as the decision above, and
+        *not* broadcast: like the per-item data timestep, each rank supervises its
+        own clip at its own noise level.
+        """
+        generator = self._rollout_noise_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._rollout_noise_generator = generator
+        draw = float(torch.rand((), device="cpu", generator=generator))
+        buckets = getattr(args, "num_timestep_buckets", None)
+        if buckets is not None and buckets > 1:
+            index = int(torch.randint(0, int(buckets), (), device="cpu", generator=generator))
+            draw = (index + draw) / float(buckets)
+        floor = ROLLOUT_SIGMA_FLOOR
+        if getattr(args, "h3_rollout_stop_shifted", False) and video_shift != 1.0:
+            # The draw *is* the shifted stop; clamp it there so the supervised
+            # band is the one the flag names, then invert. A shift of 1 (an image
+            # step) is the identity and skips the round trip entirely.
+            shifted = min(max(draw, 2.0 * floor), 1.0 - floor)
+            draw = float(unshift_sigma(torch.tensor([shifted], dtype=torch.float64), video_shift)[0])
+        return min(max(draw, 2.0 * floor), 1.0 - floor)
+
+    def _rollout_noise(self, reference: torch.Tensor) -> torch.Tensor:
+        """The pure-noise state a rollout starts from, off the dedicated stream.
+
+        Kept in fp32 whatever the DiT dtype is. The state is accumulated across
+        every Euler step of the rollout, so a BF16 state would compound its ~3
+        decimal digits over j additions; ``_predict`` casts to the compute dtype
+        at each forward anyway, so the precision costs one buffer and nothing in
+        the forward itself.
+        """
+        generator = self._rollout_noise_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._rollout_noise_generator = generator
+        return torch.randn(reference.shape, generator=generator, dtype=torch.float32).to(
+            device=reference.device, dtype=torch.float32
+        )
 
     def _draw_step_recipe(self, accelerator: Accelerator, args: argparse.Namespace) -> str | None:
         """Draw which conditioning recipe this step trains, shared by every rank.
@@ -526,6 +685,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_reference_modality = "av"
         self._step_mask = None
         self._validation_dataloader = None
+        self._rollout_probability_generator: torch.Generator | None = None
+        self._preservation_probability_generator: torch.Generator | None = None
+        self._dop_probability_generator: torch.Generator | None = None
+        self._rollout_noise_generator: torch.Generator | None = None
+        self._rollout_teacher: H3RolloutTeacherCache | None = None
+        self._rollout_data_err: dict[int, list[float]] = {}
+        self._rollout_field: list[float] = []
+        self._rollout_field_cos: list[float] = []
+        self._rollout_probe_done: set = set()
 
     @property
     def architecture(self) -> str:
@@ -574,6 +742,50 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError(
                 "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
                 " / データセットに学習データがありません。latent/Text Encoderキャッシュを事前に作成したか確認してください"
+            )
+
+        if getattr(args, "h3_rollout_supervision", False):
+            # Built here, before the transformer is loaded, because an unpaired or
+            # control-free teacher corpus must fail in seconds rather than at the
+            # first active step, which at --h3_rollout_probability 0.5 is minutes
+            # into the run.
+            enable_item_keys(train_dataset_group)
+            teacher_config = config_utils.load_user_config(args.h3_rollout_teacher_config)
+            teacher_group, _ = create_h3_dataset_group(
+                teacher_config,
+                args,
+                training=True,
+                # The teacher supplies conditioning, never a schedule: its own
+                # bucketing would only build a timestep pool nothing reads.
+                num_timestep_buckets=None,
+                shared_epoch=Value("i", 0),
+            )
+            self._rollout_teacher = H3RolloutTeacherCache.from_dataset_group(teacher_group)
+            self._rollout_teacher.require(item_key_text_caches(train_dataset_group))
+            # The student's latent caches are read here only for their reference
+            # counts: "privileged" on that channel means the teacher holds more
+            # references than the student for the same item, which is a
+            # comparison and not a property of either arm alone.
+            channel, paired = self._rollout_teacher.validate_privilege(
+                item_key_latent_caches(train_dataset_group),
+                channel=getattr(args, "h3_rollout_teacher_privilege", "auto"),
+                student_text_paths=item_key_text_caches(train_dataset_group),
+            )
+            # Named per channel rather than as a binary: this line is the only
+            # place a run says which privilege it actually resolved, and a label
+            # that quietly describes the wrong one turns the run's whole premise
+            # into a guess for whoever reads the log later.
+            privilege = {
+                "qwen": "Qwen control visuals",
+                "reference": "extra reference latents (Ref2VA variant B)",
+                "keyframe": "an endpoint conditioning task the student does not declare",
+                "caption": "a longer caption for the same clip than the student is shown",
+            }[channel]
+            logger.info(
+                "H3 rollout supervision paired %d teacher items, all privileged through %s, from %s",
+                paired,
+                privilege,
+                args.h3_rollout_teacher_config,
             )
 
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -675,6 +887,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._null_field_ratios = {}
         self._velocity_errors = {}
         self._velocity_error_ratios = {}
+        self._rollout_data_err = {}
+        self._rollout_field = []
+        self._rollout_field_cos = []
+        self._rollout_probe_done = set()
         self._branch_drift = {}
         self._prompted_drift_ratios = {}
 
@@ -773,6 +989,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         pooled_dist = [distance for distances in self._field_distances.values() for distance in distances]
         if pooled_dist:
             metrics["val/field_dist"] = sum(pooled_dist) / len(pooled_dist)
+        # Per step as well as pooled: the question is not only how wrong the walk ends
+        # up but whether the error compounds, which is what a single-step metric cannot
+        # see by construction.
+        for step_index, errors in sorted(self._rollout_data_err.items()):  # x0 estimate error along the walk
+            if errors:
+                metrics[f"val/rollout/x0_err/step{step_index}"] = sum(errors) / len(errors)
+        pooled_rollout_data = [error for errors in self._rollout_data_err.values() for error in errors]
+        if pooled_rollout_data:
+            metrics["val/rollout/x0_err"] = sum(pooled_rollout_data) / len(pooled_rollout_data)
+        if self._rollout_field:
+            metrics["val/rollout/field"] = sum(self._rollout_field) / len(self._rollout_field)
+        if self._rollout_field_cos:
+            metrics["val/rollout/field_cos"] = sum(self._rollout_field_cos) / len(self._rollout_field_cos)
         # Error against the raw data velocity, which every arm can be judged by no
         # matter what it optimised. val/loss cannot do that job: a guidance loss, a
         # teacher-matching loss and a rollout objective each report on their own
@@ -1049,6 +1278,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
             accumulator.add(sigma_bin.index, "audio", total, count)
 
+        if int(getattr(args, "h3_validation_rollout_probe", 0) or 0) > 0:
+            self._probe_rollout_field(
+                accelerator,
+                args,
+                transformer,
+                batch,
+                effective_video_mask,
+                dataset_index=dataset_index,
+                observed=observed,
+            )
         if getattr(args, "h3_validation_field_probe", False):
             self._probe_guidance_field(
                 accelerator,
@@ -1091,6 +1330,168 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if count == 0.0:
             return 0.0
         return float((tensor.float().pow(2) * valid).sum().div(count).sqrt())
+
+    @torch.no_grad()
+    def _probe_rollout_field(
+        self,
+        accelerator,
+        args,
+        transformer,
+        batch,
+        video_mask,
+        *,
+        dataset_index,
+        observed,
+    ) -> None:
+        """The field where the model actually ends up, not where the data is.
+
+        Every field number this trainer reports so far is taken at a noised DATA
+        state: a clip from the set, corrupted to some sigma. Generation never visits
+        those states. It starts at noise and walks a trajectory of its own, and each
+        step lands on whatever the previous step produced, errors included. A method
+        whose whole mechanism is correcting that walk -- supervising the student where
+        its own sampler goes rather than where the data is -- cannot show up in a
+        single-step measurement on data states, however carefully that measurement is
+        made. It is not that the metric is imprecise there; it is looking elsewhere.
+
+        This probe rolls the adapted model out from pure noise under the prompt, and
+        rolls the frozen base out from the identical noise, then reports two things at
+        the states reached:
+
+        ``val/rollout/x0_err`` -- how wrong the clean-clip estimate is at every state
+        the adapted model's own walk visits, per step and pooled. Error that grows
+        with the step index is compounding error, which is a different failure from a
+        uniformly different model, and only the per-step shape tells them apart.
+
+        ``val/rollout/field`` -- the prompted-to-empty gap of both models measured at
+        the SAME state, the one the adapted model reached. Normalising there rather
+        than at each model's own endpoint isolates the difference between the models
+        from the difference between the states.
+
+        Cost is ``2 * steps + 4`` no-grad forwards per validation, paid once per
+        dataset and observed modality rather than per item and bin.
+        """
+        steps = int(getattr(args, "h3_validation_rollout_probe", 0) or 0)
+        if steps <= 0:
+            return
+        video_latents = batch.get("latents")
+        if video_latents is None:
+            return
+        key = (dataset_index, observed, self._step_reference_modality)
+        if key in self._rollout_probe_done:
+            return
+        self._rollout_probe_done.add(key)
+        network = self._validation_network
+        if network is None:
+            raise ValueError("--h3_validation_rollout_probe requires a trainable network")
+        merged = getattr(self, "_merged_base_weight_paths", None)
+        if merged:
+            # Same reason as the data-state probe: the base rollout is produced by
+            # switching the trainable network off, and an adapter merged at load
+            # time cannot be switched off, so every ratio would be taken against
+            # the checkpoint plus that adapter while being labelled the base.
+            raise ValueError(
+                "--h3_validation_rollout_probe rolls the frozen checkpoint out as its reference, but --base_weights "
+                "merged " + ", ".join(merged) + " into it at load time, where nothing can switch them off; "
+                "drop the probe or the base weights"
+            )
+        set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_validation_rollout_probe")
+        int8_context = getattr(transformer, "int8_attention_context", None)
+        fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+
+        stop = float(getattr(args, "h3_validation_rollout_stop", 0.5))
+        # Window 1 rather than 0: the schedule builder rejects an empty window, and
+        # the one extra sigma past the stop is simply never stepped to. Indices 0..steps
+        # carry the walk; index steps is where the field is read.
+        base_sigmas = torch.tensor(rollout_base_sigmas(stop, steps, 1), dtype=torch.float32)
+        video_sigmas = shift_sigma(base_sigmas, VIDEO_FLOW_SHIFT)
+        audio_sigmas = shift_sigma(base_sigmas, AUDIO_FLOW_SHIFT)
+        video_latents = video_latents.to(device=accelerator.device)
+
+        def predict(state, index, conditioning):
+            inputs = self._rollout_state(
+                video=state,
+                audio=None,
+                video_sigma=video_sigmas[index : index + 1],
+                audio_sigma=audio_sigmas[index : index + 1],
+            )
+            with (
+                torch.random.fork_rng(devices=fork_devices),
+                int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+            ):
+                return self._predict(accelerator, transformer, batch, inputs, conditioning=conditioning).video
+
+        def walk(enabled, start):
+            set_enabled(enabled)
+            try:
+                state = start.clone()
+                for index in range(steps):
+                    velocity = predict(state, index, "prompt")
+                    if velocity is None:
+                        return state
+                    state = euler_advance(state, velocity, float(video_sigmas[index]), float(video_sigmas[index + 1]))
+                return state
+            finally:
+                set_enabled(True)
+
+        # One noise draw shared by both walks: the trajectories must differ because
+        # the models differ, not because they started apart.
+        start = self._rollout_noise(video_latents)
+        adapted_end = walk(True, start)
+        walk(False, start)
+
+        # What the model believes the clean clip is, asked at every state its own walk
+        # reaches.
+        #
+        # This exists because the two axes this study measures disagree with what a
+        # viewer sees. An arm whose single-step velocity error is indistinguishable from
+        # the untrained checkpoint -- 0.52 against 0.51 -- beat that checkpoint 9.5 to
+        # 6.0 in a blind comparison on held-out scenes. Both cannot be true of a metric
+        # that captures what matters, and the difference between them is that generation
+        # walks thirty steps while velocity_err reads one, at a state the walk never
+        # visits.
+        #
+        # H3 predicts the data-pointing velocity v = x0 - eps at x_t = (1 - s) x0 + s eps,
+        # so the clean estimate is recoverable exactly: x0_hat = x_t + s * v. That makes
+        # a ground truth available at every point of a rollout, without the rollout
+        # needing to end anywhere in particular -- and x0_hat is what the sampler is
+        # really steering, so being wrong about it is what a viewer eventually sees.
+        #
+        # Measured on the ADAPTED model along ITS OWN trajectory. Both halves matter: a
+        # walk down the base's states would ask a question about the base, and reading
+        # x0_hat at a noised data state would be velocity_err again in different units.
+        latents = video_latents.float()
+        set_enabled(True)
+        state = start.clone()
+        for index in range(steps):
+            velocity = predict(state, index, "prompt")
+            if velocity is None:
+                break
+            sigma_now = float(video_sigmas[index])
+            estimate = state + sigma_now * velocity.float()
+            energy = self._masked_rms(latents, video_mask)
+            if energy > 0.0:
+                self._rollout_data_err.setdefault(index, []).append(self._masked_rms(estimate - latents, video_mask) / energy)
+            state = euler_advance(state, velocity, sigma_now, float(video_sigmas[index + 1]))
+
+        def field_at(state, enabled):
+            set_enabled(enabled)
+            try:
+                prompted = predict(state, steps, "prompt")
+                empty = predict(state, steps, "empty")
+            finally:
+                set_enabled(True)
+            return None if prompted is None or empty is None else prompted - empty
+
+        adapted_field = field_at(adapted_end, True)
+        base_field = field_at(adapted_end, False)
+        if adapted_field is None or base_field is None:
+            return
+        base_size = self._masked_rms(base_field, video_mask)
+        if base_size <= 0.0:
+            return
+        self._rollout_field.append(self._masked_rms(adapted_field, video_mask) / base_size)
+        self._rollout_field_cos.append(self._masked_cosine(adapted_field, base_field, video_mask))
 
     @torch.no_grad()
     def _probe_guidance_field(
@@ -1423,6 +1824,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise FileNotFoundError(f"--h3_overlay_weights file not found: {overlay_weights}")
         if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
+        self._validate_rollout_args(args)
         if args.h3_guidance_null_source != "live" and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_null_source requires --h3_guidance_distillation_scale")
         if args.h3_fuse_frozen_teachers and (
@@ -2465,6 +2867,116 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return 2.0 / (math.pi * (1.0 - 2.0 * sigma + 2.0 * sigma.square()))
         return None
 
+    def _validate_rollout_args(self, args: argparse.Namespace) -> None:
+        """Reject every incoherent rollout-supervision configuration before loading.
+
+        Rollout supervision replaces the *video* half of the data objective on an
+        active step with a regression onto a privileged teacher evaluated at a
+        state the model's own sampler produced from noise. Two consequences drive
+        everything below. First, on an active step there is no data state for
+        video at all, so every recipe that presents part of the target as observed
+        has nothing to observe. Second, the teacher forward needs the trainable
+        network switched off, which only an adapter can do.
+        """
+        rollout = bool(getattr(args, "h3_rollout_supervision", False))
+        teacher_config = getattr(args, "h3_rollout_teacher_config", None)
+        # KNOWN WEAKNESS, left as it was found: "did the user write this flag" is a
+        # comparison against the default value, so a dial written with exactly its
+        # default slips through the check below without --h3_rollout_supervision.
+        # A sentinel default would settle it for the command line, but these
+        # namespaces are also built programmatically with concrete values, and a
+        # presence test then rejects a caller that set nothing unusual.
+        flags = {
+            "--h3_rollout_teacher_config": teacher_config is not None,
+            "--h3_rollout_probability": args.h3_rollout_probability != _ROLLOUT_PROBABILITY_DEFAULT,
+            "--h3_rollout_steps": args.h3_rollout_steps != _ROLLOUT_STEPS_DEFAULT,
+            "--h3_rollout_window": args.h3_rollout_window != _ROLLOUT_WINDOW_DEFAULT,
+            "--h3_rollout_stop_shifted": bool(getattr(args, "h3_rollout_stop_shifted", False)),
+            "--h3_rollout_teacher_privilege": getattr(args, "h3_rollout_teacher_privilege", "auto") != "auto",
+            "--h3_rollout_fused_teacher": bool(getattr(args, "h3_rollout_fused_teacher", False)),
+        }
+        if not rollout:
+            for flag, changed in flags.items():
+                if changed:
+                    raise ValueError(f"{flag} requires --h3_rollout_supervision")
+            return
+
+        if teacher_config is None:
+            raise ValueError(
+                "--h3_rollout_supervision requires --h3_rollout_teacher_config: the objective is defined by a "
+                "teacher conditioned on the target's own frames, and there is no default for that cache"
+            )
+        if not Path(teacher_config).is_file():
+            raise FileNotFoundError(f"--h3_rollout_teacher_config file not found: {teacher_config}")
+        if args.h3_rollout_steps < 1:
+            raise ValueError("--h3_rollout_steps must be at least 1")
+        if not 1 <= args.h3_rollout_window <= MAX_ROLLOUT_WINDOW:
+            raise ValueError(f"--h3_rollout_window must lie in [1, {MAX_ROLLOUT_WINDOW}]")
+        if not math.isfinite(args.h3_rollout_probability) or not 0 < args.h3_rollout_probability <= 1:
+            raise ValueError("--h3_rollout_probability must be finite and lie in (0, 1]")
+        if args.h3_video_loss_weight <= 0:
+            raise ValueError("--h3_rollout_supervision trains the video field and therefore needs --h3_video_loss_weight > 0")
+        if getattr(args, "h3_rollout_fused_teacher", False) and getattr(args, "h3_int8_attention", "off") == "aux":
+            # Fusing puts the student and the teacher inside one pass over the
+            # blocks, where the attention kernel is chosen per block and not per
+            # forward. "aux" asks for INT8 on the auxiliary forwards ONLY, which
+            # that pass cannot express; "train" and "off" apply to both arms alike
+            # and compose with fusion unchanged.
+            raise ValueError(
+                "--h3_rollout_fused_teacher shares one pass over the blocks with the student, so --h3_int8_attention aux "
+                "cannot select INT8 for the teacher arm alone; use --h3_int8_attention train or off, or drop the fusion"
+            )
+        if getattr(args, "h3_rollout_fused_teacher", False) and (
+            float(getattr(args, "h3_block_sparse_kv_fraction", 0.0) or 0.0) > 0
+            or float(getattr(args, "h3_block_sparse_threshold", 0.0) or 0.0) > 0
+        ):
+            # The block-sparse tile plan is built per packed sequence and stored on
+            # the attention modules themselves. The fused pass prepares every arm
+            # before it runs the first block, so the plan installed last -- the
+            # teacher's, whose privileged sequence is usually the longer one -- is
+            # the one every arm's attention would read.
+            raise ValueError(
+                "--h3_rollout_fused_teacher runs the student and the teacher through one pass over the blocks, whose "
+                "block-sparse attention plan is built per sequence and shared by the modules; with "
+                "--h3_block_sparse_kv_fraction or --h3_block_sparse_threshold above 0 every arm would attend under "
+                "the plan of the arm prepared last. Drop the fusion or the block-sparse attention"
+            )
+        # The guidance pair is allowed. Round 1 measured why: the rollout preserved
+        # the null field exactly where it supervised -- the high shifted sigmas its
+        # stop draw reaches -- and eroded the mid band (gap ratio 0.14 at sigma .6)
+        # because an inactive step ran plain flow matching and nothing held the
+        # field there. The hybrid gives those steps the guidance objective back.
+        # The two never claim one slot: on an ACTIVE step the video target is the
+        # teacher's and the guidance correction applies to audio only, which is the
+        # half the rollout leaves on its data loss anyway.
+        if args.h3_observed_modality is not None:
+            raise ValueError(
+                "--h3_rollout_supervision generates both modalities from noise, so it has no observed side; "
+                "drop --h3_observed_modality"
+            )
+        conditioning_flags = {
+            "--h3_mask_mode/--h3_mask_audio": args.h3_mask_mode != "off" or args.h3_mask_audio,
+            "--h3_extension_video_frames/--h3_extension_audio_latents": bool(
+                args.h3_extension_video_frames or args.h3_extension_audio_latents
+            ),
+            "--h3_keyframe_anchors/--h3_keyframe_random_count": bool(args.h3_keyframe_anchors or args.h3_keyframe_random_count),
+            "--h3_guide_specs": bool(getattr(args, "h3_guide_specs", "")),
+        }
+        for flag, configured in conditioning_flags.items():
+            if configured:
+                raise ValueError(
+                    f"{flag} presents part of the target as observed, which a rollout from pure noise has no clean "
+                    "latents to build; disable it or drop --h3_rollout_supervision"
+                )
+        if args.h3_frame_sigma_jitter > 0:
+            raise ValueError("--h3_frame_sigma_jitter gives each frame its own noise level, which a rollout state has no room for")
+        if args.crepa is not None:
+            # CREPA captures activations of one trainable forward per step and
+            # holds them until backward. The window's forwards would overwrite the
+            # capture the data forward made, silently aligning against the wrong
+            # state.
+            raise ValueError("--crepa captures one trainable forward per step and cannot be combined with --h3_rollout_supervision")
+
     @staticmethod
     def _runtime_network_toggle(accelerator, network, requirement: str):
         """Return the ``set_enabled`` of the trainable network for a frozen-base forward."""
@@ -2475,6 +2987,316 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if not callable(set_enabled):
             raise TypeError(f"{requirement} requires a network with set_enabled()")
         return set_enabled
+
+    @staticmethod
+    @contextmanager
+    def _trainable_block_swap(transformer, active: bool):
+        """Return to the TRAINING swap contract for one graph-carrying forward.
+
+        The inverse of ``_auxiliary_block_swap``. The auxiliary section brackets a
+        run of no-grad forwards into the cyclic forward-only schedule, which is
+        correct for every forward that has no backward -- but the null anchor's
+        student pass lives inside that same section and DOES carry a graph. Under
+        classic block swap its activations would then be produced under the
+        forward-only contract while backward expects the training one, which
+        restores the wrong blocks. Bracketing just that forward back costs two
+        mode switches and keeps the surrounding no-grad run unchanged.
+        """
+        if active:
+            transformer.switch_block_swap_for_training()
+        try:
+            yield
+        finally:
+            if active:
+                transformer.switch_block_swap_for_inference()
+
+    @staticmethod
+    @contextmanager
+    def _auxiliary_block_swap(transformer, active: bool):
+        """Run one no-grad forward on the cyclic forward-only swap schedule.
+
+        Classic block swap in training mode leaves the forward prefix on CPU for
+        its backward hooks to restore, so an auxiliary forward with no backward
+        must enter forward-only mode and return to the training layout before the
+        next graph-carrying forward. The rollout interleaves the two, so unlike
+        the guidance branch it brackets each auxiliary forward rather than one
+        contiguous group.
+        """
+        if active:
+            transformer.switch_block_swap_for_inference()
+        try:
+            yield
+        finally:
+            if active:
+                transformer.switch_block_swap_for_training()
+
+    def _rollout_state(
+        self,
+        *,
+        video: torch.Tensor | None,
+        audio: torch.Tensor | None,
+        video_sigma: torch.Tensor,
+        audio_sigma: torch.Tensor,
+    ) -> H3JointNoisyInputs:
+        """One point of a rollout, in the shape ``_predict`` reads.
+
+        The flow targets are ``None`` on purpose: a rollout state has no data
+        behind it, so there is no ``x0 - noise`` to point at. Every consumer of
+        those fields -- keyframe anchors, guides, masked conditioning, extension
+        context -- is rejected at argument time for exactly this reason.
+        """
+        return H3JointNoisyInputs(
+            video=video,
+            audio=audio,
+            video_target=None,
+            audio_target=None,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
+            video_timestep=1.0 - video_sigma,
+            audio_timestep=1.0 - audio_sigma,
+        )
+
+    @staticmethod
+    def _frozen_arm_context(set_enabled):
+        """The context a frozen arm of a fused forward is evaluated under.
+
+        Re-entered around every stage of that arm -- its embedding, each of its
+        block calls, its final layer -- so it must be cheap and idempotent.
+        ``torch.no_grad()`` is what keeps the teacher's activations out of the
+        graph, and disabling the adapter is what makes it the frozen base rather
+        than a second copy of the student.
+        """
+
+        @contextmanager
+        def enter():
+            with torch.no_grad():
+                set_enabled(False)
+                try:
+                    yield
+                finally:
+                    set_enabled(True)
+
+        return enter
+
+    def _fused_rollout_pair(
+        self,
+        accelerator: Accelerator,
+        transformer,
+        batch: dict,
+        teacher_presentation: dict,
+        state,
+        *,
+        conditioning: str,
+        set_enabled,
+        fork_devices: list,
+    ) -> tuple[H3ModelPrediction, H3ModelPrediction]:
+        """One supervised sub-step evaluated in a single pass over the blocks.
+
+        The student and the teacher pack different sequences -- the privileged
+        presentation is the longer one, which is the entire point of it -- so they
+        cannot share a batch axis. They share the *block loop* instead: each
+        swapped block is streamed from CPU once and both arms consume it before it
+        is released, which is where the time goes under ``--blocks_to_swap``.
+
+        The two arms never touch each other's tensors, so attention is isolated by
+        construction rather than by a mask, and nothing about either arm's own
+        attention changes. The teacher arm's rows stay out of the graph because
+        its whole evaluation -- embedding, blocks, final layer -- runs inside
+        ``torch.no_grad()`` with the adapter off.
+
+        No auxiliary block-swap bracket is taken here on purpose: the fused call
+        runs on the *training* layout that the student's graph-carrying arm needs,
+        and the teacher simply rides it. That is the bracket the unfused path pays
+        twice per sub-step and this one pays not at all.
+        """
+        run = self._frozen_arm_context(set_enabled)
+        student = H3FusedArm(call=self._predict_call(accelerator, batch, state, conditioning=conditioning))
+        teacher = H3FusedArm(
+            call=self._predict_call(
+                accelerator,
+                teacher_presentation,
+                state,
+                # The teacher's privilege lives in its prompt presentation; there
+                # is no privileged null branch, so an active step is always a
+                # prompted one.
+                conditioning="prompt",
+            ),
+            # Forking the RNG leaves the teacher's stochastic conditioning
+            # identical to the student's at this state, so the pair describes one
+            # state and not two. It brackets the teacher's packed-sequence build,
+            # which is the only stage that draws; the block loop draws nothing,
+            # which is why ``run`` must not fork and does not.
+            build=lambda: _forked_frozen_build(fork_devices, set_enabled),
+            run=run,
+        )
+        return tuple(self._predict_fused(accelerator, transformer, [student, teacher]))
+
+    def _teacher_presentation(self, batch: dict) -> dict:
+        """The privileged teacher's conditioning, presented through this batch.
+
+        The reference bundle is the teacher's under variant B and empty under
+        variant A; either way the target latents stay the student's, so the two
+        arms are always compared at one and the same state -- which is what makes
+        the supervision a statement about the model rather than about two
+        different clips.
+        """
+        if self._rollout_teacher is None:
+            raise RuntimeError("--h3_rollout_supervision was configured without a teacher cache")
+        item_key = batch_item_key(batch)
+        return teacher_batch(
+            batch,
+            self._rollout_teacher.entries(item_key),
+            self._rollout_teacher.reference_entries(item_key),
+        )
+
+    def _rollout_supervision(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+        batch: dict,
+        *,
+        video_latents: torch.Tensor | None,
+        audio_latents: torch.Tensor | None,
+        video_shift: float,
+        audio_shift: float,
+        conditioning: str,
+        auxiliary_block_swap: bool,
+    ) -> tuple[list[tuple[H3ModelPrediction, H3ModelPrediction]], float, list[torch.Tensor]]:
+        """Roll the student's own sampler out from noise and supervise the tail.
+
+        Returns one ``(student, teacher)`` prediction pair per supervision
+        sub-step, the unshifted base sigma the rollout stopped at, and each
+        sub-step's shifted video sigma so the loss can weight on the noise level
+        it was actually taken at rather than the data step's.
+        Both branches of every pair are evaluated at the SAME state:
+        the student with the ordinary conditioning it trains under, the teacher --
+        the frozen base, adapter disabled -- with the privileged presentation that
+        also shows the conditioner frames of the target clip.
+
+        Cost, per active step: ``steps`` no-grad forwards to reach the on-policy
+        state, then ``window`` grad forwards and ``window`` no-grad teacher
+        forwards. Gradient checkpointing applies to the grad forwards without
+        anything extra: the transformer gates its checkpoint wrapper on
+        ``torch.is_grad_enabled()``, which is exactly what separates the two
+        populations here.
+
+        ``--h3_rollout_fused_teacher`` folds each sub-step's two forwards into one
+        pass over the blocks. It changes no arithmetic -- both arms compute what
+        they computed before, bit for bit -- only the order the weights are
+        touched in, which is what ``--blocks_to_swap`` charges for.
+        """
+        teacher_presentation = self._teacher_presentation(batch)
+        set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_rollout_supervision")
+        int8_context = getattr(transformer, "int8_attention_context", None)
+        fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+
+        stop_sigma = self._draw_rollout_stop_sigma(args, video_shift)
+        base = torch.tensor(rollout_base_sigmas(stop_sigma, args.h3_rollout_steps, args.h3_rollout_window), dtype=torch.float32)
+        # Each modality rides its own shift off the shared unshifted coordinate,
+        # exactly as a data step does, so the joint rollout stays synchronized.
+        video_sigmas = shift_sigma(base, video_shift)
+        audio_sigmas = shift_sigma(base, audio_shift)
+
+        video_state = None if video_latents is None else self._rollout_noise(video_latents)
+        audio_state = None if audio_latents is None else self._rollout_noise(audio_latents)
+
+        def state_at(index: int) -> H3JointNoisyInputs:
+            return self._rollout_state(
+                video=video_state,
+                audio=audio_state,
+                video_sigma=video_sigmas[index : index + 1],
+                audio_sigma=audio_sigmas[index : index + 1],
+            )
+
+        def advance(index: int, velocity: H3ModelPrediction) -> None:
+            nonlocal video_state, audio_state
+            if index + 1 >= base.shape[0]:
+                return
+            if video_state is not None:
+                video_state = euler_advance(video_state, velocity.video, float(video_sigmas[index]), float(video_sigmas[index + 1]))
+            if audio_state is not None:
+                audio_state = euler_advance(audio_state, velocity.audio, float(audio_sigmas[index]), float(audio_sigmas[index + 1]))
+
+        # Reaching the on-policy state costs nothing but forwards: the policy is
+        # the current model, adapter included, and none of it is differentiated
+        # through. The whole prefix shares one swap bracket because it is
+        # contiguous; the window below cannot, since its trainable forwards must
+        # run on the training layout.
+        with (
+            self._auxiliary_block_swap(transformer, auxiliary_block_swap),
+            torch.no_grad(),
+            int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+        ):
+            for index in range(args.h3_rollout_steps):
+                advance(index, self._predict(accelerator, transformer, batch, state_at(index), conditioning=conditioning))
+
+        fused = bool(getattr(args, "h3_rollout_fused_teacher", False))
+        pairs: list[tuple[H3ModelPrediction, H3ModelPrediction]] = []
+        for index in range(args.h3_rollout_steps, base.shape[0]):
+            state = state_at(index)
+            if fused:
+                student, teacher = self._fused_rollout_pair(
+                    accelerator,
+                    transformer,
+                    batch,
+                    teacher_presentation,
+                    state,
+                    conditioning=conditioning,
+                    set_enabled=set_enabled,
+                    fork_devices=fork_devices,
+                )
+            else:
+                # Captured BEFORE the student runs, then replayed for the teacher.
+                # ``fork_rng`` alone would only restore the state the student left
+                # behind, so the teacher would draw the CONTINUATION of the
+                # student's sequence rather than the same one, and any stochastic
+                # conditioning would differ between the two halves of a pair that
+                # is supposed to describe a single state.
+                entry_cpu_rng = torch.get_rng_state()
+                entry_cuda_rng = [torch.cuda.get_rng_state(device) for device in fork_devices]
+                student = self._predict(accelerator, transformer, batch, state, conditioning=conditioning)
+                with (
+                    torch.random.fork_rng(devices=fork_devices),
+                    self._auxiliary_block_swap(transformer, auxiliary_block_swap),
+                    torch.no_grad(),
+                    int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                ):
+                    torch.set_rng_state(entry_cpu_rng)
+                    for device, rng_state in zip(fork_devices, entry_cuda_rng):
+                        torch.cuda.set_rng_state(rng_state, device)
+                    # Disabled inside the try, so a failure in the toggle itself
+                    # still reaches the restore rather than leaving the adapter in
+                    # whatever state it stopped in.
+                    try:
+                        set_enabled(False)
+                        teacher = self._predict(
+                            accelerator,
+                            transformer,
+                            teacher_presentation,
+                            state,
+                            # The teacher's privilege lives in its prompt
+                            # presentation; there is no privileged null branch, so
+                            # an active step is always a prompted one (enforced by
+                            # the caller, which skips a caption-dropout step).
+                            conditioning="prompt",
+                        )
+                    finally:
+                        set_enabled(True)
+            pairs.append((student, teacher))
+            # Stop-grad on the advance: the window supervises m independent states,
+            # not a differentiable m-step unroll, whose graph would grow with m and
+            # whose gradient would flow through states the teacher never scored.
+            advance(
+                index,
+                H3ModelPrediction(
+                    video=None if student.video is None else student.video.detach(),
+                    audio=None if student.audio is None else student.audio.detach(),
+                ),
+            )
+        window = slice(args.h3_rollout_steps, base.shape[0])
+        return pairs, stop_sigma, [video_sigmas[window][index : index + 1] for index in range(len(pairs))]
 
     def _configured_guidance_scale(self, args, accelerator, inputs):
         """Resolve the guidance scale this step distills towards.
@@ -2550,15 +3372,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             inputs,
         )
 
-    def _predict(
+    def _predict_call(
         self,
         accelerator: Accelerator,
-        transformer,
         batch,
         inputs,
         *,
         conditioning: str | tuple[str, ...],
-    ) -> H3ModelPrediction:
+    ) -> dict:
+        """The arguments one training forward is made of, without running it.
+
+        Split out so a fused pair can be described before either arm is
+        evaluated: the two arms of a rollout sub-step differ only in the batch
+        they present and in their conditioning branch, and everything the step's
+        recipe pinned -- the mask, the keyframes, the guides, the extension
+        context, the reference modality, the control dropout -- is shared between
+        them by construction because it is read from the same step state.
+        """
         # Checkpointing is not a per-call argument here: the model reads its own
         # ``gradient_checkpointing`` flag (set once from ``--gradient_checkpointing``)
         # and both ``MiniMaxH3Transformer.forward`` and ``MiniMaxH3TokenRefiner.forward``
@@ -2626,22 +3456,60 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # the same sharing the mask, the keyframes and the modality variant use.
         if self._step_qwen_control_dropout:
             extension_kwargs["qwen_control_dropout"] = True
+        return {
+            "batch": batch,
+            "video_hidden_states": video,
+            "audio_hidden_states": audio,
+            "video_timestep": inputs.video_timestep.to(accelerator.device),
+            "audio_timestep": inputs.audio_timestep.to(accelerator.device),
+            "conditioning": conditioning,
+            # Forwarded only when extension is active so a backend that does not
+            # implement it keeps its existing signature.
+            **extension_kwargs,
+        }
+
+    def _predict(
+        self,
+        accelerator: Accelerator,
+        transformer,
+        batch,
+        inputs,
+        *,
+        conditioning: str | tuple[str, ...],
+    ) -> H3ModelPrediction:
+        call = self._predict_call(accelerator, batch, inputs, conditioning=conditioning)
         with accelerator.autocast():
+            # Positional for the five arguments every backend has carried since
+            # the first one, so a backend that named its parameters differently
+            # keeps working.
             prediction = self.backend.predict_training(
                 transformer,
-                batch,
-                video,
-                audio,
-                inputs.video_timestep.to(accelerator.device),
-                inputs.audio_timestep.to(accelerator.device),
-                conditioning=conditioning,
-                # Forwarded only when extension is active so a backend that does
-                # not implement it keeps its existing signature.
-                **extension_kwargs,
+                call["batch"],
+                call["video_hidden_states"],
+                call["audio_hidden_states"],
+                call["video_timestep"],
+                call["audio_timestep"],
+                **{key: value for key, value in call.items() if key not in _PREDICT_POSITIONAL_KEYS},
             )
         if not isinstance(prediction, H3ModelPrediction):
             raise TypeError("H3 backend predict_training() must return H3ModelPrediction")
         return prediction
+
+    def _predict_fused(self, accelerator: Accelerator, transformer, arms: list[H3FusedArm]) -> list[H3ModelPrediction]:
+        """Run several described forwards through one pass over the blocks."""
+        if self.backend is None:
+            raise RuntimeError("H3 training backend is not loaded")
+        fused = getattr(self.backend, "predict_training_fused", None)
+        if not callable(fused):
+            raise TypeError(
+                "--h3_rollout_fused_teacher requires a training backend implementing predict_training_fused(); "
+                "drop the flag to use the ordinary two-forward path"
+            )
+        with accelerator.autocast():
+            predictions = fused(transformer, arms)
+        if len(predictions) != len(arms) or not all(isinstance(item, H3ModelPrediction) for item in predictions):
+            raise TypeError("H3 backend predict_training_fused() must return one H3ModelPrediction per arm")
+        return list(predictions)
 
     @staticmethod
     def _split_paired_prediction(prediction: H3ModelPrediction) -> tuple[H3ModelPrediction, H3ModelPrediction]:
@@ -2679,13 +3547,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         self._batch_backward_performed = False
+        # The block-swap arm gate is balanced by construction -- one hook firing
+        # per announced invocation -- but a step that raises between forward and
+        # backward leaves announcements nothing will consume. An H2D-only ring
+        # never re-prepares mid-training, so without this its gate would stay
+        # poisoned for the rest of the run. The previous step's backward is done
+        # by the time we get here, so nothing pending is ever discarded.
+        reset_backward_arms = getattr(getattr(transformer, "offloader", None), "reset_backward_arms", None)
+        if callable(reset_backward_arms):
+            reset_backward_arms()
         batch_size = int(latents.shape[0])
         if batch_size < 1:
             raise ValueError("MiniMax H3 training received an empty batch")
         preservation_active = args.h3_base_preservation_loss_weight > 0 and self._base_preservation_active(
             accelerator, args.h3_base_preservation_probability
         )
-        dop_active = args.h3_dop_loss_weight > 0 and self._base_preservation_active(accelerator, args.h3_dop_probability)
+        dop_active = args.h3_dop_loss_weight > 0 and self._dop_probability_active(accelerator, args.h3_dop_probability)
         guidance_active = args.h3_guidance_distillation_scale is not None and self._guidance_distillation_active(
             accelerator, args.h3_guidance_distillation_probability
         )
@@ -2698,6 +3575,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # reason: every item of a batch trains the same presentation.
         qwen_control_dropout = args.h3_qwen_control_dropout_rate > 0 and self._qwen_control_dropout_active(
             accelerator, args.h3_qwen_control_dropout_rate
+        )
+        # One rollout decision per optimizer step, on its own stream, so every
+        # item of a batch optimizes the same objective -- the same contract the
+        # guidance, preservation and recipe draws follow.
+        rollout_active = getattr(args, "h3_rollout_supervision", False) and self._rollout_supervision_active(
+            accelerator, args.h3_rollout_probability
         )
         if batch_size == 1:
             return self._process_single_batch(
@@ -2719,6 +3602,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 guidance_active_override=guidance_active,
                 recipe_override=recipe,
                 qwen_control_dropout_override=qwen_control_dropout,
+                rollout_active_override=rollout_active,
             )
 
         # The released H3 transformer accepts one shared packed layout, while
@@ -2757,6 +3641,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     guidance_active_override=guidance_active,
                     recipe_override=recipe,
                     qwen_control_dropout_override=qwen_control_dropout,
+                    rollout_active_override=rollout_active,
                     crepa_update_similarity_threshold=False,
                 )
                 accelerator.backward(item_loss / batch_size)
@@ -2849,6 +3734,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         guidance_active_override: bool | None = None,
         recipe_override: str | None = None,
         qwen_control_dropout_override: bool | None = None,
+        rollout_active_override: bool | None = None,
         crepa_update_similarity_threshold: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         del network_dtype, vae
@@ -3010,9 +3896,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if guidance_active_override is None
                 else guidance_active_override
             )
+        # The teacher's privilege lives entirely in its prompted presentation, so
+        # there is no privileged null field to distil into a dropped step's
+        # unconditional branch. Such a step keeps the ordinary data objective,
+        # exactly as the guidance branch stands down on one.
+        rollout_active = bool(getattr(args, "h3_rollout_supervision", False)) and conditioning == "prompt"
+        if rollout_active:
+            rollout_active = (
+                self._rollout_supervision_active(accelerator, args.h3_rollout_probability)
+                if rollout_active_override is None
+                else rollout_active_override
+            )
         reference_prediction = None
         null_anchor_student = None
         null_anchor_reference = None
+        null_anchor = None
         preservation_active = args.h3_base_preservation_loss_weight > 0 and (
             self._base_preservation_active(accelerator, args.h3_base_preservation_probability)
             if preservation_active_override is None
@@ -3022,7 +3920,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             args.h3_dop_loss_weight > 0
             and conditioning == "prompt"
             and (
-                self._base_preservation_active(accelerator, args.h3_dop_probability)
+                self._dop_probability_active(accelerator, args.h3_dop_probability)
                 if dop_active_override is None
                 else dop_active_override
             )
@@ -3047,10 +3945,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # Classic swap (and the dense trainable ring) instead expects backward
         # to restore the training layout and must explicitly enter forward-only
         # mode around no-grad teacher passes.
+        # The null anchor's frozen reference forward is a no-grad teacher pass
+        # like the others and needs the same forward-only bracket; without it a
+        # run with nothing but the anchor left classic swap in the training
+        # layout after a forward that never ran its backward.
+        null_anchor_active = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0 and conditioning == "prompt"
         auxiliary_block_swap = (
             bool(self.blocks_to_swap)
             and not getattr(self, "_block_swap_h2d_only", False)
-            and (use_guidance or preservation_active or dop_active)
+            and (use_guidance or preservation_active or dop_active or null_anchor_active)
         )
         if auxiliary_block_swap:
             # Teacher branches have no backward pass. Classic block swap in
@@ -3166,7 +4069,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 null_anchor_toggle = self._runtime_network_toggle(accelerator, network, "--h3_guidance_null_anchor_weight")
                 anchor_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
                 anchor_int8 = getattr(transformer, "int8_attention_context", None)
-                null_anchor_student = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                with self._trainable_block_swap(transformer, auxiliary_block_swap):
+                    null_anchor_student = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
                 with (
                     torch.random.fork_rng(devices=anchor_devices),
                     torch.no_grad(),
@@ -3353,8 +4257,82 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # auxiliary terms. Reported as the averaged loss whenever the optimized
         # loss differs from it.
         dense_loss = result.loss
+        rollout_replaced = False
+        if rollout_active:
+            # On-policy supervision REPLACES the video half of the data objective
+            # and leaves the audio half alone. The two halves are reduced in one
+            # joint call per sub-step rather than separately, so the mask, the
+            # per-modality weights and the token/modality balance are the ones
+            # every other H3 loss uses. Averaging that joint loss over the window
+            # is exactly "the audio data loss plus the averaged rollout video
+            # loss": the audio term is identical across sub-steps and both
+            # balances are linear in the video numerator at a fixed denominator.
+            rollout_pairs, rollout_stop_sigma, rollout_video_sigmas = self._rollout_supervision(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                video_latents=video_latents,
+                audio_latents=audio_latents,
+                video_shift=1.0 if is_image else args.h3_shift_video,
+                audio_shift=1.0 if is_image else args.h3_shift_audio,
+                conditioning=conditioning,
+                auxiliary_block_swap=bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False),
+            )
+            # The audio half is the data-forward objective this step would have run
+            # anyway -- including its guidance modification when the hybrid is on.
+            # ``prediction``/``loss_inputs`` are exactly what ``_guidance_loss_inputs``
+            # produced, so the normalized form (which rewrites the prediction) and
+            # the contrastive form (which rewrites the target) both land here
+            # unchanged, and with guidance off they are ``raw_prediction``/``inputs``
+            # and the term is bit-for-bit the plain one. No extra forward is paid:
+            # the empty branch the guidance needs was already evaluated at the data
+            # state above.
+            rollout_audio_prediction = prediction.audio
+            rollout_audio_target = loss_inputs.audio_target
+            rollout_terms = [
+                joint_prediction_loss(
+                    H3ModelPrediction(video=student.video, audio=rollout_audio_prediction),
+                    # ``joint_prediction_loss`` detaches its whole reference, which
+                    # is the stop-gradient on the teacher; detaching the audio data
+                    # target alongside it is a no-op.
+                    H3ModelPrediction(video=teacher.video, audio=rollout_audio_target),
+                    # The authored masks describe padding and authored regions of
+                    # the packed layout, which a rollout state shares with the data
+                    # state because it has the same shape; keeping them out would
+                    # train the video field on padding rows.
+                    video_mask=effective_video_mask,
+                    audio_mask=effective_audio_mask,
+                    # The video half is scored at the sub-step's own shifted sigma;
+                    # the audio half is still the data step and keeps the data
+                    # step's weight.
+                    video_sample_weight=self._sample_weight(args, sigma) if has_video else None,
+                    audio_sample_weight=audio_sample_weight,
+                    balance=args.h3_loss_balance,
+                    mask_normalization=args.h3_loss_mask_normalization,
+                    video_weight=video_weight,
+                    audio_weight=audio_weight,
+                )
+                for (student, teacher), sigma in zip(rollout_pairs, rollout_video_sigmas, strict=True)
+            ]
+            window = float(len(rollout_terms))
+            loss = sum(term.loss for term in rollout_terms) / window
+            rescaled_rollout_loss = loss
+            rollout_replaced = True
+            metrics["loss/rollout_video"] = float(sum(term.video_loss.detach() for term in rollout_terms) / window)
+            metrics["h3/rollout_stop_sigma"] = rollout_stop_sigma
+        if getattr(args, "h3_rollout_supervision", False):
+            # Only reported when the feature is on, so an existing run's metric
+            # set is unchanged.
+            metrics["h3/rollout_active"] = float(rollout_active)
+            metrics.setdefault("loss/rollout_video", 0.0)
         guidance_rescaled = False
-        if use_guidance and args.h3_guidance_distillation_probability < 1.0:
+        # A rollout-active step has already swapped its objective wholesale, and
+        # nothing about a swapped objective is divided by a probability (the same
+        # contract recipe mixing follows). Rescaling here would also rebuild the
+        # loss from ``plain_result`` and silently discard the rollout terms.
+        if use_guidance and args.h3_guidance_distillation_probability < 1.0 and not rollout_active:
             # The guidance objective replaces the ordinary one rather than adding
             # to it, so the unbiased sparse form keeps the ordinary loss every
             # step and scales only the guidance correction. Both terms reuse the
@@ -3417,14 +4395,35 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics.update(crepa_metrics)
         elif use_crepa:
             metrics.update(self._crepa.status_metrics())
-        if base_preservation_term is not None or guidance_rescaled or dop_term is not None:
+        if (
+            base_preservation_term is not None
+            or guidance_rescaled
+            or dop_term is not None
+            or rollout_replaced
+            or null_anchor is not None
+        ):
             average_loss = loss
             if base_preservation_term is not None:
                 average_loss = average_loss - base_preservation_term
+            if null_anchor is not None:
+                # An auxiliary term like preservation, and removed for the same
+                # reason: the reported average is the ordinary data loss a run
+                # without the flag would have logged, so two runs stay comparable.
+                average_loss = average_loss - null_anchor
             if guidance_rescaled:
                 # Report the dense guidance objective so the running average stays
                 # comparable across a sparse and a dense run.
                 average_loss = average_loss - rescaled_velocity_loss + dense_loss
+            if rollout_replaced:
+                # The rollout SWAPS the objective on a drawn subset of steps
+                # rather than estimating one objective sparsely, so nothing is
+                # divided by the probability -- exactly as recipe mixing rescales
+                # nothing. What would otherwise break is the running average,
+                # which would jump between two objectives on different scales; it
+                # is therefore reported as the ordinary data-velocity loss this
+                # same forward already produced, which is what a run without the
+                # flag would have logged.
+                average_loss = average_loss - rescaled_rollout_loss + dense_loss
             metrics[LOSS_FOR_AVERAGE_KEY] = float(average_loss.detach())
         # Keep capture active until backward has completed. Non-reentrant
         # gradient checkpointing recomputes hooked blocks during backward and
@@ -3506,6 +4505,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_guidance_null_anchor_weight": str(getattr(args, "h3_guidance_null_anchor_weight", 0.0)),
+            "ss_h3_rollout_supervision": str(bool(getattr(args, "h3_rollout_supervision", False))),
+            "ss_h3_rollout_probability": str(args.h3_rollout_probability),
+            "ss_h3_rollout_steps": str(args.h3_rollout_steps),
+            "ss_h3_rollout_window": str(args.h3_rollout_window),
+            "ss_h3_rollout_stop_shifted": str(bool(getattr(args, "h3_rollout_stop_shifted", False))),
+            "ss_h3_rollout_teacher": str(getattr(args, "h3_rollout_teacher_config", None) or "none"),
+            "ss_h3_rollout_teacher_privilege": str(getattr(args, "h3_rollout_teacher_privilege", "auto")),
+            # Recorded although it defines no objective: it is the one rollout
+            # knob that changes how the step is executed rather than what it
+            # optimizes, and a reader comparing two runs' throughput needs it.
+            "ss_h3_rollout_fused_teacher": str(bool(getattr(args, "h3_rollout_fused_teacher", False))),
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
             "ss_h3_dop_loss_weight": str(args.h3_dop_loss_weight),
             "ss_h3_dop_probability": str(args.h3_dop_probability),
@@ -3945,6 +4955,117 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "Report what the adapter has done to the guidance field, measured against the frozen base "
             "on the validation items. Diagnostic only, subject to removal, and not part of any recommended "
             "recipe. Requires a validation set and empty-text caches (--cache_guidance_empty)"
+        ),
+    )
+    parser.add_argument(
+        "--h3_validation_rollout_probe",
+        type=int,
+        default=0,
+        help=(
+            "roll the adapter and the frozen base out from the same noise for this many Euler steps and report, at "
+            "the states reached, how wrong the adapter's own clean-clip estimate is and how much of the guidance "
+            "field survives THERE. The field probe beside it measures on noised data states, which generation never "
+            "visits, so a method that works by correcting where the sampler goes cannot register in it. Costs "
+            "2*steps+4 no-grad forwards per validation, paid once per dataset rather than per item and bin. 0 "
+            "disables"
+        ),
+    )
+    parser.add_argument(
+        "--h3_validation_rollout_stop",
+        type=float,
+        default=0.5,
+        help=(
+            "unshifted sigma the validation rollout walks down to (default 0.5); lower goes further along the "
+            "trajectory and costs the same, higher stays nearer the noise the walk started from"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_supervision",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL truncated on-policy rollout supervision (D-OPSD). On a drawn subset of steps the VIDEO "
+            "objective is replaced: the model's own sampler runs --h3_rollout_steps no-grad Euler steps from pure "
+            "noise to a randomly drawn stopping sigma, and the next --h3_rollout_window states are supervised "
+            "against the frozen base conditioned on the target clip's own frames (--h3_rollout_teacher_config). "
+            "Audio keeps its ordinary data loss on those steps, because the Qwen conditioner has no audio path and "
+            "the teacher was measured to carry no audio advantage"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_teacher_config",
+        type=str,
+        default=None,
+        help=(
+            "second dataset TOML whose text-encoder cache carries the privileged teacher conditioning -- the SAME "
+            "items as --dataset_config, privileged either by the target clip's frames attached as qwen_control_* "
+            "assets (variant A) or by extra target frames cached as additional references (variant B). Target "
+            "latents always come from the training batch. Pairing is by item key and an unpaired or unprivileged "
+            "corpus fails before the model loads"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_teacher_privilege",
+        type=str,
+        choices=TEACHER_PRIVILEGE_CHANNELS,
+        default="auto",
+        help=(
+            "which channel carries the teacher's advantage. auto reads the caches: qwen_control_* visuals in the "
+            "teacher's TEXT cache (variant A), otherwise strictly more reference entries in its LATENT cache than "
+            "the student holds for the same item (variant B). Pin the channel only to measure one of two that a "
+            "corpus happens to carry both of"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_probability",
+        type=float,
+        default=_ROLLOUT_PROBABILITY_DEFAULT,
+        help=(
+            "probability that a step trains the rollout objective instead of the data one for video. The draw is "
+            "synchronized across distributed ranks. No loss is divided by it: the objective is swapped, not "
+            "sparsely estimated, so the reported average loss is the ordinary data-velocity loss instead"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_steps",
+        type=int,
+        default=_ROLLOUT_STEPS_DEFAULT,
+        help=(
+            "no-grad Euler steps of the model's own sampler, from pure noise to the drawn stopping sigma, that "
+            "carry the state on-policy before supervision starts. Each costs one forward and no memory beyond the "
+            "state itself"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_window",
+        type=int,
+        default=_ROLLOUT_WINDOW_DEFAULT,
+        help=(
+            f"supervised sub-steps taken after the on-policy state, at most {MAX_ROLLOUT_WINDOW}. Each costs one "
+            "trainable forward and one no-grad teacher forward, and the state advances between them under "
+            "stop-grad from the student's own prediction, so a long window drifts away from the states the "
+            "teacher's advantage was measured on"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_stop_shifted",
+        action="store_true",
+        help=(
+            "draw the rollout's stopping point uniformly over the SHIFTED video sigma range instead of the "
+            "unshifted base grid, then invert the shift to reach it. With --h3_shift_video 12 a uniform base draw "
+            "lands almost every stop above shifted sigma 0.9, so the mid band the D-OPSD preflight measured the "
+            "teacher to be strongest in (-50% relative error at .6) is never supervised. Reaching the lower base "
+            "sigmas this produces needs more --h3_rollout_steps for the state to stay on-policy"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_fused_teacher",
+        action="store_true",
+        help=(
+            "run each supervised sub-step's student and teacher forwards through ONE pass over the transformer "
+            "blocks instead of two. The two arms pack different sequences -- the teacher's presentation is the "
+            "longer one -- so they are interleaved block by block rather than batched, which leaves every arm's "
+            "attention exactly what it was and makes --blocks_to_swap stream each swapped block once per sub-step "
+            "instead of twice. Off by default so the two paths stay A/B comparable"
         ),
     )
     parser.add_argument(

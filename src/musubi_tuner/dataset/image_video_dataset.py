@@ -152,6 +152,14 @@ class ItemInfo:
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
 
+        # Which cached window of the source this item is, as the "00000-073"
+        # token of its cache file names (frame position and frame count). One
+        # source clip becomes several items when `target_frames` lists several
+        # lengths, and every one of them keeps the source's `item_key`, so the
+        # window token is the only thing that tells them apart. None for sources
+        # that yield exactly one item (single images).
+        self.cache_window: Optional[str] = None
+
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
         self.loss_mask_content: Optional[np.ndarray] = None
@@ -161,6 +169,20 @@ class ItemInfo:
         self.fp_1f_clean_indices: Optional[list[int]] = None  # indices of clean latents for 1f
         self.fp_1f_target_index: Optional[int] = None  # target index for 1f clean latents
         self.fp_1f_no_post: Optional[bool] = None  # whether to add zero values as clean latent post
+
+    @property
+    def windowed_item_key(self) -> str:
+        """`item_key` made unique across the windows cut from one source.
+
+        `item_key` names the source clip, which is not an identity when
+        `target_frames` cuts several windows out of it: three windows of one clip
+        share one `item_key` while holding three different caches. Appending the
+        window token reproduces the stem of this item's own cache files, so the
+        key both identifies the item and names its cache. Sources with a single
+        window (images) keep the bare `item_key`, unchanged from before windows
+        were distinguished at all.
+        """
+        return f"{self.item_key}_{self.cache_window}" if self.cache_window else self.item_key
 
     def __str__(self) -> str:
         return (
@@ -1180,6 +1202,9 @@ class VideoDataset(BaseDataset):
             bucket_reso = (*bucket_reso, frame_count)
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+            # tokens[-3] is the "00000-073" (or "00000-073-01") window token the
+            # caching pass wrote; several windows of one clip differ only here.
+            item_info.cache_window = tokens[-3]
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):

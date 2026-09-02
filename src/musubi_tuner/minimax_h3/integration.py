@@ -3,6 +3,9 @@ from __future__ import annotations
 import gc
 import logging
 import time
+from collections.abc import Callable, Sequence
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -110,7 +113,7 @@ from musubi_tuner.minimax_h3.references import (
     trim_reference_frames,
 )
 from musubi_tuner.minimax_h3.request import H3GenerationRequest, ReferenceKind, ReferenceRole
-from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
+from musubi_tuner.minimax_h3.training import H3FusedArm, H3ModelPrediction, H3TrainingMode
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils.model_utils import dtype_to_str, str_to_dtype
@@ -1232,6 +1235,20 @@ def _pin_observed_rows(
     return rows, schedule
 
 
+@dataclass
+class _PreparedTrainingForward:
+    """A packed training sequence, built but not yet run.
+
+    Splitting the build from the run is what lets several forwards share one pass
+    over the transformer blocks: the layout, the conditioning rows and the row
+    schedules are all per-arm and are settled here, while ``decode`` carries the
+    per-arm slicing the output needs afterwards.
+    """
+
+    kwargs: dict[str, Any]
+    decode: Callable[[Any], H3ModelPrediction]
+
+
 class _NativeTrainingBackend:
     supports_paired_conditioning = True
 
@@ -1265,7 +1282,39 @@ class _NativeTrainingBackend:
     def get_training_transformer(self) -> torch.nn.Module:
         return self.transformer
 
-    def predict_training(
+    def predict_training(self, transformer: torch.nn.Module, *args, **kwargs) -> H3ModelPrediction:
+        """One training forward: build the packed sequence, run it, decode it."""
+        prepared = self._prepare_training_forward(transformer, *args, **kwargs)
+        return prepared.decode(transformer(**prepared.kwargs))
+
+    def predict_training_fused(self, transformer: torch.nn.Module, arms: Sequence[H3FusedArm]) -> list[H3ModelPrediction]:
+        """Several training forwards sharing ONE pass over the transformer blocks.
+
+        The arms are built independently -- a privileged teacher presentation
+        packs a different, longer sequence than the student's, which is exactly
+        why the two cannot be stacked on the batch axis -- and only the block loop
+        is shared. Each arm carries its own contexts, so a frozen arm stays under
+        ``torch.no_grad()`` with its adapter off while the trainable arm builds
+        its graph.
+
+        Under ``--blocks_to_swap`` this is the whole point: the swapped blocks are
+        streamed from CPU once per fused call instead of once per arm.
+        """
+        fused = getattr(transformer, "forward_fused", None)
+        if not callable(fused):
+            raise TypeError("H3 fused training forwards require a transformer exposing forward_fused()")
+        prepared = []
+        for arm in arms:
+            with (arm.build or nullcontext)():
+                prepared.append(self._prepare_training_forward(transformer, **arm.call))
+        outputs = fused([(item.kwargs, arm.run) for item, arm in zip(prepared, arms)])
+        predictions = []
+        for item, output, arm in zip(prepared, outputs, arms):
+            with (arm.run or nullcontext)():
+                predictions.append(item.decode(output))
+        return predictions
+
+    def _prepare_training_forward(
         self,
         transformer: torch.nn.Module,
         batch: dict,
@@ -1292,7 +1341,7 @@ class _NativeTrainingBackend:
         observed_audio_rows: torch.Tensor | None = None,
         clean_video_latents: torch.Tensor | None = None,
         clean_audio_latents: torch.Tensor | None = None,
-    ) -> H3ModelPrediction:
+    ) -> _PreparedTrainingForward:
         present = video_hidden_states if video_hidden_states is not None else audio_hidden_states
         if present is None:
             raise ValueError("MiniMax H3 training requires at least one target modality")
@@ -1940,31 +1989,39 @@ class _NativeTrainingBackend:
             # the second presentation.
             video_rows = video_rows.expand(presentation_batch, -1, -1)
             audio_rows = audio_rows.expand(presentation_batch, -1, -1)
-        output = transformer(
-            video_hidden_states=video_rows,
-            audio_hidden_states=audio_rows,
-            encoder_hidden_states=text_hidden.to(model_device),
-            timestep=timestep.to(model_device),
-            timestep_indices=timestep_indices.to(model_device),
-            token_tags=layout.token_tags.to(model_device),
-            position_ids=layout.position_ids.to(model_device),
-            video_indices=layout.video_indices.to(model_device),
-            audio_indices=layout.audio_indices.to(model_device),
-            text_indices=layout.text_indices.to(model_device),
-        )
-        target_video = output.video[:, layout.num_condition_video_rows :]
-        target_audio = output.audio[:, layout.num_condition_audio_rows :]
-        video = (
-            unpatchify_video_tokens(
-                target_video,
-                latent_shape=(config.in_channels, latent_frames, latent_height, latent_width),
-                patch_size=patch_size,
+
+        def decode(output) -> H3ModelPrediction:
+            target_video = output.video[:, layout.num_condition_video_rows :]
+            target_audio = output.audio[:, layout.num_condition_audio_rows :]
+            video = (
+                unpatchify_video_tokens(
+                    target_video,
+                    latent_shape=(config.in_channels, latent_frames, latent_height, latent_width),
+                    patch_size=patch_size,
+                )
+                if video_hidden_states is not None
+                else None
             )
-            if video_hidden_states is not None
-            else None
+            audio = (
+                unpack_audio_tokens(target_audio, num_audio_latents=num_audio_latents) if audio_hidden_states is not None else None
+            )
+            return H3ModelPrediction(video=video, audio=audio)
+
+        return _PreparedTrainingForward(
+            kwargs={
+                "video_hidden_states": video_rows,
+                "audio_hidden_states": audio_rows,
+                "encoder_hidden_states": text_hidden.to(model_device),
+                "timestep": timestep.to(model_device),
+                "timestep_indices": timestep_indices.to(model_device),
+                "token_tags": layout.token_tags.to(model_device),
+                "position_ids": layout.position_ids.to(model_device),
+                "video_indices": layout.video_indices.to(model_device),
+                "audio_indices": layout.audio_indices.to(model_device),
+                "text_indices": layout.text_indices.to(model_device),
+            },
+            decode=decode,
         )
-        audio = unpack_audio_tokens(target_audio, num_audio_latents=num_audio_latents) if audio_hidden_states is not None else None
-        return H3ModelPrediction(video=video, audio=audio)
 
     def _keyframe_cache(
         self,

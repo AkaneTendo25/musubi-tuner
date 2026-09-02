@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -17,7 +18,7 @@ from musubi_tuner.minimax_h3.references import (
     validate_reference_video_sizing,
 )
 from musubi_tuner.minimax_h3.request import H3GenerationRequest
-from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
+from musubi_tuner.minimax_h3.training import H3FusedArm, H3ModelPrediction, H3TrainingMode
 
 
 class H3LatentEncoder(Protocol):
@@ -63,6 +64,15 @@ class H3TrainingBackend(Protocol):
         extension_video_frames: int = 0,
         extension_audio_latents: int = 0,
     ) -> H3ModelPrediction: ...
+
+    def predict_training_fused(self, transformer: torch.nn.Module, arms: Sequence[H3FusedArm]) -> list[H3ModelPrediction]:
+        """Several training forwards through ONE pass over the transformer blocks.
+
+        Optional. Only ``--h3_rollout_fused_teacher`` asks for it, and a backend
+        that does not implement it makes that flag fail with a message naming it
+        rather than quietly falling back to the two-forward path.
+        """
+        ...
 
 
 class H3BackendUnavailableError(RuntimeError):

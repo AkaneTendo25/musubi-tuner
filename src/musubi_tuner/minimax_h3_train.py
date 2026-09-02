@@ -101,6 +101,15 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
             raise ValueError("MiniMax H3 full fine-tuning does not accept LoRA network/dropout/max-norm options")
         if args.h3_base_preservation_loss_weight > 0:
             raise ValueError("--h3_base_preservation_loss_weight is not supported by MiniMax H3 full fine-tuning")
+        if getattr(args, "h3_rollout_supervision", False):
+            # The teacher is the frozen base reached by switching the trainable
+            # network off. A full fine-tune has no such switch: its trainable
+            # weights ARE the base, so the teacher would drift with the student
+            # and the privileged target would dissolve within a few hundred steps.
+            raise ValueError(
+                "--h3_rollout_supervision needs an adapter it can disable to reach the frozen teacher, "
+                "so it is not supported by MiniMax H3 full fine-tuning"
+            )
         if getattr(args, "h3_overlay_weights", None):
             # The overlay is a live module the dense checkpoint cannot contain,
             # so a finished full fine-tune would not reproduce the field it was

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Literal
 
@@ -38,6 +40,26 @@ class H3JointNoisyInputs:
 class H3ModelPrediction:
     video: torch.Tensor | None
     audio: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class H3FusedArm:
+    """One training forward that shares a pass over the blocks with others.
+
+    ``call`` is what ``predict_training`` would have been given. The two contexts
+    say what makes this arm different from the arms beside it, and they are split
+    because they are entered a very different number of times. ``build`` wraps the
+    single construction of the packed sequence -- the right place for anything
+    stateful, such as forking the RNG so a frozen arm's stochastic conditioning
+    does not consume the trainable arm's draws. ``run`` wraps every one of the
+    arm's block calls and its final layer, and must therefore be cheap and
+    idempotent: ``torch.no_grad()`` and an adapter toggle belong there, anything
+    that saves and restores device state does not.
+    """
+
+    call: dict
+    build: Callable[[], AbstractContextManager] | None = None
+    run: Callable[[], AbstractContextManager] | None = None
 
 
 @dataclass(frozen=True)

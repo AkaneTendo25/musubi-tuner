@@ -219,6 +219,93 @@ def create_offloader(block_type: str, blocks: list[nn.Module], num_blocks: int, 
     )
 
 
+class FusedArmBackwardGate:
+    """Retire a swapped block only after its LAST grad-carrying arm has run.
+
+    Every hook-driven offloader treats one backward-hook firing as "this block is
+    finished": it frees the block's ring slot, repoints the block's weights back
+    at their CPU master (or schedules the D2H) and pulls the next block into that
+    slot. ``register_full_backward_hook`` fires once per invocation that built a
+    graph node, so that reading of a firing is correct exactly while each block is
+    invoked once per pass.
+
+    A FUSED forward invokes each block once per arm. With one trainable arm --
+    every fused pass that existed before the depth-0 teacher-gap term -- the count
+    is still one and the hook is still right. With TWO trainable arms the first
+    firing retires a block whose other arm has not run its backward yet and,
+    under gradient checkpointing, has not yet RE-RUN its forward: the arm then
+    recomputes the block against a weight that is back on the CPU, which surfaces
+    as ``mat2 is on cpu`` at the block's first matmul.
+
+    The gate counts the graph-carrying invocations a fused forward announces
+    through :meth:`note_backward_arm` and lets the hook body run on the last
+    firing only. A pass that announces nothing -- every non-fused forward in the
+    codebase -- leaves the hook exactly as it was, so this is inert for every
+    architecture that never fuses.
+
+    The count is kept PER PASS, not as a running total, because a training step
+    may traverse the blocks several times before a single backward: an active
+    rollout step runs one fused pass per supervised sub-step, and a step can also
+    follow a fused pass with an ordinary trainable forward. Autograd unwinds
+    those passes newest-first, so a running total would let the newest pass's
+    firings consume the announcements of an older one -- suppressing the hook
+    body wholesale, including the part that makes the NEXT block resident, which
+    is what surfaced as ``mat2 is on cpu``. Announcements are therefore grouped
+    by :meth:`begin_backward_arms` and consumed from the newest group, which is
+    exactly the order the backward visits them in.
+    """
+
+    def reset_backward_arms(self) -> None:
+        """Drop the announcements of a step, at the start of the next one.
+
+        Recovery, not bookkeeping: a graph that is built and then abandoned (a
+        step that raised between forward and backward) would otherwise leave a
+        count no hook will ever consume, and suppress the next pass's retirement.
+        Called from ``prepare_block_devices_before_forward`` and, because an
+        H2D-only ring never re-prepares mid-training, once per training step.
+        """
+        self._backward_arms: dict[int, list[int]] = {}
+        self._backward_pass: int = 0
+        self._backward_arm_pass: dict[int, int] = {}
+
+    def begin_backward_arms(self) -> None:
+        """Open a new pass over the blocks: what follows announces into its own group."""
+        if getattr(self, "_backward_arms", None) is None:
+            self.reset_backward_arms()
+        self._backward_pass = getattr(self, "_backward_pass", 0) + 1
+
+    def note_backward_arm(self, block_index: int) -> None:
+        """Announce one graph-carrying invocation of ``block_index`` in this pass."""
+        if getattr(self, "_backward_arms", None) is None:
+            self.reset_backward_arms()
+        groups = self._backward_arms.setdefault(block_index, [])
+        if not groups or self._backward_arm_pass.get(block_index) != self._backward_pass:
+            groups.append(0)
+            self._backward_arm_pass[block_index] = self._backward_pass
+        groups[-1] += 1
+
+    def retire_backward_arm(self, block_index: int) -> bool:
+        """Whether this firing is the block's last one in the pass being unwound.
+
+        An unannounced block returns ``True`` on every firing, which is the
+        behaviour of every caller that does not fuse.
+        """
+        arms = getattr(self, "_backward_arms", None)
+        if not arms:
+            return True
+        groups = arms.get(block_index)
+        if not groups:
+            return True
+        groups[-1] -= 1
+        if groups[-1] > 0:
+            return False
+        groups.pop()
+        if not groups:
+            del arms[block_index]
+            self._backward_arm_pass.pop(block_index, None)
+        return True
+
+
 class Offloader:
     """
     common offloading class
@@ -750,7 +837,7 @@ class TrainableBlockRingOffloader:
         _clean_memory_on_device(self.device)
 
 
-class ModelOffloader(Offloader):
+class ModelOffloader(Offloader, FusedArmBackwardGate):
     """
     supports forward offloading
     """
@@ -815,6 +902,11 @@ class ModelOffloader(Offloader):
         block_idx_to_wait = block_index - 1
 
         def backward_hook(module, grad_input, grad_output):
+            # A fused pass invokes this block once per arm, so the hook fires once
+            # per TRAINABLE arm. Retiring the block on the first firing would move
+            # it to the CPU while the remaining arms' backward is still to come.
+            if not self.retire_backward_arm(block_index):
+                return
             if self.debug:
                 print(f"Backward hook for block {block_index}")
 
@@ -826,6 +918,7 @@ class ModelOffloader(Offloader):
         return backward_hook
 
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]):
+        self.reset_backward_arms()
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
 
@@ -1586,7 +1679,7 @@ class LoRALinearStreamOffloader:
         del blocks, block_idx
 
 
-class LoRAStreamOffloader:
+class LoRAStreamOffloader(FusedArmBackwardGate):
     """
     H2D-only offloader for training where the base weights are frozen (e.g. LoRA / LoHa / LoKr).
 
@@ -1696,6 +1789,8 @@ class LoRAStreamOffloader:
         if supports_backward:
             self.remove_handles = []
             for i, block in enumerate(blocks):
+                if self.is_stream[i]:
+                    self.remove_handles.append(block.register_full_backward_pre_hook(self._create_backward_pre_hook(i)))
                 hook = self._create_backward_hook(i)
                 if hook is not None:
                     self.remove_handles.append(block.register_full_backward_hook(hook))
@@ -1820,6 +1915,7 @@ class LoRAStreamOffloader:
                 handle.remove()
 
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]):
+        self.reset_backward_arms()
         if self.S == 0:
             return
 
@@ -1958,6 +2054,34 @@ class LoRAStreamOffloader:
             for k in range(self.B):
                 self._load(k, k, "fwd")
 
+    def _create_backward_pre_hook(self, block_index: int):
+        """Residency for THIS invocation, whatever the ring scheduling did.
+
+        The post-hook chain below is a schedule: it assumes the backward walks
+        the blocks once, downwards, so waiting for ``block_index - 1`` when
+        ``block_index`` finishes is enough. A training step that traverses the
+        blocks more than once before its single backward breaks that assumption
+        at every pass boundary -- the newest pass ends at block 0 and the next
+        one starts again at the last block, which the ring no longer holds -- and
+        under gradient checkpointing the block's forward is re-run right there,
+        against weights that are back on their CPU master.
+
+        This fires before any of the module's own backward nodes, hence before
+        the checkpoint recomputation they trigger, and ``wait_for_block`` is a
+        no-op for a block the schedule already made resident. So it costs a
+        dictionary lookup on the healthy path and reloads the block on the one
+        the schedule does not cover.
+        """
+
+        def backward_pre_hook(module, grad_output):
+            self._wait_ctx = "bwd"
+            try:
+                self.wait_for_block(block_index)
+            finally:
+                self._wait_ctx = "fwd"
+
+        return backward_pre_hook
+
     def _create_backward_hook(self, block_index: int):
         prefetch = self.is_stream[block_index]
         wait_prev = block_index - 1 >= 0 and self.is_stream[block_index - 1]
@@ -1965,6 +2089,12 @@ class LoRAStreamOffloader:
             return None
 
         def backward_hook(module, grad_input, grad_output):
+            # A fused pass invokes this block once per arm, so the hook fires once
+            # per TRAINABLE arm. Retiring the block on the first firing would
+            # rebind its weights to the CPU master while the remaining arms have
+            # yet to recompute it under gradient checkpointing.
+            if not self.retire_backward_arm(block_index):
+                return
             if prefetch:
                 # consumed block_index in backward: free its slot and prefetch B streaming-slots behind
                 j = self.rank[block_index]

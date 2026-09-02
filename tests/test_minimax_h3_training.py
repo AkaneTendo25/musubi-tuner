@@ -3846,6 +3846,9 @@ def test_h3_sparse_dop_skips_both_auxiliary_forwards():
     trainer = MiniMaxH3NetworkTrainer()
     trainer.dit_dtype = torch.float32
     trainer._base_preservation_active = lambda accelerator, probability: False
+    # DOP draws on its own stream, so suppressing preservation no longer
+    # suppresses it: this test is about a step where BOTH draws are inactive.
+    trainer._dop_probability_active = lambda accelerator, probability: False
     backend = _StochasticPreservationBackend()
     trainer.backend = backend
     transformer = _ScaleTransformer()
@@ -3896,22 +3899,56 @@ def test_h3_base_preservation_rejects_networks_without_runtime_disable_support()
         )
 
 
-def test_h3_base_preservation_draw_advances_cpu_rng_and_broadcasts(monkeypatch):
+def test_h3_base_preservation_draw_leaves_the_ambient_stream_alone_and_broadcasts(monkeypatch):
+    """The sparse draw runs on its own generator, not on the global CPU stream.
+
+    It used to consume the ambient stream, which advanced it once per step before
+    the rollout and inactive-supervision generators were lazily seeded FROM that
+    stream -- so enabling sparse preservation silently reseeded both and changed
+    which steps a seeded rollout run selected. Only the one-off seed draw is taken
+    from the global stream now.
+    """
     broadcasts = []
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(torch.distributed, "broadcast", lambda value, src: broadcasts.append((value.clone(), src)))
 
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._preservation_probability_generator = torch.Generator()
+    trainer._preservation_probability_generator.manual_seed(11)
+
     torch.manual_seed(321)
-    torch.rand(())
     expected_next = torch.rand(())
     torch.manual_seed(321)
-    MiniMaxH3NetworkTrainer._base_preservation_active(_FakeAccelerator(), 0.5)
+    trainer._base_preservation_active(_FakeAccelerator(), 0.5)
     actual_next = torch.rand(())
 
     assert actual_next == expected_next
     assert len(broadcasts) == 1 and broadcasts[0][1] == 0
+
+
+def test_h3_sparse_preservation_costs_the_ambient_stream_one_draw_not_one_per_step(monkeypatch):
+    """The exact bound the dedicated stream buys, and its honest limit.
+
+    Seeding is lazy and the seed itself is taken from the global stream, so the
+    first sparse draw offsets it once -- the same contract the guidance branch
+    already documents. What must not happen is an offset that grows with training
+    length, because that is what reseeded the rollout generator differently for
+    every run configuration.
+    """
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+
+    def stream_after(steps):
+        trainer = MiniMaxH3NetworkTrainer()
+        torch.manual_seed(4242)
+        for _ in range(steps):
+            trainer._base_preservation_active(_FakeAccelerator(), 0.5)
+        return int(torch.randint(0, 1 << 62, (), device="cpu").item())
+
+    # One step and fifty steps leave the ambient stream in the same place: only
+    # the one-off seed came off it.
+    assert stream_after(1) == stream_after(50)
 
 
 def test_h3_ref2va_rejects_training_time_sample_prompts():

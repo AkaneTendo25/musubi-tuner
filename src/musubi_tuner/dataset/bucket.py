@@ -189,6 +189,12 @@ class BucketBatchManager:
         self.h3_conditioning_mask_paths: dict[str, str] = {}
         self._h3_conditioning_mask_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
         self._h3_degenerate_masks_warned: set[str] = set()
+        # Batch key under which to list the item keys a batch was built from, or
+        # None to emit nothing. A batch is otherwise identity-free, and H3's
+        # rollout supervision has to pair a step with a teacher cache entry keyed
+        # by item. The consumer passes the key name in, so nothing here imports an
+        # architecture and no other batch schema changes.
+        self.h3_item_keys_batch_key: Optional[str] = None
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -365,6 +371,15 @@ class BucketBatchManager:
         for key in batch_tensor_data.keys():
             if key not in varlen_keys:
                 batch_tensor_data[key] = torch.stack(batch_tensor_data[key])
+
+        if self.h3_item_keys_batch_key is not None:
+            # One name per batch member, in the order the tensors above were
+            # stacked, so slicing a batch item slices its key with it. The
+            # windowed key, because `item_key` alone names the source clip and
+            # several cached windows of one clip would then share a name.
+            batch_tensor_data[self.h3_item_keys_batch_key] = [
+                getattr(item_info, "windowed_item_key", item_info.item_key) for item_info in bucket[start:end]
+            ]
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps

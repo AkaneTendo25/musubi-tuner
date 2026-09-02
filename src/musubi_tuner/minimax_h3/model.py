@@ -22,9 +22,11 @@ Diffusers model APIs and lets Musubi load the Comfy BF16 repack directly.
 from __future__ import annotations
 
 import inspect
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any
 
 import torch
 from diffusers.models.embeddings import get_timestep_embedding
@@ -126,6 +128,26 @@ class MiniMaxH3TransformerConfig:
 class MiniMaxH3TransformerOutput:
     video: torch.Tensor
     audio: torch.Tensor
+
+
+@dataclass
+class MiniMaxH3PackedState:
+    """One embedded packed sequence, as the block loop reads and rewrites it.
+
+    Everything here is per-sequence: the row-indexed AdaLN selector, the RoPE
+    tables cut for this sequence's positions, and whatever pairwise mask its
+    padding produced. Two states therefore share nothing but the weights, which
+    is what lets several of them ride one pass over the blocks.
+    """
+
+    hidden_states: torch.Tensor
+    timestep_embedding: torch.Tensor
+    adaln_indices: torch.Tensor
+    rotary_emb: tuple[torch.Tensor, torch.Tensor]
+    attention_mask: torch.Tensor | None
+    timestep_indices: torch.Tensor
+    video_indices: torch.Tensor
+    audio_indices: torch.Tensor
 
 
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -711,6 +733,125 @@ class MiniMaxH3Transformer(nn.Module):
         embedding = table.index_select(0, lower) * (1.0 - fraction) + table.index_select(0, upper) * fraction
         return embedding.to(timestep.device)
 
+    @property
+    def _checkpoint_start(self) -> int:
+        return 0 if self.gradient_checkpointing_blocks is None else len(self.blocks) - self.gradient_checkpointing_blocks
+
+    def _run_block(self, block: MiniMaxH3TransformerBlock, block_index: int, state: MiniMaxH3PackedState) -> torch.Tensor:
+        """One block applied to one packed sequence, checkpointed or not.
+
+        The checkpoint decision reads ``torch.is_grad_enabled()``, which is what
+        separates a graph-carrying arm from a no-grad one when several arms share
+        a single pass over the blocks.
+        """
+        if torch.is_grad_enabled() and self.gradient_checkpointing and block_index >= self._checkpoint_start:
+            return self._checkpointed_block(
+                block,
+                block_index,
+                state.hidden_states,
+                state.timestep_embedding,
+                state.adaln_indices,
+                state.rotary_emb,
+                state.attention_mask,
+            )
+        return block(
+            state.hidden_states,
+            state.timestep_embedding,
+            state.adaln_indices,
+            state.rotary_emb,
+            state.attention_mask,
+        )
+
+    def _finalize(self, state: MiniMaxH3PackedState) -> MiniMaxH3TransformerOutput:
+        hidden_states = state.hidden_states
+        if self.activation_cpu_offloading:
+            hidden_states = hidden_states.to(self.final_layer.norm.weight.device)
+        return self.final_layer(
+            hidden_states,
+            state.timestep_embedding,
+            state.timestep_indices,
+            state.video_indices,
+            state.audio_indices,
+        )
+
+    def _begin_backward_arms(self) -> Callable[[int], None] | None:
+        """Open this traversal's announcement group, and return the announcer.
+
+        Every graph-carrying pass over the blocks opens a group, fused or not: a
+        step may traverse the blocks several times before its single backward,
+        autograd unwinds those traversals newest-first, and a pass that announced
+        nothing would otherwise have its hook firings consume an older pass's
+        announcements and be suppressed -- ring scheduling and all.
+        """
+        if not self.blocks_to_swap:
+            return None
+        begin = getattr(self.offloader, "begin_backward_arms", None)
+        if begin is not None:
+            begin()
+        return getattr(self.offloader, "note_backward_arm", None)
+
+    def forward_fused(
+        self,
+        arms: Sequence[tuple[dict[str, Any], Callable[[], AbstractContextManager] | None]],
+    ) -> list[MiniMaxH3TransformerOutput]:
+        """Run several packed sequences through ONE pass over the blocks.
+
+        Each arm is ``(forward kwargs, context factory)``: the kwargs are exactly
+        what :meth:`forward` accepts, and the context -- re-entered around the
+        arm's embedding stage, around every one of its block calls, and around its
+        final layer -- is where a caller expresses what makes that arm different
+        from the others. A frozen teacher arm passes ``torch.no_grad()`` with its
+        adapter disabled; the trainable arm passes nothing.
+
+        The arms do not share a tensor, only the weights: two packed sequences of
+        different lengths -- which is what a privileged teacher presentation
+        always is -- cannot be stacked on the batch axis, and concatenating them
+        into one sequence would need a pairwise mask that costs quadratically and
+        forecloses the flash and INT8 kernels. Interleaving instead keeps every
+        arm's attention exactly the attention it would have had on its own, and
+        isolation between arms is structural: an arm's rows never enter another
+        arm's tensor at all.
+
+        What it buys is the streaming: under ``--blocks_to_swap`` each swapped
+        block is waited for once and released once per fused call, so N arms cost
+        one block-ring traversal instead of N.
+        """
+        if not arms:
+            raise ValueError("MiniMax H3 fused forward needs at least one arm")
+        contexts = [context if context is not None else nullcontext for _, context in arms]
+        states = []
+        for (kwargs, _), context in zip(arms, contexts):
+            with context():
+                states.append(self._prepare(**kwargs))
+        if self.reusable_activation_offloader is not None and torch.is_grad_enabled():
+            self.reusable_activation_offloader.begin_forward()
+        # An offloader that retires a swapped block from a backward hook counts
+        # one firing per block per pass, because that is what a non-fused forward
+        # produces. Here each block is invoked once per arm, so every arm that
+        # builds a graph adds a firing, and the block must not be retired until
+        # the last of them has run -- under gradient checkpointing the others have
+        # not even re-run its forward yet. Announced per invocation rather than
+        # from an arm count, so an arm whose output carries no graph (a frozen
+        # teacher, or a pass with nothing trainable upstream) is not counted:
+        # such an arm registers no backward node and fires no hook.
+        note_backward_arm = self._begin_backward_arms()
+        for block_index, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(block_index)
+            for state, context in zip(states, contexts):
+                with context():
+                    hidden_states = self._run_block(block, block_index, state)
+                    if note_backward_arm is not None and hidden_states.requires_grad:
+                        note_backward_arm(block_index)
+                    state.hidden_states = hidden_states
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, block_index)
+        outputs = []
+        for state, context in zip(states, contexts):
+            with context():
+                outputs.append(self._finalize(state))
+        return outputs
+
     def forward(
         self,
         video_hidden_states: torch.Tensor,
@@ -725,6 +866,47 @@ class MiniMaxH3Transformer(nn.Module):
         text_indices: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> MiniMaxH3TransformerOutput:
+        state = self._prepare(
+            video_hidden_states=video_hidden_states,
+            audio_hidden_states=audio_hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep=timestep,
+            timestep_indices=timestep_indices,
+            token_tags=token_tags,
+            position_ids=position_ids,
+            video_indices=video_indices,
+            audio_indices=audio_indices,
+            text_indices=text_indices,
+            attention_mask=attention_mask,
+        )
+        if self.reusable_activation_offloader is not None and torch.is_grad_enabled():
+            self.reusable_activation_offloader.begin_forward()
+        note_backward_arm = self._begin_backward_arms()
+        for block_index, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(block_index)
+            state.hidden_states = self._run_block(block, block_index, state)
+            if note_backward_arm is not None and state.hidden_states.requires_grad:
+                note_backward_arm(block_index)
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, block_index)
+        return self._finalize(state)
+
+    def _prepare(
+        self,
+        video_hidden_states: torch.Tensor,
+        audio_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        timestep_indices: torch.Tensor,
+        token_tags: torch.Tensor,
+        position_ids: torch.Tensor,
+        video_indices: torch.Tensor,
+        audio_indices: torch.Tensor,
+        text_indices: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> MiniMaxH3PackedState:
+        """Embed one packed sequence into the state the block loop advances."""
         sequence_length = position_ids.shape[0]
         if position_ids.shape != (sequence_length, 3):
             raise ValueError(f"position_ids must have shape (sequence_length, 3), got {tuple(position_ids.shape)}")
@@ -764,35 +946,13 @@ class MiniMaxH3Transformer(nn.Module):
             padding_mask = is_padding[None, :] == is_padding[:, None]
             attention_mask = padding_mask if attention_mask is None else attention_mask & padding_mask
 
-        checkpoint_start = (
-            0 if self.gradient_checkpointing_blocks is None else len(self.blocks) - self.gradient_checkpointing_blocks
+        return MiniMaxH3PackedState(
+            hidden_states=hidden_states,
+            timestep_embedding=timestep_embedding,
+            adaln_indices=adaln_indices,
+            rotary_emb=rotary_emb,
+            attention_mask=attention_mask,
+            timestep_indices=timestep_indices,
+            video_indices=video_indices,
+            audio_indices=audio_indices,
         )
-        if self.reusable_activation_offloader is not None and torch.is_grad_enabled():
-            self.reusable_activation_offloader.begin_forward()
-        for block_index, block in enumerate(self.blocks):
-            if self.blocks_to_swap:
-                self.offloader.wait_for_block(block_index)
-            if torch.is_grad_enabled() and self.gradient_checkpointing and block_index >= checkpoint_start:
-                hidden_states = self._checkpointed_block(
-                    block,
-                    block_index,
-                    hidden_states,
-                    timestep_embedding,
-                    adaln_indices,
-                    rotary_emb,
-                    attention_mask,
-                )
-            else:
-                hidden_states = block(
-                    hidden_states,
-                    timestep_embedding,
-                    adaln_indices,
-                    rotary_emb,
-                    attention_mask,
-                )
-            if self.blocks_to_swap:
-                self.offloader.submit_move_blocks_forward(self.blocks, block_index)
-
-        if self.activation_cpu_offloading:
-            hidden_states = hidden_states.to(self.final_layer.norm.weight.device)
-        return self.final_layer(hidden_states, timestep_embedding, timestep_indices, video_indices, audio_indices)
