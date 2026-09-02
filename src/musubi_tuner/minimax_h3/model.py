@@ -22,6 +22,7 @@ Diffusers model APIs and lets Musubi load the Comfy BF16 repack directly.
 from __future__ import annotations
 
 import inspect
+import types
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -37,6 +38,13 @@ from torch.utils.checkpoint import checkpoint
 from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffloader
 from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig, SequencePlan, block_sparse_attention, build_plan
 from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
+from musubi_tuner.minimax_h3.selective_checkpoint import (
+    SavedActivations,
+    attention_kernel_is_visible,
+    checkpoint_context_fn,
+    projection_region,
+    validate_checkpoint_keep,
+)
 from musubi_tuner.minimax_h3.triton_kernels import (
     try_fused_indexed_adaln_rmsnorm,
     try_fused_qk_norm_rope,
@@ -164,13 +172,28 @@ class MiniMaxH3PackedState:
 
 
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Split RoPE on the leading ``cos.shape[-1]`` channels of ``[B, S, heads, head_dim]``.
+
+    The reference form ``cat((x * cos + cat((-x2, x1)) * sin, passthrough)).contiguous()`` is
+    written out per half instead. In forward ``x1 * cos - x2 * sin`` computes the same
+    elementwise values as ``x1 * cos + (-x2) * sin`` (negation is exact and ``a + (-b)`` is
+    ``a - b`` in IEEE arithmetic), so the outputs are equal element for element, while the
+    ``neg``, the intermediate ``cat`` and the trailing ``contiguous`` copy over the full head
+    width disappear. The three inputs come from one ``split``, whose backward is a single
+    ``cat`` instead of three zero-filled slice backwards: the backward graph is structurally
+    different from the reference's and algebraically equal to it; the gradients matched the
+    reference elementwise on CPU (bf16/fp16/fp32), CUDA coverage pending. Per Q or K this is
+    ~11.5 to ~5.4 head-widths of traffic in forward and ~9.75 to ~5.75 in backward."""
     rotary_dim = cos.shape[-1]
-    rotary, passthrough = hidden_states[..., :rotary_dim], hidden_states[..., rotary_dim:]
+    half = rotary_dim // 2
+    first, second, passthrough = hidden_states.split((half, rotary_dim - half, hidden_states.shape[-1] - rotary_dim), dim=-1)
     cos = cos[None, :, None, :]
     sin = sin[None, :, None, :]
-    first, second = rotary.chunk(2, dim=-1)
-    rotated = torch.cat((-second, first), dim=-1)
-    return torch.cat((rotary * cos + rotated * sin, passthrough), dim=-1).contiguous()
+    cos_first, cos_second = cos[..., :half], cos[..., half:]
+    sin_first, sin_second = sin[..., :half], sin[..., half:]
+    rotated_first = first * cos_first - second * sin_first
+    rotated_second = second * cos_second + first * sin_second
+    return torch.cat((rotated_first, rotated_second, passthrough), dim=-1)
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -237,11 +260,42 @@ class MiniMaxH3Attention(nn.Module):
         self.block_sparse_config: BlockSparseConfig | None = None
         self.block_sparse_plan: SequencePlan | None = None
         self.fused_qk_norm_rope = False
+        # Set by ``MiniMaxH3Transformer.set_checkpoint_keep("qkv")``; gates the
+        # region ``install_projection_region`` wraps around the base projection.
+        self.checkpoint_keep_qkv = False
+        # Route the attention kernel through ``_attention_core_opaque`` (see there); a no-op
+        # outside torch.compile, where both are the same eager code.
+        self.opaque_attention = False
         self.inner_dim = heads * head_dim
         self.qkv_proj = nn.Linear(hidden_size, 3 * self.inner_dim, bias=False)
         self.q_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(self.inner_dim, hidden_size, bias=False)
+
+    def install_projection_region(self) -> None:
+        """Wrap the base projection's own ``forward`` in the ``qkv`` checkpoint region, once.
+
+        Wrapping the module's forward rather than the call site is what keeps
+        adapters out of the region: a LoRA applied afterwards captures this
+        wrapper as its ``org_forward`` and runs its own down/up matmuls around
+        it, so only the frozen projection (plain, scaled FP8 or ConvRot INT8)
+        is inside. Installed permanently and gated by ``checkpoint_keep_qkv``,
+        because an adapter may already hold a reference to it.
+        """
+        projection = self.qkv_proj
+        if getattr(projection, "_h3_projection_region", False):
+            return
+        base_forward = projection.forward
+        attention = self
+
+        def forward(module: nn.Module, *args: Any, **kwargs: Any) -> torch.Tensor:
+            if not attention.checkpoint_keep_qkv:
+                return base_forward(*args, **kwargs)
+            with projection_region(module.in_features, module.out_features):
+                return base_forward(*args, **kwargs)
+
+        projection.forward = types.MethodType(forward, projection)
+        projection._h3_projection_region = True
 
     def forward(
         self,
@@ -249,17 +303,24 @@ class MiniMaxH3Attention(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        query, key, value = self.project_qkv(hidden_states, rotary_emb)
+        core = self._attention_core_opaque if self.opaque_attention else self._attention_core
+        hidden_states = core(query, key, value, attention_mask)
+        with h3_profile_scope("h3.out"):
+            return self.out_proj(hidden_states)
+
+    def project_qkv(
+        self, hidden_states: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor] | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Projected, normalised and rotated ``[B, S, heads, head_dim]`` Q/K plus V."""
         with h3_profile_scope("h3.qkv"):
             query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
         query = query.unflatten(-1, (self.heads, self.head_dim))
         key = key.unflatten(-1, (self.heads, self.head_dim))
         value = value.unflatten(-1, (self.heads, self.head_dim))
-
         with h3_profile_scope("h3.rope"):
             query, key = self._norm_and_rotate(query, key, rotary_emb)
-        hidden_states = self._attention_core(query, key, value, attention_mask)
-        with h3_profile_scope("h3.out"):
-            return self.out_proj(hidden_states)
+        return query, key, value
 
     def _norm_and_rotate(
         self, query: torch.Tensor, key: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor] | None
@@ -330,6 +391,16 @@ class MiniMaxH3Attention(nn.Module):
                 )
             hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         return hidden_states
+
+    # The same core, invisible to Dynamo. A kernel binding Dynamo cannot trace (a FlashAttention
+    # build without ``torch.library`` fake kernels, the Triton INT8 path) breaks the graph *inside*
+    # the attention call, and the breaks cascade: the call site is split, the transposes and
+    # reshapes around the kernel are stranded in fragments of a few ops, and the norm, modulation,
+    # gating and residual elementwise chain of the block is cut in the middle instead of fusing
+    # on each side of the kernel. Disabling this one function makes it a single break at the
+    # call, with one fused graph before it and one after; it runs eagerly, autograd included,
+    # so numerics are the eager ones. SDPA traces natively and stays in the graph.
+    _attention_core_opaque = torch.compiler.disable(_attention_core, recursive=True)
 
 
 class MiniMaxH3FeedForward(nn.Module):
@@ -414,6 +485,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         )
         self.hidden_size = config.hidden_size
         self.fused_indexed_adaln = False
+        self.fused_elementwise = False
 
     def _norm_and_modulate(
         self,
@@ -435,8 +507,18 @@ class MiniMaxH3TransformerBlock(nn.Module):
             if fused is not None:
                 return fused
         normalized = norm(hidden_states)
+        if self.fused_elementwise:
+            # shift + normalized * (1 + scale) with the product kept in the fp32 accumulator and
+            # rounded once: 2 kernels and 6 tensor passes instead of 3 and 8.
+            return torch.addcmul(shift.index_select(0, adaln_indices), normalized, 1.0 + scale.index_select(0, adaln_indices))
         normalized = normalized * (1.0 + scale.index_select(0, adaln_indices))
         return normalized + shift.index_select(0, adaln_indices)
+
+    def _gated_residual(self, hidden_states: torch.Tensor, gate: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
+        if self.fused_elementwise:
+            # One kernel, 4 tensor passes, the product rounded once (the default rounds it twice).
+            return torch.addcmul(hidden_states, gate, branch)
+        return hidden_states + gate * branch
 
     def forward(
         self,
@@ -446,34 +528,35 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Written out in this one frame on purpose: under torch.compile a graph break inside an
+        # inlined callee is replayed at every frame level above it (nested graph breaks), so the
+        # opaque attention kernel is called from here, not from ``self.attn.forward``, and a block
+        # compiles to exactly one graph before the kernel and one after.
         with h3_profile_scope("h3.block"):
-            return self._forward(hidden_states, timestep_embedding, adaln_indices, rotary_emb, attention_mask)
+            with h3_profile_scope("h3.adaln"):
+                modulation = self.adaln_proj(timestep_embedding).view(-1, 6 * self.hidden_size).to(hidden_states.dtype)
+            shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
 
-    def _forward(
-        self,
-        hidden_states: torch.Tensor,
-        timestep_embedding: torch.Tensor,
-        adaln_indices: torch.Tensor,
-        rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        with h3_profile_scope("h3.adaln"):
-            modulation = self.adaln_proj(timestep_embedding).view(-1, 6 * self.hidden_size).to(hidden_states.dtype)
-        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
+            with h3_profile_scope("h3.norm"):
+                norm_hidden_states = self._norm_and_modulate(self.norm1, hidden_states, shift_attn, scale_attn, adaln_indices)
+            with h3_profile_scope("h3.attn"):
+                attn = self.attn
+                if attn.opaque_attention:
+                    query, key, value = attn.project_qkv(norm_hidden_states, rotary_emb)
+                    attention = attn._attention_core_opaque(query, key, value, attention_mask)
+                    with h3_profile_scope("h3.out"):
+                        attention = attn.out_proj(attention)
+                else:
+                    attention = attn(norm_hidden_states, rotary_emb, attention_mask)
+            with h3_profile_scope("h3.gate"):
+                hidden_states = self._gated_residual(hidden_states, gate_attn.index_select(0, adaln_indices), attention)
 
-        with h3_profile_scope("h3.norm"):
-            norm_hidden_states = self._norm_and_modulate(self.norm1, hidden_states, shift_attn, scale_attn, adaln_indices)
-        with h3_profile_scope("h3.attn"):
-            attention = self.attn(norm_hidden_states, rotary_emb, attention_mask)
-        with h3_profile_scope("h3.gate"):
-            hidden_states = hidden_states + gate_attn.index_select(0, adaln_indices) * attention
-
-        with h3_profile_scope("h3.norm"):
-            norm_hidden_states = self._norm_and_modulate(self.norm2, hidden_states, shift_mlp, scale_mlp, adaln_indices)
-        with h3_profile_scope("h3.mlp"):
-            feed_forward = self.mlp(norm_hidden_states)
-        with h3_profile_scope("h3.gate"):
-            return hidden_states + gate_mlp.index_select(0, adaln_indices) * feed_forward
+            with h3_profile_scope("h3.norm"):
+                norm_hidden_states = self._norm_and_modulate(self.norm2, hidden_states, shift_mlp, scale_mlp, adaln_indices)
+            with h3_profile_scope("h3.mlp"):
+                feed_forward = self.mlp(norm_hidden_states)
+            with h3_profile_scope("h3.gate"):
+                return self._gated_residual(hidden_states, gate_mlp.index_select(0, adaln_indices), feed_forward)
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -547,6 +630,9 @@ class MiniMaxH3Transformer(nn.Module):
         self.final_layer = MiniMaxH3FinalLayer(config)
         self.gradient_checkpointing = False
         self.gradient_checkpointing_blocks: int | None = None
+        self.checkpoint_keep = "none"
+        self._checkpoint_saved = SavedActivations()
+        self._checkpointed_blocks = 0
         self.activation_cpu_offloading = False
         self.activation_cpu_offload_pin_memory = False
         self.reusable_activation_offloader: ReusableActivationOffloader | None = None
@@ -564,6 +650,7 @@ class MiniMaxH3Transformer(nn.Module):
         return next(self.parameters()).dtype
 
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False) -> None:
+        self._validate_checkpoint_keep(activation_cpu_offloading=activation_cpu_offloading)
         self.gradient_checkpointing = True
         self.activation_cpu_offloading = activation_cpu_offloading
 
@@ -582,6 +669,84 @@ class MiniMaxH3Transformer(nn.Module):
             raise ValueError(f"H3 gradient checkpoint block count must be in [0, {len(self.blocks)}], got {blocks}")
         self.gradient_checkpointing_blocks = blocks
 
+    def set_checkpoint_keep(self, keep: str) -> None:
+        """Choose what block checkpointing keeps instead of recomputing.
+
+        ``none`` is plain checkpointing. ``attention`` keeps each block's fused
+        attention output (and logsumexp), so recomputation skips the attention
+        forward; ``qkv`` also keeps the QKV projection's matmul output. Weights
+        are never kept, so block swap streams them for the recompute exactly as
+        before; only activations change.
+        """
+        keep = validate_checkpoint_keep(keep)
+        attention_modes = {
+            module.attention_mode for block in self.blocks for module in block.modules() if isinstance(module, MiniMaxH3Attention)
+        }
+        if keep != "none":
+            for attention_mode in sorted(attention_modes):
+                if not attention_kernel_is_visible(attention_mode):
+                    raise ValueError(
+                        f"H3 checkpoint keep={keep!r} cannot see the {attention_mode!r} attention kernel: the installed "
+                        "package does not register its torch.library ops, so nothing would be kept; use --sdpa or "
+                        "a flash-attn build with registered ops"
+                    )
+        self._validate_checkpoint_keep(keep=keep)
+        self.checkpoint_keep = keep
+        for block in self.blocks:
+            for module in block.modules():
+                if isinstance(module, MiniMaxH3Attention):
+                    module.checkpoint_keep_qkv = keep == "qkv"
+                    if keep == "qkv":
+                        module.install_projection_region()
+
+    def _begin_checkpoint_pass(self) -> None:
+        self._checkpoint_saved.reset()
+        self._checkpointed_blocks = 0
+
+    def _verify_checkpoint_pass(self) -> None:
+        """Refuse to run on with a keep mode that kept nothing.
+
+        Whether SDPA takes a fused backend is decided per batch from the mask,
+        dtype and head width; the math backend is a composite of ordinary ops
+        the policy cannot save. The projection matmul can likewise be hidden by
+        a fused adapter kernel. Silently degrading to plain checkpointing would
+        be worse than stopping, so a pass whose checkpointed blocks saved fewer
+        outputs than there were blocks is an error.
+        """
+        blocks = self._checkpointed_blocks
+        if self.checkpoint_keep == "none" or not blocks:
+            return
+        saved = self._checkpoint_saved
+        if saved.attention < blocks:
+            raise RuntimeError(
+                f"H3 checkpoint keep={self.checkpoint_keep!r} saved {saved.attention} fused attention outputs for {blocks} "
+                "checkpointed block calls: SDPA resolved to the math backend for this batch (mask, dtype or head width), "
+                "which the policy cannot keep. Drop --h3_checkpoint_keep or make the batch eligible for a fused backend"
+            )
+        if self.checkpoint_keep == "qkv" and saved.projection < blocks:
+            raise RuntimeError(
+                f"H3 checkpoint keep='qkv' saved {saved.projection} QKV projection outputs for {blocks} checkpointed block "
+                "calls: the base projection ran outside the dispatcher (a fused adapter kernel or a non-Linear path). "
+                "Use --h3_checkpoint_keep attention"
+            )
+
+    def _validate_checkpoint_keep(self, *, keep: str | None = None, activation_cpu_offloading: bool | None = None) -> None:
+        """Reject a keep mode the other memory options cannot serve; called before each of them changes."""
+        keep = self.checkpoint_keep if keep is None else keep
+        if keep == "none":
+            return
+        offloading = self.activation_cpu_offloading if activation_cpu_offloading is None else activation_cpu_offloading
+        if offloading:
+            raise ValueError(
+                "H3 checkpoint keep cannot be combined with CPU offload of checkpoint activations: the kept tensors "
+                "live in the selective checkpoint cache, which the offload hooks never see"
+            )
+        if self.blocks_to_swap and (self.layer_streaming or getattr(self.offloader, "recompute_requires_wait", False)):
+            raise ValueError(
+                "H3 checkpoint keep requires whole-block H2D-only block swap: layer streaming and the trainable ring "
+                "transfer weights inside the checkpointed region, which the selective checkpoint cache cannot replay"
+            )
+
     def enable_attention_auto_dispatch(self) -> None:
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
@@ -597,6 +762,17 @@ class MiniMaxH3Transformer(nn.Module):
     def enable_fused_indexed_adaln(self) -> None:
         for module in self.blocks:
             module.fused_indexed_adaln = True
+
+    def enable_fused_elementwise(self) -> None:
+        """AdaLN modulation and gated residuals as ``addcmul`` (one rounding instead of two)."""
+        for block in self.blocks:
+            block.fused_elementwise = True
+
+    def set_compile_opaque_attention(self, enabled: bool) -> None:
+        """Hide the attention kernel call from Dynamo (see ``MiniMaxH3Attention._attention_core_opaque``)."""
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module.opaque_attention = bool(enabled)
 
     def enable_fused_swiglu(self) -> None:
         for module in self.modules():
@@ -684,6 +860,7 @@ class MiniMaxH3Transformer(nn.Module):
             blocks_to_swap,
             config,
         )
+        self._validate_checkpoint_keep()
 
     def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
         if self.blocks_to_swap:
@@ -767,6 +944,13 @@ class MiniMaxH3Transformer(nn.Module):
                     return checkpoint(forward, hidden_states, use_reentrant=False)
             with torch.autograd.graph.save_on_cpu(pin_memory=self.activation_cpu_offload_pin_memory):
                 return checkpoint(forward, hidden_states, use_reentrant=False)
+        if self.checkpoint_keep != "none":
+            # The policy keeps the fused attention output (and at ``qkv`` the
+            # projection matmul) in the selective checkpoint cache; every other
+            # op, weights included, is re-run by the recompute as before.
+            self._checkpointed_blocks += 1
+            context_fn = checkpoint_context_fn(self.checkpoint_keep, self._checkpoint_saved)
+            return checkpoint(forward, hidden_states, use_reentrant=False, context_fn=context_fn)
         return checkpoint(forward, hidden_states, use_reentrant=False)
 
     def _time_embedding(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -883,6 +1067,7 @@ class MiniMaxH3Transformer(nn.Module):
         # teacher, or a pass with nothing trainable upstream) is not counted:
         # such an arm registers no backward node and fires no hook.
         note_backward_arm = self._begin_backward_arms()
+        self._begin_checkpoint_pass()
         for block_index, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_index)
@@ -894,6 +1079,7 @@ class MiniMaxH3Transformer(nn.Module):
                     state.hidden_states = hidden_states
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_index)
+        self._verify_checkpoint_pass()
         outputs = []
         for state, context in zip(states, contexts):
             with context():
@@ -930,6 +1116,7 @@ class MiniMaxH3Transformer(nn.Module):
         if self.reusable_activation_offloader is not None and torch.is_grad_enabled():
             self.reusable_activation_offloader.begin_forward()
         note_backward_arm = self._begin_backward_arms()
+        self._begin_checkpoint_pass()
         for block_index, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_index)
@@ -938,6 +1125,7 @@ class MiniMaxH3Transformer(nn.Module):
                 note_backward_arm(block_index)
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_index)
+        self._verify_checkpoint_pass()
         return self._finalize(state)
 
     def _prepare(

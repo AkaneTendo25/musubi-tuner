@@ -58,6 +58,15 @@ def bimi_init_(weight: torch.Tensor) -> None:
         weight.copy_(tiled.reshape(weight.shape))
 
 
+def _is_power_of_two(value) -> bool:
+    """Whether a scalar factor scales any floating value exactly (``1``, ``0.5``, ``2``, ``1/32``...)."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+    return value > 0.0 and math.isfinite(value) and math.frexp(value)[0] == 0.5
+
+
 def _profile_scope(name: str):
     """A ``torch.profiler.record_function`` label while a profiler collects, else a null context."""
     if getattr(torch.autograd.profiler, "_is_profiler_enabled", False):
@@ -165,6 +174,9 @@ class LoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        # Opt in to ``add(org, delta, alpha=multiplier * scale)`` for factors that are not powers
+        # of two, where the single fused rounding differs from multiply-then-add by bf16 ulps.
+        self.fused_scale_add = False
 
     def _down_modules(self):
         return [self.lora_down] if self.split_dims is None else list(self.lora_down)
@@ -259,7 +271,27 @@ class LoRAModule(torch.nn.Module):
         factor produced an owned tensor -- ``lora_up``'s output on a 3-D input is an autograd
         *view* of the underlying matmul result, and writing into a view rebases the graph onto
         ``CopySlices``, which costs a full-size temporary in backward instead of forward.
+
+        When both factors are powers of two (``1``, ``alpha / rank`` for the usual
+        power-of-two ranks and alphas) the whole thing is one
+        ``add(org, delta, alpha=multiplier * scale)`` kernel at 3 instead of 5 tensor passes.
+        The kernel evaluates ``org + alpha * delta`` in opmath (fp32 for bf16/fp16) and rounds
+        once; for a finite, in-range value a power-of-two ``alpha`` scales it exactly, so this
+        equals the separate multiply (exact) and add (rounded once) of the old order for every
+        finite bf16/fp16/fp32 element whose scaled magnitude stays out of the subnormal range --
+        verified elementwise against the old path on CPU, CUDA coverage pending. Other factors
+        keep the multiply-then-add order, whose double rounding a fused ``alpha`` would change;
+        ``fused_scale_add`` opts them in.
         """
+        if (
+            delta.is_floating_point()
+            and delta.dtype == org_forwarded.dtype
+            and (self.fused_scale_add or (_is_power_of_two(self.multiplier) and _is_power_of_two(scale)))
+        ):
+            factor = self.multiplier * scale
+            if factor == 1.0:
+                return org_forwarded + delta
+            return torch.add(org_forwarded, delta, alpha=factor)
         owned = False
         for factor in (self.multiplier, scale):
             if factor == 1.0:

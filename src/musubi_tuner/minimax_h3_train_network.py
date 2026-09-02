@@ -2735,6 +2735,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # either a stale ring slot (h2d_only, which is why block swap
                 # requires gradient checkpointing at all) or a CPU-resident storage.
                 raise ValueError("partial H3 gradient checkpointing cannot be combined with block swap")
+        checkpoint_keep = getattr(args, "h3_checkpoint_keep", "none")
+        if checkpoint_keep != "none":
+            # The policy keeps activations in the selective checkpoint cache,
+            # which neither the CPU offload hooks nor a compiled block can see,
+            # and it only works where the attention forward is a dispatcher op.
+            if not args.gradient_checkpointing:
+                raise ValueError("--h3_checkpoint_keep requires --gradient_checkpointing")
+            if args.gradient_checkpointing_cpu_offload:
+                raise ValueError("--h3_checkpoint_keep cannot be combined with --gradient_checkpointing_cpu_offload")
+            if args.compile:
+                raise ValueError("--h3_checkpoint_keep cannot be combined with --compile")
+            if getattr(args, "h3_int8_attention", "off") == "train":
+                raise ValueError("--h3_checkpoint_keep cannot be combined with --h3_int8_attention train")
+            if getattr(args, "h3_block_sparse_kv_fraction", 0.0) > 0 or getattr(args, "h3_block_sparse_threshold", 0.0) > 0:
+                raise ValueError("--h3_checkpoint_keep cannot be combined with block-sparse attention")
+            if (args.blocks_to_swap or 0) > 0 and getattr(args, "block_swap_granularity", "block") == "layer":
+                raise ValueError("--h3_checkpoint_keep cannot be combined with --block_swap_granularity layer")
+            if checkpoint_keep == "qkv" and args.h3_convrot_int8_lora_fused:
+                # The fused kernel runs base and adapter in one Triton launch,
+                # bypassing the base projection's forward the region wraps.
+                raise ValueError("--h3_checkpoint_keep qkv cannot be combined with --h3_convrot_int8_lora_fused")
         if args.h3_gradient_checkpointing_cpu_offload_pin_memory and not (
             args.gradient_checkpointing and args.gradient_checkpointing_cpu_offload
         ):
@@ -2768,6 +2789,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_attn_auto_dispatch requires --sdpa")
         if getattr(args, "h3_int8_attention", "off") != "off" and args.compile:
             raise ValueError("--h3_int8_attention cannot currently be combined with --compile")
+        if getattr(args, "h3_compile_attention", "inline") == "opaque" and getattr(args, "compile_fullgraph", False):
+            raise ValueError("--h3_compile_attention opaque is one graph break per block, which --compile_fullgraph forbids")
         block_sparse_kv_fraction = getattr(args, "h3_block_sparse_kv_fraction", 0.0)
         block_sparse_threshold = getattr(args, "h3_block_sparse_threshold", 0.0)
         # The runtime config rejects the same bounds, but only on the first
@@ -2830,6 +2853,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def on_train_start(self, args, accelerator, network, transformer, optimizer) -> None:
         super().on_train_start(args, accelerator, network, transformer, optimizer)
+        if getattr(args, "h3_fused_elementwise", False) and isinstance(network, torch.nn.Module):
+            # The adapters' delta add joins the single-rounding regime for factors that are not
+            # powers of two (power-of-two factors already take the fused, bit-identical path).
+            for module in network.modules():
+                if hasattr(module, "fused_scale_add"):
+                    module.fused_scale_add = True
         self._h3_profiler = None
         steps = int(getattr(args, "h3_profile_steps", 0) or 0)
         if steps <= 0:
@@ -2854,6 +2883,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
         transformer.set_gradient_checkpointing_blocks(args.h3_gradient_checkpointing_blocks)
         transformer.set_activation_cpu_offload_pin_memory(args.h3_gradient_checkpointing_cpu_offload_pin_memory)
+        checkpoint_keep = getattr(args, "h3_checkpoint_keep", "none")
+        if checkpoint_keep != "none":
+            transformer.set_checkpoint_keep(checkpoint_keep)
         fraction = getattr(args, "h3_block_sparse_kv_fraction", 0.0)
         threshold = getattr(args, "h3_block_sparse_threshold", 0.0)
         set_block_sparse = getattr(transformer, "set_block_sparse_attention", None)
@@ -2891,6 +2923,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             transformer.enable_fused_swiglu()
             if args.compile:
                 logger.warning("--h3_fused_swiglu falls back to the Inductor path inside compiled blocks")
+        if getattr(args, "h3_fused_elementwise", False):
+            transformer.enable_fused_elementwise()
         set_swiglu_chunk_rows = getattr(transformer, "set_swiglu_chunk_rows", None)
         if callable(set_swiglu_chunk_rows):
             set_swiglu_chunk_rows(getattr(args, "h3_swiglu_chunk_rows", 0))
@@ -3294,12 +3328,36 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             accelerator.print("all H3 base weights merged during model loading: " + ", ".join(base_weight_paths))
         return transformer
 
+    @staticmethod
+    def _compile_opaque_attention(args) -> bool:
+        """Whether compiled blocks call the attention kernel through the Dynamo-opaque wrapper.
+
+        ``inline`` (the default) traces the call as every --compile run did before the option
+        existed. ``auto`` hides FlashAttention (its Python binding graph-breaks inside the call,
+        which cascades into fragments around every block's kernel) and leaves SDPA traced, since
+        it stays in the graph on its own; ``fullgraph`` forbids any break, so auto never hides."""
+        mode = getattr(args, "h3_compile_attention", "inline")
+        if mode == "opaque":
+            return True
+        if mode == "inline":
+            return False
+        return not getattr(args, "sdpa", False) and not getattr(args, "compile_fullgraph", False)
+
     def compile_transformer(self, args, transformer):
         target_blocks = model_utils.resolve_compile_block_lists(transformer, ("blocks", "token_refiner.blocks"))
         count = sum(len(blocks) for blocks in target_blocks)
         logger.info("MiniMax H3: resolved %d regional torch.compile blocks", count)
         if count == 0:
             raise RuntimeError("--compile set but no H3 transformer blocks were resolved")
+        opaque = self._compile_opaque_attention(args)
+        set_opaque = getattr(transformer, "set_compile_opaque_attention", None)
+        if callable(set_opaque):
+            set_opaque(opaque)
+            logger.info(
+                "MiniMax H3: attention kernel %s to Dynamo (--h3_compile_attention %s)",
+                "opaque, one graph break per block at the kernel" if opaque else "inline, traced into the block graph",
+                getattr(args, "h3_compile_attention", "inline"),
+            )
         return model_utils.compile_transformer(
             args,
             transformer,
@@ -5224,6 +5282,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
             "ss_h3_fused_indexed_adaln": str(args.h3_fused_indexed_adaln),
             "ss_h3_fused_swiglu": str(args.h3_fused_swiglu),
+            "ss_h3_fused_elementwise": str(getattr(args, "h3_fused_elementwise", False)),
+            "ss_h3_compile_attention": str(getattr(args, "h3_compile_attention", "inline")),
             "ss_h3_swiglu_chunk_rows": str(args.h3_swiglu_chunk_rows),
             "ss_h3_int8_attention": args.h3_int8_attention,
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
@@ -5992,6 +6052,29 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h3_fused_elementwise",
+        action="store_true",
+        help=(
+            "apply the AdaLN modulation, the gated residual adds and a LoRA delta add whose factor is not a power of two "
+            "as single addcmul / add(alpha=) kernels: the product stays in the fp32 accumulator and is rounded once, so "
+            "results differ from the default two-kernel form by bf16 rounding (typically the last bit); saves about a "
+            "third of the elementwise memory traffic of a block in eager mode"
+        ),
+    )
+    parser.add_argument(
+        "--h3_compile_attention",
+        choices=("inline", "auto", "opaque"),
+        default="inline",
+        help=(
+            "with --compile, how the attention kernel call is presented to Dynamo. 'inline' (default) traces it, which "
+            "is the partitioning every existing --compile run has; 'opaque' hides it behind torch.compiler.disable so a "
+            "block compiles to exactly one graph before and one after the kernel (for FlashAttention bindings Dynamo "
+            "cannot trace, whose internal graph break otherwise cascades into unfusable fragments); 'auto' is opaque for "
+            "--flash_attn/--flash3 and inline for --sdpa and under --compile_fullgraph, which forbids any break. "
+            "Opt in after checking the compile log for graph breaks inside the attention call"
+        ),
+    )
+    parser.add_argument(
         "--h3_swiglu_chunk_rows",
         type=int,
         default=0,
@@ -6007,6 +6090,20 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "checkpoint only the last N of H3's 50 main blocks; default checkpoints all blocks. "
             "Lower values trade more VRAM for less recomputation and require resident eager blocks"
+        ),
+    )
+    parser.add_argument(
+        "--h3_checkpoint_keep",
+        choices=("none", "attention", "qkv"),
+        default="none",
+        help=(
+            "what block gradient checkpointing keeps instead of recomputing: 'attention' keeps each block's fused "
+            "attention output so the recompute skips the attention forward; 'qkv' also keeps the base QKV projection "
+            "output. Costs one (or four) rows-by-hidden activations per checkpointed block and needs a fused attention "
+            "kernel (SDPA flash/cuDNN/efficient or registered flash-attn ops); a batch that falls back to SDPA's math "
+            "backend stops with an error. Requires --gradient_checkpointing; incompatible with "
+            "--gradient_checkpointing_cpu_offload, --compile, --h3_int8_attention train, block-sparse attention, "
+            "--block_swap_granularity layer and, for 'qkv', --h3_convrot_int8_lora_fused"
         ),
     )
     parser.add_argument(
