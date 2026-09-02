@@ -3711,6 +3711,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_rollout_teacher_privilege": getattr(args, "h3_rollout_teacher_privilege", "auto") != "auto",
             "--h3_rollout_fused_teacher": bool(getattr(args, "h3_rollout_fused_teacher", False)),
             "--h3_rollout_field_floor": float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) != 0.0,
+            "--h3_rollout_field_floor_direction": getattr(args, "h3_rollout_field_floor_direction", "self") != "self",
+            "--h3_rollout_field_floor_sigma_max": float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0)) != 1.0,
         }
         if not rollout:
             for flag, changed in flags.items():
@@ -3738,6 +3740,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Gated on "> 0" below, so a negative weight would configure the floor
             # and then quietly train without it.
             raise ValueError("--h3_rollout_field_floor must be finite and non-negative; 0 disables it")
+        floor_sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
+        if not math.isfinite(floor_sigma_max) or not 0 < floor_sigma_max <= 1:
+            raise ValueError("--h3_rollout_field_floor_sigma_max must be finite and lie in (0, 1]")
+        if field_floor <= 0 and (getattr(args, "h3_rollout_field_floor_direction", "self") != "self" or floor_sigma_max != 1.0):
+            raise ValueError(
+                "--h3_rollout_field_floor_direction and --h3_rollout_field_floor_sigma_max shape the field floor and "
+                "need --h3_rollout_field_floor above 0"
+            )
         if field_floor > 0 and float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) <= 0:
             # The floor measures the student's prompted prediction against the
             # FROZEN empty branch. What inference amplifies is the gap to the
@@ -4209,6 +4219,32 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         adapted_length, adapted_valid = length(adapted)
         base_length, base_valid = length(base.detach())
         return adapted_length / base_length.clamp_min(1e-6), adapted_valid & base_valid
+
+    @staticmethod
+    def _field_projection_ratio(
+        adapted: torch.Tensor, base: torch.Tensor, direction: torch.Tensor, mask
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-sample ``<adapted, d> / (||d|| ||base||)`` over the authored elements, graph kept.
+
+        The length of the student's field measured along ``direction`` (the
+        teacher's field at the same state) against the base's plain length, so a
+        field pointing the wrong way scores short however long it is, and the
+        gradient on ``adapted`` is the unit teacher direction rather than the
+        student's own. Invalid where a sample has no authored element or either
+        reference vector vanishes.
+        """
+        flat_adapted = adapted.float().flatten(1)
+        flat_base = base.detach().float().flatten(1)
+        flat_direction = direction.detach().float().flatten(1)
+        if mask is None:
+            valid_elements = torch.ones_like(flat_base)
+        else:
+            valid_elements = mask.to(device=base.device, dtype=torch.float32).expand_as(base).flatten(1)
+        base_norm = torch.linalg.vector_norm(flat_base * valid_elements, dim=1)
+        direction_norm = torch.linalg.vector_norm(flat_direction * valid_elements, dim=1)
+        projection = (flat_adapted * flat_direction * valid_elements).sum(dim=1) / direction_norm.clamp_min(1e-6)
+        valid = (valid_elements.sum(dim=1) > 0) & (base_norm > 0) & (direction_norm > 0)
+        return projection / base_norm.clamp_min(1e-6), valid
 
     def _configured_guidance_scale(self, args, accelerator, inputs):
         """Resolve the guidance scale this step distills towards.
@@ -5248,16 +5284,32 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # student's own null in the difference, the cheapest way to lengthen
                 # the field would be to move that null, which is the degeneracy the
                 # frozen-null forms exist to remove.
-                measured = [
-                    self._field_length_ratio(
-                        student.video - base_empty.video.detach(),
-                        base_prompted.video - base_empty.video,
-                        effective_video_mask,
-                    )
-                    for (student, _teacher), (base_prompted, base_empty) in zip(rollout_pairs, rollout_bases, strict=True)
-                ]
+                # Along the student's own field ('self'), or along the teacher's
+                # field at the same state ('teacher'), where lengthening in a wrong
+                # direction earns nothing and the gradient turns the field as it
+                # lengthens it.
+                along_teacher = getattr(args, "h3_rollout_field_floor_direction", "self") == "teacher"
+                measured = []
+                for (student, teacher), (base_prompted, base_empty) in zip(rollout_pairs, rollout_bases, strict=True):
+                    empty = base_empty.video.detach()
+                    adapted_field = student.video - empty
+                    base_field = base_prompted.video - empty
+                    if along_teacher:
+                        measured.append(
+                            self._field_projection_ratio(adapted_field, base_field, teacher.video - empty, effective_video_mask)
+                        )
+                    else:
+                        measured.append(self._field_length_ratio(adapted_field, base_field, effective_video_mask))
                 ratios = torch.stack([ratio for ratio, _valid in measured])
                 valid = torch.stack([flag for _ratio, flag in measured]).to(ratios.dtype)
+                # States above the sigma ceiling drop out of the mean, like
+                # unauthored samples.
+                sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
+                if sigma_max < 1.0:
+                    in_band = torch.stack(
+                        [(sigma.reshape(-1)[:1] <= sigma_max).to(ratios.dtype).to(ratios.device) for sigma in rollout_video_sigmas]
+                    ).expand_as(valid)
+                    valid = valid * in_band
                 scored = valid.sum().clamp_min(1.0)
                 rollout_field_floor = float(args.h3_rollout_field_floor) * (torch.relu(1.0 - ratios).pow(2) * valid).sum() / scored
                 loss = loss + rollout_field_floor
@@ -5467,6 +5519,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # optimizes, and a reader comparing two runs' throughput needs it.
             "ss_h3_rollout_fused_teacher": str(bool(getattr(args, "h3_rollout_fused_teacher", False))),
             "ss_h3_rollout_field_floor": str(float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)),
+            "ss_h3_rollout_field_floor_direction": str(getattr(args, "h3_rollout_field_floor_direction", "self")),
+            "ss_h3_rollout_field_floor_sigma_max": str(float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))),
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
             "ss_h3_dop_loss_weight": str(args.h3_dop_loss_weight),
             "ss_h3_dop_probability": str(args.h3_dop_probability),
@@ -6049,6 +6103,31 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "prediction. Costs two no-grad frozen "
             "forwards per supervised sub-step (folded into the fused pass under --h3_rollout_fused_teacher). "
             "Requires --h3_rollout_supervision and a text cache built with --cache_guidance_empty. 0 disables"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_field_floor_direction",
+        choices=("self", "teacher"),
+        default="self",
+        help=(
+            "which direction the field floor measures the student's field along. 'self' (default) floors the plain "
+            "length ||g' - e||, whose gradient lengthens the field along the student's OWN current direction -- "
+            "which at a sampler state has usually drifted, so the floor lengthens the error. 'teacher' floors the "
+            "PROJECTION of the student's field onto the direction of the privileged teacher's field at the same "
+            "state, <g' - e, t> / ||t|| against ||g - e|| with t = teacher - e: lengthening along a wrong direction "
+            "earns nothing, and the gradient pulls toward the teacher's direction, so the floor lengthens and turns "
+            "the field at once. No extra forward: the teacher is already evaluated at that state"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_field_floor_sigma_max",
+        type=float,
+        default=1.0,
+        help=(
+            "apply the field floor only at supervised states whose SHIFTED video sigma is at most this value; "
+            "sub-steps above it are left out of the floor's mean. The checkpoint's implied guidance scale runs to "
+            "11-16 above sigma 0.9 where the data are nearly noise, and a floor there pushes into noise. 1.0 (default) "
+            "applies it everywhere"
         ),
     )
     parser.add_argument(

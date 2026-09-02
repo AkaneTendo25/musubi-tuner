@@ -2675,3 +2675,87 @@ def test_field_floor_warns_without_the_null_anchor(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         MiniMaxH3NetworkTrainer()._validate_rollout_args(anchored)
     assert not any("null_anchor" in record.getMessage() for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# The floor's direction and sigma ceiling
+# ---------------------------------------------------------------------------
+
+
+def test_field_projection_ratio_scores_a_misdirected_field_short():
+    base = torch.zeros(1, 4)
+    base[0, 0] = 2.0
+    teacher = torch.zeros(1, 4)
+    teacher[0, 0] = 5.0  # same direction as the base, different length
+    aligned = torch.zeros(1, 4)
+    aligned[0, 0] = 1.0
+    orthogonal = torch.zeros(1, 4)
+    orthogonal[0, 1] = 1.0
+    ratio, valid = MiniMaxH3NetworkTrainer._field_projection_ratio(aligned, base, teacher, None)
+    assert ratio.item() == pytest.approx(0.5) and valid.item()
+    ratio, valid = MiniMaxH3NetworkTrainer._field_projection_ratio(orthogonal, base, teacher, None)
+    # As long as the aligned one, and worth nothing along the teacher.
+    assert ratio.item() == pytest.approx(0.0) and valid.item()
+    # And the gradient is the unit teacher direction, not the student's own.
+    adapted = orthogonal.clone().requires_grad_(True)
+    ratio, _ = MiniMaxH3NetworkTrainer._field_projection_ratio(adapted, base, teacher, None)
+    ratio.sum().backward()
+    torch.testing.assert_close(adapted.grad, torch.tensor([[0.5, 0.0, 0.0, 0.0]]))
+
+
+def test_field_projection_ratio_is_invalid_where_a_reference_vanishes():
+    adapted = torch.ones(2, 4)
+    base = torch.ones(2, 4)
+    teacher = torch.stack([torch.ones(4), torch.zeros(4)])
+    _, valid = MiniMaxH3NetworkTrainer._field_projection_ratio(adapted, base, teacher, None)
+    assert valid.tolist() == [True, False]
+
+
+def test_teacher_direction_matches_self_on_an_aligned_stub(tmp_path):
+    """The stub field is a multiple of the ones vector for every arm, so the
+    projection onto the teacher IS the length: both directions give one number."""
+    teacher = _teacher_file(tmp_path)
+    _, self_loss, self_metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+    _, teacher_loss, teacher_metrics, _ = _run_step(*_FLOOR_FLAGS, "--h3_rollout_field_floor_direction", "teacher", teacher=teacher)
+    assert teacher_metrics["h3/rollout_field_ratio"] == pytest.approx(self_metrics["h3/rollout_field_ratio"])
+    assert float(teacher_loss.detach()) == pytest.approx(float(self_loss.detach()))
+    teacher_loss.backward()
+
+
+def test_field_floor_sigma_ceiling_drops_the_states_above_it(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    # A rollout state sits at a shifted video sigma near 1; a ceiling of 0.05 leaves
+    # nothing to score, so the floor is zero and the ratio reports zero.
+    _, loss, metrics, _ = _run_step(*_FLOOR_FLAGS, "--h3_rollout_field_floor_sigma_max", "0.05", teacher=teacher)
+    _, plain_loss, _, _ = _run_step(*_ROLLOUT_FLAGS, teacher=teacher)
+    assert metrics["loss/rollout_field_floor"] == 0.0
+    assert metrics["h3/rollout_field_ratio"] == 0.0
+    assert float(loss.detach()) == pytest.approx(float(plain_loss.detach()))
+
+
+def test_field_floor_shape_flags_require_the_floor(tmp_path):
+    for flag in (("--h3_rollout_field_floor_direction", "teacher"), ("--h3_rollout_field_floor_sigma_max", "0.9")):
+        args = _flag_args(*_ROLLOUT_FLAGS, *flag, teacher=_teacher_file(tmp_path))
+        with pytest.raises(ValueError, match="need --h3_rollout_field_floor above 0"):
+            MiniMaxH3NetworkTrainer()._validate_rollout_args(args)
+    with pytest.raises(ValueError, match="requires --h3_rollout_supervision"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(_flag_args("--h3_rollout_field_floor_direction", "teacher"))
+    bad = _flag_args(*_FLOOR_FLAGS, "--h3_rollout_field_floor_sigma_max", "0", teacher=_teacher_file(tmp_path))
+    with pytest.raises(ValueError, match="sigma_max"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(bad)
+
+
+def test_field_floor_shape_is_recorded_in_adapter_metadata(tmp_path):
+    args = _flag_args(
+        *_FLOOR_FLAGS,
+        "--h3_rollout_field_floor_direction",
+        "teacher",
+        "--h3_rollout_field_floor_sigma_max",
+        "0.9",
+        teacher=_teacher_file(tmp_path),
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    metadata = trainer.extra_metadata(args)
+    assert metadata["ss_h3_rollout_field_floor_direction"] == "teacher"
+    assert metadata["ss_h3_rollout_field_floor_sigma_max"] == "0.9"

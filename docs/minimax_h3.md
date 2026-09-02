@@ -1008,7 +1008,8 @@ learned, and ordinary training shortens it. `--h3_rollout_field_floor W` (requir
 proxy of it: at every supervised state the frozen base's prompted prediction `g` and empty prediction `e` are evaluated
 alongside the student's prompted prediction `g'`, and the step adds `W * relu(1 - ‖g' - e‖ / ‖g - e‖)^2`, averaged over the
 window's authored samples. A displacement no shorter than the checkpoint's field costs nothing; a shorter one is pushed
-longer along its own current direction, so the term never chooses where the field points.
+longer. In the default `self` mode that push is along the field's own current direction, so the term never chooses where
+the field points; the `teacher` mode below borrows the teacher's direction instead.
 
 Both lengths are taken against the **frozen** empty branch on purpose: with the student's own null in the difference, the
 cheapest way to lengthen the field would be to move that null, which is the degeneracy the frozen-null forms remove. The
@@ -1018,9 +1019,19 @@ reports. Nothing in the floor stops `e'` from drifting toward `g'`; `--h3_guidan
 `e`, and the trainer warns when the floor is configured without it. With the anchor the two gaps coincide up to the anchor's
 residual; without it the floor is a displacement floor on the prompted branch alone.
 
+The direction the length is measured along is a choice. `--h3_rollout_field_floor_direction self` (default) floors the
+plain length, and its gradient is the unit vector of the student's own field: at a sampler state that direction has
+usually drifted, so the floor lengthens the error, which is what the first arm showed (field length 0.96 at step 500 with
+the fit standing still). `teacher` floors the projection of the student's field onto the direction of the privileged
+teacher's field at the same state, `<g' - e, t> / ‖t‖` against `‖g - e‖` with `t = teacher - e`: a field pointing the
+wrong way scores short however long it is, and the gradient is the teacher's unit direction, so the term lengthens and
+turns the field at once. The teacher is already evaluated at that state, so this costs nothing further.
+`--h3_rollout_field_floor_sigma_max` keeps the floor off the top of the schedule, where the checkpoint's implied guidance
+scale runs to 11-16 and the data are nearly noise.
+
 Costs two no-gradient frozen forwards per supervised state, folded into the fused pass under `--h3_rollout_fused_teacher`.
 Requires a student text cache built with `--cache_guidance_empty`. Reported as `loss/rollout_field_floor` and, as the mean
-length ratio over the step's scored samples, `h3/rollout_field_ratio`; the averaged loss excludes the term. Experimental:
+ratio over the step's scored samples, `h3/rollout_field_ratio`; the averaged loss excludes the term. Experimental:
 judge it by `val/rollout/field_cos`, `val/drift/prompted_rel` and blind renders rather than by `val/rollout/field`, whose
 length it directly pushes on when the anchor holds.
 
@@ -1375,7 +1386,9 @@ Every objective here is off unless its flag is given, and a run without them tra
 | `--h3_rollout_teacher_privilege {auto,qwen,reference,keyframe,caption}` | `auto` (default) reads the caches and resolves the channel. Every channel is a difference between the teacher's cache and the student's for the same item: a teacher whose Qwen assets or endpoint task the student also carries is not privileged. Only the resolved channel's presentation reaches the teacher, so pin one to measure a particular channel on a corpus that carries several. |
 | `--h3_rollout_stop_shifted` | Draw the stop sigma uniformly on the shifted video schedule instead of the shared unshifted one. Video and audio stay synchronized either way. |
 | `--h3_rollout_fused_teacher` | Compute the student and teacher predictions for one supervised state in a single pass over the blocks, so each swapped block is streamed once per state instead of once per arm. May increase transient memory. Rejected together with `--h3_int8_attention aux` and with block-sparse attention (`--h3_block_sparse_kv_fraction` or `--h3_block_sparse_threshold` above `0`), whose per-sequence attention plan the fused pass cannot keep separate per arm. |
-| `--h3_rollout_field_floor 0.0` | Experimental. Length floor on a frozen-null proxy of the guidance field at the supervised rollout states: `W * relu(1 - ‖g' - e‖ / ‖g - e‖)^2` with the frozen base's prompted `g` and empty `e` and the student's prompted `g'` at the same state. Holds `‖g' - e‖` at no less than the checkpoint's field length and leaves the direction to the teacher term; it does not bound the gap to the student's own empty branch, so pair it with `--h3_guidance_null_anchor_weight`. Requires `--h3_rollout_supervision` and `--cache_guidance_empty`; two extra no-gradient frozen forwards per supervised state. `0` disables. See [Field length floor](#field-length-floor). |
+| `--h3_rollout_field_floor 0.0` | Experimental. Length floor on a frozen-null proxy of the guidance field at the supervised rollout states: `W * relu(1 - ‖g' - e‖ / ‖g - e‖)^2` with the frozen base's prompted `g` and empty `e` and the student's prompted `g'` at the same state. In the default `self` mode holds `‖g' - e‖` at no less than the checkpoint's field length and leaves the direction to the teacher term (see `--h3_rollout_field_floor_direction`); it does not bound the gap to the student's own empty branch, so pair it with `--h3_guidance_null_anchor_weight`. Requires `--h3_rollout_supervision` and `--cache_guidance_empty`; two extra no-gradient frozen forwards per supervised state. `0` disables. See [Field length floor](#field-length-floor). |
+| `--h3_rollout_field_floor_direction {self,teacher}` | Which direction the floor measures the student's field along. `self` (default) floors the plain length, whose gradient lengthens the field along the student's own current direction. `teacher` floors the projection of the student's field onto the privileged teacher's field at the same state, so lengthening in a wrong direction earns nothing and the gradient turns the field toward the teacher as it lengthens it. No extra forward. Needs the floor above `0`. |
+| `--h3_rollout_field_floor_sigma_max 1.0` | Apply the floor only at supervised states whose shifted video sigma is at most this value; states above it drop out of the floor's mean. Needs the floor above `0`. |
 | `--h3_dop_loss_weight 0.0` | Differential Output Preservation, off at the default: penalizes LoRA drift from the frozen base under a trigger-free rewrite of each caption. |
 | `--h3_dop_probability 1.0` | Evaluate DOP on a synchronized random fraction of prompt-conditioned batches and inverse-probability scale its loss. |
 | `--crepa` | Temporal representation alignment for video training. |
