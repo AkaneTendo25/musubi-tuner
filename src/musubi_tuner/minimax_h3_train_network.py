@@ -857,6 +857,20 @@ def _anchor_probability(args) -> float:
     return 1.0 if value is None else float(value)
 
 
+def _null_anchor_weight_at(args, global_step: int) -> float:
+    """The data-step null anchor's weight at this step: the configured weight, or a
+    linear ramp from it to --h3_guidance_null_anchor_weight_end over --max_train_steps
+    when an end value is given. The ramp reaches its end at the last step and stays
+    there past it."""
+    start = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0)
+    end = getattr(args, "h3_guidance_null_anchor_weight_end", None)
+    if end is None:
+        return start
+    total = max(1, int(getattr(args, "max_train_steps", 0) or 0))
+    fraction = min(1.0, max(0.0, float(global_step) / float(total)))
+    return start + (float(end) - start) * fraction
+
+
 def _apply_timestep_focus(base: torch.Tensor, low: float, high: float, probability: float) -> torch.Tensor:
     """Map one uniform draw to a uniform/background mixture without another RNG draw."""
     if probability <= 0.0:
@@ -2958,6 +2972,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Every gate on this feature reads "> 0", so a negative weight would
             # configure the anchor and then quietly train without it.
             raise ValueError("--h3_guidance_null_anchor_weight must be finite and non-negative; 0 disables it")
+        anchor_end = getattr(args, "h3_guidance_null_anchor_weight_end", None)
+        if anchor_end is not None:
+            if not math.isfinite(float(anchor_end)) or float(anchor_end) < 0:
+                raise ValueError("--h3_guidance_null_anchor_weight_end must be finite and non-negative")
+            if anchor_weight <= 0:
+                raise ValueError(
+                    "--h3_guidance_null_anchor_weight_end ramps the anchor and needs --h3_guidance_null_anchor_weight above 0"
+                )
         anchor_probability = _anchor_probability(args)
         if not math.isfinite(anchor_probability) or not 0 < anchor_probability <= 1:
             raise ValueError("--h3_guidance_null_anchor_probability must be finite and lie in (0, 1]")
@@ -6191,8 +6213,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if null_anchor_student is not None and null_anchor_reference is not None:
             # A sparse anchor is an estimator of the dense one: the active term is
             # divided by its probability so the expected gradient is unchanged.
+            scheduled_anchor_weight = _null_anchor_weight_at(args, global_step)
             null_anchor = (
-                float(args.h3_guidance_null_anchor_weight)
+                scheduled_anchor_weight
                 / null_anchor_probability
                 * joint_prediction_loss(
                     null_anchor_student,
@@ -6209,6 +6232,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
             loss = loss + null_anchor
             metrics["loss/guidance_null_anchor"] = float(null_anchor.detach())
+            if getattr(args, "h3_guidance_null_anchor_weight_end", None) is not None:
+                metrics["h3/null_anchor_weight"] = scheduled_anchor_weight
         elif float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0:
             # Present every step once the flag is on, so a run whose anchor never fired
             # is visible as a flat zero rather than as a missing tag nobody looks for.
@@ -6442,6 +6467,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_guidance_null_anchor_weight": str(getattr(args, "h3_guidance_null_anchor_weight", 0.0)),
+            "ss_h3_guidance_null_anchor_weight_end": str(getattr(args, "h3_guidance_null_anchor_weight_end", None)),
             "ss_h3_guidance_null_anchor_probability": str(_anchor_probability(args)),
             "ss_h3_rollout_supervision": str(bool(getattr(args, "h3_rollout_supervision", False))),
             "ss_h3_rollout_probability": str(args.h3_rollout_probability),
@@ -7285,6 +7311,17 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "sub-steps above it are left out of the floor's mean. The checkpoint's implied guidance scale runs to "
             "11-16 above sigma 0.9 where the data are nearly noise, and a floor there pushes into noise. 1.0 (default) "
             "applies it everywhere"
+        ),
+    )
+    parser.add_argument(
+        "--h3_guidance_null_anchor_weight_end",
+        type=float,
+        default=None,
+        help=(
+            "DEBUG. Ramp the data-step null anchor's weight linearly from --h3_guidance_null_anchor_weight at step 0 "
+            "to this value at --max_train_steps (constant after). A strong anchor early holds the empty branch while "
+            "training is noisiest; a weaker one late lets a weakly conditioned concept (a trigger word) settle. "
+            "Reports h3/null_anchor_weight. Needs the start weight above 0; the rollout-state anchor is not ramped"
         ),
     )
     parser.add_argument(

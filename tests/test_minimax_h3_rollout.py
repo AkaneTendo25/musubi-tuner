@@ -3718,3 +3718,23 @@ def test_teacher_magnitude_term_uses_the_direction_terms_reduction(tmp_path):
     assert ratio_magnitude == pytest.approx((2.0 / 3.0) / (1.0 / 2.0), rel=1e-4)
     # The raw video mean the metric reports is unweighted and does not move.
     assert two["loss/rollout_video"] == pytest.approx(one["loss/rollout_video"])
+
+
+def test_null_anchor_weight_ramps_linearly_to_the_end_value():
+    from musubi_tuner.minimax_h3_train_network import _null_anchor_weight_at
+
+    args = _flag_args(
+        "--h3_guidance_null_anchor_weight", "1.0", "--h3_guidance_null_anchor_weight_end", "0.2", "--max_train_steps", "1000"
+    )
+    assert _null_anchor_weight_at(args, 0) == pytest.approx(1.0)
+    assert _null_anchor_weight_at(args, 500) == pytest.approx(0.6)
+    assert _null_anchor_weight_at(args, 1000) == pytest.approx(0.2)
+    assert _null_anchor_weight_at(args, 5000) == pytest.approx(0.2)
+    plain = _flag_args("--h3_guidance_null_anchor_weight", "0.7")
+    assert _null_anchor_weight_at(plain, 999) == pytest.approx(0.7)
+
+
+def test_null_anchor_weight_end_needs_a_start_weight():
+    args = _flag_args("--h3_guidance_null_anchor_weight_end", "0.2")
+    with pytest.raises(ValueError, match="needs --h3_guidance_null_anchor_weight above 0"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
