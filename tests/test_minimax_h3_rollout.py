@@ -3569,3 +3569,152 @@ def test_term_gradients_are_skipped_under_block_swap(tmp_path, caplog):
         )
     assert not [k for k in metrics if k.startswith("h3/grad/")]
     assert any("blocks_to_swap 0" in r.getMessage() for r in caplog.records)
+
+
+_DIRECTION_FLAGS = (*_FLOOR_FLAGS, "--h3_rollout_teacher_magnitude_weight", "0")
+
+
+def test_teacher_magnitude_weight_needs_the_floor(tmp_path):
+    args = _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_teacher_magnitude_weight", "0", teacher=_teacher_file(tmp_path))
+    with pytest.raises(ValueError, match="needs --h3_rollout_field_floor"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(args)
+
+
+def test_teacher_magnitude_weight_must_lie_in_the_unit_interval(tmp_path):
+    args = _flag_args(*_FLOOR_FLAGS, "--h3_rollout_teacher_magnitude_weight", "1.5", teacher=_teacher_file(tmp_path))
+    with pytest.raises(ValueError, match="must lie in"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(args)
+
+
+def test_teacher_magnitude_weight_one_is_the_old_objective(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, plain_loss, plain_metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+    _, same_loss, metrics, _ = _run_step(*_FLOOR_FLAGS, "--h3_rollout_teacher_magnitude_weight", "1.0", teacher=teacher)
+    assert float(same_loss.detach()) == pytest.approx(float(plain_loss.detach()))
+    assert "loss/rollout_teacher_magnitude" not in metrics and "loss/rollout_teacher_magnitude" not in plain_metrics
+
+
+def test_directed_field_residual_is_invariant_to_the_field_length():
+    """Scaling the student's field by any factor leaves the directed prediction
+    unchanged, so the residual against the teacher carries no gradient on the
+    length; the length gap and the ratio see the scaling."""
+    torch.manual_seed(0)
+    empty = torch.randn(2, 3, 4, 5)
+    teacher = empty + torch.randn(2, 3, 4, 5)
+    field = torch.randn(2, 3, 4, 5)
+    mask = torch.ones(2, 1, 4, 5)
+    mask[1, :, :2] = 0.0
+    factor = torch.tensor(2.5, requires_grad=True)
+    student = empty + field * factor
+    directed, gap, valid, ratio, scored = MiniMaxH3NetworkTrainer._directed_field_residual(student, teacher, empty, mask)
+    reference, _, _, unit_ratio, _ = MiniMaxH3NetworkTrainer._directed_field_residual(empty + field, teacher, empty, mask)
+    assert torch.allclose(directed, reference, atol=1e-5)
+    assert bool(valid.all()) and bool(scored.all())
+    assert torch.allclose(ratio, unit_ratio * 2.5, rtol=1e-4)
+    residual = ((directed - teacher) * mask).pow(2).sum()
+    (grad,) = torch.autograd.grad(residual, factor, retain_graph=True)
+    assert abs(float(grad)) < 1e-4
+    (gap_grad,) = torch.autograd.grad(gap.sum(), factor)
+    assert abs(float(gap_grad)) > 1e-3
+
+
+def test_direction_only_teacher_term_leaves_the_floor_alone_and_changes_the_length_gradient(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, whole_loss, whole_metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+    _, directed_loss, metrics, _ = _run_step(*_DIRECTION_FLAGS, teacher=teacher)
+    assert metrics["loss/rollout_teacher_magnitude"] == 0.0
+    assert metrics["h3/rollout_teacher_length_ratio"] > 0
+    # The floor measures the student's actual field, not the rescaled one.
+    assert metrics["loss/rollout_field_floor"] == pytest.approx(whole_metrics["loss/rollout_field_floor"])
+    assert metrics["h3/rollout_field_ratio"] == pytest.approx(whole_metrics["h3/rollout_field_ratio"])
+    (whole_scale,) = _graph_parameters(whole_loss)
+    (directed_scale,) = _graph_parameters(directed_loss)
+    whole_loss.backward()
+    directed_loss.backward()
+    # With the stub the scale IS the field length; removing the teacher's pull on
+    # it changes the gradient, in the direction opposite to that pull (the stub
+    # teacher's field is longer than the student's, so the whole match pulled up).
+    assert float(directed_scale.grad) != pytest.approx(float(whole_scale.grad))
+    assert float(directed_scale.grad) > float(whole_scale.grad)
+
+
+def test_teacher_magnitude_weight_adds_the_length_gap(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, zero_loss, zero_metrics, _ = _run_step(*_DIRECTION_FLAGS, teacher=teacher)
+    _, half_loss, half_metrics, _ = _run_step(*_FLOOR_FLAGS, "--h3_rollout_teacher_magnitude_weight", "0.5", teacher=teacher)
+    assert half_metrics["loss/rollout_teacher_magnitude"] > 0
+    assert float(half_loss.detach()) == pytest.approx(float(zero_loss.detach()) + half_metrics["loss/rollout_teacher_magnitude"])
+    assert half_metrics["h3/rollout_teacher_length_ratio"] == pytest.approx(zero_metrics["h3/rollout_teacher_length_ratio"])
+
+
+@pytest.mark.parametrize("balance", ["token", "modality"])
+@pytest.mark.parametrize("normalization", ["weighted", "full"])
+def test_direction_only_joint_term_has_no_radial_gradient_under_every_reduction(balance, normalization):
+    """The directed student fed to ``joint_prediction_loss`` (with an audio half, a
+    soft mask and a sample weight) is flat in the student's field length."""
+    from musubi_tuner.minimax_h3.training import joint_prediction_loss
+
+    torch.manual_seed(1)
+    empty = torch.randn(2, 3, 4, 5)
+    teacher = empty + torch.randn(2, 3, 4, 5)
+    field = torch.randn(2, 3, 4, 5)
+    mask = torch.rand(2, 3, 4, 5)  # a soft, full-shape mask
+    factor = torch.tensor(0.4, requires_grad=True)
+    student = empty + field * factor
+    directed, *_ = MiniMaxH3NetworkTrainer._directed_field_residual(student, teacher, empty, mask)
+    audio = torch.randn(2, 6, 7)
+    loss = joint_prediction_loss(
+        H3ModelPrediction(video=directed, audio=audio),
+        H3ModelPrediction(video=teacher, audio=torch.randn(2, 6, 7)),
+        video_mask=mask,
+        video_sample_weight=torch.tensor([0.5, 2.0]),
+        balance=balance,
+        mask_normalization=normalization,
+    ).loss
+    (grad,) = torch.autograd.grad(loss, factor)
+    assert abs(float(grad)) < 1e-4
+
+
+def test_directed_field_residual_scores_the_length_gap_but_not_the_direction_of_a_zero_field():
+    empty = torch.zeros(2, 3, 4, 5)
+    teacher = empty + torch.ones(2, 3, 4, 5)
+    student = empty.clone()  # zero field: no direction
+    directed, gap, authored, ratio, scored = MiniMaxH3NetworkTrainer._directed_field_residual(student, teacher, empty, None)
+    assert bool(authored.all()) and not bool(scored.any())
+    assert torch.equal(directed, teacher)  # the direction residual is zero there
+    assert torch.allclose(gap, torch.ones(2))  # the length gap is still seen
+    assert torch.allclose(ratio, torch.ones(2))  # and reported as neutral
+
+
+def test_teacher_magnitude_weight_is_rejected_without_rollout_supervision():
+    with pytest.raises(ValueError, match="requires --h3_rollout_supervision"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(
+            _flag_args("--h3_rollout_teacher_magnitude_weight", "0", "--h3_rollout_field_floor", "0.3")
+        )
+
+
+def test_teacher_magnitude_term_uses_the_direction_terms_reduction(tmp_path):
+    """Under modality balance with an audio half present, the magnitude term carries
+    the direction term's video share: doubling the video loss weight at a fixed
+    audio weight scales it by (2/3) / (1/2)."""
+    teacher = _teacher_file(tmp_path)
+    _, _, one, _ = _run_step(
+        *_FLOOR_FLAGS, "--h3_rollout_teacher_magnitude_weight", "0.5", "--h3_loss_balance", "modality", teacher=teacher
+    )
+    _, _, two, _ = _run_step(
+        *_FLOOR_FLAGS,
+        "--h3_rollout_teacher_magnitude_weight",
+        "0.5",
+        "--h3_loss_balance",
+        "modality",
+        "--h3_video_loss_weight",
+        "2.0",
+        teacher=teacher,
+    )
+    assert one["loss/rollout_teacher_magnitude"] > 0
+    # The stub batch carries audio, so under modality balance the video share is
+    # w_v / (w_v + w_a): 1/2 at the defaults, 2/3 with the video weight doubled.
+    ratio_magnitude = two["loss/rollout_teacher_magnitude"] / one["loss/rollout_teacher_magnitude"]
+    assert ratio_magnitude == pytest.approx((2.0 / 3.0) / (1.0 / 2.0), rel=1e-4)
+    # The raw video mean the metric reports is unweighted and does not move.
+    assert two["loss/rollout_video"] == pytest.approx(one["loss/rollout_video"])

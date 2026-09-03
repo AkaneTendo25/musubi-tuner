@@ -39,6 +39,7 @@ Two released transformers, with different conditioning contracts:
   - [Optimizers](#optimizers)
   - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
   - [Rollout supervision](#rollout-supervision)
+  - [Current recommended settings](#current-recommended-settings)
   - [Full-parameter BF16 training](#full-parameter-bf16-training)
   - [Saving and resuming](#saving-and-resuming)
   - [Key options](#key-options)
@@ -729,21 +730,10 @@ regex network arguments; those patterns are matched against complete module path
 an exception to exclusions rather than a universal standalone allow-list.
 
 NoRA (Normalized Low-Rank Adaptation, [Kang et al. 2026, arXiv:2608.31036](https://arxiv.org/abs/2608.31036)) is available
-through `--network_args`. It keeps every column of `lora_down` (one rank-length vector per input feature) at unit norm, so
-`lora_down` carries directions and all magnitude lives in `lora_up`; set `--network_alpha` equal to `--network_dim` (scaling 1),
-which the paper assumes and the trainer warns about otherwise.
-
-| `--network_args` value | Behaviour |
-| --- | --- |
-| `nora=off` (default) | Plain LoRA, bit-identical to a run without the argument. |
-| `nora=forward` | `lora_down` is re-normalised on every forward and gradients flow through the normalisation. The saved adapter stores the normalised `lora_down`, so it is an ordinary LoRA whose `lora_up @ lora_down` is the training-time delta up to the save dtype's rounding (exact in fp32; bf16 shifts column norms by about 1e-3); it merges and infers without NoRA code, and `--network_weights` from such a file re-normalises to the same delta. |
-| `nora=init` | `lora_down` is normalised once after initialisation and trained as an ordinary parameter afterwards. |
-| `init=bimi` | Block-identity initialisation: `lora_down` is `r x r` identity blocks tiled along the input axis (columns orthonormal within each `r x r` block and repeated across blocks; the last block is truncated when the input size is not a multiple of `r`), `lora_up` is zero. Combine with `nora=forward` or `nora=init`. |
-
-The normalisation runs over the rank axis, so `conv_dim` adapters on convolutions get the same per-column treatment over their
-flattened input dims. Loading an adapter that was not saved by a NoRA run into a `nora=` run logs a warning because its column
-norms are not unit; with `nora=forward` its delta would change. Resume states (`--save_state`) keep the raw parameters the
-optimizer moments belong to; only the adapter `.safetensors` is normalised.
+through `--network_args`: `nora=forward` keeps every column of `lora_down` at unit norm on each forward (the saved adapter is an
+ordinary LoRA and needs no NoRA code to merge or infer), `nora=init` normalises once at initialisation, and `init=bimi` gives
+`lora_down` a block-identity start; set `--network_alpha` equal to `--network_dim`. Default `nora=off` is bit-identical to a
+run without the argument.
 
 LoHa/LoKr are unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally
 `--compile_auto_cache_size_limit`, `--compile_fallback_to_eager`, or `--inductor_config KEY=VALUE ...`. GPU compilation requires
@@ -904,202 +894,243 @@ training evaluates every value in `sample_slider_range`.
 
 ### Training a guidance-distilled model
 
-H3 is guidance-distilled. Direct LoRA training does not explicitly constrain the adapter to retain the base model's
-CFG-free prediction. Four optional strategies expose different constraints:
+The released H3 checkpoints are guidance-distilled: one prompted forward returns the prediction that an undistilled
+model would produce with classifier-free guidance, i.e. the empty-prompt prediction plus a scale times the
+difference between the prompted and empty-prompt predictions. The flow-matching loss does not model this. Its
+minimum is the un-amplified conditional prediction, so fine-tuning with the plain loss moves the model toward that
+minimum and removes the built-in amplification. The training loss decreases while prompt adherence, contrast and
+detail in the generated output degrade.
 
-1. **The guidance-distillation objective, currently the recommended starting point for FL2VA.**
-   `--h3_guidance_distillation_scale 3.5 --h3_guidance_loss_form contrastive` supervises the adapter against an
-   extrapolated guided target built from the cached empty-text branch instead of against the raw data velocity, so the
-   prompted-to-empty field the distilled checkpoint carries is part of what is optimized rather than something the data
-   loss quietly erodes. It costs one extra no-gradient forward over the packed sequence; see the flag table below for the
-   scale range, the sparse variant and the schedules. Requires the empty-text cache
-   (`--cache_guidance_empty` at caching time).
-2. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base. Add
-   `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with inverse-probability loss scaling.
-3. `--h3_rollout_supervision` supervises the adapter at states its own sampler reaches, against a privileged teacher — see
-   [Rollout supervision](#rollout-supervision). It needs a second dataset config and is the most expensive of the four.
-4. If a compatible de-distillation training adapter is provided, load it through `--base_weights` while training the concept
-   LoRA, then remove it for inference. Adapters are checkpoint-specific: the Ref2VA checkpoint needs its own adapter, not one
-   made for FL2VA. Community examples:
-   * [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter) publishes one for each
-     checkpoint — `minimax_h3_training_adapter_v1.safetensors` for **FL2VA** and
-     `minimax_h3_ref2va_training_adapter_v1.safetensors` for **Ref2VA** (the repository carries no model card, so the
-     targets are read off the file names; an earlier `minimax_h3_training_adapter_alpha.safetensors` is also present).
-   * [DiffSynth-Studio/MiniMax-H3-TrainingAdapter](https://modelscope.ai/models/DiffSynth-Studio/MiniMax-H3-TrainingAdapter)
-     on ModelScope, for **FL2VA**, trained by DiffSynth-Studio's differential-LoRA recipe.
+The methods below keep the frozen checkpoint in the objective so that the amplification is preserved. Each entry
+gives a short description, advantages, disadvantages, the step cost relative to a plain LoRA step, and the flags
+that enable it. The current recommended settings for the two checkpoints close the section.
 
-   Community adapters are renamed on load, so a file published in PEFT naming
-   (`blocks.N.….lora_A.weight`, with or without an adapter name such as `.default`, and with or without a
-   `diffusion_model.` / `transformer.` prefix) can be passed to `--base_weights` as downloaded. A file reaching modules this
-   network does not adapt is rejected rather than trimmed.
+Terms: the *field* is the difference between the prompted and the empty-prompt prediction, the quantity the
+distilled amplification scales. *Field length* is its norm; *field direction* is its orientation. The *null branch*
+is the empty-prompt prediction. Costs are approximate step-time ratios against a plain LoRA step.
 
-For concept LoRA training over a de-distillation adapter, sparse preservation can provide an additional anchor, but the two
-objectives are not equivalent: preservation retains the loaded base's predictions, while a de-distillation adapter changes them.
-The adapter remains loaded only during LoRA training; validate the resulting concept LoRA against stock H3.
+#### Methods
 
-The training adapter approximates the undistilled model. Validate short runs and check samples again after removing it.
+##### Plain LoRA
 
-### Rollout supervision
+LoRA training with the unmodified flow-matching loss. No term references the frozen checkpoint, and the field length
+decreases to a fraction of the checkpoint's during the first few hundred steps.
 
-The ordinary objective supervises the model at states built from data. `--h3_rollout_supervision` instead runs the adapter's
-own sampler from noise for a few no-gradient Euler steps and supervises the model at the state it reaches, against a frozen
-teacher evaluated there.
+- **Advantages:** lowest cost; fastest concept acquisition.
+- **Disadvantages:** removes the distilled amplification. Output quality is below the base model's at the training
+  resolution and length. Cost **1x** (the reference for the ratios below).
+- **Flags:** none.
 
-The teacher is the same frozen checkpoint, privileged rather than larger: a second dataset whose cache carries information
-about the target clip that the student's cache does not. Four channels are recognized, and `auto` picks whichever the caches
-contain:
+##### De-distilling adapter (`--base_weights`)
 
-| Channel | The teacher's cache carries | Available in |
-| --- | --- | --- |
-| `reference` | extra frames of the target clip declared as references | Ref2VA |
-| `keyframe` | the clip's own first and/or last frames as conditioning | FL2VA, I2VA, L2VA |
-| `qwen` | frames of the target clip attached as `qwen_control_*` visuals | any mode |
-| `caption` | a longer or more detailed caption for the same clip | any mode |
+A separately trained adapter is merged into the frozen base for the duration of training so that the training base
+approximates an undistilled model. Only the training base changes; at inference the LoRA is applied to the stock
+checkpoint without the adapter and without an extra forward.
 
-Both datasets must name the same clips; everything the chosen channel does not carry must match, and only the privileged
-field itself may differ. A teacher that does not extend the student is rejected before the model loads rather than training
-on a meaningless target.
+- **Advantages:** no change to the training loop or to inference; combines with any objective.
+- **Disadvantages:** the adapter approximates the undistilled model, and its error enters the LoRA; an adapter must
+  exist for the checkpoint in use. Cost about **1x**.
+- **Flags:** `--base_weights adapter.safetensors` (repeatable), `--base_weights_multiplier`; optionally
+  `--h3_base_preservation_loss_weight` and `--h3_base_preservation_probability` to add a preservation term against
+  the base on a fraction of steps.
 
-#### Building the teacher dataset
+##### Contrastive guidance loss
 
-Copy the training config, point it at a separate `cache_directory`, and add the privileged field. On the reference channel
-that means more references per clip — the student's source directory holds one image per target, the teacher's holds
-several, including frames taken from inside the target itself:
+Each step additionally evaluates the model with the empty prompt, and the training target is rewritten as the
+empty-prompt prediction plus S times the offset from it to the data velocity. The empty-prompt prediction is the
+student's own and changes during training.
 
-```toml
-[[datasets]]
-target_video_directory = "/data/targets"
-target_modalities = ["video"]
-source_image_directory = "/data/references_teacher"   # the student's: /data/references
-source_modalities = ["image"]
-cache_directory = "/data/cache/ref2va_teacher"        # separate, or the two caches collide
-target_frames = [124]
-```
+- **Advantages:** one extra forward; no second dataset; maintains field length to a useful degree.
+- **Disadvantages:** the reference point moves with the student, so the field can shorten or rotate while the loss
+  is satisfied; S must be measured per checkpoint. Cost **1.4x to 1.6x**.
+- **Flags:** `--h3_guidance_distillation_scale S`, `--h3_guidance_loss_form contrastive`; optionally
+  `--h3_guidance_loss_schedule {sigma,constant}`, `--h3_guidance_distillation_probability`,
+  `--h3_guidance_audio_scale`, `--h3_guidance_cfg_zero`, `--h3_guidance_scale_range`. Requires a text cache built
+  with `--cache_guidance_empty`.
 
-Cache it with the same two commands the training set uses, pointed at this config, and with **identical** sizing options:
-reference sizing is part of the cache key, so a mismatch fails with a missing-key error.
+##### Frozen-null target with the null anchor
 
-When the teacher's privilege is the caption or the clip's own keyframes, its target latents are the student's latents.
-Do not encode them twice: point the teacher at the student's latent cache with `latent_cache_directory` and keep its own
-`cache_directory` for the text-encoder outputs, which differ. The latent-cache command then skips every existing file under
-`--skip_existing` and never purges a borrowed directory; only the text-cache command does real work.
+The contrastive target with a fixed reference point: the empty-prompt prediction is taken from the frozen
+checkpoint, the target is normalised against it, and an anchor term penalises the distance between the student's
+empty-prompt prediction and the frozen one.
+
+- **Advantages:** the most effective single term for preserving the field; the anchor gradient is close to
+  orthogonal to the data gradient.
+- **Disadvantages:** with anchor weight 1.0 and a weak condition (a single trigger word) the concept may not be
+  learned; reduce the anchor weight for weakly conditioned tasks. Cost about **1.8x** on its own.
+- **Flags:** `--h3_guidance_loss_form normalized`, `--h3_guidance_null_source frozen`,
+  `--h3_guidance_null_anchor_weight W`; optionally `--h3_guidance_null_anchor_probability`,
+  `--h3_guidance_loss_schedule constant`, `--h3_caption_dropout_rate 0` (dropout trains the branch the anchor
+  holds), `--h3_fuse_frozen_teachers` to batch the frozen forwards.
+
+##### Rollout supervision
+
+The student runs its own sampler for a few steps from noise and is supervised at the resulting states against the
+frozen checkpoint evaluated with information the student does not receive: the clip's reference or keyframe, or a
+richer caption. This is the on-policy distillation objective of D-OPSD. On its own it underperforms the mixtures
+below; in practice it runs on a fraction of the steps and one of the guidance targets runs on the rest.
+
+- **Hybrid D-OPSD:** rollout supervision on half the steps and the contrastive target on the other half. On FL2VA it
+  learns a style while matching the base model's output quality.
+- **Advantages:** supervises the states the sampler visits; corrects field direction; the teacher is the same
+  checkpoint.
+- **Disadvantages:** requires a second cached dataset for the teacher; the teacher must receive information the
+  student does not (the trainer rejects a teacher whose conditioning the student also has); the teacher predicts
+  with less amplification than the checkpoint, so field length still decreases unless the floor below is added.
+  Cost **1.9x** on FL2VA and **5x to 7x** on Ref2VA, where the teacher input includes reference frames.
+- **Flags:** `--h3_rollout_supervision`, `--h3_rollout_teacher_config teacher.toml`,
+  `--h3_rollout_teacher_privilege {auto,reference,keyframe,caption,qwen}`, `--h3_rollout_probability`
+  (default 0.5), `--h3_rollout_steps` (default 2), `--h3_rollout_window` (default 1), `--h3_rollout_fused_teacher`
+  (evaluates all frozen arms in one pass; recommended); optionally `--h3_rollout_prefix`, `--h3_rollout_stop_min`,
+  `--h3_rollout_stop_shifted`, `--h3_rollout_null_anchor_weight`.
+
+###### Building the teacher dataset
+
+Copy the training dataset config, add the privileged field, and give it its own `cache_directory`. On the reference
+channel the teacher's source directory holds more references per clip than the student's, including frames from the
+target itself. On the caption or keyframe channel the clips are identical, so the teacher can read the student's
+latents and cache only its text presentation:
 
 ```toml
 [[datasets]]
 video_jsonl_file = "/data/train.jsonl"                 # the student's items
-cache_directory = "/data/cache/fl2va_teacher"          # text-encoder outputs only
+cache_directory = "/data/cache/fl2va_teacher"          # the teacher's text-encoder cache
 latent_cache_directory = "/data/cache/fl2va"           # the student's latents, read as-is
 target_frames = [124]
 ```
 
-The reference channel does not qualify: the teacher's extra references are new latents, so it caches both halves.
+Cache the teacher config with the same two cache commands and the same sizing options as the training set. Under
+`--skip_existing` the latent command skips the existing files and does not purge a borrowed directory. A keyframe
+teacher needs a text cache made with the keyframe task (`--task fl2va` or `i2va`); a reference teacher caches both
+halves.
+
+##### Field length floor
+
+At the rollout states the length of the student's field is compared with the frozen checkpoint's field at the same
+state, and the step is penalised when the student's is shorter. The term does not act on the direction, and it is
+measured against the frozen empty branch, so it is used together with the null anchor.
+
+- **Advantages:** restores the length that the rollout teacher removes; on Ref2VA it improves rendered output over the
+  same recipe without it; no extra forward under the fused teacher.
+- **Disadvantages:** the weight matters (0.3 works; 1.0 prevents learning); the metrics it acts on
+  (`h3/rollout_field_ratio`, `val/rollout/field`) are the ones it inflates, so evaluate it by
+  `val/rollout/field_cos`, `val/drift/prompted_rel` and rendered output. An upper bound on the same ratio
+  (`--h3_rollout_field_cap`) was tested and is retired: it degraded Ref2VA and had no effect on FL2VA.
+- **Flags:** `--h3_rollout_field_floor 0.3` (requires rollout supervision, the frozen null and an anchor);
+  optionally `--h3_rollout_field_floor_sigma_max`, `--h3_rollout_field_floor_direction {self,teacher}`.
+- **Related:** `--h3_rollout_teacher_magnitude_weight M` splits the rollout teacher term into a direction part and a
+  length part and weights the length part by `M`; `0` matches the teacher's direction only and leaves the length to
+  the floor, so the two terms no longer oppose each other. Experimental. Upstream musubi-tuner applies the same split
+  to its off-policy teacher-matching loss (kohya-ss/musubi-tuner#1065, #1086).
+
+##### NAFP: Null-Anchored Field Preservation
+
+The combination of the frozen-null target with the anchor, rollout supervision against a privileged teacher, and the
+length floor. The anchor fixes the reference point, the teacher term sets the direction, the floor holds the length.
+
+- **Advantages:** the only recipe that constrains length, direction and the null branch together; on Ref2VA it gives
+  the best rendered output and retains about three quarters of the base's field length, where pure rollout retains
+  half.
+- **Disadvantages:** the highest cost, three to four forwards per step, about **2.2x** on FL2VA and **3.5x to 4x** on
+  Ref2VA. With anchor weight 1.0 and a weak condition (a trigger word) it may learn no style; lower the anchor weight
+  for such tasks. Rule of thumb: a reference condition takes anchor 1.0; a trigger word takes 0 to 0.3.
+- **Flags:** the union of the three sections above; the exact set is under *Current recommended settings* below.
+
+##### Stability controls
+
+Optional additions that apply to any of the recipes above.
+
+- `--h3_adapter_ema_decay 0.999` maintains an EMA of the adapter, saved beside each checkpoint as
+  `<name>-ema-step<N>.safetensors`; `--h3_validate_ema` validates the EMA instead of the live weights. No step cost.
+- `--h3_adapter_prompt_only` runs every empty-prompt forward with the adapter disabled, which makes the null anchor
+  redundant by construction. Less effective than the anchor: the shared weights still drift.
+- `--h3_guidance_scale_sigma_max 0.9` disables the target amplification above that sigma, where the implied scale is
+  very large and the data is close to noise. Improves validation fit on FL2VA; combine with the floor.
+- `--h3_measured_variance_weighting curve.json` weights samples by a measured dispersion curve. Degrades field
+  direction; not recommended.
+- `--h3_validation_multipliers 0.75,1.25` validates the adapter at several LoRA multipliers in one pass.
+- Diagnostics: `--h3_term_grad_every N` (per-term gradient norms and cosines; single process and
+  `--blocks_to_swap 0` only), `--h3_adapter_stats_every N`, `--h3_train_sigma_bins`, `--h3_validation_std`.
+
+#### Metrics
+
+The training loss does not show the loss of amplification, so three validation metrics are used to track it,
+computed on the held-out set every `--validate_every_n_steps` without rendering:
+
+- `val/drift/prompted_rel`: how far the prompted prediction has moved from the base model's, relative to the base's
+  field length. The empty-prompt branch cancels in it, so no preservation term can improve it artificially. Values
+  below about 0.9 correspond to output without visible damage; values around 1 and above correspond to visible
+  artifacts.
+- `val/rollout/field` and `val/rollout/field_cos`: field length and direction at the states the adapted model's own
+  sampler reaches. A plain LoRA drops the length to roughly a third of the base's within a few hundred steps.
+  The floor raises the length directly, so judge it by the cosine.
+- `val/velocity_err_rel`: the adapted model's prediction error over the base model's on the same targets. Below 1
+  means the adapter learned something; it is the counterweight to the two preservation metrics, which an adapter
+  that barely changed would pass.
+
+Training metrics are enabled by the flags listed; everything under `val/` requires
+`--validation_dataset_config`, and the field metrics require `--h3_validation_field_probe` or
+`--h3_validation_rollout_probe`.
+
+| Metric | Enabled by | Meaning | Expected |
+| --- | --- | --- | --- |
+| `loss/video`, `loss/audio` | always | Training loss per modality under the active objective. | decreasing |
+| `loss/video/bin{k}` | `--h3_train_sigma_bins` | Video loss by sigma bin (cuts 0.5 / 0.8 / 0.9). | top bin noisier |
+| `loss/rollout_video` | rollout | Teacher term at the rollout states (direction part when the split is on). | decreasing |
+| `loss/rollout_field_floor`, `h3/rollout_field_ratio` | floor | Floor penalty; student field length over the base's at rollout states. | ratio near 1 |
+| `loss/rollout_teacher_magnitude`, `h3/rollout_teacher_length_ratio` | magnitude weight below 1 | Length gap to the teacher; student over teacher field length. | — |
+| `h3/rollout_active`, `h3/rollout_stop_sigma` | rollout | Whether the step used the rollout objective; the stop sigma of the prefix. | mean of the first equals the probability |
+| `h3/rollout_teacher_cos_base`, `h3/rollout_teacher_vs_base` | floor | Difference between the privileged teacher and the base at the rollout states. | below 1; 1 means the teacher adds nothing |
+| `h3/grad/<term>_norm`, `h3/grad/cos_<a>_<b>` | `--h3_term_grad_every` | Per-term gradient norms and pairwise cosines. | anchor cosine near 0; floor cosine negative |
+| `h3/adapter/delta_norm`, `h3/adapter/ema_rel_dist` | `--h3_adapter_stats_every` | Norm of the adapter delta; distance of the live weights from the EMA. | delta increasing; distance below 0.3 |
+| `val/loss` | validation | Held-out loss. | decreasing |
+| `val/field`, `val/field_cos`, `val/field_dist` | field probe | Field length over the base's, cosine to the base's field, and a combined distance, at noised data states. | length near 1, cosine near 1, distance near 0 |
+| `val/velocity_err_rel` | field probe | Adapted error over the base's error on the same target. | below 1 |
+| `val/drift/prompted_rel` | field probe | Distance of the prompted prediction from the base's, relative to the base's field length. Not affected by any preservation term. | low; near 1 indicates collapse |
+| `val/drift/empty` | field probe | Distance of the empty-prompt prediction from the base's. | near 0 with an anchor |
+| `val/rollout/field`, `val/rollout/field_cos` | rollout probe | Field length and direction at the states the adapted sampler reaches. | length above 0.5, cosine near 1; do not evaluate the floor by the length alone |
+| `val/rollout/x0_err`, `/step{i}` | rollout probe | Clean-clip error along the adapted model's own sampling trajectory; an increase with `i` indicates compounding error. | flat |
+| `*_std` | `--h3_validation_std` | Per-clip standard deviation of the pooled metric. | — |
+
+Checkpoint selection: choose the step at which `val/drift/prompted_rel` and `val/rollout/field_cos` are still
+acceptable and `val/velocity_err_rel` has stopped improving, then confirm on rendered output.
+
+#### Current recommended settings
+
+Ref2VA trains with NAFP; FL2VA trains with Hybrid D-OPSD (H-OPSD). Both share the base flags:
 
 ```shell
-python minimax_h3_cache_latents.py --dataset_config teacher.toml \
-  --vae /models/MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors \
-  --device cuda --skip_existing
-python minimax_h3_cache_text_encoder_outputs.py --dataset_config teacher.toml \
-  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
-  --task ref2va --device cuda --skip_existing
+--network_module networks.lora_minimax_h3 --network_dim 16 --network_alpha 16 --h3_adaln_rank 16 \
+--optimizer_type adamw8bit --learning_rate 1e-4 --gradient_checkpointing --mixed_precision bf16 \
+--timestep_sampling sigmoid --sdpa --blocks_to_swap 12 --block_swap_h2d_only --seed 1234 \
+--validation_dataset_config holdout.toml --validate_every_n_steps 250 --validate_at_start \
+--save_every_n_steps 250 --h3_validation_field_probe --h3_validation_rollout_probe 4
 ```
 
-Then train:
+**Ref2VA: NAFP.** About 3.5x to 4x a plain step.
 
 ```shell
-accelerate launch minimax_h3_train_network.py ... \
-  --h3_rollout_supervision \
-  --h3_rollout_teacher_config teacher.toml \
-  --h3_rollout_probability 0.5 --h3_rollout_steps 2 --h3_rollout_window 1
+--dit minimax_h3_ref2va_bf16.safetensors --h3_training_mode ref2va --reference_image_short_edge 384 \
+--h3_rollout_supervision --h3_rollout_teacher_config teacher.toml --h3_rollout_teacher_privilege reference \
+--h3_rollout_probability 0.5 --h3_rollout_steps 2 --h3_rollout_window 1 --h3_rollout_fused_teacher \
+--h3_guidance_distillation_scale 5.0 --h3_guidance_loss_schedule constant --h3_guidance_loss_form normalized \
+--h3_guidance_null_source frozen --h3_guidance_null_anchor_weight 1.0 --h3_caption_dropout_rate 0 \
+--h3_rollout_field_floor 0.3 \
+--max_train_steps 2000
 ```
 
-Those are also the defaults. The window is the parameter to raise last: each supervised state adds a gradient-bearing forward
-and a teacher forward, so it costs more than an extra rollout step does.
+**FL2VA: Hybrid D-OPSD (H-OPSD).** Learns a style where NAFP with anchor 1.0 does not, and matches the base
+model's output quality, at the cost of a shorter field. About 1.9x a plain step. The teacher config uses the
+keyframe task (`--task fl2va` text cache) while the student trains text-only (`t2va`). NAFP with a lower anchor
+weight is the alternative when field preservation matters more than the amount of style.
 
-Two limitations. The rollout reaches its stop sigma in `--h3_rollout_steps` uniform steps while inference takes around twenty
-on a shifted schedule, so the supervised states approximate the sampler's rather than reproduce them. And the objective is
-established on Ref2VA; on FL2VA it has not been.
-
-#### Who walks the prefix
-
-Asking the teacher at a state the student produced is what makes the supervision on-policy, and it is also where a
-privileged teacher can be handed a conflicted input: with the keyframe channel the teacher sees a clean first frame beside
-content the student invented from a bare prompt, and its velocity there describes neither clip. `--h3_rollout_prefix
-teacher` walks the no-gradient prefix with the frozen privileged teacher instead, so the window starts from states the
-teacher's own trajectory produced and the student refines them for `--h3_rollout_window` sub-steps. A window of `1` is
-off-policy anchoring; a longer window moves back toward on-policy. It costs the same forwards. The reference channel is
-less exposed to the mismatch, since the reference is not a frame of the clip; the keyframe channel is the case it was
-added for.
-
-#### Field length floor
-
-The teacher term sets the *direction* of the guidance field at the supervised states. Its *length* -- how far the prompted
-prediction stands from the empty-prompt one -- belongs to the guidance distillation rather than to the concept being
-learned, and ordinary training shortens it. `--h3_rollout_field_floor W` (requires `--h3_rollout_supervision`) holds a
-proxy of it: at every supervised state the frozen base's prompted prediction `g` and empty prediction `e` are evaluated
-alongside the student's prompted prediction `g'`, and the step adds `W * relu(1 - ‖g' - e‖ / ‖g - e‖)^2`, averaged over the
-window's authored samples. A displacement no shorter than the checkpoint's field costs nothing; a shorter one is pushed
-longer. In the default `self` mode that push is along the field's own current direction, so the term never chooses where
-the field points; the `teacher` mode below borrows the teacher's direction instead.
-
-Both lengths are taken against the **frozen** empty branch on purpose: with the student's own null in the difference, the
-cheapest way to lengthen the field would be to move that null, which is the degeneracy the frozen-null forms remove. The
-price of that choice is that the floor bounds `‖g' - e‖`, the prompted prediction's distance from the *frozen* null, and
-not `‖g' - e'‖`, its distance from the student's *own* null, which is what inference amplifies and what `val/rollout/field`
-reports. Nothing in the floor stops `e'` from drifting toward `g'`; `--h3_guidance_null_anchor_weight` is what holds `e'` at
-`e`, and the trainer warns when the floor is configured without it. With the anchor the two gaps coincide up to the anchor's
-residual; without it the floor is a displacement floor on the prompted branch alone.
-
-The direction the length is measured along is a choice. `--h3_rollout_field_floor_direction self` (default) floors the
-plain length, and its gradient is the unit vector of the student's own field: at a sampler state that direction has
-usually drifted, so the floor lengthens the error, which is what the first arm showed (field length 0.96 at step 500 with
-the fit standing still). `teacher` floors the projection of the student's field onto the direction of the privileged
-teacher's field at the same state, `<g' - e, t> / ‖t‖` against `‖g - e‖` with `t = teacher - e`: a field pointing the
-wrong way scores short however long it is, and the gradient is the teacher's unit direction, so the term lengthens and
-turns the field at once. The teacher is already evaluated at that state, so this costs nothing further.
-`--h3_rollout_field_floor_sigma_max` keeps the floor off the top of the schedule, where the checkpoint's implied guidance
-scale runs to 11-16 and the data are nearly noise.
-
-Costs two no-gradient frozen forwards per supervised state, folded into the fused pass under `--h3_rollout_fused_teacher`.
-Requires a student text cache built with `--cache_guidance_empty`. Reported as `loss/rollout_field_floor` and, as the mean
-ratio over the step's scored samples, `h3/rollout_field_ratio`; with the floor's frozen arms in hand the step also reports
-`h3/rollout_teacher_cos_base` (the teacher's field direction against the base's at the supervised states) and
-`h3/rollout_teacher_vs_base` (the teacher's distance from the student over the base's), which read 1 and 1 for a teacher
-that has nothing left to teach. The averaged loss excludes the term. Experimental:
-judge it by `val/rollout/field_cos`, `val/drift/prompted_rel` and blind renders rather than by `val/rollout/field`, whose
-length it directly pushes on when the anchor holds.
-
-#### Stability
-
-The frozen-base objectives above remove the *systematic* collapse of the guidance field. What remains is variance and
-competition between terms, and three of those have analytic remedies that cost no extra forwards.
-
-- **Target dispersion.** The guidance target `e + S(y - e)` carries `S^2` times the noise of the data target, and that
-  noise depends on sigma. `--h3_measured_variance_weighting` reads a `probe_g_curve` report and weights each sample by the
-  inverse of `raw^2 - g^2` at its shifted sigma, normalised to mean 1 over the buckets and capped. That quantity is a
-  dispersion *proxy*, not a variance: `raw` is a mean of residual norms rather than a root mean square and `g` the norm of
-  the mean residual, both divided by the target norm, so the difference orders the buckets by how noisy the one-draw
-  target is there and no more. The weighting is therefore a heuristic sigma reweighting that changes the objective --
-  noisy noise levels count for less -- rather than a variance-reduced estimate of the same objective, and the mean-1
-  normalisation over buckets preserves the effective step only approximately under the sampled sigma distribution and the
-  cap. It reallocates the step; it does not create information, so where gradient accumulation is affordable it is a
-  complement, not a substitute.
-- **The empty branch.** `--h3_adapter_prompt_only` switches the adapter off on every empty-prompt forward, so the student's
-  empty branch is the frozen one exactly and `--h3_guidance_null_source live` becomes the frozen source in effect. The
-  null anchor becomes identically zero and its two forwards a step disappear; the live-null degeneracy (an empty branch
-  that chases the clip so the field vanishes with the loss satisfied) becomes structurally impossible. Nothing changes at
-  inference, where a guidance-distilled checkpoint only ever runs its prompted branch. Caption dropout is rejected with
-  it, since a dropped step would train nothing. The wrapper asks the network whether the adapter is already off (LoRA
-  networks report it) and leaves an existing frozen bracket alone.
-- **Two masters on one state.** The data term and the rollout term otherwise claim the same noise levels with different
-  targets. Without `--h3_rollout_stop_shifted`, `--h3_timestep_focus_max` (with `--h3_timestep_focus_probability 1` and
-  uniform sampling) and `--h3_rollout_stop_min` are both unshifted base sigmas, and `focus_max <= stop_min` gives the two
-  terms disjoint bands so each noise level has one term. With the shifted stop the two bounds live on different
-  coordinates and must be converted before any such claim; audio rides its own shift either way.
-
-What these do not remove: the information per sample about the new content is one draw of `y`, and no reformulation
-with the same fixed point changes its signal-to-noise ratio -- the normalised form is the contrastive gradient scaled by
-`1/S^2`, and mixing the model's own or an EMA prediction into the target scales it by the mixing weight. That part is a
-learning-rate-against-steps trade, or gradient accumulation.
+```shell
+--dit minimax_h3_fl2va_bf16.safetensors \
+--h3_rollout_supervision --h3_rollout_teacher_config teacher.toml --h3_rollout_teacher_privilege keyframe \
+--h3_rollout_probability 0.5 --h3_rollout_steps 4 --h3_rollout_window 2 --h3_rollout_fused_teacher \
+--h3_guidance_distillation_scale 3.5 --h3_guidance_loss_form contrastive \
+--max_train_steps 3000
+```
 
 ### Full-parameter BF16 training
 
@@ -1454,14 +1485,15 @@ Every objective here is off unless its flag is given, and a run without them tra
 | `--h3_rollout_stop_shifted` | Draw the stop sigma uniformly on the shifted video schedule instead of the shared unshifted one. Video and audio stay synchronized either way. |
 | `--h3_rollout_fused_teacher` | Compute the student and teacher predictions for one supervised state in a single pass over the blocks, so each swapped block is streamed once per state instead of once per arm. May increase transient memory. Rejected together with `--h3_int8_attention aux` and with block-sparse attention (`--h3_block_sparse_kv_fraction` or `--h3_block_sparse_threshold` above `0`), whose per-sequence attention plan the fused pass cannot keep separate per arm. |
 | `--h3_rollout_field_floor 0.0` | Experimental. Length floor on a frozen-null proxy of the guidance field at the supervised rollout states: `W * relu(1 - ‖g' - e‖ / ‖g - e‖)^2` with the frozen base's prompted `g` and empty `e` and the student's prompted `g'` at the same state. In the default `self` mode holds `‖g' - e‖` at no less than the checkpoint's field length and leaves the direction to the teacher term (see `--h3_rollout_field_floor_direction`); it does not bound the gap to the student's own empty branch, so pair it with `--h3_guidance_null_anchor_weight`. Requires `--h3_rollout_supervision` and `--cache_guidance_empty`; two extra no-gradient frozen forwards per supervised state. `0` disables. See [Field length floor](#field-length-floor). |
+| `--h3_rollout_teacher_magnitude_weight 1.0` | Experimental. Below `1` the rollout teacher term is split in field space against the frozen empty branch: direction (the student's field rescaled to the teacher's field length, matched to the teacher's field; no gradient on the length) plus `M *` a separate magnitude term. `0` takes the teacher's direction only and leaves the field's length to the floor, removing the measured conflict between the two. Needs `--h3_rollout_field_floor` above `0`. See [Field length floor](#field-length-floor). |
 | `--h3_rollout_field_floor_direction {self,teacher}` | Which direction the floor measures the student's field along. `self` (default) floors the plain length, whose gradient lengthens the field along the student's own current direction. `teacher` floors the projection of the student's field onto the privileged teacher's field at the same state, so lengthening in a wrong direction earns nothing and the gradient turns the field toward the teacher as it lengthens it. No extra forward. Needs the floor above `0`. |
 | `--h3_rollout_field_floor_sigma_max 1.0` | Apply the floor only at supervised states whose shifted video sigma is at most this value; states above it drop out of the floor's mean. Needs the floor above `0`. |
 | `--h3_rollout_field_cap 0.0` | Upper bound on the field-length ratio the floor scores: adds `relu(ratio - cap)^2` under the floor's weight, holding the field in a band `[1, cap]`. An over-long field shows as burnt colour and contrast, and once co-adapted into the weights it is not undone by an inference multiplier. Under `--h3_rollout_field_floor_direction teacher` the ratio is the signed projection onto the teacher's direction and the cap bounds that projection, not the field's total length. Needs the floor above `0` and a value above `1`. |
 | `--h3_rollout_null_anchor_weight 0.0` | The null anchor at the supervised rollout states: the student's empty-prompt prediction there (adapter on, gradient) is held to the frozen base's, weighted by this value. One graded forward per supervised state on rollout steps only, against the frozen empty arm the floor already evaluates; the data-step anchor can then be dropped to move the anchor onto the states generation walks. Requires `--cache_guidance_empty`; rejected with `--h3_adapter_prompt_only`. |
 | `--h3_rollout_prefix {student,teacher}` | Who walks the no-gradient prefix of the rollout. `student` (default) is on-policy. `teacher` walks it with the frozen privileged teacher and the student's window refines the states it reaches -- a hybrid policy that keeps the teacher off states the student built from a conditioning it does not share. Same forward count. |
 | `--h3_rollout_stop_min 0.0` | Lower bound of the rollout stop draw, on the coordinate the draw is made on (unshifted base, or the shifted video sigma under `--h3_rollout_stop_shifted`). Without the shifted stop, `--h3_timestep_focus_max` at or below it gives the data term and the rollout term disjoint base-sigma bands. `0` draws the whole range. |
-| `--h3_adapter_prompt_only` | Run every empty-prompt forward with the adapter off, so the student's empty branch is the frozen checkpoint's by construction. A guidance-distilled checkpoint never evaluates its empty branch at inference. Makes the live-null degeneracy impossible and `--h3_guidance_null_anchor_weight` redundant (the two are rejected together, as is `--h3_caption_dropout_rate` above `0`). See [Stability](#stability). |
-| `--h3_measured_variance_weighting curve.json` | Weight each sample's loss by the inverse of the target dispersion proxy measured at its shifted sigma, read off a `probe_g_curve` report (`raw^2 - g^2` per bucket and modality; a proxy, not a variance), normalised to mean 1 and capped by `--h3_measured_variance_weight_max` (default `4.0`). A heuristic sigma reweighting that changes the objective; composes multiplicatively with `--weighting_scheme`. See [Stability](#stability). |
+| `--h3_adapter_prompt_only` | Run every empty-prompt forward with the adapter off, so the student's empty branch is the frozen checkpoint's by construction. A guidance-distilled checkpoint never evaluates its empty branch at inference. Makes the live-null degeneracy impossible and `--h3_guidance_null_anchor_weight` redundant (the two are rejected together, as is `--h3_caption_dropout_rate` above `0`). See [Stability](#stability-controls). |
+| `--h3_measured_variance_weighting curve.json` | Weight each sample's loss by the inverse of the target dispersion proxy measured at its shifted sigma, read off a `probe_g_curve` report (`raw^2 - g^2` per bucket and modality; a proxy, not a variance), normalised to mean 1 and capped by `--h3_measured_variance_weight_max` (default `4.0`). A heuristic sigma reweighting that changes the objective; composes multiplicatively with `--weighting_scheme`. See [Stability](#stability-controls). |
 | `--h3_guidance_scale_sigma_max 1.0` | Cap on the guidance target's schedule: above this shifted sigma the distillation scale is `1` and the step trains on the plain data target. The checkpoints' implied scale runs to 11-16 above sigma 0.9, where the data are nearly noise. `1.0` applies the schedule everywhere. |
 | `--h3_guidance_audio_scale` | Distillation scale for the audio half of the guidance target; unset uses the configured video scale (including a per-sample `--h3_guidance_scale_range` draw) for both. At exactly `1` the audio target is the plain data target bit for bit. The released checkpoints' audio field is not a clean amplification (its implied scale is not constant across sigma and the residual is nearly all systematic at the top), so `1.0` keeps the audio target plain while the video keeps the guidance form. At least `1`. |
 | `--h3_validation_multipliers 0.75,1.25` | Repeat validation's data-state pass at these adapter multipliers and report `val/m<multiplier>/velocity_err_rel`, `field`, `field_cos`, `drift/prompted_rel`: how the adapter responds to the strength knob users turn at inference. One extra pass per multiplier; the rollout probe is not repeated. |

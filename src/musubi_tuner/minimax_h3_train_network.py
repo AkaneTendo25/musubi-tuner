@@ -4058,6 +4058,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_rollout_field_floor_direction": getattr(args, "h3_rollout_field_floor_direction", "self") != "self",
             "--h3_rollout_field_floor_sigma_max": float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0)) != 1.0,
             "--h3_rollout_stop_min": float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0) != 0.0,
+            "--h3_rollout_teacher_magnitude_weight": float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0)) != 1.0,
             "--h3_rollout_prefix": getattr(args, "h3_rollout_prefix", "student") != "student",
             "--h3_rollout_null_anchor_weight": float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0) != 0.0,
             "--h3_rollout_field_cap": float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0) != 0.0,
@@ -4105,6 +4106,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         field_cap = float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)
         if field_cap != 0.0 and (not math.isfinite(field_cap) or field_cap <= 1.0):
             raise ValueError("--h3_rollout_field_cap must be finite and above 1 (0 disables it)")
+        magnitude_weight = float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0))
+        if not math.isfinite(magnitude_weight) or not 0.0 <= magnitude_weight <= 1.0:
+            raise ValueError("--h3_rollout_teacher_magnitude_weight must lie in [0, 1]; 1 (default) matches the teacher whole")
+        if magnitude_weight < 1.0 and field_floor <= 0:
+            raise ValueError(
+                "--h3_rollout_teacher_magnitude_weight below 1 matches the teacher's field in direction only and leaves "
+                "its length to the floor; it needs --h3_rollout_field_floor above 0 (which also supplies the frozen empty "
+                "branch the field is measured against)"
+            )
         if field_floor <= 0 and (
             getattr(args, "h3_rollout_field_floor_direction", "self") != "self" or floor_sigma_max != 1.0 or field_cap != 0.0
         ):
@@ -4628,6 +4638,56 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             bases if (field_floor or rollout_anchor) else None,
             student_empties if rollout_anchor else None,
         )
+
+    @staticmethod
+    def _masked_field_lengths(tensor: torch.Tensor, mask) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-sample RMS length over the authored elements, graph kept, with a
+        per-sample validity flag (a sample with no authored element has no length).
+        ``sqrt(sum(x^2 * m) / sum(m))``: the same weighting the joint loss applies,
+        so a soft mask enters once, not squared."""
+        flat = tensor.float().flatten(1)
+        if mask is None:
+            count = torch.full((flat.shape[0],), float(flat.shape[1]), device=flat.device)
+            return torch.linalg.vector_norm(flat, dim=1) / count.sqrt(), count > 0
+        valid = mask.to(device=tensor.device, dtype=torch.float32).expand_as(tensor).flatten(1)
+        count = valid.sum(dim=1)
+        return (flat.square() * valid).sum(dim=1).div(count.clamp_min(1e-12)).sqrt(), count > 0
+
+    @classmethod
+    def _directed_field_residual(
+        cls, student_video: torch.Tensor, teacher_video: torch.Tensor, empty_video: torch.Tensor, mask
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the teacher match in field space against the frozen empty branch.
+
+        Returns the student's prediction with its field ``g' - e`` rescaled to the
+        teacher's field length (scale-invariant in the student's field, so the
+        residual against the teacher carries no gradient on that length), the
+        per-sample squared length gap ``(||g' - e|| - ||t - e||)^2`` (graph kept),
+        the per-sample authored flag, the per-sample length ratio (detached) and the
+        per-sample flag of the samples whose direction was scored.
+        """
+        empty = empty_video.detach().float()
+        student_field = student_video.float() - empty
+        teacher_field = (teacher_video.float() - empty).detach()
+        student_length, authored = cls._masked_field_lengths(student_field, mask)
+        teacher_length, _ = cls._masked_field_lengths(teacher_field, mask)
+        # A direction exists only where both fields have one; where either is
+        # (numerically) zero the directed prediction is set to the teacher's, so
+        # the direction residual is zero there and carries no gradient. The length
+        # gap is scored wherever the sample is authored: a zero field against a
+        # non-zero one is exactly the case the magnitude term (or the floor) must
+        # see.
+        eps = torch.finfo(torch.float32).eps * 64
+        directed_valid = authored & (student_length > eps) & (teacher_length > eps)
+        scale = torch.where(directed_valid, teacher_length / student_length.clamp_min(eps), torch.ones_like(student_length))
+        shape = (-1,) + (1,) * (student_field.dim() - 1)
+        directed = torch.where(
+            directed_valid.reshape(shape), empty + student_field * scale.reshape(shape), (empty + teacher_field)
+        ).to(student_video.dtype)
+        gap = (student_length - teacher_length).pow(2) * authored.to(student_length.dtype)
+        with torch.no_grad():
+            ratio = torch.where(directed_valid, student_length / teacher_length.clamp_min(eps), torch.ones_like(student_length))
+        return directed, gap, authored, ratio, directed_valid
 
     @staticmethod
     def _field_length_ratio(adapted: torch.Tensor, base: torch.Tensor, mask) -> tuple[torch.Tensor, torch.Tensor]:
@@ -5722,6 +5782,91 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # state above.
             rollout_audio_prediction = prediction.audio
             rollout_audio_target = loss_inputs.audio_target
+            magnitude_weight = float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0))
+            decompose_teacher = magnitude_weight < 1.0 and rollout_bases is not None
+            rollout_magnitude_terms: list[torch.Tensor] = []
+            rollout_length_ratios: list[float] = []
+            if decompose_teacher:
+                # The privileged teacher knows the target better than the student
+                # and predicts with less guidance: its FIELD (prediction minus the
+                # frozen empty branch) is shorter than the base's, and matching it
+                # whole teaches that shortening along with the direction. Here the
+                # teacher's field is matched in DIRECTION only: the student's field
+                # is rescaled to the teacher's length before the residual is taken,
+                # which is scale-invariant in the student's field and so carries no
+                # gradient on its length. The length is the floor's business (and,
+                # weighted by --h3_rollout_teacher_magnitude_weight, a separate
+                # magnitude term), so the two no longer pull against each other.
+                # (The same decomposition upstream musubi-tuner applies to its
+                # off-policy teacher-matching loss; kohya-ss/musubi-tuner#1065, #1086.)
+                directed_students = []
+                ratio_sum, ratio_count = 0.0, 0.0
+                for (student, teacher), (_base_prompted, base_empty), sigma in zip(
+                    rollout_pairs, rollout_bases, rollout_video_sigmas, strict=True
+                ):
+                    directed, _gap, _authored, ratio, directed_valid = self._directed_field_residual(
+                        student.video, teacher.video, base_empty.video, effective_video_mask
+                    )
+                    directed_students.append(directed)
+                    # The magnitude half in the joint loss's own units and reduction:
+                    # the student's field against a detached copy of itself rescaled
+                    # to the teacher's length. Per sample that residual's masked MSE
+                    # is exactly (||g' - e|| - ||t - e||)^2, and its gradient is
+                    # radial (along the student's own field), so this term and the
+                    # directed one partition the teacher match into length and
+                    # direction. Same mask, sample weight and balance as every other
+                    # video term; the audio half is present with a zero residual.
+                    empty = base_empty.video.detach()
+                    student_field = student.video - empty
+                    student_length, _ = self._masked_field_lengths(student_field, effective_video_mask)
+                    teacher_length, _ = self._masked_field_lengths((teacher.video - empty).detach(), effective_video_mask)
+                    eps = torch.finfo(torch.float32).eps * 64
+                    radial_scale = (teacher_length / student_length.clamp_min(eps)).detach()
+                    shape = (-1,) + (1,) * (student_field.dim() - 1)
+                    radial_target = empty + (student_field.detach().float() * radial_scale.reshape(shape)).to(student.video.dtype)
+                    # A student field with no direction cannot be rescaled: its
+                    # length gap is scored against the teacher itself (residual
+                    # -(t - e), squared length L_t^2), whose gradient points at the
+                    # teacher. That is the documented subgradient of the gap at a
+                    # zero field.
+                    radial_target = torch.where(directed_valid.reshape(shape), radial_target, teacher.video.detach())
+                    # Reduced with the SAME joint call as the direction term: the
+                    # audio half is present with a zero residual (the prediction
+                    # against its own detached copy), so the token/modality balance
+                    # and the denominators are the direction term's, and the video
+                    # share of this term equals the video share of that one.
+                    rollout_magnitude_terms.append(
+                        joint_prediction_loss(
+                            H3ModelPrediction(video=student.video, audio=rollout_audio_prediction),
+                            H3ModelPrediction(
+                                video=radial_target,
+                                audio=rollout_audio_prediction.detach() if rollout_audio_prediction is not None else None,
+                            ),
+                            video_mask=effective_video_mask,
+                            audio_mask=effective_audio_mask,
+                            video_sample_weight=self._sample_weight(args, sigma) if has_video else None,
+                            audio_sample_weight=audio_sample_weight,
+                            balance=args.h3_loss_balance,
+                            mask_normalization=args.h3_loss_mask_normalization,
+                            video_weight=video_weight,
+                            audio_weight=audio_weight,
+                        ).loss
+                    )
+                    ratio_sum += float((ratio * directed_valid.to(ratio.dtype)).sum())
+                    ratio_count += float(directed_valid.sum())
+                rollout_length_ratios.append(ratio_sum / ratio_count if ratio_count > 0 else 1.0)
+            # The pairs the teacher term is formed from: the directed students when the
+            # split is on, the raw students otherwise. ``rollout_pairs`` itself is left
+            # alone: the floor and the teacher metrics below measure the student's
+            # actual field, not the rescaled one.
+            term_pairs = (
+                [
+                    (H3ModelPrediction(video=directed, audio=student.audio), teacher)
+                    for directed, (student, teacher) in zip(directed_students, rollout_pairs, strict=True)
+                ]
+                if decompose_teacher
+                else rollout_pairs
+            )
             rollout_terms = [
                 joint_prediction_loss(
                     H3ModelPrediction(video=student.video, audio=rollout_audio_prediction),
@@ -5745,13 +5890,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     video_weight=video_weight,
                     audio_weight=audio_weight,
                 )
-                for (student, teacher), sigma in zip(rollout_pairs, rollout_video_sigmas, strict=True)
+                for (student, teacher), sigma in zip(term_pairs, rollout_video_sigmas, strict=True)
             ]
             window = float(len(rollout_terms))
             loss = sum(term.loss for term in rollout_terms) / window
+            if decompose_teacher:
+                # The magnitude half of the teacher term, weighted down (0 leaves
+                # the length to the floor alone). Averaged over the window like
+                # the direction half, scaled by the video weight the joint loss
+                # gives its video term.
+                rollout_teacher_magnitude = magnitude_weight * sum(rollout_magnitude_terms) / float(len(rollout_magnitude_terms))
+                loss = loss + rollout_teacher_magnitude
+                metrics["loss/rollout_teacher_magnitude"] = float(rollout_teacher_magnitude.detach())
+                metrics["h3/rollout_teacher_length_ratio"] = sum(rollout_length_ratios) / float(len(rollout_length_ratios))
             rescaled_rollout_loss = loss
             rollout_main_objective = loss
             rollout_replaced = True
+            # With the split on, this is the direction half; the magnitude half is
+            # loss/rollout_teacher_magnitude.
             metrics["loss/rollout_video"] = float(sum(term.video_loss.detach() for term in rollout_terms) / window)
             metrics["h3/rollout_stop_sigma"] = rollout_stop_sigma
             if rollout_student_empties is not None:
@@ -5851,6 +6007,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0:
                 metrics.setdefault("loss/rollout_field_floor", 0.0)
                 metrics.setdefault("h3/rollout_field_ratio", 0.0)
+            if float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0)) < 1.0:
+                metrics.setdefault("loss/rollout_teacher_magnitude", 0.0)
+                metrics.setdefault("h3/rollout_teacher_length_ratio", 0.0)
             if float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0) > 0:
                 metrics.setdefault("loss/rollout_null_anchor", 0.0)
         guidance_rescaled = False
@@ -6157,6 +6316,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_rollout_window": str(args.h3_rollout_window),
             "ss_h3_rollout_stop_shifted": str(bool(getattr(args, "h3_rollout_stop_shifted", False))),
             "ss_h3_rollout_stop_min": str(float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0)),
+            "ss_h3_rollout_teacher_magnitude_weight": str(float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0))),
             "ss_h3_adapter_prompt_only": str(bool(getattr(args, "h3_adapter_prompt_only", False))),
             "ss_h3_guidance_scale_sigma_max": str(float(getattr(args, "h3_guidance_scale_sigma_max", 1.0))),
             "ss_h3_adapter_ema_decay": str(float(getattr(args, "h3_adapter_ema_decay", 0.0) or 0.0)),
@@ -6751,6 +6911,25 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "longer one -- so they are interleaved block by block rather than batched, which leaves every arm's "
             "attention exactly what it was and makes --blocks_to_swap stream each swapped block once per sub-step "
             "instead of twice. Off by default so the two paths stay A/B comparable"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_teacher_magnitude_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "how much of the teacher's field LENGTH the rollout term matches, in [0, 1]. 1 (default) matches the "
+            "teacher's prediction whole, as before. Below 1 the video half of every supervised sub-step is split in "
+            "field space against the frozen empty branch e: the direction term is the residual between the student's "
+            "field g' - e rescaled to the teacher's field length and the teacher's field t - e (scale-invariant in the "
+            "student's field, so it moves the field's direction and never its length), and the magnitude term "
+            "weight * (||g' - e|| - ||t - e||)^2 is added separately. A privileged teacher predicts with less guidance "
+            "and its field is shorter than the checkpoint's; matching it whole shortens the student's field while the "
+            "floor lengthens it (the two gradients were measured at cosine -0.57). 0 leaves the length to the floor "
+            "alone. The split is a REPLACEMENT objective, not a decomposition of the default one: direction plus "
+            "weight * length gap is not the whole-prediction MSE, and exactly 1 switches back to the whole match. "
+            "Requires --h3_rollout_field_floor above 0. Reports loss/rollout_teacher_magnitude and "
+            "h3/rollout_teacher_length_ratio (student field length over the teacher's at the supervised states)"
         ),
     )
     parser.add_argument(
