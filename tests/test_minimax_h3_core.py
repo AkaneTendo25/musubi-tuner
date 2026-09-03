@@ -4866,3 +4866,160 @@ def test_skip_existing_rejects_text_caches_presenting_other_keyframe_visuals(mon
     assert plain(item, presented) is False
     assert same(item, text_only) is False
     assert plain(item, text_only) is True
+
+
+def test_h3_teacher_dataset_borrows_latents_but_keeps_its_own_text_cache(tmp_path):
+    """A rollout-teacher config sets ``latent_cache_directory`` to the student's cache: latent
+    paths resolve there, text-encoder paths stay in its own ``cache_directory``, and the
+    latent-cache script must treat the borrowed directory as read-only."""
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    target = videos / "target.mp4"
+    target.write_bytes(b"video fixture")
+    student_cache = tmp_path / "cache_student"
+    teacher_cache = tmp_path / "cache_teacher"
+    config = {
+        "general": {"batch_size": 1, "resolution": [512, 512]},
+        "datasets": [
+            {
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
+                "cache_directory": str(student_cache),
+                "target_frames": [22],
+            },
+            {
+                "target_video_directory": str(videos),
+                "target_modalities": ["video", "audio"],
+                "cache_directory": str(teacher_cache),
+                "latent_cache_directory": str(student_cache),
+                "target_frames": [22],
+            },
+        ],
+    }
+    group, _ = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    student, teacher = group.datasets
+    item = ItemInfo(str(target), "video", (512, 512), (512, 512, 22), frame_count=22)
+
+    assert student.latent_cache_directory == str(student_cache) and not student.latent_cache_borrowed
+    assert teacher.latent_cache_directory == str(student_cache) and teacher.latent_cache_borrowed
+    assert teacher.get_latent_cache_path(item) == student.get_latent_cache_path(item)
+    assert os.path.dirname(teacher.get_text_encoder_output_cache_path(item)) == str(teacher_cache)
+    assert os.path.dirname(student.get_text_encoder_output_cache_path(item)) == str(student_cache)
+
+    # The borrowed directory is enumerated for skip_existing but never purged, even
+    # when the teacher's own item set does not cover a file that lives there.
+    student_cache.mkdir()
+    stale = student_cache / "other_00000-022_0512x0512_mmh3.safetensors"
+    stale.write_bytes(b"latent")
+    assert [os.path.normpath(p) for p in teacher.get_all_latent_cache_files()] == [os.path.normpath(str(stale))]
+    from musubi_tuner import cache_latents
+
+    class BorrowingDataset:
+        latent_cache_borrowed = teacher.latent_cache_borrowed
+        latent_cache_directory = teacher.latent_cache_directory
+
+        def retrieve_latent_cache_batches(self, num_workers):
+            return iter(())
+
+        def get_all_latent_cache_files(self):
+            return teacher.get_all_latent_cache_files()
+
+        def latent_cache_purge_allowed(self, datasets):
+            return teacher.latent_cache_purge_allowed(datasets)
+
+    cache_latents.encode_datasets(
+        [BorrowingDataset()], lambda batch: None, Namespace(num_workers=1, skip_existing=True, keep_cache=False)
+    )
+    assert stale.exists()
+
+
+def test_shared_latent_directory_is_never_purged_by_its_owner_or_a_borrower(tmp_path):
+    """Two datasets of one run resolve to the same latent directory: neither may purge it,
+    and the audio dataset honours the key too."""
+    from musubi_tuner import cache_latents
+    from musubi_tuner.dataset.image_video_dataset import VideoDataset
+    from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
+
+    shared = tmp_path / "latents"
+    shared.mkdir()
+    stale = shared / "other_00000-022_0512x0512_mmh3.safetensors"
+    stale.write_bytes(b"latent")
+    common = dict(
+        resolution=(512, 512),
+        caption_extension=".txt",
+        batch_size=1,
+        num_repeats=1,
+        enable_bucket=False,
+        bucket_no_upscale=False,
+        video_directory=str(tmp_path),
+        target_frames=[22],
+        architecture="mmh3",
+    )
+    owner = VideoDataset(cache_directory=str(shared), **common)
+    borrower = VideoDataset(cache_directory=str(tmp_path / "teacher_text"), latent_cache_directory=str(shared), **common)
+    alone = VideoDataset(cache_directory=str(tmp_path / "solo"), **common)
+
+    assert owner.latent_cache_purge_allowed([owner]) is True
+    assert owner.latent_cache_purge_allowed([owner, borrower]) is False
+    assert borrower.latent_cache_purge_allowed([owner, borrower]) is False
+    assert alone.latent_cache_purge_allowed([owner, borrower, alone]) is True
+
+    class Stub:
+        def __init__(self, ds):
+            self.ds = ds
+
+        def __getattr__(self, name):
+            return getattr(self.ds, name)
+
+        def retrieve_latent_cache_batches(self, num_workers):
+            return iter(())
+
+    stubs = [Stub(owner), Stub(borrower)]
+    cache_latents.encode_datasets(stubs, lambda batch: None, Namespace(num_workers=1, skip_existing=False, keep_cache=False))
+    assert stale.exists()
+
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    (audio_dir / "tone.wav").write_bytes(b"audio")
+    audio = H3AudioDataset(
+        {
+            "audio_directory": str(audio_dir),
+            "cache_directory": str(tmp_path / "audio_text"),
+            "latent_cache_directory": str(shared),
+            "target_frames": [22],
+            "resolution": [512, 512],
+        },
+        {},
+    )
+    item = next(audio.retrieve_latent_cache_batches(1))[1][0]
+    assert os.path.dirname(item.latent_cache_path) == str(shared)
+    assert os.path.dirname(item.text_encoder_output_cache_path) == str(tmp_path / "audio_text")
+
+
+def test_prepare_for_training_pairs_latents_from_the_borrowed_directory(tmp_path):
+    """Training reads latents from ``latent_cache_directory`` and the text cache from
+    ``cache_directory`` when they are split."""
+    from musubi_tuner.dataset.image_video_dataset import VideoDataset
+
+    latents = tmp_path / "latents"
+    text = tmp_path / "text"
+    latents.mkdir()
+    text.mkdir()
+    key = "clip_00000-022"
+    save_file({"latents": torch.zeros(1, 16, 2, 64, 64)}, str(latents / f"{key}_0512x0512_mmh3.safetensors"))
+    save_file({"varlen_text_embeds": torch.zeros(4, 8)}, str(text / f"{key}_mmh3_te.safetensors"))
+    ds = VideoDataset(
+        resolution=(512, 512),
+        caption_extension=".txt",
+        batch_size=1,
+        num_repeats=1,
+        enable_bucket=False,
+        bucket_no_upscale=False,
+        video_directory=str(tmp_path),
+        target_frames=[22],
+        architecture="mmh3",
+        cache_directory=str(text),
+        latent_cache_directory=str(latents),
+    )
+    ds.prepare_for_training()
+    assert ds.num_train_items == 1

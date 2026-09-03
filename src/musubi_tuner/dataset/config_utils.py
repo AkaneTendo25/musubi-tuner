@@ -38,6 +38,10 @@ class BaseDatasetParams:
     batch_size: int = 1
     num_repeats: int = 1
     cache_directory: Optional[str] = None
+    # Latent caches read from (and written to) here instead of cache_directory; the
+    # text-encoder cache stays in cache_directory. Lets a rollout teacher dataset
+    # share the student's latents while carrying its own conditioning.
+    latent_cache_directory: Optional[str] = None
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
     loss_mask_directory: Optional[str] = None
@@ -130,6 +134,7 @@ class ConfigSanitizer:
         "image_directory": str,
         "image_jsonl_file": str,
         "cache_directory": str,
+        "latent_cache_directory": str,
         "control_directory": str,
         "multiple_target": bool,
         "h3_image_frame_count": int,
@@ -150,6 +155,7 @@ class ConfigSanitizer:
         "frame_sample": int,
         "max_frames": int,
         "cache_directory": str,
+        "latent_cache_directory": str,
         "source_fps": float,
         "fp_latent_window_size": int,
     }
@@ -320,6 +326,7 @@ def generate_dataset_group_by_blueprint(
         loss_mask_use_alpha: {dataset.loss_mask_use_alpha}
         loss_mask_invert: {dataset.loss_mask_invert}
         cache_directory: "{dataset.cache_directory}"
+        latent_cache_directory: "{dataset.latent_cache_directory}"
         debug_dataset: {dataset.debug_dataset}
     """
         )

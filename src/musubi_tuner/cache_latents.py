@@ -290,6 +290,16 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
         save_latent_cache(item, l)
 
 
+def latent_cache_purge_allowed(dataset, datasets) -> bool:
+    """Purge guard shared by the latent cache scripts: datasets that borrow or share a
+    latent directory never delete files there. Datasets without the guard keep the old
+    behaviour."""
+    guard = getattr(dataset, "latent_cache_purge_allowed", None)
+    if callable(guard):
+        return bool(guard(datasets))
+    return True
+
+
 def encode_datasets(
     datasets: list[BaseDataset],
     encode: callable,
@@ -379,9 +389,12 @@ def encode_datasets(
 
         # remove old cache files not in the dataset
         all_cache_files = dataset.get_all_latent_cache_files()
+        shared = not latent_cache_purge_allowed(dataset, datasets)
+        if shared and not args.keep_cache:
+            logger.info(f"Latent cache directory is shared with another dataset; not purging {dataset.latent_cache_directory}")
         for cache_file in all_cache_files:
             if os.path.normpath(cache_file) not in all_latent_cache_paths:
-                if args.keep_cache:
+                if args.keep_cache or shared:
                     logger.info(f"Keep cache file not in the dataset: {cache_file}")
                 else:
                     os.remove(cache_file)

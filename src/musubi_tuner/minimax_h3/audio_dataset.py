@@ -40,6 +40,7 @@ class H3AudioDataset(BaseDataset):
             num_repeats=int(value("num_repeats", 1)),
             cache_directory=value("cache_directory"),
             architecture=ARCHITECTURE_MINIMAX_H3,
+            latent_cache_directory=value("latent_cache_directory"),
         )
         audio_directory = value("audio_directory")
         audio_jsonl_file = value("audio_jsonl_file")
@@ -93,7 +94,7 @@ class H3AudioDataset(BaseDataset):
     def get_latent_cache_path(self, item_info: ItemInfo) -> str:
         width, height = self.resolution
         return os.path.join(
-            self.cache_directory,
+            self.latent_cache_directory,
             f"{self._cache_basename(item_info.item_key)}_00000-{self.target_frames:03d}"
             f"_{width:04d}x{height:04d}_{self.architecture}.safetensors",
         )

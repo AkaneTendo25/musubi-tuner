@@ -367,6 +367,10 @@ this way runs off the base model's reference statistics and needs careful valida
 Both caches record which reference files produced them, so swapping, reordering, or editing a reference rebuilds that item under
 `--skip_existing`.
 
+A dataset may read its latents from another dataset's cache: `latent_cache_directory` points at that directory while
+`cache_directory` keeps the dataset's own text-encoder outputs. It exists for rollout-teacher datasets that share the
+student's clips; see [Building the teacher dataset](#building-the-teacher-dataset).
+
 ### External aligned video guides
 
 To train a LoRA with an external video aligned to the target timeline, select one or more source-video references with
@@ -974,6 +978,21 @@ target_frames = [124]
 
 Cache it with the same two commands the training set uses, pointed at this config, and with **identical** sizing options:
 reference sizing is part of the cache key, so a mismatch fails with a missing-key error.
+
+When the teacher's privilege is the caption or the clip's own keyframes, its target latents are the student's latents.
+Do not encode them twice: point the teacher at the student's latent cache with `latent_cache_directory` and keep its own
+`cache_directory` for the text-encoder outputs, which differ. The latent-cache command then skips every existing file under
+`--skip_existing` and never purges a borrowed directory; only the text-cache command does real work.
+
+```toml
+[[datasets]]
+video_jsonl_file = "/data/train.jsonl"                 # the student's items
+cache_directory = "/data/cache/fl2va_teacher"          # text-encoder outputs only
+latent_cache_directory = "/data/cache/fl2va"           # the student's latents, read as-is
+target_frames = [124]
+```
+
+The reference channel does not qualify: the teacher's extra references are new latents, so it caches both halves.
 
 ```shell
 python minimax_h3_cache_latents.py --dataset_config teacher.toml \

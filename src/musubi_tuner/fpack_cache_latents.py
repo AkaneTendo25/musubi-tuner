@@ -488,9 +488,12 @@ def encode_datasets_framepack(datasets: list[BaseDataset], encode: callable, arg
 
         # remove old cache files not in the dataset
         all_cache_files = dataset.get_all_latent_cache_files()
+        shared = not cache_latents.latent_cache_purge_allowed(dataset, datasets)
+        if shared and not args.keep_cache:
+            logger.info(f"Latent cache directory is shared with another dataset; not purging {dataset.latent_cache_directory}")
         for cache_file in all_cache_files:
             if os.path.normpath(cache_file) not in all_latent_cache_paths:
-                if args.keep_cache:
+                if args.keep_cache or shared:
                     logger.info(f"Keep cache file not in the dataset: {cache_file}")
                 else:
                     os.remove(cache_file)

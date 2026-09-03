@@ -117,6 +117,8 @@ def _dataset_entry_to_dict(entry) -> dict:
             d["audio_directory"] = entry.directory
 
     d["cache_directory"] = _default_cache_directory(entry)
+    if getattr(entry, "latent_cache_directory", ""):
+        d["latent_cache_directory"] = entry.latent_cache_directory
     reference_cache_directories = _merge_path_values(
         [entry.reference_cache_directory] if entry.reference_cache_directory else [],
         _split_path_list(getattr(entry, "extra_reference_cache_directories", "")),

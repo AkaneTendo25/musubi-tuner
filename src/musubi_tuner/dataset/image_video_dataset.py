@@ -233,6 +233,7 @@ class BaseDataset(torch.utils.data.Dataset):
         default_loss_mask_path: Optional[str] = None,
         loss_mask_use_alpha: bool = False,
         loss_mask_invert: bool = False,
+        latent_cache_directory: Optional[str] = None,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -241,6 +242,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
+        # None means the latents live beside the text cache in cache_directory.
+        self._latent_cache_directory = latent_cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
         self.loss_mask_directory = loss_mask_directory
@@ -265,8 +268,38 @@ class BaseDataset(torch.utils.data.Dataset):
         }
         return metadata
 
+    @property
+    def latent_cache_directory(self) -> Optional[str]:
+        """Where the latent caches live: ``latent_cache_directory`` when the dataset borrows
+        them (a rollout teacher sharing the student's latents), else ``cache_directory``."""
+        return self._latent_cache_directory or self.cache_directory
+
+    @property
+    def latent_cache_borrowed(self) -> bool:
+        """True when the latents belong to another dataset's cache directory: the latent
+        cache scripts must then neither purge nor claim files there."""
+        return bool(self._latent_cache_directory) and os.path.normpath(self._latent_cache_directory) != os.path.normpath(
+            self.cache_directory or ""
+        )
+
     def get_all_latent_cache_files(self):
-        return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        return glob.glob(os.path.join(self.latent_cache_directory, f"*_{self.architecture}.safetensors"))
+
+    def latent_cache_purge_allowed(self, datasets: Sequence["BaseDataset"]) -> bool:
+        """Whether the latent cache script may delete files it did not write in this
+        dataset's latent directory. Not when the directory is borrowed, and not when
+        another dataset of the same run resolves to the same directory: its files would
+        be "not in the dataset" here and be removed before it ran."""
+        if self.latent_cache_borrowed:
+            return False
+        mine = os.path.normcase(os.path.normpath(os.path.abspath(self.latent_cache_directory or "")))
+        for other in datasets:
+            if other is self:
+                continue
+            theirs = getattr(other, "latent_cache_directory", None) or getattr(other, "cache_directory", None)
+            if theirs and os.path.normcase(os.path.normpath(os.path.abspath(theirs))) == mine:
+                return False
+        return True
 
     def get_all_text_encoder_output_cache_files(self):
         return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_te.safetensors"))
@@ -344,8 +377,8 @@ class BaseDataset(torch.utils.data.Dataset):
         """
         w, h = item_info.original_size
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
-        assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
-        return os.path.join(self.cache_directory, f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors")
+        assert self.latent_cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
+        return os.path.join(self.latent_cache_directory, f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors")
 
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
@@ -474,6 +507,7 @@ class ImageDataset(BaseDataset):
         default_loss_mask_path: Optional[str] = None,
         loss_mask_use_alpha: bool = False,
         loss_mask_invert: bool = False,
+        latent_cache_directory: Optional[str] = None,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -489,6 +523,7 @@ class ImageDataset(BaseDataset):
             default_loss_mask_path,
             loss_mask_use_alpha,
             loss_mask_invert,
+            latent_cache_directory=latent_cache_directory,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -749,7 +784,7 @@ class ImageDataset(BaseDataset):
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
 
         # glob cache files
-        latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        latent_cache_files = glob.glob(os.path.join(self.latent_cache_directory, f"*_{self.architecture}.safetensors"))
 
         # assign cache files to item info
         # (width, height) -> [ItemInfo] or (width, height, other conds...) -> [ItemInfo]
@@ -861,6 +896,7 @@ class VideoDataset(BaseDataset):
         default_loss_mask_path: Optional[str] = None,
         loss_mask_use_alpha: bool = False,
         loss_mask_invert: bool = False,
+        latent_cache_directory: Optional[str] = None,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -876,6 +912,7 @@ class VideoDataset(BaseDataset):
             default_loss_mask_path,
             loss_mask_use_alpha,
             loss_mask_invert,
+            latent_cache_directory=latent_cache_directory,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -1172,7 +1209,7 @@ class VideoDataset(BaseDataset):
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
 
         # glob cache files
-        latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        latent_cache_files = glob.glob(os.path.join(self.latent_cache_directory, f"*_{self.architecture}.safetensors"))
 
         # assign cache files to item info
         bucketed_item_info: dict[tuple[int, int, int], list[ItemInfo]] = {}  # (width, height, frame_count) -> [ItemInfo]

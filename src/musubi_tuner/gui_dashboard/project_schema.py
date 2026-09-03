@@ -71,6 +71,7 @@ class DatasetEntry(BaseModel):
     type: Literal["video", "image", "audio"] = "video"
     directory: str = ""
     cache_directory: str = ""
+    latent_cache_directory: str = ""
     reference_cache_directory: str = ""
     extra_reference_cache_directories: str = ""
     reference_frames: Optional[int] = None
