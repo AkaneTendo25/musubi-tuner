@@ -1534,11 +1534,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         before_drift = {b: len(v) for b, v in self._prompted_drift_ratios.items()}
         before_err = {b: len(v) for b, v in self._velocity_error_ratios.items()}
         yield
-        record = self._trigger_items.setdefault(which, {}).setdefault(item, {"drift": [], "err": []})
+        record = self._trigger_items.setdefault(which, {}).setdefault(
+            item, {"drift": [], "err": [], "drift_bins": {}, "err_bins": {}}
+        )
         for b, values in self._prompted_drift_ratios.items():
-            record["drift"].extend(values[before_drift.get(b, 0) :])
+            fresh = values[before_drift.get(b, 0) :]
+            record["drift"].extend(fresh)
+            record["drift_bins"].setdefault(b, []).extend(fresh)
         for b, values in self._velocity_error_ratios.items():
-            record["err"].extend(values[before_err.get(b, 0) :])
+            fresh = values[before_err.get(b, 0) :]
+            record["err"].extend(fresh)
+            record["err_bins"].setdefault(b, []).extend(fresh)
 
     @staticmethod
     def _pooled(values: dict, accelerator=None) -> float | None:
@@ -1946,6 +1952,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             with_std("val/trigger/drift_gain", drift_gain)
             with_std("val/trigger/err_rel_bare", bare_err)
             with_std("val/trigger/err_gain", err_gain)
+            # Per sigma bin: at a low-noise data state the clip itself already shows
+            # the concept, so the caption adds little there; the trigger's effect
+            # lives at the high-noise end, where the state is close to pure noise.
+            bins_seen = sorted({b for trig, bare in paired for b in (*trig["drift_bins"], *bare["drift_bins"])})
+            for b in bins_seen:
+                gains = []
+                for trig, bare in paired:
+                    t_bin, b_bin = item_mean(trig["drift_bins"].get(b, [])), item_mean(bare["drift_bins"].get(b, []))
+                    if t_bin is not None and b_bin is not None:
+                        gains.append(t_bin - b_bin)
+                if gains:
+                    metrics[f"val/trigger/drift_gain/bin{b}"] = sum(gains) / len(gains)
+                err_gains = []
+                for trig, bare in paired:
+                    t_bin, b_bin = item_mean(trig["err_bins"].get(b, [])), item_mean(bare["err_bins"].get(b, []))
+                    if t_bin is not None and b_bin is not None:
+                        err_gains.append(b_bin - t_bin)
+                if err_gains:
+                    metrics[f"val/trigger/err_gain/bin{b}"] = sum(err_gains) / len(err_gains)
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
