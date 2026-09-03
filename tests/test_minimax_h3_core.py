@@ -5029,3 +5029,54 @@ def test_prepare_for_training_pairs_latents_from_the_borrowed_directory(tmp_path
     )
     ds.prepare_for_training()
     assert ds.num_train_items == 1
+
+
+def test_owner_purge_of_a_borrowed_directory_warns(tmp_path, caplog):
+    """The owner keeps its purge; when another dataset of the run borrows its latents,
+    the cache script says so before removing anything."""
+    import logging
+
+    from musubi_tuner import cache_latents
+    from musubi_tuner.dataset.image_video_dataset import VideoDataset
+
+    shared = tmp_path / "latents"
+    shared.mkdir()
+    (shared / "other_00000-022_0512x0512_mmh3.safetensors").write_bytes(b"latent")
+    common = dict(
+        resolution=(512, 512),
+        caption_extension=".txt",
+        batch_size=1,
+        num_repeats=1,
+        enable_bucket=False,
+        bucket_no_upscale=False,
+        video_directory=str(tmp_path),
+        target_frames=[22],
+        architecture="mmh3",
+    )
+    owner = VideoDataset(cache_directory=str(shared), **common)
+    borrower = VideoDataset(cache_directory=str(tmp_path / "teacher_text"), latent_cache_directory=str(shared), **common)
+    assert [b is borrower for b in cache_latents.latent_cache_borrowers(owner, [owner, borrower])] == [True]
+    assert cache_latents.latent_cache_borrowers(borrower, [owner, borrower]) == []
+
+    class Stub:
+        def __init__(self, ds):
+            self.ds = ds
+
+        def __getattr__(self, name):
+            return getattr(self.ds, name)
+
+        def retrieve_latent_cache_batches(self, num_workers):
+            return iter(())
+
+    with caplog.at_level(logging.WARNING):
+        cache_latents.encode_datasets(
+            [Stub(owner), Stub(borrower)], lambda batch: None, Namespace(num_workers=1, skip_existing=False, keep_cache=False)
+        )
+    assert any("latent_cache_directory" in r.getMessage() and "--keep_cache" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    (shared / "other_00000-022_0512x0512_mmh3.safetensors").write_bytes(b"latent")
+    with caplog.at_level(logging.WARNING):
+        cache_latents.encode_datasets(
+            [Stub(owner), Stub(borrower)], lambda batch: None, Namespace(num_workers=1, skip_existing=False, keep_cache=True)
+        )
+    assert not [r for r in caplog.records if "--keep_cache" in r.getMessage()]

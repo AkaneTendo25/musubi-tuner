@@ -491,6 +491,12 @@ def encode_datasets_framepack(datasets: list[BaseDataset], encode: callable, arg
         shared = not cache_latents.latent_cache_purge_allowed(dataset, datasets)
         if shared and not args.keep_cache:
             logger.info(f"Latent cache directory is shared with another dataset; not purging {dataset.latent_cache_directory}")
+        elif not args.keep_cache and cache_latents.latent_cache_borrowers(dataset, datasets):
+            logger.warning(
+                f"{dataset.latent_cache_directory} is read by another dataset of this run through latent_cache_directory; "
+                "this dataset's purge removes any latent there that is not one of its own items. Pass --keep_cache if the "
+                "two item sets differ"
+            )
         for cache_file in all_cache_files:
             if os.path.normpath(cache_file) not in all_latent_cache_paths:
                 if args.keep_cache or shared:

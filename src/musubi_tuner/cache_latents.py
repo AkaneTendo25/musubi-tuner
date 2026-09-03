@@ -300,6 +300,23 @@ def latent_cache_purge_allowed(dataset, datasets) -> bool:
     return True
 
 
+def latent_cache_borrowers(dataset, datasets) -> list:
+    """The other datasets of this run that read their latents from ``dataset``'s latent
+    directory. Their files look like strangers to ``dataset``'s purge."""
+    mine = getattr(dataset, "latent_cache_directory", None) or getattr(dataset, "cache_directory", None)
+    if not mine:
+        return []
+    mine = os.path.normcase(os.path.normpath(os.path.abspath(mine)))
+    borrowers = []
+    for other in datasets:
+        if other is dataset or not getattr(other, "latent_cache_borrowed", False):
+            continue
+        theirs = getattr(other, "latent_cache_directory", None)
+        if theirs and os.path.normcase(os.path.normpath(os.path.abspath(theirs))) == mine:
+            borrowers.append(other)
+    return borrowers
+
+
 def encode_datasets(
     datasets: list[BaseDataset],
     encode: callable,
@@ -392,6 +409,14 @@ def encode_datasets(
         shared = not latent_cache_purge_allowed(dataset, datasets)
         if shared and not args.keep_cache:
             logger.info(f"Latent cache directory is shared with another dataset; not purging {dataset.latent_cache_directory}")
+        elif not args.keep_cache and latent_cache_borrowers(dataset, datasets):
+            # The owner keeps its ordinary purge. Files that only a borrowing
+            # dataset of this run needs are strangers to it and would be removed.
+            logger.warning(
+                f"{dataset.latent_cache_directory} is read by another dataset of this run through latent_cache_directory; "
+                "this dataset's purge removes any latent there that is not one of its own items. Pass --keep_cache if the "
+                "two item sets differ"
+            )
         for cache_file in all_cache_files:
             if os.path.normpath(cache_file) not in all_latent_cache_paths:
                 if args.keep_cache or shared:
