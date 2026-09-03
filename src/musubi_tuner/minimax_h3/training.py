@@ -284,8 +284,15 @@ def cfg_zero_rescaled_empty(
     return H3ModelPrediction(video=video, audio=audio)
 
 
-def guidance_scale_for_sigma(configured_scale: float | torch.Tensor, sigma: torch.Tensor, schedule: str) -> torch.Tensor:
+def guidance_scale_for_sigma(
+    configured_scale: float | torch.Tensor, sigma: torch.Tensor, schedule: str, sigma_max: float = 1.0
+) -> torch.Tensor:
     """Resolve the per-example guidance scale for one H3 modality.
+
+    ``sigma_max`` caps the schedule: at a (shifted) sigma above it the scale is
+    1, i.e. the plain data target. Measured on the released checkpoints the
+    implied scale runs to 11-16 in the top of the schedule where the data are
+    nearly noise, and a guidance target there multiplies noise by the scale.
 
     ``configured_scale`` is normally the single authoritative distillation
     scale. It may also be a tensor, which is how a per-sample scale drawn from
@@ -308,11 +315,16 @@ def guidance_scale_for_sigma(configured_scale: float | torch.Tensor, sigma: torc
         if isinstance(scale, torch.Tensor):
             # ``full_like`` cannot carry a per-sample value; the multiply is the
             # broadcasting equivalent and keeps sigma's device and dtype.
-            return scale * torch.ones_like(sigma)
-        return torch.full_like(sigma, scale)
-    if schedule == "sigma":
-        return 1.0 + (scale - 1.0) * sigma
-    raise ValueError(f"unsupported H3 guidance loss schedule: {schedule}")
+            resolved = scale * torch.ones_like(sigma)
+        else:
+            resolved = torch.full_like(sigma, scale)
+    elif schedule == "sigma":
+        resolved = 1.0 + (scale - 1.0) * sigma
+    else:
+        raise ValueError(f"unsupported H3 guidance loss schedule: {schedule}")
+    if sigma_max < 1.0:
+        resolved = torch.where(sigma > sigma_max, torch.ones_like(resolved), resolved)
+    return resolved
 
 
 def contrastive_guidance_target(

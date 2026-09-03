@@ -204,6 +204,18 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also apply the adapters to the first pass, which the two-pass split exists to avoid",
     )
+    parser.add_argument(
+        "--h3_null_guidance_scale",
+        type=float,
+        default=0.0,
+        help=(
+            "classifier-free guidance at sampling time against the BASE checkpoint's empty-prompt branch: each step "
+            "runs the prompted forward with the adapters and a null-prompt forward with the adapters off, and combines "
+            "them as null + scale * (prompted - null). Restores amplification an adapter trained with a plain data loss "
+            "lost (its field settles near 1/w of the base's; a scale near w brings it back). Two forwards per step. "
+            "Needs --lora_weight. 0 (default) samples the prompted branch only"
+        ),
+    )
     parser.add_argument("--compile", action="store_true", help="regionally compile H3 transformer blocks")
     parser.add_argument("--compile_backend", default="inductor")
     parser.add_argument(
@@ -313,6 +325,7 @@ def generator_from_args(args: argparse.Namespace, request: H3GenerationRequest):
         first_pass_steps=args.first_pass_steps,
         second_pass_strength=args.second_pass_strength,
         first_pass_lora=args.first_pass_lora,
+        null_guidance_scale=args.h3_null_guidance_scale,
         latent_upscaler=args.latent_upscaler,
         latent_upscale_scale=args.latent_upscale_scale,
         compile_model=args.compile,

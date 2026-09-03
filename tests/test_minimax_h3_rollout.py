@@ -3022,3 +3022,208 @@ def test_field_cap_and_prefix_are_validated_and_recorded(tmp_path):
     metadata = trainer.extra_metadata(args)
     assert metadata["ss_h3_rollout_field_cap"] == "1.25"
     assert metadata["ss_h3_rollout_prefix"] == "teacher"
+
+
+# ---------------------------------------------------------------------------
+# Sigma cap on the guidance target, adapter EMA, multiplier sweep
+# ---------------------------------------------------------------------------
+
+
+def test_guidance_scale_sigma_max_caps_the_schedule():
+    from musubi_tuner.minimax_h3.training import guidance_scale_for_sigma
+
+    sigma = torch.tensor([0.5, 0.95])
+    torch.testing.assert_close(guidance_scale_for_sigma(4.0, sigma, "constant"), torch.tensor([4.0, 4.0]))
+    torch.testing.assert_close(guidance_scale_for_sigma(4.0, sigma, "constant", sigma_max=0.9), torch.tensor([4.0, 1.0]))
+    torch.testing.assert_close(guidance_scale_for_sigma(4.0, sigma, "sigma", sigma_max=0.9), torch.tensor([1.0 + 3.0 * 0.5, 1.0]))
+    per_sample = guidance_scale_for_sigma(torch.tensor([2.0, 6.0]), sigma, "constant", sigma_max=0.9)
+    torch.testing.assert_close(per_sample, torch.tensor([2.0, 1.0]))
+
+
+def test_guidance_scale_sigma_max_is_validated_and_recorded():
+    with pytest.raises(ValueError, match="sigma_max"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_guidance_scale_sigma_max", "0"))
+    trainer = MiniMaxH3NetworkTrainer()
+    args = _flag_args("--h3_guidance_scale_sigma_max", "0.9")
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_guidance_scale_sigma_max"] == "0.9"
+
+
+class _EmaNetwork(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(2))
+        self.saved = []
+
+    def save_weights(self, path, dtype, metadata):
+        self.saved.append((path, dtype, dict(metadata), self.weight.detach().clone()))
+
+
+def test_adapter_ema_tracks_the_parameters_and_saves_on_schedule(tmp_path):
+    args = _flag_args(
+        "--h3_adapter_ema_decay", "0.5", "--save_every_n_steps", "2", "--output_dir", str(tmp_path), "--output_name", "arm"
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    network = _EmaNetwork()
+    accelerator = _FakeAccelerator()
+    accelerator.is_main_process = True
+    # Step 0 (global_step 0 -> step 1): the EMA is initialised at the live value.
+    with torch.no_grad():
+        network.weight.fill_(1.0)
+    trainer.on_post_optimizer_step(args, accelerator, network, None, True, 0)
+    torch.testing.assert_close(trainer._adapter_ema["weight"], torch.tensor([1.0, 1.0]))
+    # Step 1 (-> step 2): decay 0.5 between 1.0 and the new value 3.0 -> 2.0, and a save.
+    with torch.no_grad():
+        network.weight.fill_(3.0)
+    trainer.on_post_optimizer_step(args, accelerator, network, None, True, 1)
+    torch.testing.assert_close(trainer._adapter_ema["weight"], torch.tensor([2.0, 2.0]))
+    assert len(network.saved) == 1
+    path, _dtype, metadata, weights_at_save = network.saved[0]
+    assert path.endswith("arm-ema-step00000002.safetensors")
+    assert metadata["ss_h3_adapter_ema"] == "True" and metadata["ss_steps"] == "2"
+    # Saved with the EMA swapped in, and the live weights put back afterwards.
+    torch.testing.assert_close(weights_at_save, torch.tensor([2.0, 2.0]))
+    torch.testing.assert_close(network.weight.detach(), torch.tensor([3.0, 3.0]))
+    # No update without a synchronised gradient step.
+    trainer.on_post_optimizer_step(args, accelerator, network, None, False, 2)
+    torch.testing.assert_close(trainer._adapter_ema["weight"], torch.tensor([2.0, 2.0]))
+
+
+def test_adapter_ema_flags_are_validated():
+    with pytest.raises(ValueError, match="ema_decay"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_adapter_ema_decay", "1.0"))
+    with pytest.raises(ValueError, match="requires --h3_adapter_ema_decay"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_validate_ema"))
+
+
+def test_validation_multipliers_are_parsed_and_validated():
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(_flag_args("--h3_validation_multipliers", "0.75, 1.0,1.25"))
+    assert trainer._validation_multipliers == [0.75, 1.0, 1.25]
+    with pytest.raises(ValueError, match="comma-separated numbers"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_validation_multipliers", "a,b"))
+    with pytest.raises(ValueError, match="non-negative"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_validation_multipliers", "-1"))
+
+
+def test_multiplier_sweep_scales_the_modules_pools_per_multiplier_and_restores(monkeypatch):
+    """The sweep sets every LoRA module's multiplier, runs the batch pass, pools
+    the data-state ratios under val/m<multiplier>/..., and leaves the modules and
+    the live pools exactly as it found them."""
+
+    class _Module:
+        def __init__(self):
+            self.multiplier = 1.0
+
+    class _Network:
+        def __init__(self):
+            self.unet_loras = [_Module(), _Module()]
+            self.text_encoder_loras = []
+
+    trainer = MiniMaxH3NetworkTrainer()
+    args = _flag_args("--h3_validation_multipliers", "0.5,1.0,2", "--h3_validation_rollout_probe", "3")
+    trainer.handle_model_specific_args(args)
+    trainer._validation_dataloader = [(0, {"clip": 1})]
+    seen = []
+
+    def fake_validate_batch(accelerator, a, transformer, dataset_index, batch, bins, observed, tasks, accumulators, seed):
+        multiplier = network.unet_loras[0].multiplier
+        seen.append((multiplier, a.h3_validation_rollout_probe, trainer._rollout_probe_done))
+        trainer._velocity_error_ratios.setdefault(0, []).append(multiplier * 0.1)
+        trainer._field_ratios.setdefault(0, []).append(multiplier)
+        trainer._field_cosines.setdefault(0, []).append(0.9)
+        trainer._prompted_drift_ratios.setdefault(0, []).append(multiplier * 0.2)
+
+    monkeypatch.setattr(trainer, "_validate_batch", fake_validate_batch)
+    network = _Network()
+    trainer._reset_validation_pools()
+    trainer._field_ratios = {0: [0.42]}  # a live-pass value that must survive the sweep
+    metrics = trainer._validate_multiplier_sweep(_FakeAccelerator(), args, None, network, [0.5], (None,), ((None, "av"),), 0)
+
+    assert [m for m, _, _ in seen] == [0.5, 2.0]
+    # The rollout probe is off during the sweep and back afterwards.
+    assert all(probe == 0 and done is None for _, probe, done in seen)
+    assert args.h3_validation_rollout_probe == 3
+    assert metrics["val/m0.5/field"] == pytest.approx(0.5)
+    assert metrics["val/m2/field"] == pytest.approx(2.0)
+    assert metrics["val/m0.5/velocity_err_rel"] == pytest.approx(0.05)
+    assert metrics["val/m2/drift/prompted_rel"] == pytest.approx(0.4)
+    assert [module.multiplier for module in network.unet_loras] == [1.0, 1.0]
+    assert trainer._field_ratios == {0: [0.42]}
+
+
+# ---------------------------------------------------------------------------
+# Inference null guidance
+# ---------------------------------------------------------------------------
+
+
+def test_null_guidance_combines_two_forwards_with_the_adapter_off_for_the_null():
+    from musubi_tuner.minimax_h3.inference import H3NullGuidance, _guided_transformer_call
+    from musubi_tuner.minimax_h3.model import MiniMaxH3TransformerOutput
+
+    events = []
+
+    class _Transformer:
+        adapter = True
+
+        def __call__(self, **kwargs):
+            hidden = kwargs["encoder_hidden_states"]
+            events.append((float(hidden.mean()), self.adapter))
+            # prompted (mean 1) with adapter -> 3; null (mean 0) without -> 1
+            value = 3.0 if self.adapter else 1.0
+            return MiniMaxH3TransformerOutput(video=torch.full((1, 2), value), audio=torch.full((1, 2), value * 2))
+
+    transformer = _Transformer()
+
+    def set_adapter(on):
+        transformer.adapter = on
+        events.append(("adapter", on))
+
+    prompted = torch.ones(1, 4, 8)
+    guidance = H3NullGuidance(scale=2.0, null_text_hidden=torch.zeros(4, 8), set_adapter=set_adapter)
+    out = _guided_transformer_call(transformer, guidance, encoder_hidden_states=prompted, timestep=torch.tensor([0.5]))
+    # null + 2 * (prompted - null) = 1 + 2 * (3 - 1) = 5; audio 2 + 2 * (6 - 2) = 10
+    torch.testing.assert_close(out.video, torch.full((1, 2), 5.0))
+    torch.testing.assert_close(out.audio, torch.full((1, 2), 10.0))
+    assert events == [(1.0, True), ("adapter", False), (0.0, False), ("adapter", True)]
+    # Without guidance: one forward, untouched.
+    events.clear()
+    out = _guided_transformer_call(transformer, None, encoder_hidden_states=prompted)
+    torch.testing.assert_close(out.video, torch.full((1, 2), 3.0))
+    assert events == [(1.0, True)]
+
+
+def test_null_guidance_rejects_a_null_presentation_of_another_layout():
+    from musubi_tuner.minimax_h3.inference import H3NullGuidance, _guided_transformer_call
+    from musubi_tuner.minimax_h3.model import MiniMaxH3TransformerOutput
+
+    class _Transformer:
+        def __call__(self, **kwargs):
+            return MiniMaxH3TransformerOutput(video=torch.zeros(1, 2), audio=torch.zeros(1, 2))
+
+    guidance = H3NullGuidance(scale=2.0, null_text_hidden=torch.zeros(3, 8))
+    with pytest.raises(ValueError, match="layout-preserving"):
+        _guided_transformer_call(_Transformer(), guidance, encoder_hidden_states=torch.ones(1, 4, 8))
+
+
+def test_generator_exposes_the_null_guidance_flag():
+    from musubi_tuner.minimax_h3_generate_video import create_parser
+
+    required = ["--model", "m.safetensors", "--prompt", "p", "--output", "o.mp4"]
+    args = create_parser().parse_args([*required, "--h3_null_guidance_scale", "4.0"])
+    assert args.h3_null_guidance_scale == 4.0
+    assert create_parser().parse_args(required).h3_null_guidance_scale == 0.0
+
+
+def test_adapter_ema_saves_on_the_initialising_step_when_scheduled(tmp_path):
+    trainer = MiniMaxH3NetworkTrainer()
+    args = _flag_args(
+        "--h3_adapter_ema_decay", "0.5", "--save_every_n_steps", "1", "--output_dir", str(tmp_path), "--output_name", "eager"
+    )
+    trainer.handle_model_specific_args(args)
+    network = _EmaNetwork()
+    accelerator = _FakeAccelerator()
+    accelerator.is_main_process = True
+    trainer.on_post_optimizer_step(args, accelerator, network, None, True, 0)
+    assert network.saved and network.saved[0][0].endswith("eager-ema-step00000001.safetensors")

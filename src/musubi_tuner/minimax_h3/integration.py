@@ -74,6 +74,7 @@ from musubi_tuner.minimax_h3.component_loader import (
     load_video_vae_encoder,
 )
 from musubi_tuner.minimax_h3.inference import (
+    H3NullGuidance,
     CANVAS_MULTIPLE,
     VIDEO_SPATIAL_COMPRESSION,
     H3EncodedReferences,
@@ -307,6 +308,7 @@ def create_generator(
     first_pass_steps: int = 0,
     second_pass_strength: float = 0.5,
     first_pass_lora: bool = False,
+    null_guidance_scale: float = 0.0,
     latent_upscaler: Path | None = None,
     latent_upscale_scale: float = 1.0,
     compile_model: bool = False,
@@ -359,6 +361,7 @@ def create_generator(
         first_pass_steps=first_pass_steps,
         second_pass_strength=second_pass_strength,
         first_pass_lora=first_pass_lora,
+        null_guidance_scale=null_guidance_scale,
         latent_upscaler=latent_upscaler,
         latent_upscale_scale=latent_upscale_scale,
         compile_model=compile_model,
@@ -430,6 +433,7 @@ class _NativeGenerator:
         first_pass_steps: int = 0,
         second_pass_strength: float = 0.5,
         first_pass_lora: bool = False,
+        null_guidance_scale: float = 0.0,
         latent_upscaler: Path | None = None,
         latent_upscale_scale: float = 1.0,
     ) -> None:
@@ -447,6 +451,8 @@ class _NativeGenerator:
         self.first_pass_steps = first_pass_steps
         self.second_pass_strength = second_pass_strength
         self.first_pass_lora = first_pass_lora
+        self.null_guidance_scale = float(null_guidance_scale or 0.0)
+        self._null_conditioning = None
         self.latent_upscaler = Path(latent_upscaler) if latent_upscaler else None
         self.latent_upscale_scale = latent_upscale_scale
         if (height is None) != (width is None):
@@ -545,6 +551,11 @@ class _NativeGenerator:
             conditioning = (
                 encoder.encode_reference_prompt(prompt, references) if references else encoder.encode_prompt(prompt, images)
             )
+            null_conditioning = None
+            if self.null_guidance_scale > 0:
+                # Encoded in the same encoder session: loading the text encoder
+                # twice would cost more than the whole denoise.
+                null_conditioning = encoder.encode_null_conditioning(prompt, images, references)
         finally:
             encoder.close()
             del encoder
@@ -552,6 +563,14 @@ class _NativeGenerator:
         clean_memory_on_device(self.device)
         from musubi_tuner.minimax_h3.learned_context import apply_learned_context
 
+        if null_conditioning is not None:
+            # The same composition as the prompted presentation, so the two keep
+            # one token layout and the guidance combines them row by row.
+            self._null_conditioning = apply_learned_context(
+                null_conditioning,
+                self.learned_context,
+                self.learned_context_composition,
+            )
         return apply_learned_context(
             conditioning,
             self.learned_context,
@@ -779,6 +798,9 @@ class _NativeGenerator:
         first_steps = self.first_pass_steps or self.num_inference_steps
         if not self.first_pass_lora:
             self._set_lora_multiplier(networks, 0.0)
+            # With the adapters off there is no field to restore; a null forward
+            # would only switch them back on for the rest of the pass.
+            first_pass_kwargs = {**first_pass_kwargs, "null_guidance": None}
         try:
             video, audio = self._measure(
                 "first_pass",
@@ -982,6 +1004,16 @@ class _NativeGenerator:
             device=self.device,
             condition_seed=request.seed,
         )
+        if self.null_guidance_scale > 0:
+            if self._null_conditioning is None:
+                raise RuntimeError("MiniMax H3 null guidance: the null presentation was not encoded")
+            base_kwargs["null_guidance"] = H3NullGuidance(
+                scale=self.null_guidance_scale,
+                null_text_hidden=self._null_conditioning[H3_TEXT_HIDDEN_KEY],
+                # The adapters are runtime LoRA modules: multiplier 0 is the
+                # frozen checkpoint, None restores the configured multipliers.
+                set_adapter=lambda on, nets=networks: self._set_lora_multiplier(nets, None if on else 0.0),
+            )
         if references is not None:
             base_kwargs.update(references=references, keyframe_rows=keyframe_rows, keyframe_anchors=anchors)
             if guides is not None:

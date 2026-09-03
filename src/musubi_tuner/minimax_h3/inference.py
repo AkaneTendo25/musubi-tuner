@@ -17,7 +17,8 @@ from __future__ import annotations
 import gc
 import json
 import math
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace as dataclass_replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -134,6 +135,54 @@ def resolve_canvas_size(ratio: str, reference: Path | None = None) -> tuple[int,
     return (
         max(CANVAS_MULTIPLE, round(height / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
         max(CANVAS_MULTIPLE, round(width / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+    )
+
+
+@dataclass(frozen=True)
+class H3NullGuidance:
+    """Classifier-free guidance at inference against the BASE's empty-prompt branch.
+
+    A guidance-distilled checkpoint runs one prompted branch and needs no
+    guidance; an adapter trained on it with a plain data loss loses part of the
+    baked-in amplification (the field settles near 1/w of the base's). This puts
+    it back at sampling time: the empty-prompt branch is evaluated with the
+    adapters OFF, so it is the frozen checkpoint's own null, and the output is
+    ``null + scale * (prompted - null)``. Two forwards per step instead of one.
+    ``set_adapter(False)`` / ``set_adapter(True)`` bracket the null forward.
+    """
+
+    scale: float
+    null_text_hidden: torch.Tensor
+    set_adapter: Callable[[bool], None] | None = None
+
+
+def _guided_transformer_call(transformer, null_guidance: "H3NullGuidance | None", **kwargs):
+    """One denoising forward, or two combined under ``null_guidance``."""
+    output = transformer(**kwargs)
+    if null_guidance is None or null_guidance.scale == 1.0:
+        return output
+    prompted_hidden = kwargs["encoder_hidden_states"]
+    null_hidden = null_guidance.null_text_hidden
+    if null_hidden.dim() == prompted_hidden.dim() - 1:
+        null_hidden = null_hidden[None]
+    null_hidden = null_hidden.to(device=prompted_hidden.device, dtype=prompted_hidden.dtype)
+    if tuple(null_hidden.shape) != tuple(prompted_hidden.shape):
+        raise ValueError(
+            f"MiniMax H3 null guidance needs a layout-preserving null presentation: prompted text is "
+            f"{tuple(prompted_hidden.shape)}, null is {tuple(null_hidden.shape)}"
+        )
+    if null_guidance.set_adapter is not None:
+        null_guidance.set_adapter(False)
+    try:
+        null = transformer(**{**kwargs, "encoder_hidden_states": null_hidden})
+    finally:
+        if null_guidance.set_adapter is not None:
+            null_guidance.set_adapter(True)
+    scale = float(null_guidance.scale)
+    return dataclass_replace(
+        output,
+        video=None if output.video is None else null.video + scale * (output.video - null.video),
+        audio=None if output.audio is None else null.audio + scale * (output.audio - null.audio),
     )
 
 
@@ -428,6 +477,7 @@ def denoise_fl2va(
     init_video: torch.Tensor | None = None,
     init_audio: torch.Tensor | None = None,
     denoise_strength: float = 1.0,
+    null_guidance: H3NullGuidance | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate FL2VA joint latents with optional first/last keyframe conditioning.
 
@@ -522,7 +572,9 @@ def denoise_fl2va(
             condition_timestep,
         )
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-            output = transformer(
+            output = _guided_transformer_call(
+                transformer,
+                null_guidance,
                 video_hidden_states=video_rows,
                 audio_hidden_states=audio_rows,
                 encoder_hidden_states=text_hidden,
@@ -585,6 +637,7 @@ def denoise_ref2va(
     init_video: torch.Tensor | None = None,
     init_audio: torch.Tensor | None = None,
     denoise_strength: float = 1.0,
+    null_guidance: H3NullGuidance | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate joint AV latents with ordered Ref2VA image, video, and audio context.
 
@@ -742,7 +795,9 @@ def denoise_ref2va(
             torch.ones(1, device=device),
         )
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-            output = transformer(
+            output = _guided_transformer_call(
+                transformer,
+                null_guidance,
                 video_hidden_states=video_rows,
                 audio_hidden_states=audio_rows,
                 encoder_hidden_states=text_hidden,

@@ -686,6 +686,15 @@ class MiniMaxH3ConditioningEncoder:
         hidden, tags = self._encode_prompt(prompt, null_instruction=True)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
 
+    def encode_null_conditioning(self, prompt: str, images=(), references=()) -> dict[str, torch.Tensor]:
+        """The null presentation of a prompt WITH its images or references kept in the layout.
+
+        Same token layout as the prompted presentation, so the two can be
+        combined row by row at sampling time (inference null guidance).
+        """
+        hidden, tags = self._encode_prompt(prompt, images, references, null_instruction=True)
+        return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
+
     def encode_reference_prompt(
         self,
         prompt: str,

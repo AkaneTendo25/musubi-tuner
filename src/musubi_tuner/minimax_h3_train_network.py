@@ -1311,6 +1311,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._adapter_network = None
         self._adapter_prompt_only = False
         self._measured_variance_curve = None
+        self._validation_multipliers = []
+        self._adapter_ema = None
         self._step_recipe: str | None = None
         self._step_qwen_control_dropout = False
         self._crepa: H3CREPA | None = None
@@ -1468,6 +1470,119 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             generator=loader_generator,
         )
 
+    _VALIDATION_POOLS = (
+        "_field_ratios",
+        "_field_cosines",
+        "_field_distances",
+        "_null_field_ratios",
+        "_velocity_errors",
+        "_velocity_error_ratios",
+        "_rollout_data_err",
+        "_branch_drift",
+        "_prompted_drift_ratios",
+    )
+
+    def _validation_pools(self) -> dict:
+        return {name: getattr(self, name) for name in self._VALIDATION_POOLS} | {
+            "_rollout_field": self._rollout_field,
+            "_rollout_field_cos": self._rollout_field_cos,
+            "_rollout_probe_done": self._rollout_probe_done,
+        }
+
+    def _restore_validation_pools(self, pools: dict) -> None:
+        for name, value in pools.items():
+            setattr(self, name, value)
+
+    def _reset_validation_pools(self) -> None:
+        for name in self._VALIDATION_POOLS:
+            setattr(self, name, {})
+        self._rollout_field = []
+        self._rollout_field_cos = []
+        self._rollout_probe_done = set()
+
+    @staticmethod
+    def _pooled(values: dict, accelerator=None) -> float | None:
+        """Mean over every pooled value, across ranks when an accelerator is given."""
+        pooled = [item for items in values.values() for item in items]
+        if accelerator is None:
+            return sum(pooled) / len(pooled) if pooled else None
+        stats = torch.tensor([float(sum(pooled)), float(len(pooled))], dtype=torch.float64, device=accelerator.device)
+        reduce = getattr(accelerator, "reduce", None)
+        if callable(reduce):
+            stats = reduce(stats, reduction="sum")
+        return float(stats[0] / stats[1]) if float(stats[1]) > 0 else None
+
+    def _validate_multiplier_sweep(
+        self, accelerator, args, transformer, network, bins, observed_modes, validation_tasks, validation_seed
+    ) -> dict[str, float]:
+        """Repeat the data-state validation pass at other adapter multipliers.
+
+        The adapter's strength is the inference knob every user turns; this is how
+        the field and the fit respond to it, the analogue of a guidance-scale
+        sensitivity curve. Only the per-batch data-state probes are pooled (loss
+        accumulators and the rollout probe are not repeated); the live pools are
+        put back untouched afterwards.
+        """
+        multipliers = [m for m in self._validation_multipliers if m != 1.0]
+        if not multipliers or network is None:
+            return {}
+        unwrapped = accelerator.unwrap_model(network)
+        modules = list(getattr(unwrapped, "unet_loras", ())) + list(getattr(unwrapped, "text_encoder_loras", ()))
+        if not modules:
+            logger.warning("--h3_validation_multipliers: the network exposes no LoRA modules to scale; sweep skipped")
+            return {}
+        original = [module.multiplier for module in modules]
+        saved = self._validation_pools()
+        probe_steps = getattr(args, "h3_validation_rollout_probe", 0)
+        metrics: dict[str, float] = {}
+        try:
+            for multiplier in multipliers:
+                for module in modules:
+                    module.multiplier = multiplier
+                self._reset_validation_pools()
+                # The rollout probe is expensive and not repeated: mark it done.
+                self._rollout_probe_done = None
+                accumulators = {
+                    task: H3ValidationAccumulator(
+                        len(bins),
+                        balance=args.h3_loss_balance,
+                        video_weight=0.0 if task[0] == "video" else args.h3_video_loss_weight,
+                        audio_weight=0.0 if task[0] == "audio" else args.h3_audio_loss_weight,
+                    )
+                    for task in validation_tasks
+                }
+                args.h3_validation_rollout_probe = 0
+                with preserve_rng_state():
+                    for dataset_index, batch in self._validation_dataloader:
+                        self._validate_batch(
+                            accelerator,
+                            args,
+                            transformer,
+                            dataset_index,
+                            batch,
+                            bins,
+                            observed_modes,
+                            validation_tasks,
+                            accumulators,
+                            validation_seed,
+                        )
+                tag = f"val/m{multiplier:g}"
+                for key, pool in (
+                    ("velocity_err_rel", self._velocity_error_ratios),
+                    ("field", self._field_ratios),
+                    ("field_cos", self._field_cosines),
+                    ("drift/prompted_rel", self._prompted_drift_ratios),
+                ):
+                    value = self._pooled(pool, accelerator)
+                    if value is not None:
+                        metrics[f"{tag}/{key}"] = value
+        finally:
+            args.h3_validation_rollout_probe = probe_steps
+            for module, value in zip(modules, original, strict=True):
+                module.multiplier = value
+            self._restore_validation_pools(saved)
+        return metrics
+
     @torch.no_grad()
     def validate(
         self,
@@ -1526,6 +1641,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             for task in validation_tasks
         }
         validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
+        sweep_metrics: dict[str, float] = {}
         self._validation_network = network
         self._adapter_prompt_only = bool(getattr(args, "h3_adapter_prompt_only", False))
         self._validation_global_step = int(global_step)
@@ -1573,20 +1689,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # leaves the swapped prefix on CPU because it expects backward
                 # hooks to restore it before the next forward.
                 transformer.switch_block_swap_for_inference()
-            with preserve_rng_state():
-                for dataset_index, batch in self._validation_dataloader:
-                    self._validate_batch(
-                        accelerator,
-                        args,
-                        transformer,
-                        dataset_index,
-                        batch,
-                        bins,
-                        observed_modes,
-                        validation_tasks,
-                        accumulators,
-                        validation_seed,
-                    )
+            use_ema = bool(getattr(args, "h3_validate_ema", False))
+            with self._adapter_ema_weights(accelerator, network) if use_ema else nullcontext() as ema_swapped:
+                if use_ema and not ema_swapped:
+                    logger.warning("--h3_validate_ema: no EMA yet (first validation before any optimizer step); validating live")
+                with preserve_rng_state():
+                    for dataset_index, batch in self._validation_dataloader:
+                        self._validate_batch(
+                            accelerator,
+                            args,
+                            transformer,
+                            dataset_index,
+                            batch,
+                            bins,
+                            observed_modes,
+                            validation_tasks,
+                            accumulators,
+                            validation_seed,
+                        )
+                sweep_metrics = self._validate_multiplier_sweep(
+                    accelerator, args, transformer, network, bins, observed_modes, validation_tasks, validation_seed
+                )
         finally:
             self._step_mask = None
             self._step_keyframes = None
@@ -1601,6 +1724,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 network.train(network_was_training)
 
         metrics = {}
+        metrics.update(sweep_metrics)
         observed_labels = {None: "joint", "video": "v2a", "audio": "a2v"}
         reduced_metrics = {}
         for (observed, reference), accumulator in accumulators.items():
@@ -2641,6 +2765,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "--h3_adapter_prompt_only switches the adapter off on empty-prompt forwards, so a caption-dropout "
                     "step would train nothing; set --h3_caption_dropout_rate 0"
                 )
+        scale_sigma_max = float(getattr(args, "h3_guidance_scale_sigma_max", 1.0))
+        if not math.isfinite(scale_sigma_max) or not 0 < scale_sigma_max <= 1:
+            raise ValueError("--h3_guidance_scale_sigma_max must be finite and lie in (0, 1]")
+        self._validation_multipliers = []
+        raw_multipliers = str(getattr(args, "h3_validation_multipliers", "") or "").strip()
+        if raw_multipliers:
+            try:
+                self._validation_multipliers = [float(item) for item in raw_multipliers.split(",") if item.strip()]
+            except ValueError as error:
+                raise ValueError("--h3_validation_multipliers must be comma-separated numbers") from error
+            if any(not math.isfinite(m) or m < 0 for m in self._validation_multipliers):
+                raise ValueError("--h3_validation_multipliers must be finite and non-negative")
+        ema_decay = float(getattr(args, "h3_adapter_ema_decay", 0.0) or 0.0)
+        if not math.isfinite(ema_decay) or not 0 <= ema_decay < 1:
+            raise ValueError("--h3_adapter_ema_decay must be finite and lie in [0, 1); 0 disables it")
+        if getattr(args, "h3_validate_ema", False) and ema_decay <= 0:
+            raise ValueError("--h3_validate_ema requires --h3_adapter_ema_decay above 0")
+        self._adapter_ema = None
         self._measured_variance_curve = None
         curve_path = getattr(args, "h3_measured_variance_weighting", None)
         weight_max = float(getattr(args, "h3_measured_variance_weight_max", 4.0))
@@ -2965,11 +3107,78 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step) -> None:
         super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        if sync_gradients:
+            self._update_adapter_ema(args, accelerator, network, global_step)
         if self._h3_profiler is None or not sync_gradients:
             return
         self._h3_profiler.step()
         if self._h3_profiler.finished:
             self._h3_profiler = None
+
+    # ------------------------------------------------------------------ adapter EMA
+    @staticmethod
+    def _adapter_parameters(accelerator, network) -> list[tuple[str, torch.nn.Parameter]]:
+        unwrapped = accelerator.unwrap_model(network)
+        return [(name, parameter) for name, parameter in unwrapped.named_parameters() if parameter.requires_grad]
+
+    def _update_adapter_ema(self, args, accelerator, network, global_step: int) -> None:
+        """Track the trainable parameters' EMA and save it beside each scheduled checkpoint.
+
+        Called after every optimizer step (the base loop increments its step
+        counter afterwards, so the step this update belongs to is ``global_step
+        + 1``). The average is kept in fp32 on the parameters' device; LoRA
+        parameters are small enough for that.
+        """
+        decay = float(getattr(args, "h3_adapter_ema_decay", 0.0) or 0.0)
+        if decay <= 0 or network is None:
+            return
+        parameters = self._adapter_parameters(accelerator, network)
+        with torch.no_grad():
+            if self._adapter_ema is None:
+                self._adapter_ema = {name: parameter.detach().float().clone() for name, parameter in parameters}
+            else:
+                for name, parameter in parameters:
+                    shadow = self._adapter_ema[name]
+                    shadow.mul_(decay).add_(parameter.detach().float(), alpha=1.0 - decay)
+        step = int(global_step) + 1
+        every = getattr(args, "save_every_n_steps", None)
+        if every and step % int(every) == 0 and accelerator.is_main_process:
+            self._save_adapter_ema(args, accelerator, network, step)
+
+    @contextmanager
+    def _adapter_ema_weights(self, accelerator, network):
+        """Swap the EMA into the trainable parameters for the duration of the block."""
+        if self._adapter_ema is None or network is None:
+            yield False
+            return
+        parameters = self._adapter_parameters(accelerator, network)
+        backup = {}
+        with torch.no_grad():
+            for name, parameter in parameters:
+                backup[name] = parameter.detach().clone()
+                parameter.copy_(self._adapter_ema[name].to(dtype=parameter.dtype))
+        try:
+            yield True
+        finally:
+            with torch.no_grad():
+                for name, parameter in parameters:
+                    parameter.copy_(backup[name])
+
+    def _save_adapter_ema(self, args, accelerator, network, step: int) -> None:
+        unwrapped = accelerator.unwrap_model(network)
+        save_weights = getattr(unwrapped, "save_weights", None)
+        if not callable(save_weights):
+            logger.warning("--h3_adapter_ema_decay: the network has no save_weights(); the EMA is kept but not saved")
+            return
+        os.makedirs(args.output_dir, exist_ok=True)
+        path = os.path.join(args.output_dir, f"{args.output_name}-ema-step{step:08d}.safetensors")
+        dtype = model_utils.str_to_dtype(getattr(args, "save_precision", None), torch.bfloat16)
+        metadata = dict(self.extra_metadata(args))
+        metadata["ss_h3_adapter_ema"] = "True"
+        metadata["ss_steps"] = str(step)
+        with self._adapter_ema_weights(accelerator, network):
+            save_weights(path, dtype, metadata)
+        logger.info("saved adapter EMA: %s", path)
 
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
         transformer.set_gradient_checkpointing_blocks(args.h3_gradient_checkpointing_blocks)
@@ -4421,12 +4630,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 configured_scale.reshape(-1, 1),
                 video_sigma.reshape(1, -1),
                 args.h3_guidance_loss_schedule,
+                sigma_max=float(getattr(args, "h3_guidance_scale_sigma_max", 1.0)),
             ).reshape(configured_scale.shape[0], 1, video_sigma.shape[0], 1, 1)
         else:
             video_scale = guidance_scale_for_sigma(
                 configured_scale,
                 video_sigma,
                 args.h3_guidance_loss_schedule,
+                sigma_max=float(getattr(args, "h3_guidance_scale_sigma_max", 1.0)),
             )
             if inputs.video_frame_sigma is not None:
                 video_scale = video_scale.reshape(1, 1, -1, 1, 1)
@@ -4434,6 +4645,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             configured_scale,
             inputs.audio_sigma,
             args.h3_guidance_loss_schedule,
+            sigma_max=float(getattr(args, "h3_guidance_scale_sigma_max", 1.0)),
         )
         if args.h3_guidance_loss_form == "contrastive":
             true_target = H3ModelPrediction(inputs.video_target, inputs.audio_target)
@@ -5687,6 +5899,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_rollout_stop_shifted": str(bool(getattr(args, "h3_rollout_stop_shifted", False))),
             "ss_h3_rollout_stop_min": str(float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0)),
             "ss_h3_adapter_prompt_only": str(bool(getattr(args, "h3_adapter_prompt_only", False))),
+            "ss_h3_guidance_scale_sigma_max": str(float(getattr(args, "h3_guidance_scale_sigma_max", 1.0))),
+            "ss_h3_adapter_ema_decay": str(float(getattr(args, "h3_adapter_ema_decay", 0.0) or 0.0)),
             "ss_h3_measured_variance_weighting": str(getattr(args, "h3_measured_variance_weighting", None) or "none"),
             "ss_h3_measured_variance_weight_max": str(float(getattr(args, "h3_measured_variance_weight_max", 4.0))),
             "ss_h3_rollout_teacher": str(getattr(args, "h3_rollout_teacher_config", None) or "none"),
@@ -6283,6 +6497,43 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "forwards per supervised sub-step (folded into the fused pass under --h3_rollout_fused_teacher). "
             "Requires --h3_rollout_supervision and a text cache built with --cache_guidance_empty. 0 disables"
         ),
+    )
+    parser.add_argument(
+        "--h3_guidance_scale_sigma_max",
+        type=float,
+        default=1.0,
+        help=(
+            "cap on the guidance target's schedule: at a shifted sigma above this value the distillation scale is 1 "
+            "and the step trains on the plain data target. The released checkpoints' implied scale runs to 11-16 "
+            "above sigma 0.9 where the data are nearly noise. 1.0 (default) applies the schedule everywhere"
+        ),
+    )
+    parser.add_argument(
+        "--h3_validation_multipliers",
+        type=str,
+        default="",
+        help=(
+            "comma-separated LoRA multipliers (e.g. 0.75,1.25) at which validation repeats its data-state pass and "
+            "reports val/m<multiplier>/velocity_err_rel, field, field_cos and drift/prompted_rel: how the adapter "
+            "behaves when its strength is turned at inference, the analogue of a guidance-scale sensitivity curve. "
+            "The rollout probe is not repeated. Each multiplier costs one more validation pass"
+        ),
+    )
+    parser.add_argument(
+        "--h3_adapter_ema_decay",
+        type=float,
+        default=0.0,
+        help=(
+            "keep an exponential moving average of the adapter's trainable parameters with this decay, updated after "
+            "every optimizer step, and save it beside each scheduled checkpoint as <output_name>-ema-step<N>.safetensors "
+            "(an ordinary adapter file). Damps the step-to-step swing between competing loss terms without changing "
+            "what is optimised. 0 (default) keeps no average"
+        ),
+    )
+    parser.add_argument(
+        "--h3_validate_ema",
+        action="store_true",
+        help="run validation on the EMA adapter (--h3_adapter_ema_decay) instead of the live one",
     )
     parser.add_argument(
         "--h3_adapter_prompt_only",
