@@ -179,3 +179,27 @@ class TestStateSaverIntegration:
             args, self._accelerator(saved), 501, epoch=1, step_in_epoch=0, apply_retention=False
         )
         assert (tmp_path / "run-step00000501-state").exists()
+
+
+class TestProjectConfigMigration:
+    def test_legacy_retention_fields_fold_into_unified_option(self):
+        from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
+
+        config = ProjectConfig.model_validate(
+            {
+                "version": 1,
+                "training": {"save_last_n_steps": 5, "save_last_n_epochs_state": 2},
+                "full_finetune": {"save_last_n_steps": 3},
+            }
+        )
+        assert config.training.save_last_n_checkpoints == 5
+        assert config.training.save_last_n_checkpoints_state == 2
+        assert config.full_finetune.save_last_n_checkpoints == 3
+
+    def test_unified_value_wins_over_legacy(self):
+        from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
+
+        config = ProjectConfig.model_validate(
+            {"version": 1, "training": {"save_last_n_steps": 5, "save_last_n_checkpoints": 9}}
+        )
+        assert config.training.save_last_n_checkpoints == 9

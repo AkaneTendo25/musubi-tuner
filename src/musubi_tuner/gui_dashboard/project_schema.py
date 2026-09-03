@@ -1654,6 +1654,16 @@ class ProjectConfig(BaseModel):
                 full_finetune = dict(full_finetune)
                 if not full_finetune.get("output_dir"):
                     full_finetune["output_dir"] = get_ltx2_training_output_dir_default()
+                # Same retention fold as the training section above.
+                for legacy, unified in (
+                    ("save_last_n_steps", "save_last_n_checkpoints"),
+                    ("save_last_n_epochs", "save_last_n_checkpoints"),
+                    ("save_last_n_steps_state", "save_last_n_checkpoints_state"),
+                    ("save_last_n_epochs_state", "save_last_n_checkpoints_state"),
+                ):
+                    value = full_finetune.pop(legacy, None)
+                    if value is not None and full_finetune.get(unified) is None:
+                        full_finetune[unified] = value
                 data["full_finetune"] = full_finetune
 
             for section_name in ("caching", "training", "full_finetune", "remote_stage_server", "inference"):
