@@ -871,3 +871,148 @@ def test_h3_field_probe_fingerprint_reads_the_validation_config_content(tmp_path
 
     assert first["validation_seed"] == "3"
     assert first["validation_dataset_config"] != second["validation_dataset_config"]
+
+
+class _ConditionalBackend(_ValidationBackend):
+    """An adapter whose effect exists only on triggered items: with the adapter on and
+    the batch not marked bare, the prompted prediction is doubled; otherwise it is the
+    base's. The empty branch is always the base's."""
+
+    def predict_training(
+        self,
+        transformer,
+        batch,
+        video_hidden_states,
+        audio_hidden_states,
+        video_timestep,
+        audio_timestep,
+        *,
+        conditioning="prompt",
+        **_kwargs,
+    ):
+        del video_timestep, audio_timestep
+        self.calls.append((conditioning, torch.is_grad_enabled()))
+        adapter_on = getattr(transformer, "adapter_enabled", True)
+        bare = bool(batch.get("bare", False))
+        if conditioning == "empty":
+            scale = 0.25
+        elif adapter_on and not bare:
+            scale = 2.0
+        else:
+            scale = 1.0
+        return H3ModelPrediction(
+            video_hidden_states * scale if video_hidden_states is not None else None,
+            audio_hidden_states * scale if audio_hidden_states is not None else None,
+        )
+
+
+class _TriggerNetwork:
+    def __init__(self, transformer):
+        self.transformer = transformer
+
+    def set_enabled(self, enabled):
+        self.transformer.adapter_enabled = enabled
+
+    def is_enabled(self):
+        return getattr(self.transformer, "adapter_enabled", True)
+
+    def named_parameters(self):
+        return self.transformer.named_parameters()
+
+    def eval(self):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    @property
+    def training(self):
+        return False
+
+
+class _TriggerAccelerator(_ValidationAccelerator):
+    @staticmethod
+    def unwrap_model(model):
+        return model
+
+
+def _trigger_batches(bare: bool):
+    from musubi_tuner.minimax_h3.cache import (
+        H3_EMPTY_TEXT_HIDDEN_KEY,
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+        H3_TEXT_HIDDEN_KEY,
+        H3_TEXT_TOKEN_TAGS_KEY,
+    )
+    from musubi_tuner.minimax_h3.rollout import H3_ROLLOUT_ITEM_KEYS_BATCH_KEY
+
+    batches = []
+    for index, name in enumerate(("clip_a", "clip_b")):
+        torch.manual_seed(index)
+        batch = {
+            "latents": torch.randn(1, 24, 2, 2, 2),
+            "timesteps": None,
+            H3_TEXT_HIDDEN_KEY: [torch.full((4, 8), 0.25)],
+            H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long)],
+            H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(4, 8)],
+            H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long)],
+            H3_ROLLOUT_ITEM_KEYS_BATCH_KEY: [name],
+        }
+        if bare:
+            batch["bare"] = True
+        batches.append((index, batch))
+    return batches
+
+
+def test_trigger_probe_reports_the_conditional_gain_and_leaves_the_main_metrics_alone():
+    args = _validation_args()
+    args.h3_validation_field_probe = True
+    args.h3_validation_bare_dataset_config = "bare.toml"
+    args.h3_validation_std = True
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ConditionalBackend()
+    trainer._validation_dataloader = _trigger_batches(bare=False)
+    trainer._bare_validation_dataloader = _trigger_batches(bare=True)
+    transformer = _ValidationTransformer()
+    network = _TriggerNetwork(transformer)
+    accelerator = _TriggerAccelerator()
+
+    trainer.validate(accelerator, args, transformer, network, 7, None)
+    metrics, _ = accelerator.logged[-1]
+
+    assert metrics["val/trigger/pairs"] == 2.0
+    # Triggered: the prompted prediction moved from 1x to 2x the latents against a
+    # base field of 0.75x, so the relative drift is 1/0.75; bare: no movement.
+    assert metrics["val/drift/prompted_rel"] == pytest.approx(1.0 / 0.75, abs=1e-5)
+    assert metrics["val/trigger/drift_bare"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["val/trigger/drift_gain"] == pytest.approx(1.0 / 0.75, abs=1e-5)
+    assert "val/trigger/drift_gain_std" in metrics
+    # The fit ratio: the adapter is worse than the base on the triggered items (2x vs
+    # 1x of a unit-velocity target) and identical on the bare ones, so the gain is
+    # negative here and exactly zero on the bare side.
+    assert metrics["val/trigger/err_rel_bare"] == pytest.approx(1.0, abs=1e-6)
+    assert metrics["val/trigger/err_gain"] == pytest.approx(1.0 - metrics["val/velocity_err_rel"], abs=1e-5)
+    # The bare pass never touched the main pools.
+    assert metrics["val/field"] == pytest.approx((2.0 - 0.25) / 0.75, abs=1e-5)
+
+
+def test_trigger_probe_needs_the_field_probe():
+    args = _validation_args()
+    args.validation_dataset_config = "holdout.toml"
+    args.h3_validation_bare_dataset_config = "bare.toml"
+    with pytest.raises(ValueError, match="needs --h3_validation_field_probe"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_trigger_probe_rejects_a_full_finetune_before_any_validation_work():
+    args = _validation_args()
+    args.h3_validation_field_probe = True
+    args.h3_validation_bare_dataset_config = "bare.toml"
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ConditionalBackend()
+    trainer._validation_dataloader = None
+    trainer._build_validation_dataloader = lambda *a, **k: (_ for _ in ()).throw(AssertionError("loader built"))
+    with pytest.raises(ValueError, match="full fine-tune"):
+        trainer.validate(_TriggerAccelerator(), args, _ValidationTransformer(), None, 7, None)
+    assert trainer.backend.calls == []

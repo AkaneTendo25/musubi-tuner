@@ -1051,6 +1051,10 @@ Optional additions that apply to any of the recipes above.
 - `--h3_validation_multipliers 0.75,1.25` validates the adapter at several LoRA multipliers in one pass.
 - Diagnostics: `--h3_term_grad_every N` (per-term gradient norms and cosines; single process and
   `--blocks_to_swap 0` only), `--h3_adapter_stats_every N`, `--h3_train_sigma_bins`, `--h3_validation_std`.
+- `--h3_validation_bare_dataset_config bare.toml`: the trigger probe. A second validation set over the same items
+  with the trigger removed from the captions (share the latents with `latent_cache_directory`, cache the text only).
+  Reports how much more the adapter changes the prediction and improves the fit with the trigger than without, i.e.
+  whether the concept was learned conditionally rather than the corpus fitted. LoRA runs only; doubles the probe cost.
 
 #### Metrics
 
@@ -1088,6 +1092,8 @@ Training metrics are enabled by the flags listed; everything under `val/` requir
 | `val/velocity_err_rel` | field probe | Adapted error over the base's error on the same target. | below 1 |
 | `val/drift/prompted_rel` | field probe | Distance of the prompted prediction from the base's, relative to the base's field length. Not affected by any preservation term. | low; near 1 indicates collapse |
 | `val/drift/empty` | field probe | Distance of the empty-prompt prediction from the base's. | near 0 with an anchor |
+| `val/trigger/drift_gain`, `val/trigger/err_gain` | bare dataset config | Prompted drift with the trigger minus without; fit improvement with the trigger minus without. | well above 0 when the concept was learned; near 0 when only the corpus was fitted |
+| `val/trigger/drift_bare`, `val/trigger/err_rel_bare`, `val/trigger/pairs` | bare dataset config | The bare-caption values and the number of paired items. | bare drift low |
 | `val/rollout/field`, `val/rollout/field_cos` | rollout probe | Field length and direction at the states the adapted sampler reaches. | length above 0.5, cosine near 1; do not evaluate the floor by the length alone |
 | `val/rollout/x0_err`, `/step{i}` | rollout probe | Clean-clip error along the adapted model's own sampling trajectory; an increase with `i` indicates compounding error. | flat |
 | `*_std` | `--h3_validation_std` | Per-clip standard deviation of the pooled metric. | — |

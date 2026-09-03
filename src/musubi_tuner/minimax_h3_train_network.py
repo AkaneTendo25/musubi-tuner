@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
 import copy
 import gc
 import hashlib
@@ -1458,14 +1459,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         collator = collator_class(current_epoch, ds_for_collator)
         return train_dataset_group, collator, current_epoch
 
-    def _build_validation_dataloader(self, args, accelerator):
+    def _build_validation_dataloader(self, args, accelerator, config_path: str | None = None, *, item_keys: bool = False):
         validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
         with preserve_rng_state():
             seed_validation_forward(validation_seed)
             validation_args = copy.copy(args)
             validation_args.h3_load_dino_features = False
             current_epoch = Value("i", 0)
-            user_config = config_utils.load_user_config(args.validation_dataset_config)
+            user_config = config_utils.load_user_config(config_path or args.validation_dataset_config)
             dataset_group, _ = create_h3_dataset_group(
                 user_config,
                 validation_args,
@@ -1475,6 +1476,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if dataset_group.num_train_items == 0 or len(dataset_group) == 0:
             raise ValueError("MiniMax H3 validation dataset contains no cached items")
+        if item_keys:
+            # The trigger probe pairs the two validation sets by item, so the batches
+            # have to say which item they carry.
+            enable_item_keys(dataset_group)
         item_count = len(dataset_group)
         if args.max_validation_items is not None:
             item_count = min(item_count, args.max_validation_items)
@@ -1517,6 +1522,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._rollout_field = []
         self._rollout_field_cos = []
         self._rollout_probe_done = set()
+
+    @contextlib.contextmanager
+    def _trigger_capture(self, which: str, batch):
+        """Collect the per-item drift and fit ratios one validation item appends,
+        keyed by the item, for the trigger probe. A no-op when ``batch`` is None."""
+        if batch is None:
+            yield
+            return
+        item = batch_item_key(batch)
+        before_drift = {b: len(v) for b, v in self._prompted_drift_ratios.items()}
+        before_err = {b: len(v) for b, v in self._velocity_error_ratios.items()}
+        yield
+        record = self._trigger_items.setdefault(which, {}).setdefault(item, {"drift": [], "err": []})
+        for b, values in self._prompted_drift_ratios.items():
+            record["drift"].extend(values[before_drift.get(b, 0) :])
+        for b, values in self._velocity_error_ratios.items():
+            record["err"].extend(values[before_err.get(b, 0) :])
 
     @staticmethod
     def _pooled(values: dict, accelerator=None) -> float | None:
@@ -1625,8 +1647,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_reference_modality = "av"
         self._step_qwen_control_dropout = False
         self._step_recipe = None
+        trigger_probe = bool(getattr(args, "h3_validation_bare_dataset_config", None))
+        if trigger_probe and self._probe_base_is_the_live_model(accelerator, network):
+            # Decided before any loader, snapshot or forward: the bare pass keys its
+            # base branches under its own prefix, which the full fine-tune's
+            # step-zero reference file does not carry.
+            raise ValueError(
+                "--h3_validation_bare_dataset_config needs a trainable network (LoRA); not supported on a full fine-tune"
+            )
         if self._validation_dataloader is None:
-            self._validation_dataloader = self._build_validation_dataloader(args, accelerator)
+            self._validation_dataloader = self._build_validation_dataloader(args, accelerator, item_keys=trigger_probe)
+        if trigger_probe and getattr(self, "_bare_validation_dataloader", None) is None:
+            self._bare_validation_dataloader = self._build_validation_dataloader(
+                args, accelerator, args.h3_validation_bare_dataset_config, item_keys=True
+            )
+        self._trigger_pass = None
+        self._trigger_items: dict[str, dict[str, dict[str, list[float]]]] = {"trig": {}, "bare": {}}
 
         bins = validation_sigma_bins(
             args.validation_timestep_bins,
@@ -1713,18 +1749,54 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     logger.warning("--h3_validate_ema: no EMA yet (first validation before any optimizer step); validating live")
                 with preserve_rng_state():
                     for dataset_index, batch in self._validation_dataloader:
-                        self._validate_batch(
-                            accelerator,
-                            args,
-                            transformer,
-                            dataset_index,
-                            batch,
-                            bins,
-                            observed_modes,
-                            validation_tasks,
-                            accumulators,
-                            validation_seed,
+                        with self._trigger_capture("trig", batch if trigger_probe else None):
+                            self._validate_batch(
+                                accelerator,
+                                args,
+                                transformer,
+                                dataset_index,
+                                batch,
+                                bins,
+                                observed_modes,
+                                validation_tasks,
+                                accumulators,
+                                validation_seed,
+                            )
+                if trigger_probe:
+                    # The same items with the trigger removed from the caption: the
+                    # per-item numbers land in their own pool and the main pools are
+                    # left as they were, so every val/ metric above is unchanged.
+                    saved_pools = self._validation_pools()
+                    self._reset_validation_pools()
+                    self._trigger_pass = "bare"
+                    bare_accumulators = {
+                        task: H3ValidationAccumulator(
+                            len(bins),
+                            balance=args.h3_loss_balance,
+                            video_weight=0.0 if task[0] == "video" else args.h3_video_loss_weight,
+                            audio_weight=0.0 if task[0] == "audio" else args.h3_audio_loss_weight,
                         )
+                        for task in validation_tasks
+                    }
+                    try:
+                        with preserve_rng_state():
+                            for dataset_index, batch in self._bare_validation_dataloader:
+                                with self._trigger_capture("bare", batch):
+                                    self._validate_batch(
+                                        accelerator,
+                                        args,
+                                        transformer,
+                                        dataset_index,
+                                        batch,
+                                        bins,
+                                        observed_modes,
+                                        validation_tasks,
+                                        bare_accumulators,
+                                        validation_seed,
+                                    )
+                    finally:
+                        self._trigger_pass = None
+                        self._restore_validation_pools(saved_pools)
                 sweep_metrics = self._validate_multiplier_sweep(
                     accelerator, args, transformer, network, bins, observed_modes, validation_tasks, validation_seed
                 )
@@ -1845,6 +1917,35 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 metrics[f"val/drift/prompted_rel/bin{bin_index}"] = sum(ratios) / len(ratios)
         pooled_drift = [ratio for ratios in self._prompted_drift_ratios.values() for ratio in ratios]
         with_std("val/drift/prompted_rel", pooled_drift)
+        trigger_items = getattr(self, "_trigger_items", None) or {}
+        paired = [
+            (trigger_items["trig"][item], trigger_items["bare"][item])
+            for item in trigger_items.get("trig", {})
+            if item in trigger_items.get("bare", {})
+        ]
+        if paired:
+            # Conditionality of what was learned: how much more the adapter moves the
+            # prediction with the trigger in the caption than without it, and how much
+            # more it improves the fit with the trigger than without. An adapter that
+            # learned the corpus rather than the concept scores about zero on both.
+            def item_mean(values: list[float]) -> float | None:
+                return sum(values) / len(values) if values else None
+
+            drift_gain, err_gain, bare_drift, bare_err = [], [], [], []
+            for trig, bare in paired:
+                t_drift, b_drift = item_mean(trig["drift"]), item_mean(bare["drift"])
+                t_err, b_err = item_mean(trig["err"]), item_mean(bare["err"])
+                if t_drift is not None and b_drift is not None:
+                    drift_gain.append(t_drift - b_drift)
+                    bare_drift.append(b_drift)
+                if t_err is not None and b_err is not None:
+                    err_gain.append(b_err - t_err)
+                    bare_err.append(b_err)
+            metrics["val/trigger/pairs"] = float(len(paired))
+            with_std("val/trigger/drift_bare", bare_drift)
+            with_std("val/trigger/drift_gain", drift_gain)
+            with_std("val/trigger/err_rel_bare", bare_err)
+            with_std("val/trigger/err_gain", err_gain)
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
@@ -2459,6 +2560,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         live_base = self._probe_base_is_the_live_model(accelerator, network)
         key = (dataset_index, sigma_bin.index, observed, self._step_reference_modality)
+        if getattr(self, "_trigger_pass", None) == "bare":
+            # The bare caption is a different conditioning: its base branches are
+            # cached under their own key, never mixed with the triggered ones.
+            key = ("bare",) + key
         if live_base and key not in self._field_base_gaps and int(getattr(self, "_validation_global_step", 0) or 0) != 0:
             raise ValueError(
                 "--h3_validation_field_probe on a full fine-tune measures against a reference taken at step 0, and "
@@ -2603,6 +2708,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
         )
         args.dit_dtype = model_utils.dtype_to_str(self.dit_dtype)
+        if getattr(args, "h3_validation_bare_dataset_config", None) and not getattr(args, "h3_validation_field_probe", False):
+            raise ValueError("--h3_validation_bare_dataset_config is the trigger probe; it needs --h3_validation_field_probe")
         if getattr(args, "h3_validation_field_probe", False) and not getattr(args, "validation_dataset_config", None):
             # The probe reports a ratio measured on held-out items. Run on the training
             # set it would report how well the adapter reproduces the field where it
@@ -7020,6 +7127,21 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "report the data step's video loss under loss/video/bin<k> for the shifted-sigma bin it fell in "
             "(edges 0.5, 0.8, 0.9), so where learning happens along the schedule is visible during training"
+        ),
+    )
+    parser.add_argument(
+        "--h3_validation_bare_dataset_config",
+        type=str,
+        default=None,
+        help=(
+            "DEBUG. Trigger probe: a second validation dataset over the SAME items as --validation_dataset_config whose "
+            "captions lack the trigger word (share the latents with latent_cache_directory and cache only the text). "
+            "Every validation runs the field probe on it as well and pairs the items: val/trigger/drift_gain is how much "
+            "further the adapter moves the prompted prediction with the trigger than without (as a share of the base's "
+            "field), val/trigger/err_gain how much more it improves the fit with the trigger than without "
+            "(val/velocity_err_rel without minus with). An adapter that learned the concept scores well above 0 on both; "
+            "one that only fitted the corpus scores about 0. Also reports val/trigger/drift_bare, val/trigger/err_rel_bare "
+            "and val/trigger/pairs. Needs --h3_validation_field_probe; LoRA runs only. Doubles the field-probe cost"
         ),
     )
     parser.add_argument(
