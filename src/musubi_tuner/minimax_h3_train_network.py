@@ -849,6 +849,12 @@ def interpolate_curve(sigmas: torch.Tensor, weights: torch.Tensor, query: torch.
     return values[lower] + t * (values[upper] - values[lower])
 
 
+def _anchor_probability(args) -> float:
+    """--h3_guidance_null_anchor_probability with an absent value meaning 1, not a zero."""
+    value = getattr(args, "h3_guidance_null_anchor_probability", None)
+    return 1.0 if value is None else float(value)
+
+
 def _apply_timestep_focus(base: torch.Tensor, low: float, high: float, probability: float) -> torch.Tensor:
     """Map one uniform draw to a uniform/background mixture without another RNG draw."""
     if probability <= 0.0:
@@ -1060,6 +1066,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             generator = torch.Generator()
             generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
             self._preservation_probability_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
+
+    def _null_anchor_probability_active(self, accelerator: Accelerator, probability: float) -> bool:
+        """The same, for the null anchor's own sparse draw (--h3_guidance_null_anchor_probability)."""
+        if probability >= 1.0:
+            return True
+        generator = getattr(self, "_null_anchor_probability_generator", None)
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._null_anchor_probability_generator = generator
         return self._sparse_branch_active(accelerator, probability, generator)
 
     def _dop_probability_active(self, accelerator: Accelerator, probability: float) -> bool:
@@ -2796,6 +2813,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Every gate on this feature reads "> 0", so a negative weight would
             # configure the anchor and then quietly train without it.
             raise ValueError("--h3_guidance_null_anchor_weight must be finite and non-negative; 0 disables it")
+        anchor_probability = _anchor_probability(args)
+        if not math.isfinite(anchor_probability) or not 0 < anchor_probability <= 1:
+            raise ValueError("--h3_guidance_null_anchor_probability must be finite and lie in (0, 1]")
+        if anchor_probability < 1.0 and anchor_weight <= 0:
+            raise ValueError("--h3_guidance_null_anchor_probability requires --h3_guidance_null_anchor_weight above 0")
         if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
             raise ValueError("--h3_base_preservation_probability must be finite and lie in (0, 1]")
         if not math.isfinite(args.h3_dop_loss_weight) or args.h3_dop_loss_weight < 0:
@@ -4022,6 +4044,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_rollout_field_floor_sigma_max": float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0)) != 1.0,
             "--h3_rollout_stop_min": float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0) != 0.0,
             "--h3_rollout_prefix": getattr(args, "h3_rollout_prefix", "student") != "student",
+            "--h3_rollout_null_anchor_weight": float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0) != 0.0,
             "--h3_rollout_field_cap": float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0) != 0.0,
         }
         if not rollout:
@@ -4056,6 +4079,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         floor_sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
         if not math.isfinite(floor_sigma_max) or not 0 < floor_sigma_max <= 1:
             raise ValueError("--h3_rollout_field_floor_sigma_max must be finite and lie in (0, 1]")
+        rollout_anchor = float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0)
+        if not math.isfinite(rollout_anchor) or rollout_anchor < 0:
+            raise ValueError("--h3_rollout_null_anchor_weight must be finite and non-negative; 0 disables it")
+        if rollout_anchor > 0 and getattr(args, "h3_adapter_prompt_only", False):
+            raise ValueError(
+                "--h3_rollout_null_anchor_weight holds the student's empty branch, which --h3_adapter_prompt_only "
+                "already pins to the frozen one; drop one of the two"
+            )
         field_cap = float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)
         if field_cap != 0.0 and (not math.isfinite(field_cap) or field_cap <= 1.0):
             raise ValueError("--h3_rollout_field_cap must be finite and above 1 (0 disables it)")
@@ -4066,7 +4097,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "--h3_rollout_field_floor_direction, --h3_rollout_field_floor_sigma_max and --h3_rollout_field_cap shape "
                 "the field floor and need --h3_rollout_field_floor above 0"
             )
-        if field_floor > 0 and float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) <= 0:
+        if (
+            field_floor > 0
+            and float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) <= 0
+            and float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0) <= 0
+        ):
             # The floor measures the student's prompted prediction against the
             # FROZEN empty branch. What inference amplifies is the gap to the
             # student's OWN empty branch, and nothing in the floor stops that
@@ -4075,8 +4110,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # the prompted branch alone, which is a weaker statement.
             logger.warning(
                 "--h3_rollout_field_floor holds the prompted prediction's distance from the FROZEN empty branch; the "
-                "field inference amplifies is the distance to the student's own empty branch, which only "
-                "--h3_guidance_null_anchor_weight holds. Without the anchor the floor does not bound that field"
+                "field inference amplifies is the distance to the student's own empty branch, which only an anchor "
+                "(--h3_guidance_null_anchor_weight or --h3_rollout_null_anchor_weight) holds. Without one the floor "
+                "does not bound that field"
             )
         if getattr(args, "h3_rollout_fused_teacher", False) and getattr(args, "h3_int8_attention", "off") == "aux":
             # Fusing puts the student and the teacher inside one pass over the
@@ -4261,6 +4297,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         set_enabled,
         fork_devices: list,
         frozen_base: bool = False,
+        frozen_empty: bool = False,
+        student_empty: bool = False,
     ) -> list[H3ModelPrediction]:
         """One supervised sub-step evaluated in a single pass over the blocks.
 
@@ -4306,15 +4344,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             run=run,
         )
         arms = [student, teacher]
-        if frozen_base:
-            arms.extend(
-                H3FusedArm(
-                    call=self._predict_call(accelerator, batch, state, conditioning=branch),
-                    build=lambda: _forked_frozen_build(fork_devices, set_enabled),
-                    run=run,
-                )
-                for branch in ("prompt", "empty")
+        # Frozen arms after the pair: the base's prompted and empty predictions
+        # for the floor, or the empty one alone for the rollout anchor.
+        frozen_branches = ("prompt", "empty") if frozen_base else (("empty",) if frozen_empty else ())
+        arms.extend(
+            H3FusedArm(
+                call=self._predict_call(accelerator, batch, state, conditioning=branch),
+                build=lambda: _forked_frozen_build(fork_devices, set_enabled),
+                run=run,
             )
+            for branch in frozen_branches
+        )
+        if student_empty:
+            # Graded, adapter on: the student's own empty branch at this state.
+            arms.append(H3FusedArm(call=self._predict_call(accelerator, batch, state, conditioning="empty")))
         return self._predict_fused(accelerator, transformer, arms)
 
     def _teacher_presentation(self, batch: dict) -> dict:
@@ -4353,7 +4396,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         list[tuple[H3ModelPrediction, H3ModelPrediction]],
         float,
         list[torch.Tensor],
-        list[tuple[H3ModelPrediction, H3ModelPrediction]] | None,
+        list[tuple[H3ModelPrediction | None, H3ModelPrediction]] | None,
+        list[H3ModelPrediction] | None,
     ]:
         """Roll the student's own sampler out from noise and supervise the tail.
 
@@ -4361,8 +4405,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         sub-step, the unshifted base sigma the rollout stopped at, each
         sub-step's shifted video sigma so the loss can weight on the noise level
         it was actually taken at rather than the data step's, and -- under
-        ``--h3_rollout_field_floor`` -- one ``(base_prompted, base_empty)`` pair
-        of frozen predictions per sub-step at that same state, else ``None``.
+        ``--h3_rollout_field_floor`` or ``--h3_rollout_null_anchor_weight`` -- one
+        ``(base_prompted, base_empty)`` pair of frozen predictions per sub-step at
+        that same state (``base_prompted`` is ``None`` when only the anchor asked),
+        else ``None``; and under the rollout anchor the student's own graded
+        empty-prompt prediction per sub-step, else ``None``.
         Both branches of every pair are evaluated at the SAME state:
         the student with the ordinary conditioning it trains under, the teacher --
         the frozen base, adapter disabled -- with the privileged presentation that
@@ -4386,7 +4433,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         int8_context = getattr(transformer, "int8_attention_context", None)
         fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
         field_floor = float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0
-        if field_floor:
+        rollout_anchor = float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0) > 0
+        if field_floor or rollout_anchor:
             missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
             if missing_empty:
                 raise ValueError(
@@ -4465,7 +4513,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         fused = bool(getattr(args, "h3_rollout_fused_teacher", False))
         pairs: list[tuple[H3ModelPrediction, H3ModelPrediction]] = []
-        bases: list[tuple[H3ModelPrediction, H3ModelPrediction]] = []
+        bases: list[tuple[H3ModelPrediction | None, H3ModelPrediction]] = []
+        student_empties: list[H3ModelPrediction] = []
         for index in range(args.h3_rollout_steps, base.shape[0]):
             state = state_at(index)
             if fused:
@@ -4479,9 +4528,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     set_enabled=set_enabled,
                     fork_devices=fork_devices,
                     frozen_base=field_floor,
+                    frozen_empty=rollout_anchor and not field_floor,
+                    student_empty=rollout_anchor,
                 )
+                if rollout_anchor:
+                    student_empties.append(frozen.pop())
                 if field_floor:
                     bases.append((frozen[0], frozen[1]))
+                elif rollout_anchor:
+                    bases.append((None, frozen[0]))
             else:
                 # Captured BEFORE the student runs, then replayed for the teacher.
                 # ``fork_rng`` alone would only restore the state the student left
@@ -4492,6 +4547,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 entry_cpu_rng = torch.get_rng_state()
                 entry_cuda_rng = [torch.cuda.get_rng_state(device) for device in fork_devices]
                 student = self._predict(accelerator, transformer, batch, state, conditioning=conditioning)
+                if rollout_anchor:
+                    # The student's own empty branch at the same state, graded and
+                    # with the adapter on; its conditioning draws replay the entry
+                    # RNG so the arm describes this state and not the next.
+                    with torch.random.fork_rng(devices=fork_devices):
+                        torch.set_rng_state(entry_cpu_rng)
+                        for device, rng_state in zip(fork_devices, entry_cuda_rng):
+                            torch.cuda.set_rng_state(rng_state, device)
+                        student_empties.append(self._predict(accelerator, transformer, batch, state, conditioning="empty"))
                 with (
                     torch.random.fork_rng(devices=fork_devices),
                     self._auxiliary_block_swap(transformer, auxiliary_block_swap),
@@ -4517,17 +4581,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             # the caller, which skips a caption-dropout step).
                             conditioning="prompt",
                         )
-                        if field_floor:
-                            # The floor's two frozen arms describe the same state
-                            # as the pair above, so each replays the entry RNG the
-                            # way the teacher did rather than continuing its draws.
-                            frozen = []
-                            for branch in ("prompt", "empty"):
+                        if field_floor or rollout_anchor:
+                            # The frozen arms describe the same state as the pair
+                            # above, so each replays the entry RNG the way the
+                            # teacher did rather than continuing its draws.
+                            frozen = {}
+                            for branch in ("prompt", "empty") if field_floor else ("empty",):
                                 torch.set_rng_state(entry_cpu_rng)
                                 for device, rng_state in zip(fork_devices, entry_cuda_rng):
                                     torch.cuda.set_rng_state(rng_state, device)
-                                frozen.append(self._predict(accelerator, transformer, batch, state, conditioning=branch))
-                            bases.append((frozen[0], frozen[1]))
+                                frozen[branch] = self._predict(accelerator, transformer, batch, state, conditioning=branch)
+                            bases.append((frozen.get("prompt"), frozen["empty"]))
                     finally:
                         set_enabled(True)
             pairs.append((student, teacher))
@@ -4546,7 +4610,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             pairs,
             stop_sigma,
             [video_sigmas[window][index : index + 1] for index in range(len(pairs))],
-            bases if field_floor else None,
+            bases if (field_floor or rollout_anchor) else None,
+            student_empties if rollout_anchor else None,
         )
 
     @staticmethod
@@ -5280,7 +5345,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # like the others and needs the same forward-only bracket; without it a
         # run with nothing but the anchor left classic swap in the training
         # layout after a forward that never ran its backward.
-        null_anchor_active = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0 and conditioning == "prompt"
+        null_anchor_probability = _anchor_probability(args)
+        null_anchor_active = (
+            float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0
+            and conditioning == "prompt"
+            and self._null_anchor_probability_active(accelerator, null_anchor_probability)
+        )
         auxiliary_block_swap = (
             bool(self.blocks_to_swap)
             and not getattr(self, "_block_swap_h2d_only", False)
@@ -5374,7 +5444,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         if null_set_enabled is not None:
                             null_set_enabled(True)
             null_anchor_weight = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0)
-            if null_anchor_weight > 0 and conditioning == "prompt":
+            if null_anchor_active:
                 # Hold the EMPTY-prompt prediction where the checkpoint had it, and
                 # leave the prompted one entirely free.
                 #
@@ -5590,6 +5660,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         dense_loss = result.loss
         rollout_replaced = False
         rollout_field_floor = None
+        rollout_null_anchor = None
         if rollout_active:
             # On-policy supervision REPLACES the video half of the data objective
             # and leaves the audio half alone. The two halves are reduced in one
@@ -5599,18 +5670,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # is exactly "the audio data loss plus the averaged rollout video
             # loss": the audio term is identical across sub-steps and both
             # balances are linear in the video numerator at a fixed denominator.
-            rollout_pairs, rollout_stop_sigma, rollout_video_sigmas, rollout_bases = self._rollout_supervision(
-                args,
-                accelerator,
-                transformer,
-                network,
-                batch,
-                video_latents=video_latents,
-                audio_latents=audio_latents,
-                video_shift=1.0 if is_image else args.h3_shift_video,
-                audio_shift=1.0 if is_image else args.h3_shift_audio,
-                conditioning=conditioning,
-                auxiliary_block_swap=bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False),
+            rollout_pairs, rollout_stop_sigma, rollout_video_sigmas, rollout_bases, rollout_student_empties = (
+                self._rollout_supervision(
+                    args,
+                    accelerator,
+                    transformer,
+                    network,
+                    batch,
+                    video_latents=video_latents,
+                    audio_latents=audio_latents,
+                    video_shift=1.0 if is_image else args.h3_shift_video,
+                    audio_shift=1.0 if is_image else args.h3_shift_audio,
+                    conditioning=conditioning,
+                    auxiliary_block_swap=bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False),
+                )
             )
             # The audio half is the data-forward objective this step would have run
             # anyway -- including its guidance modification when the hybrid is on.
@@ -5654,7 +5727,30 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             rollout_replaced = True
             metrics["loss/rollout_video"] = float(sum(term.video_loss.detach() for term in rollout_terms) / window)
             metrics["h3/rollout_stop_sigma"] = rollout_stop_sigma
-            if rollout_bases is not None:
+            if rollout_student_empties is not None:
+                # The null anchor at the supervised states: the student's own empty
+                # branch held to the frozen base's, where generation walks.
+                anchor_terms = [
+                    joint_prediction_loss(
+                        student_empty,
+                        base_empty,
+                        video_mask=effective_video_mask,
+                        audio_mask=effective_audio_mask,
+                        video_sample_weight=self._sample_weight(args, sigma) if has_video else None,
+                        audio_sample_weight=audio_sample_weight,
+                        balance=args.h3_loss_balance,
+                        mask_normalization=args.h3_loss_mask_normalization,
+                        video_weight=video_weight,
+                        audio_weight=audio_weight,
+                    ).loss
+                    for student_empty, (_base_prompted, base_empty), sigma in zip(
+                        rollout_student_empties, rollout_bases, rollout_video_sigmas, strict=True
+                    )
+                ]
+                rollout_null_anchor = float(args.h3_rollout_null_anchor_weight) * sum(anchor_terms) / float(len(anchor_terms))
+                loss = loss + rollout_null_anchor
+                metrics["loss/rollout_null_anchor"] = float(rollout_null_anchor.detach())
+            if rollout_bases is not None and float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0:
                 # A LENGTH floor on the guidance field at the supervised states.
                 # The teacher term above sets the field's direction; this holds
                 # its length at no less than the checkpoint's, and nothing more.
@@ -5708,6 +5804,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0:
                 metrics.setdefault("loss/rollout_field_floor", 0.0)
                 metrics.setdefault("h3/rollout_field_ratio", 0.0)
+            if float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0) > 0:
+                metrics.setdefault("loss/rollout_null_anchor", 0.0)
         guidance_rescaled = False
         # A rollout-active step has already swapped its objective wholesale, and
         # nothing about a swapped objective is divided by a probability (the same
@@ -5747,8 +5845,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics["h3/base_preservation_active"] = float(preservation_active)
             metrics.setdefault("loss/base_preservation", 0.0)
         if null_anchor_student is not None and null_anchor_reference is not None:
+            # A sparse anchor is an estimator of the dense one: the active term is
+            # divided by its probability so the expected gradient is unchanged.
             null_anchor = (
                 float(args.h3_guidance_null_anchor_weight)
+                / null_anchor_probability
                 * joint_prediction_loss(
                     null_anchor_student,
                     null_anchor_reference,
@@ -5768,6 +5869,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Present every step once the flag is on, so a run whose anchor never fired
             # is visible as a flat zero rather than as a missing tag nobody looks for.
             metrics["loss/guidance_null_anchor"] = 0.0
+        if float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0 and null_anchor_probability < 1.0:
+            metrics["h3/null_anchor_active"] = float(null_anchor_active)
         if use_crepa and self._crepa.active:
             crepa_loss, crepa_metrics = self._crepa.loss(
                 batch.get("h3_dino_features"), update_similarity_threshold=crepa_update_similarity_threshold
@@ -5799,6 +5902,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # An auxiliary term like the anchor: the reported average stays the
                 # ordinary data loss a run without the flag would have logged.
                 average_loss = average_loss - rollout_field_floor
+            if rollout_null_anchor is not None:
+                average_loss = average_loss - rollout_null_anchor
             if rollout_replaced:
                 # The rollout SWAPS the objective on a drawn subset of steps
                 # rather than estimating one objective sparsely, so nothing is
@@ -5892,6 +5997,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_guidance_null_anchor_weight": str(getattr(args, "h3_guidance_null_anchor_weight", 0.0)),
+            "ss_h3_guidance_null_anchor_probability": str(_anchor_probability(args)),
             "ss_h3_rollout_supervision": str(bool(getattr(args, "h3_rollout_supervision", False))),
             "ss_h3_rollout_probability": str(args.h3_rollout_probability),
             "ss_h3_rollout_steps": str(args.h3_rollout_steps),
@@ -5912,6 +6018,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_rollout_field_floor": str(float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)),
             "ss_h3_rollout_field_floor_direction": str(getattr(args, "h3_rollout_field_floor_direction", "self")),
             "ss_h3_rollout_field_cap": str(float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)),
+            "ss_h3_rollout_null_anchor_weight": str(float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0)),
             "ss_h3_rollout_prefix": str(getattr(args, "h3_rollout_prefix", "student")),
             "ss_h3_rollout_field_floor_sigma_max": str(float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))),
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
@@ -6593,6 +6700,20 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h3_rollout_null_anchor_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "the null anchor at the supervised ROLLOUT states: at each one the student's empty-prompt prediction "
+            "(adapter on, gradient) is held to the frozen base's empty prediction there, weighted by this value. The "
+            "data-step anchor (--h3_guidance_null_anchor_weight) costs two forwards on every prompted step; this one "
+            "costs one graded forward per supervised state on rollout steps only, and the frozen empty arm it needs "
+            "is the one --h3_rollout_field_floor already evaluates. Use it with the data-step anchor at 0 to move "
+            "the anchor onto the states generation walks, or with both for belt and braces. Requires "
+            "--h3_rollout_supervision and --cache_guidance_empty; rejected with --h3_adapter_prompt_only. 0 disables"
+        ),
+    )
+    parser.add_argument(
         "--h3_rollout_field_cap",
         type=float,
         default=0.0,
@@ -6646,6 +6767,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "the prompted-minus-empty difference, which this term directly holds, so they flatter it. Costs one "
             "extra grad forward and one no-grad forward, about 1.8x a step, and reaches a given fit in more steps. "
             "Skipped on caption-dropout steps. One seed, small corpora; treat as experimental. 0 disables"
+        ),
+    )
+    parser.add_argument(
+        "--h3_guidance_null_anchor_probability",
+        type=float,
+        default=1.0,
+        help=(
+            "evaluate the null anchor on this synchronized random fraction of prompted steps and divide the active "
+            "term by it, so the expected gradient is the dense anchor's at a fraction of its two forwards a step "
+            "(1.8x -> 1 + 0.8p). Its own random stream, like the other sparse branches. 1 (default) anchors every step"
         ),
     )
     parser.add_argument(

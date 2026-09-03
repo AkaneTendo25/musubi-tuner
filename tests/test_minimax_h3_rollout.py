@@ -3227,3 +3227,130 @@ def test_adapter_ema_saves_on_the_initialising_step_when_scheduled(tmp_path):
     accelerator.is_main_process = True
     trainer.on_post_optimizer_step(args, accelerator, network, None, True, 0)
     assert network.saved and network.saved[0][0].endswith("eager-ema-step00000001.safetensors")
+
+
+# ---------------------------------------------------------------------------
+# Sparse null anchor
+# ---------------------------------------------------------------------------
+
+_ANCHOR_FLAGS = (*_NORMALIZED_FLAGS[:4], "--h3_guidance_null_source", "frozen", "--h3_guidance_null_anchor_weight", "1.0")
+
+
+def test_sparse_null_anchor_skips_the_forwards_on_an_inactive_step_and_rescales_an_active_one():
+    _, dense_loss, dense_metrics, _ = _run_step(*_ANCHOR_FLAGS)
+    trainer_off = None
+
+    def run(active):
+        nonlocal trainer_off
+        args = _flag_args(*_ANCHOR_FLAGS, "--h3_guidance_null_anchor_probability", "0.25")
+        trainer = MiniMaxH3NetworkTrainer()
+        trainer.handle_model_specific_args(args)
+        trainer.dit_dtype = torch.float32
+        backend = _RolloutBackend()
+        trainer.backend = backend
+        trainer._null_anchor_probability_active = lambda accelerator, probability: active
+        transformer = _ScaleTransformer()
+        network = _ToggleNetwork(transformer)
+        video, batch = _rollout_batch()
+        torch.manual_seed(0)
+        loss, metrics = trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            network,
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+        return backend, loss, metrics
+
+    off_backend, off_loss, off_metrics = run(False)
+    on_backend, on_loss, on_metrics = run(True)
+    # Inactive: no anchor forwards at all (data + frozen empty only), term reported as zero.
+    assert off_metrics["loss/guidance_null_anchor"] == 0.0
+    assert off_metrics["h3/null_anchor_active"] == 0.0
+    assert len(off_backend.calls) == 2
+    # Active: the two anchor forwards run and the term is the dense one divided by p.
+    assert on_metrics["h3/null_anchor_active"] == 1.0
+    assert len(on_backend.calls) == 4
+    assert on_metrics["loss/guidance_null_anchor"] == pytest.approx(dense_metrics["loss/guidance_null_anchor"] / 0.25)
+    assert "h3/null_anchor_active" not in dense_metrics
+
+
+def test_sparse_null_anchor_is_validated_and_recorded():
+    with pytest.raises(ValueError, match="anchor_probability"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args(*_ANCHOR_FLAGS, "--h3_guidance_null_anchor_probability", "0")
+        )
+    with pytest.raises(ValueError, match="requires --h3_guidance_null_anchor_weight"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_guidance_null_anchor_probability", "0.5"))
+    args = _flag_args(*_ANCHOR_FLAGS, "--h3_guidance_null_anchor_probability", "0.5")
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_guidance_null_anchor_probability"] == "0.5"
+
+
+# ---------------------------------------------------------------------------
+# Null anchor at rollout states
+# ---------------------------------------------------------------------------
+
+_ROLLOUT_ANCHOR_FLAGS = (*_ROLLOUT_FLAGS, "--h3_rollout_null_anchor_weight", "1.0", "--h3_audio_loss_weight", "0.0")
+
+
+def test_rollout_null_anchor_adds_a_graded_empty_arm_and_a_frozen_empty_arm(tmp_path):
+    backend, loss, metrics, _ = _run_step(*_ROLLOUT_ANCHOR_FLAGS, teacher=_teacher_file(tmp_path))
+    loss.backward()
+    window = backend.calls[3:]
+    # student (prompt, on, grad), student empty (empty, on, grad), teacher (off), base empty (off)
+    assert [c["conditioning"] for c in window] == ["prompt", "empty", "prompt", "empty"]
+    assert [c["adapter"] for c in window] == [True, True, False, False]
+    assert [c["grad"] for c in window] == [True, True, False, False]
+    assert all(torch.equal(c["video_state"], window[0]["video_state"]) for c in window)
+    # Stub: student empty = 0.5 * 0.25 + 0 = 0.125, frozen empty = 0.25: MSE 0.015625 (audio silenced).
+    assert metrics["loss/rollout_null_anchor"] == pytest.approx(0.125**2)
+
+
+def test_rollout_null_anchor_is_an_auxiliary_term(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, plain_loss, plain_metrics, _ = _run_step(*_ROLLOUT_FLAGS, "--h3_audio_loss_weight", "0.0", teacher=teacher)
+    _, anchored_loss, metrics, _ = _run_step(*_ROLLOUT_ANCHOR_FLAGS, teacher=teacher)
+    assert float(anchored_loss.detach()) == pytest.approx(float(plain_loss.detach()) + metrics["loss/rollout_null_anchor"])
+    assert metrics[LOSS_FOR_AVERAGE_KEY] == pytest.approx(plain_metrics[LOSS_FOR_AVERAGE_KEY])
+
+
+def test_rollout_null_anchor_rides_the_fused_pass_with_and_without_the_floor(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    for extra in ((), ("--h3_rollout_field_floor", "0.3")):
+        naive_backend, naive_loss, naive_metrics, _ = _run_step(
+            *_ROLLOUT_ANCHOR_FLAGS, *extra, teacher=teacher, backend=_FusedRolloutBackend()
+        )
+        fused_backend, fused_loss, fused_metrics, _ = _run_step(
+            *_ROLLOUT_ANCHOR_FLAGS, *extra, "--h3_rollout_fused_teacher", teacher=teacher, backend=_FusedRolloutBackend()
+        )
+        assert fused_backend.fused_calls == 1
+        torch.testing.assert_close(fused_loss, naive_loss, rtol=0, atol=0)
+        assert fused_metrics == naive_metrics
+        assert sorted((c["conditioning"], c["adapter"], c["grad"]) for c in fused_backend.calls) == sorted(
+            (c["conditioning"], c["adapter"], c["grad"]) for c in naive_backend.calls
+        )
+
+
+def test_rollout_null_anchor_reports_zero_when_inactive_and_is_validated(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, _, metrics, _ = _run_step(*_ROLLOUT_ANCHOR_FLAGS, teacher=teacher, active=False)
+    assert metrics["loss/rollout_null_anchor"] == 0.0
+    with pytest.raises(ValueError, match="requires --h3_rollout_supervision"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(_flag_args("--h3_rollout_null_anchor_weight", "1.0"))
+    with pytest.raises(ValueError, match="drop one of the two"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(
+            _flag_args(*_ROLLOUT_ANCHOR_FLAGS, "--h3_adapter_prompt_only", teacher=teacher)
+        )
+    args = _flag_args(*_ROLLOUT_ANCHOR_FLAGS, teacher=teacher)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_rollout_null_anchor_weight"] == "1.0"
