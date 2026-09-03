@@ -6048,8 +6048,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # normalised down weight when the module has one). Split and
                 # convolutional adapters are skipped, so the norm covers what it
                 # covers and is reported only when something contributed.
+                down_module = getattr(module, "lora_down", None)
                 effective = getattr(module, "effective_down_weight", None)
-                down = effective() if callable(effective) else getattr(getattr(module, "lora_down", None), "weight", None)
+                if down_module is None:
+                    continue
+                down = effective(down_module) if callable(effective) else getattr(down_module, "weight", None)
                 up = getattr(getattr(module, "lora_up", None), "weight", None)
                 if down is None or up is None or down.dim() != 2 or up.dim() != 2:
                     continue

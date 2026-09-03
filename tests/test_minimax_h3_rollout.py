@@ -3510,3 +3510,30 @@ def test_term_gradients_main_is_the_rollout_objective_alone_on_a_rollout_step(tm
     assert metrics["h3/grad/main_norm"] > 0 and metrics["h3/grad/floor_norm"] > 0
     assert metrics["h3/grad/main_norm"] != pytest.approx(metrics["h3/grad/floor_norm"])
     loss.backward()
+
+
+def test_adapter_stats_use_the_module_effective_down_weight():
+    class _Nora(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_down = torch.nn.Linear(4, 2, bias=False)
+            self.lora_up = torch.nn.Linear(2, 3, bias=False)
+            self.scale = 1.0
+            self.multiplier = 1.0
+            torch.nn.init.ones_(self.lora_down.weight)
+            torch.nn.init.ones_(self.lora_up.weight)
+
+        def effective_down_weight(self, down):
+            return down.weight * 0.5
+
+    class _Net(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.unet_loras = torch.nn.ModuleList([_Nora()])
+            self.text_encoder_loras = []
+
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(_flag_args())
+    metrics = trainer._adapter_stat_metrics(_FakeAccelerator(), _Net())
+    # up @ (0.5 * down) = 1 everywhere on 3x4: Frobenius sqrt(12).
+    assert metrics["h3/adapter/delta_norm"] == pytest.approx(12**0.5)
