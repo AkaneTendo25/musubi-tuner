@@ -669,12 +669,14 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
             total_checkpoints += int(total_epochs) // save_every_n_epochs
 
         # Apply keep_last limits
-        keep_last_steps = _coerce_int(training.get("save_last_n_steps", 0), 0)
-        keep_last_epochs = _coerce_int(training.get("save_last_n_epochs", 0), 0)
-        if keep_last_steps:
-            total_checkpoints = min(total_checkpoints, keep_last_steps + 1)
-        if keep_last_epochs:
-            total_checkpoints = min(total_checkpoints, keep_last_epochs + 1)
+        keep_last = _coerce_int(
+            training.get("save_last_n_checkpoints")
+            or training.get("save_last_n_steps")
+            or training.get("save_last_n_epochs"),
+            0,
+        )
+        if keep_last:
+            total_checkpoints = min(total_checkpoints, keep_last)
 
         total_storage_gb = (checkpoint_size_mb * total_checkpoints) / 1024
 

@@ -714,10 +714,8 @@ class TrainingConfig(BaseModel):
     output_name: str = "minimax_h3_lora"
     save_every_n_epochs: Optional[int] = None
     save_every_n_steps: Optional[int] = None
-    save_last_n_epochs: Optional[int] = None
-    save_last_n_steps: Optional[int] = None
-    save_last_n_epochs_state: Optional[int] = None
-    save_last_n_steps_state: Optional[int] = None
+    save_last_n_checkpoints: Optional[int] = None
+    save_last_n_checkpoints_state: Optional[int] = None
     async_checkpoint_save: bool = False
     save_state: bool = False
     save_state_mode: Literal["full", "minimal"] = "full"
@@ -1632,6 +1630,17 @@ class ProjectConfig(BaseModel):
                     training["output_dir"] = get_ltx2_training_output_dir_default()
                 if not training.get("network_module"):
                     training["network_module"] = get_ltx2_training_network_module_default()
+                # Unified retention: legacy keep-last fields all meant "how many checkpoints
+                # to keep" — fold them into save_last_n_checkpoints(_state).
+                for legacy, unified in (
+                    ("save_last_n_steps", "save_last_n_checkpoints"),
+                    ("save_last_n_epochs", "save_last_n_checkpoints"),
+                    ("save_last_n_steps_state", "save_last_n_checkpoints_state"),
+                    ("save_last_n_epochs_state", "save_last_n_checkpoints_state"),
+                ):
+                    value = training.pop(legacy, None)
+                    if value is not None and training.get(unified) is None:
+                        training[unified] = value
                 data["training"] = training
 
             model_dir = data.get("model_dir") or None

@@ -555,7 +555,7 @@ class HiDreamO1Trainer(HiDreamO1NetworkTrainer):
                                 if args.save_state:
                                     train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
 
-                                remove_step_no = train_utils.get_remove_step_no(args, global_step)
+                                remove_step_no = train_utils.get_remove_ckpt_no(args, global_step, args.save_every_n_steps)
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
                                     remove_model(remove_ckpt_name)
@@ -594,7 +594,7 @@ class HiDreamO1Trainer(HiDreamO1NetworkTrainer):
                         use_memory_efficient_saving=args.mem_eff_save,
                     )
 
-                    remove_epoch_no = train_utils.get_remove_epoch_no(args, epoch + 1)
+                    remove_epoch_no = train_utils.get_remove_ckpt_no(args, epoch + 1, args.save_every_n_epochs)
                     if remove_epoch_no is not None:
                         remove_ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no)
                         remove_model(remove_ckpt_name)
