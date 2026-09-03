@@ -3537,3 +3537,35 @@ def test_adapter_stats_use_the_module_effective_down_weight():
     metrics = trainer._adapter_stat_metrics(_FakeAccelerator(), _Net())
     # up @ (0.5 * down) = 1 everywhere on 3x4: Frobenius sqrt(12).
     assert metrics["h3/adapter/delta_norm"] == pytest.approx(12**0.5)
+
+
+def test_term_gradients_are_skipped_under_block_swap(tmp_path, caplog):
+    teacher = _teacher_file(tmp_path)
+    args = _flag_args(*_FLOOR_FLAGS, "--h3_term_grad_every", "1", teacher=teacher)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _RolloutBackend()
+    trainer._rollout_teacher = _StubTeacherCache()
+    trainer._rollout_supervision_active = lambda accelerator, probability: True
+    trainer.blocks_to_swap = 4
+    transformer = _SwapAwareScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video, batch = _rollout_batch()
+    with caplog.at_level(logging.WARNING):
+        _, metrics = trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            network,
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+    assert not [k for k in metrics if k.startswith("h3/grad/")]
+    assert any("blocks_to_swap 0" in r.getMessage() for r in caplog.records)

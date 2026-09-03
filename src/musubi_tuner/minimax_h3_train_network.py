@@ -5981,6 +5981,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_qwen_control_dropout = False
         self._step_recipe = None
         term_every = int(getattr(args, "h3_term_grad_every", 0) or 0)
+        if term_every > 0 and bool(self.blocks_to_swap):
+            # Every block-swap offloader retires a block on its backward hook
+            # firing; a separate autograd.grad per term fires those hooks before
+            # the step's real backward and leaves the ring in the wrong state.
+            if not getattr(self, "_term_grad_swap_warned", False):
+                logger.warning("--h3_term_grad_every needs --blocks_to_swap 0; skipped under block swap")
+                self._term_grad_swap_warned = True
+            term_every = 0
         if term_every > 0 and int(getattr(accelerator, "num_processes", 1) or 1) > 1:
             # torch.autograd.grad is not an interface DDP's reducer supports; walking
             # a DDP-built graph before the real backward can trip its ready marks.
@@ -6810,7 +6818,8 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "null anchor, field floor, rollout anchor, base preservation) and report h3/grad/<term>_norm and the "
             "pairwise h3/grad/cos_<a>_<b>: whether the terms pull the adapter the same way or against each other. "
             "Each term costs one extra backward on those steps and one flattened fp32 copy of the adapter's gradient "
-            "held at once. Single-process only (skipped with a warning under distributed training). 0 (default) disables"
+            "held at once. Single-process only and only without block swap (the offloader retires blocks on backward-hook "
+            "firings, which a separate per-term backward would trip); skipped with a warning otherwise. 0 (default) disables"
         ),
     )
     parser.add_argument(
