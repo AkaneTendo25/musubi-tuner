@@ -604,6 +604,9 @@ class _ToggleNetwork:
     def is_enabled(self):
         return getattr(self.transformer, "adapter_enabled", True)
 
+    def named_parameters(self):
+        return self.transformer.named_parameters()
+
 
 class _RolloutBackend:
     """A field that depends on the text presented and on the adapter being on.
@@ -3411,3 +3414,99 @@ def test_contrastive_target_at_scale_one_is_the_plain_target_bit_for_bit():
     torch.testing.assert_close(guided.video, empty.video + 3.0 * (target.video - empty.video))
     plain = contrastive_guidance_target(target, empty, 1.0)
     assert plain.video is target.video and plain.audio is target.audio
+
+
+# ---------------------------------------------------------------------------
+# Training diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_term_gradients_report_norms_and_cosines_and_leave_the_graph_usable(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, loss, metrics, _ = _run_step(
+        *_FLOOR_FLAGS,
+        "--h3_guidance_null_anchor_weight",
+        "1.0",
+        *_NORMALIZED_FLAGS[:4],
+        "--h3_guidance_null_source",
+        "frozen",
+        "--h3_term_grad_every",
+        "1",
+        teacher=teacher,
+    )
+    assert metrics["h3/grad/main_norm"] > 0
+    assert "h3/grad/floor_norm" in metrics and "h3/grad/anchor_norm" in metrics
+    assert -1.0 <= metrics["h3/grad/cos_main_anchor"] <= 1.0
+    assert "h3/grad/cos_main_floor" in metrics
+    # The step's own backward still works after the per-term grads.
+    loss.backward()
+
+
+def test_term_gradients_are_off_by_default_and_on_schedule(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, _, metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+    assert not [k for k in metrics if k.startswith("h3/grad/")]
+
+
+def test_adapter_stats_report_delta_norm_and_ema_distance():
+    class _Lin(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_down = torch.nn.Linear(4, 2, bias=False)
+            self.lora_up = torch.nn.Linear(2, 3, bias=False)
+            self.scale = 0.5
+            self.multiplier = 1.0
+            torch.nn.init.ones_(self.lora_down.weight)
+            torch.nn.init.ones_(self.lora_up.weight)
+
+    class _Net(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.unet_loras = torch.nn.ModuleList([_Lin()])
+            self.text_encoder_loras = []
+
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(_flag_args())
+    net = _Net()
+    metrics = trainer._adapter_stat_metrics(_FakeAccelerator(), net)
+    # up @ down = 2 everywhere on a 3x4 matrix, times scale 0.5 -> 1 everywhere: Frobenius sqrt(12).
+    assert metrics["h3/adapter/delta_norm"] == pytest.approx(12**0.5)
+    assert "h3/adapter/ema_rel_dist" not in metrics
+    trainer._adapter_ema = {name: torch.zeros_like(p) for name, p in net.named_parameters()}
+    metrics = trainer._adapter_stat_metrics(_FakeAccelerator(), net)
+    assert metrics["h3/adapter/ema_rel_dist"] == pytest.approx(1.0)
+
+
+def test_train_sigma_bins_report_the_step_bin_only():
+    _, _, off, _ = _run_step()
+    assert not [k for k in off if k.startswith("loss/video/bin")]
+    _, _, on, _ = _run_step("--h3_train_sigma_bins")
+    bins = [k for k in on if k.startswith("loss/video/bin")]
+    assert len(bins) == 1
+    assert on[bins[0]] == pytest.approx(on["loss/video"])
+
+
+def test_validation_std_flag_is_parsed_and_diagnostic_ints_validated():
+    args = _flag_args("--h3_validation_std", "--h3_term_grad_every", "50", "--h3_adapter_stats_every", "10")
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+    with pytest.raises(ValueError, match="non-negative"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_term_grad_every", "-1"))
+
+
+def test_rollout_teacher_value_metrics_appear_with_the_floor(tmp_path):
+    _, _, metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=_teacher_file(tmp_path))
+    # Stub: teacher field 0.75 and base field 0.25 are parallel -> cos 1; the
+    # teacher is three times as far from the student as the base prompted branch.
+    assert metrics["h3/rollout_teacher_cos_base"] == pytest.approx(1.0)
+    assert metrics["h3/rollout_teacher_vs_base"] == pytest.approx((0.75 + 0.25 - 0.375) / (0.25 + 0.25 - 0.375))
+
+
+def test_term_gradients_main_is_the_rollout_objective_alone_on_a_rollout_step(tmp_path):
+    """On a rollout step the floor is folded into the loss before the auxiliaries;
+    the reported main term must still be the rollout objective without it."""
+    teacher = _teacher_file(tmp_path)
+    _, loss, metrics, _ = _run_step(*_FLOOR_FLAGS, "--h3_term_grad_every", "1", teacher=teacher)
+    # main and floor are different terms with different gradients on the scale.
+    assert metrics["h3/grad/main_norm"] > 0 and metrics["h3/grad/floor_norm"] > 0
+    assert metrics["h3/grad/main_norm"] != pytest.approx(metrics["h3/grad/floor_norm"])
+    loss.backward()

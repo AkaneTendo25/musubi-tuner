@@ -1042,7 +1042,10 @@ scale runs to 11-16 and the data are nearly noise.
 
 Costs two no-gradient frozen forwards per supervised state, folded into the fused pass under `--h3_rollout_fused_teacher`.
 Requires a student text cache built with `--cache_guidance_empty`. Reported as `loss/rollout_field_floor` and, as the mean
-ratio over the step's scored samples, `h3/rollout_field_ratio`; the averaged loss excludes the term. Experimental:
+ratio over the step's scored samples, `h3/rollout_field_ratio`; with the floor's frozen arms in hand the step also reports
+`h3/rollout_teacher_cos_base` (the teacher's field direction against the base's at the supervised states) and
+`h3/rollout_teacher_vs_base` (the teacher's distance from the student over the base's), which read 1 and 1 for a teacher
+that has nothing left to teach. The averaged loss excludes the term. Experimental:
 judge it by `val/rollout/field_cos`, `val/drift/prompted_rel` and blind renders rather than by `val/rollout/field`, whose
 length it directly pushes on when the anchor holds.
 
@@ -1443,6 +1446,10 @@ Every objective here is off unless its flag is given, and a run without them tra
 | `--h3_guidance_scale_sigma_max 1.0` | Cap on the guidance target's schedule: above this shifted sigma the distillation scale is `1` and the step trains on the plain data target. The checkpoints' implied scale runs to 11-16 above sigma 0.9, where the data are nearly noise. `1.0` applies the schedule everywhere. |
 | `--h3_guidance_audio_scale` | Distillation scale for the audio half of the guidance target; unset uses the configured video scale (including a per-sample `--h3_guidance_scale_range` draw) for both. At exactly `1` the audio target is the plain data target bit for bit. The released checkpoints' audio field is not a clean amplification (its implied scale is not constant across sigma and the residual is nearly all systematic at the top), so `1.0` keeps the audio target plain while the video keeps the guidance form. At least `1`. |
 | `--h3_validation_multipliers 0.75,1.25` | Repeat validation's data-state pass at these adapter multipliers and report `val/m<multiplier>/velocity_err_rel`, `field`, `field_cos`, `drift/prompted_rel`: how the adapter responds to the strength knob users turn at inference. One extra pass per multiplier; the rollout probe is not repeated. |
+| `--h3_term_grad_every 0` | Every N steps differentiate each loss term (main objective, null anchor, field floor, rollout anchor, base preservation) on the adapter separately and report `h3/grad/<term>_norm` and pairwise `h3/grad/cos_<a>_<b>`: whether the terms agree or fight. One extra backward per term on those steps and one flattened fp32 gradient per term held at once. Single-process only; skipped with a warning under distributed training. |
+| `--h3_adapter_stats_every 0` | Every N steps report `h3/adapter/delta_norm` (Frobenius norm of the weight delta over the unsplit Linear LoRA modules; split and convolutional adapters are not counted) and, with an EMA, `h3/adapter/ema_rel_dist` (relative distance of the live parameters from their EMA). |
+| `--h3_train_sigma_bins` | Report the data step's video loss under `loss/video/bin<k>` for its shifted-sigma bin (edges 0.5, 0.8, 0.9). |
+| `--h3_validation_std` | Report `<key>_std`, the per-clip sample standard deviation, beside each pooled validation metric that at least two clips contributed to. |
 | `--h3_adapter_ema_decay 0.0` | Keep an exponential moving average of the adapter's trainable parameters, updated after every optimizer step, and save it beside each scheduled checkpoint as `<output_name>-ema-step<N>.safetensors` (an ordinary adapter file). Damps the step-to-step swing between competing terms without changing the objective. `--h3_validate_ema` validates the average instead of the live adapter. |
 | `--h3_dop_loss_weight 0.0` | Differential Output Preservation, off at the default: penalizes LoRA drift from the frozen base under a trigger-free rewrite of each caption. |
 | `--h3_dop_probability 1.0` | Evaluate DOP on a synchronized random fraction of prompt-conditioned batches and inverse-probability scale its loss. |

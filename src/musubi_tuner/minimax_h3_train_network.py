@@ -1766,9 +1766,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         for bin_index, ratios in sorted(self._field_ratios.items()):
             if ratios:
                 metrics[f"val/field/bin{bin_index}"] = sum(ratios) / len(ratios)
+        report_std = bool(getattr(args, "h3_validation_std", False))
+
+        def with_std(key: str, values: list) -> None:
+            if not values:
+                return
+            mean = sum(values) / len(values)
+            metrics[key] = mean
+            if report_std and len(values) > 1:
+                metrics[f"{key}_std"] = (sum((v - mean) ** 2 for v in values) / (len(values) - 1)) ** 0.5
+
         pooled = [ratio for ratios in self._field_ratios.values() for ratio in ratios]
-        if pooled:
-            metrics["val/field"] = sum(pooled) / len(pooled)
+        with_std("val/field", pooled)
         # The ratio is a length, and guidance is a vector. An adapter can hold the
         # length exactly while turning the direction the field pushes in, which the
         # ratio alone would report as a field left untouched, so the two are only
@@ -1780,11 +1789,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if ratios:
                 metrics[f"val/velocity_err_rel/bin{bin_index}"] = sum(ratios) / len(ratios)
         pooled_rel = [ratio for ratios in self._velocity_error_ratios.values() for ratio in ratios]
-        if pooled_rel:
-            metrics["val/velocity_err_rel"] = sum(pooled_rel) / len(pooled_rel)
+        with_std("val/velocity_err_rel", pooled_rel)
         pooled_cos = [cosine for cosines in self._field_cosines.values() for cosine in cosines]
-        if pooled_cos:
-            metrics["val/field_cos"] = sum(pooled_cos) / len(pooled_cos)
+        with_std("val/field_cos", pooled_cos)
         # Reported beside the two it combines, not instead of them: the pair says HOW a
         # field was lost -- shortened, turned, or both -- while this says how far it went.
         for bin_index, distances in sorted(self._field_distances.items()):
@@ -1802,10 +1809,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         pooled_rollout_data = [error for errors in self._rollout_data_err.values() for error in errors]
         if pooled_rollout_data:
             metrics["val/rollout/x0_err"] = sum(pooled_rollout_data) / len(pooled_rollout_data)
-        if self._rollout_field:
-            metrics["val/rollout/field"] = sum(self._rollout_field) / len(self._rollout_field)
-        if self._rollout_field_cos:
-            metrics["val/rollout/field_cos"] = sum(self._rollout_field_cos) / len(self._rollout_field_cos)
+        with_std("val/rollout/field", self._rollout_field)
+        with_std("val/rollout/field_cos", self._rollout_field_cos)
         # Error against the raw data velocity, which every arm can be judged by no
         # matter what it optimised. val/loss cannot do that job: a guidance loss, a
         # teacher-matching loss and a rollout objective each report on their own
@@ -1838,8 +1843,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if ratios:
                 metrics[f"val/drift/prompted_rel/bin{bin_index}"] = sum(ratios) / len(ratios)
         pooled_drift = [ratio for ratios in self._prompted_drift_ratios.values() for ratio in ratios]
-        if pooled_drift:
-            metrics["val/drift/prompted_rel"] = sum(pooled_drift) / len(pooled_drift)
+        with_std("val/drift/prompted_rel", pooled_drift)
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
@@ -2782,6 +2786,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "--h3_adapter_prompt_only switches the adapter off on empty-prompt forwards, so a caption-dropout "
                     "step would train nothing; set --h3_caption_dropout_rate 0"
                 )
+        for name in ("h3_term_grad_every", "h3_adapter_stats_every"):
+            value = int(getattr(args, name, 0) or 0)
+            if value < 0:
+                raise ValueError(f"--{name} must be non-negative; 0 disables it")
+        self._train_sigma_bin_loss: dict[int, list[float]] = {}
         audio_scale = getattr(args, "h3_guidance_audio_scale", None)
         if audio_scale is not None and (not math.isfinite(audio_scale) or audio_scale < 1.0):
             raise ValueError("--h3_guidance_audio_scale must be finite and at least 1")
@@ -3144,7 +3153,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     @staticmethod
     def _adapter_parameters(accelerator, network) -> list[tuple[str, torch.nn.Parameter]]:
         unwrapped = accelerator.unwrap_model(network)
-        return [(name, parameter) for name, parameter in unwrapped.named_parameters() if parameter.requires_grad]
+        named = getattr(unwrapped, "named_parameters", None)
+        if not callable(named):
+            return []
+        return [(name, parameter) for name, parameter in named() if parameter.requires_grad]
 
     def _update_adapter_ema(self, args, accelerator, network, global_step: int) -> None:
         """Track the trainable parameters' EMA and save it beside each scheduled checkpoint.
@@ -5638,6 +5650,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
             "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
         }
+        if getattr(args, "h3_train_sigma_bins", False) and has_video:
+            # Only the bin this step fell in is reported; the batch average keeps
+            # a key wherever at least one item carried it.
+            sigma_bin = bisect.bisect_right([0.5, 0.8, 0.9], float(inputs.video_sigma.mean()))
+            metrics[f"loss/video/bin{sigma_bin}"] = float(result.video_loss.detach())
         if args.h3_dop_loss_weight > 0:
             metrics["h3/dop_active"] = float(dop_active)
             metrics["loss/dop"] = 0.0 if dop_term is None else float(dop_term.detach())
@@ -5667,6 +5684,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # loss differs from it.
         dense_loss = result.loss
         rollout_replaced = False
+        rollout_main_objective = None
         rollout_field_floor = None
         rollout_null_anchor = None
         if rollout_active:
@@ -5732,6 +5750,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             window = float(len(rollout_terms))
             loss = sum(term.loss for term in rollout_terms) / window
             rescaled_rollout_loss = loss
+            rollout_main_objective = loss
             rollout_replaced = True
             metrics["loss/rollout_video"] = float(sum(term.video_loss.detach() for term in rollout_terms) / window)
             metrics["h3/rollout_stop_sigma"] = rollout_stop_sigma
@@ -5770,6 +5789,26 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # field at the same state ('teacher'), where lengthening in a wrong
                 # direction earns nothing and the gradient turns the field as it
                 # lengthens it.
+                # How much the privileged teacher still knows at these states: the
+                # direction of its field against the base's, and its distance from
+                # the student against the base's. A teacher that has collapsed onto
+                # the base reads cos 1 and ratio 1 here, and then supervises nothing.
+                teacher_cos, teacher_ratio = [], []
+                for (student, teacher), (base_prompted, base_empty) in zip(rollout_pairs, rollout_bases, strict=True):
+                    if base_prompted is None:
+                        continue
+                    teacher_field = teacher.video - base_empty.video
+                    base_field = base_prompted.video - base_empty.video
+                    teacher_cos.append(self._masked_cosine(teacher_field, base_field, effective_video_mask))
+                    base_gap = self._masked_rms(base_prompted.video - student.video.detach(), effective_video_mask)
+                    if base_gap > 0:
+                        teacher_ratio.append(
+                            self._masked_rms(teacher.video - student.video.detach(), effective_video_mask) / base_gap
+                        )
+                if teacher_cos:
+                    metrics["h3/rollout_teacher_cos_base"] = sum(teacher_cos) / len(teacher_cos)
+                if teacher_ratio:
+                    metrics["h3/rollout_teacher_vs_base"] = sum(teacher_ratio) / len(teacher_ratio)
                 along_teacher = getattr(args, "h3_rollout_field_floor_direction", "self") == "teacher"
                 measured = []
                 for (student, teacher), (base_prompted, base_empty) in zip(rollout_pairs, rollout_bases, strict=True):
@@ -5830,6 +5869,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             guidance_rescaled = True
         if args.h3_guidance_distillation_probability < 1.0:
             metrics["h3/guidance_distillation_active"] = float(use_guidance)
+        # The objective before any auxiliary term is added: what --h3_term_grad_every
+        # reports against the anchors and the floor. On a rollout step the floor and
+        # the rollout anchor were already folded into ``loss``, so the objective is
+        # the one captured when the rollout loss was formed.
+        main_objective = rollout_main_objective if rollout_replaced else loss
         base_preservation_term = None
         if reference_prediction is not None:
             preservation = joint_prediction_loss(
@@ -5936,7 +5980,96 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_reference_modality = "av"
         self._step_qwen_control_dropout = False
         self._step_recipe = None
+        term_every = int(getattr(args, "h3_term_grad_every", 0) or 0)
+        if term_every > 0 and int(getattr(accelerator, "num_processes", 1) or 1) > 1:
+            # torch.autograd.grad is not an interface DDP's reducer supports; walking
+            # a DDP-built graph before the real backward can trip its ready marks.
+            if not getattr(self, "_term_grad_ddp_warned", False):
+                logger.warning("--h3_term_grad_every is single-process only; skipped under distributed training")
+                self._term_grad_ddp_warned = True
+            term_every = 0
+        if term_every > 0 and int(global_step) % term_every == 0 and torch.is_grad_enabled() and network is not None:
+            terms = {
+                "main": main_objective,
+                "anchor": null_anchor,
+                "floor": rollout_field_floor,
+                "rollout_anchor": rollout_null_anchor,
+                "preservation": base_preservation_term,
+            }
+            metrics.update(self._term_gradient_metrics(accelerator, network, terms))
+        stats_every = int(getattr(args, "h3_adapter_stats_every", 0) or 0)
+        if stats_every > 0 and int(global_step) % stats_every == 0 and network is not None:
+            metrics.update(self._adapter_stat_metrics(accelerator, network))
         return loss, metrics
+
+    def _term_gradient_metrics(self, accelerator, network, terms: dict) -> dict[str, float]:
+        """Per-term gradients on the adapter: norms and pairwise cosines.
+
+        Each term is differentiated separately with the graph retained, so the
+        step's own backward runs unchanged afterwards. A term that does not
+        reach a parameter contributes zeros there.
+        """
+        parameters = [parameter for _name, parameter in self._adapter_parameters(accelerator, network)]
+        if not parameters:
+            return {}
+        flats: dict[str, torch.Tensor] = {}
+        for name, term in terms.items():
+            if term is None or not isinstance(term, torch.Tensor) or not term.requires_grad:
+                continue
+            grads = torch.autograd.grad(term, parameters, retain_graph=True, allow_unused=True)
+            flats[name] = torch.cat(
+                [
+                    (torch.zeros_like(parameter) if grad is None else grad).detach().float().reshape(-1)
+                    for parameter, grad in zip(parameters, grads, strict=True)
+                ]
+            )
+        metrics: dict[str, float] = {}
+        names = list(flats)
+        for name in names:
+            metrics[f"h3/grad/{name}_norm"] = float(flats[name].norm())
+        for i, left in enumerate(names):
+            for right in names[i + 1 :]:
+                denominator = float(flats[left].norm()) * float(flats[right].norm())
+                metrics[f"h3/grad/cos_{left}_{right}"] = (
+                    float(torch.dot(flats[left], flats[right])) / denominator if denominator > 0 else 0.0
+                )
+        return metrics
+
+    def _adapter_stat_metrics(self, accelerator, network) -> dict[str, float]:
+        """Norm of the adapter's weight delta and its distance from the EMA."""
+        unwrapped = accelerator.unwrap_model(network)
+        modules = list(getattr(unwrapped, "unet_loras", ())) + list(getattr(unwrapped, "text_encoder_loras", ()))
+        metrics: dict[str, float] = {}
+        total = 0.0
+        contributed = 0
+        with torch.no_grad():
+            for module in modules:
+                # Unsplit Linear adapters only: the delta is up @ down (NoRA's
+                # normalised down weight when the module has one). Split and
+                # convolutional adapters are skipped, so the norm covers what it
+                # covers and is reported only when something contributed.
+                effective = getattr(module, "effective_down_weight", None)
+                down = effective() if callable(effective) else getattr(getattr(module, "lora_down", None), "weight", None)
+                up = getattr(getattr(module, "lora_up", None), "weight", None)
+                if down is None or up is None or down.dim() != 2 or up.dim() != 2:
+                    continue
+                factor = float(getattr(module, "scale", 1.0)) * float(getattr(module, "multiplier", 1.0))
+                total += float((up.float() @ down.float()).pow(2).sum()) * factor * factor
+                contributed += 1
+            if contributed:
+                metrics["h3/adapter/delta_norm"] = total**0.5
+            if self._adapter_ema is not None:
+                live_sq, dist_sq = 0.0, 0.0
+                for name, parameter in self._adapter_parameters(accelerator, network):
+                    shadow = self._adapter_ema.get(name)
+                    if shadow is None:
+                        continue
+                    live = parameter.detach().float()
+                    live_sq += float(live.pow(2).sum())
+                    dist_sq += float((live - shadow).pow(2).sum())
+                if live_sq > 0:
+                    metrics["h3/adapter/ema_rel_dist"] = (dist_sq / live_sq) ** 0.5
+        return metrics
 
     def call_dit(self, *args, **kwargs):
         del args, kwargs
@@ -6664,6 +6797,46 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_validate_ema",
         action="store_true",
         help="run validation on the EMA adapter (--h3_adapter_ema_decay) instead of the live one",
+    )
+    parser.add_argument(
+        "--h3_term_grad_every",
+        type=int,
+        default=0,
+        help=(
+            "every N optimizer steps, take each loss term's gradient on the adapter separately (main objective, "
+            "null anchor, field floor, rollout anchor, base preservation) and report h3/grad/<term>_norm and the "
+            "pairwise h3/grad/cos_<a>_<b>: whether the terms pull the adapter the same way or against each other. "
+            "Each term costs one extra backward on those steps and one flattened fp32 copy of the adapter's gradient "
+            "held at once. Single-process only (skipped with a warning under distributed training). 0 (default) disables"
+        ),
+    )
+    parser.add_argument(
+        "--h3_adapter_stats_every",
+        type=int,
+        default=0,
+        help=(
+            "every N steps report h3/adapter/delta_norm (Frobenius norm of the weight delta over the unsplit Linear LoRA "
+            "modules; split and convolutional adapters are not counted) and, with --h3_adapter_ema_decay, "
+            "h3/adapter/ema_rel_dist (distance of the live parameters from "
+            "their EMA, relative): a direct reading of how far the adapter has moved and how much it swings. "
+            "0 (default) disables"
+        ),
+    )
+    parser.add_argument(
+        "--h3_train_sigma_bins",
+        action="store_true",
+        help=(
+            "report the data step's video loss under loss/video/bin<k> for the shifted-sigma bin it fell in "
+            "(edges 0.5, 0.8, 0.9), so where learning happens along the schedule is visible during training"
+        ),
+    )
+    parser.add_argument(
+        "--h3_validation_std",
+        action="store_true",
+        help=(
+            "report the per-clip sample standard deviation beside each pooled validation metric (<key>_std) wherever "
+            "at least two clips contributed: the noise floor of that metric"
+        ),
     )
     parser.add_argument(
         "--h3_adapter_prompt_only",
