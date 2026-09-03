@@ -187,7 +187,7 @@ def _loss_and_grads(model, network, dtype, *, checkpointing=False):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_tiny_model_loss_and_gradients_are_bit_identical_to_the_pre_rewrite_block(monkeypatch, dtype, checkpointing):
-    """The default path (rotary rewrite, fused LoRA add for power-of-two factors) against the old formulas."""
+    """The default path retains the pre-optimization formulas exactly."""
     model, network = _tiny_lora_model(dtype)
     loss, grads = _loss_and_grads(model, network, dtype, checkpointing=checkpointing)
 

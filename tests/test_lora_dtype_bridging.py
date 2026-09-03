@@ -345,11 +345,11 @@ def test_fuse_delta_issues_fewer_full_size_elementwise_kernels():
         return mode.count
 
     # multiplier != 1 and scale != 1: two muls + one add -> one mul, one in-place mul, one in-place add
-    # (same kernel count but two fewer allocations); multiplier == 1 additionally drops a kernel, and
-    # power-of-two factors (exact scaling) collapse into a single add(alpha=) kernel.
+    # (same kernel count but two fewer allocations); multiplier == 1 additionally drops a kernel.
+    # Fusing the scale into add(alpha=) is reserved for the explicit H3 fused-elementwise option.
     assert count(1.0, 4, naive=True) == 3  # naive always runs mul, mul, add
     assert count(1.0, 4, naive=False) == 1  # both factors are 1.0 -> plain add only
-    assert count(1.0, 2, naive=False) == 1  # scale 0.5 -> add(org, delta, alpha=0.5), bit-identical
+    assert count(1.0, 2, naive=False) == 2  # scale 0.5 -> multiply, then add in the historical order
     assert count(0.75, 2, naive=False) == 3  # 0.75 is not a power of two -> mul, in-place mul, in-place add
 
 

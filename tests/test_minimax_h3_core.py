@@ -4933,9 +4933,8 @@ def test_h3_teacher_dataset_borrows_latents_but_keeps_its_own_text_cache(tmp_pat
     assert stale.exists()
 
 
-def test_shared_latent_directory_is_never_purged_by_its_owner_or_a_borrower(tmp_path):
-    """Two datasets of one run resolve to the same latent directory: neither may purge it,
-    and the audio dataset honours the key too."""
+def test_borrowed_latent_directory_is_not_purged_but_owner_keeps_historical_policy(tmp_path):
+    """Only the dataset opting into a borrowed latent directory suppresses purging."""
     from musubi_tuner import cache_latents
     from musubi_tuner.dataset.image_video_dataset import VideoDataset
     from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
@@ -4960,7 +4959,7 @@ def test_shared_latent_directory_is_never_purged_by_its_owner_or_a_borrower(tmp_
     alone = VideoDataset(cache_directory=str(tmp_path / "solo"), **common)
 
     assert owner.latent_cache_purge_allowed([owner]) is True
-    assert owner.latent_cache_purge_allowed([owner, borrower]) is False
+    assert owner.latent_cache_purge_allowed([owner, borrower]) is True
     assert borrower.latent_cache_purge_allowed([owner, borrower]) is False
     assert alone.latent_cache_purge_allowed([owner, borrower, alone]) is True
 
@@ -4976,7 +4975,14 @@ def test_shared_latent_directory_is_never_purged_by_its_owner_or_a_borrower(tmp_
 
     stubs = [Stub(owner), Stub(borrower)]
     cache_latents.encode_datasets(stubs, lambda batch: None, Namespace(num_workers=1, skip_existing=False, keep_cache=False))
-    assert stale.exists()
+    assert not stale.exists()  # the ordinary owner retains the historical purge
+
+    borrowed_only_stale = shared / "borrowed_only_00000-022_0512x0512_mmh3.safetensors"
+    borrowed_only_stale.write_bytes(b"latent")
+    cache_latents.encode_datasets(
+        [Stub(borrower)], lambda batch: None, Namespace(num_workers=1, skip_existing=False, keep_cache=False)
+    )
+    assert borrowed_only_stale.exists()
 
     audio_dir = tmp_path / "audio"
     audio_dir.mkdir()

@@ -172,28 +172,14 @@ class MiniMaxH3PackedState:
 
 
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Split RoPE on the leading ``cos.shape[-1]`` channels of ``[B, S, heads, head_dim]``.
-
-    The reference form ``cat((x * cos + cat((-x2, x1)) * sin, passthrough)).contiguous()`` is
-    written out per half instead. In forward ``x1 * cos - x2 * sin`` computes the same
-    elementwise values as ``x1 * cos + (-x2) * sin`` (negation is exact and ``a + (-b)`` is
-    ``a - b`` in IEEE arithmetic), so the outputs are equal element for element, while the
-    ``neg``, the intermediate ``cat`` and the trailing ``contiguous`` copy over the full head
-    width disappear. The three inputs come from one ``split``, whose backward is a single
-    ``cat`` instead of three zero-filled slice backwards: the backward graph is structurally
-    different from the reference's and algebraically equal to it; the gradients matched the
-    reference elementwise on CPU (bf16/fp16/fp32), CUDA coverage pending. Per Q or K this is
-    ~11.5 to ~5.4 head-widths of traffic in forward and ~9.75 to ~5.75 in backward."""
+    """Apply the released H3 RoPE formula without changing its operation order."""
     rotary_dim = cos.shape[-1]
-    half = rotary_dim // 2
-    first, second, passthrough = hidden_states.split((half, rotary_dim - half, hidden_states.shape[-1] - rotary_dim), dim=-1)
+    rotary, passthrough = hidden_states[..., :rotary_dim], hidden_states[..., rotary_dim:]
     cos = cos[None, :, None, :]
     sin = sin[None, :, None, :]
-    cos_first, cos_second = cos[..., :half], cos[..., half:]
-    sin_first, sin_second = sin[..., :half], sin[..., half:]
-    rotated_first = first * cos_first - second * sin_first
-    rotated_second = second * cos_second + first * sin_second
-    return torch.cat((rotated_first, rotated_second, passthrough), dim=-1)
+    first, second = rotary.chunk(2, dim=-1)
+    rotated = torch.cat((-second, first), dim=-1)
+    return torch.cat((rotary * cos + rotated * sin, passthrough), dim=-1).contiguous()
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):

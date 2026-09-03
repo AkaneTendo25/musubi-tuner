@@ -286,20 +286,13 @@ class BaseDataset(torch.utils.data.Dataset):
         return glob.glob(os.path.join(self.latent_cache_directory, f"*_{self.architecture}.safetensors"))
 
     def latent_cache_purge_allowed(self, datasets: Sequence["BaseDataset"]) -> bool:
-        """Whether the latent cache script may delete files it did not write in this
-        dataset's latent directory. Not when the directory is borrowed, and not when
-        another dataset of the same run resolves to the same directory: its files would
-        be "not in the dataset" here and be removed before it ran."""
-        if self.latent_cache_borrowed:
-            return False
-        mine = os.path.normcase(os.path.normpath(os.path.abspath(self.latent_cache_directory or "")))
-        for other in datasets:
-            if other is self:
-                continue
-            theirs = getattr(other, "latent_cache_directory", None) or getattr(other, "cache_directory", None)
-            if theirs and os.path.normcase(os.path.normpath(os.path.abspath(theirs))) == mine:
-                return False
-        return True
+        """Allow the historical purge unless this dataset explicitly borrows its latents.
+
+        In particular, two ordinary datasets that happen to share ``cache_directory`` retain
+        the pre-feature behaviour. Only ``latent_cache_directory`` opting into a different
+        directory changes the purge policy.
+        """
+        return not self.latent_cache_borrowed
 
     def get_all_text_encoder_output_cache_files(self):
         return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_te.safetensors"))

@@ -687,10 +687,11 @@ class H3StepProfiler:
             return 0.0
         return max(self._window_end - self._window_start, 0.0) * 1e6
 
-    def _finish(self, note: str) -> None:
+    def _finish(self, note: str, *, profiler_stopped: bool = False) -> None:
         steps = self.active_steps_done if note else self.active_steps
         self.table = format_h3_profile_table(categorize_h3_profile_rows(self._rows), self._wall_us(), steps, self._busy_us, note)
-        self._profiler.stop()
+        if not profiler_stopped:
+            self._profiler.stop()
         sections = [self.table]
         if self._scopes is not None:
             sections.append(format_h3_profile_scopes(self._scopes, self._wall_us(), steps))
@@ -713,7 +714,7 @@ class H3StepProfiler:
         # Stopping inside the active phase delivers the partial trace to _on_trace_ready.
         self._profiler.stop()
         if self._rows is not None and self.active_steps_done > 0:
-            self._finish(f" of the {self.active_steps} requested, INCOMPLETE")
+            self._finish(f" of the {self.active_steps} requested, INCOMPLETE", profiler_stopped=True)
             return
         message = (
             f"--h3_profile_steps {self.active_steps}: the profiling window never opened; training ended after "
