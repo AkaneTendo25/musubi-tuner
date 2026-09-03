@@ -346,9 +346,20 @@ def contrastive_guidance_target(
         if isinstance(audio_guidance_scale, torch.Tensor) and target.audio is not None
         else audio_guidance_scale
     )
+
+    def guided(data, null, scale):
+        if data is None:
+            return None
+        # A scale of exactly 1 asks for the plain data target; return it as is
+        # rather than through ``null + (data - null)``, whose cancellation is not
+        # bit-exact.
+        if not isinstance(scale, torch.Tensor) and float(scale) == 1.0:
+            return data
+        return null + scale * (data - null)
+
     return H3ModelPrediction(
-        video=(empty.video + video_scale * (target.video - empty.video)) if target.video is not None else None,
-        audio=(empty.audio + audio_scale * (target.audio - empty.audio)) if target.audio is not None else None,
+        video=guided(target.video, empty.video, video_scale),
+        audio=guided(target.audio, empty.audio, audio_scale),
     )
 
 

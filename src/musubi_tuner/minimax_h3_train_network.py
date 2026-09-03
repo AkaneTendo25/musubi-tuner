@@ -2782,6 +2782,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "--h3_adapter_prompt_only switches the adapter off on empty-prompt forwards, so a caption-dropout "
                     "step would train nothing; set --h3_caption_dropout_rate 0"
                 )
+        audio_scale = getattr(args, "h3_guidance_audio_scale", None)
+        if audio_scale is not None and (not math.isfinite(audio_scale) or audio_scale < 1.0):
+            raise ValueError("--h3_guidance_audio_scale must be finite and at least 1")
         scale_sigma_max = float(getattr(args, "h3_guidance_scale_sigma_max", 1.0))
         if not math.isfinite(scale_sigma_max) or not 0 < scale_sigma_max <= 1:
             raise ValueError("--h3_guidance_scale_sigma_max must be finite and lie in (0, 1]")
@@ -4706,8 +4709,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
             if inputs.video_frame_sigma is not None:
                 video_scale = video_scale.reshape(1, 1, -1, 1, 1)
+        # The audio field of the released checkpoints is not a clean amplification
+        # (its noise-averaged residual is nearly all systematic at the top of the
+        # schedule), so the audio half may take its own scale; 1 leaves the audio
+        # target plain while the video target keeps the guidance form.
+        audio_configured = getattr(args, "h3_guidance_audio_scale", None)
         audio_scale = guidance_scale_for_sigma(
-            configured_scale,
+            configured_scale if audio_configured is None else float(audio_configured),
             inputs.audio_sigma,
             args.h3_guidance_loss_schedule,
             sigma_max=float(getattr(args, "h3_guidance_scale_sigma_max", 1.0)),
@@ -5955,6 +5963,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
+            "ss_h3_guidance_audio_scale": str(getattr(args, "h3_guidance_audio_scale", None) or "same"),
             "ss_h3_guidance_scale_range": (
                 "fixed"
                 if self._guidance_scale_range is None
@@ -6157,6 +6166,20 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
+    )
+    parser.add_argument(
+        "--h3_guidance_audio_scale",
+        type=float,
+        default=None,
+        help=(
+            "distillation scale for the AUDIO half of the guidance target; unset (default) uses the shared configured "
+            "scale for both modalities, including a per-sample draw under --h3_guidance_scale_range. The audio field "
+            "of the released checkpoints is not "
+            "a clean amplification of a null-to-data difference (measured: its implied scale is not constant across "
+            "sigma and its residual is nearly all systematic at the top), so an amplified audio target adds noise "
+            "without a matching field to hold; 1.0 keeps the audio target plain while the video keeps the guidance "
+            "form. Must be at least 1; ignored when the guidance objective is off"
+        ),
     )
     parser.add_argument(
         "--h3_guidance_scale_range",

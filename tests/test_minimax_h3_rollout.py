@@ -3354,3 +3354,60 @@ def test_rollout_null_anchor_reports_zero_when_inactive_and_is_validated(tmp_pat
     trainer = MiniMaxH3NetworkTrainer()
     trainer.handle_model_specific_args(args)
     assert trainer.extra_metadata(args)["ss_h3_rollout_null_anchor_weight"] == "1.0"
+
+
+# ---------------------------------------------------------------------------
+# Audio guidance scale
+# ---------------------------------------------------------------------------
+
+
+def test_audio_guidance_scale_reaches_the_audio_target_only(monkeypatch):
+    """With the audio scale at 1 the audio half is the plain data target while the
+    video half keeps the guided form; the video pair is bit-identical either way."""
+    from musubi_tuner import minimax_h3_train_network as module
+
+    recorded = []
+    original = module.contrastive_guidance_target
+
+    def spy(target, empty, guidance_scale, *, audio_guidance_scale=None):
+        recorded.append((guidance_scale, audio_guidance_scale))
+        return original(target, empty, guidance_scale, audio_guidance_scale=audio_guidance_scale)
+
+    monkeypatch.setattr(module, "contrastive_guidance_target", spy)
+    flags = (
+        "--h3_guidance_distillation_scale",
+        "3.0",
+        "--h3_guidance_loss_form",
+        "contrastive",
+        "--h3_guidance_loss_schedule",
+        "constant",
+    )
+    _run_step(*flags)
+    _run_step(*flags, "--h3_guidance_audio_scale", "1.0")
+    same_video, same_audio = recorded[0]
+    plain_video, plain_audio = recorded[1]
+    torch.testing.assert_close(torch.as_tensor(same_video), torch.as_tensor(plain_video))
+    assert float(torch.as_tensor(same_audio).reshape(-1)[0]) == pytest.approx(3.0)
+    assert float(torch.as_tensor(plain_audio).reshape(-1)[0]) == pytest.approx(1.0)
+
+
+def test_audio_guidance_scale_is_validated_and_recorded():
+    with pytest.raises(ValueError, match="audio_scale"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_guidance_audio_scale", "0.5"))
+    trainer = MiniMaxH3NetworkTrainer()
+    args = _flag_args("--h3_guidance_distillation_scale", "3.0", "--h3_guidance_audio_scale", "1.0")
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_guidance_audio_scale"] == "1.0"
+    assert MiniMaxH3NetworkTrainer().extra_metadata(_flag_args())["ss_h3_guidance_audio_scale"] == "same"
+
+
+def test_contrastive_target_at_scale_one_is_the_plain_target_bit_for_bit():
+    from musubi_tuner.minimax_h3.training import contrastive_guidance_target
+
+    target = H3ModelPrediction(video=torch.randn(1, 4, 2, 3, 3), audio=torch.randn(1, 2, 6, 3))
+    empty = H3ModelPrediction(video=torch.randn(1, 4, 2, 3, 3), audio=torch.randn(1, 2, 6, 3))
+    guided = contrastive_guidance_target(target, empty, 3.0, audio_guidance_scale=1.0)
+    assert guided.audio is target.audio
+    torch.testing.assert_close(guided.video, empty.video + 3.0 * (target.video - empty.video))
+    plain = contrastive_guidance_target(target, empty, 1.0)
+    assert plain.video is target.video and plain.audio is target.audio
