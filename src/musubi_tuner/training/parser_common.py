@@ -714,17 +714,11 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         "--save_last_n_checkpoints",
         type=int,
         default=None,
-        help="keep only the last N checkpoints on disk, whether saving every N epochs or every N steps"
-        " / エポック保存でもステップ保存でも、最新N個のチェックポイントだけを残す（古いものは削除する）",
+        help="keep only the last N checkpoints on disk (and their matching states), whether saving"
+        " every N epochs or every N steps / エポック保存でもステップ保存でも、最新N個のチェックポイント"
+        "（と対になるstate）だけを残す（古いものは削除する）",
     )
-    parser.add_argument(
-        "--save_last_n_checkpoints_state",
-        type=int,
-        default=None,
-        help="keep only the last N checkpoint states (overrides --save_last_n_checkpoints)"
-        " / 最新N個のstateだけを残す（--save_last_n_checkpointsの指定を上書きする）",
-    )
-    # Legacy retention flags, kept as aliases of --save_last_n_checkpoints(_state): they all
+    # Legacy retention flags, kept as hidden aliases of --save_last_n_checkpoints: they all
     # mean "how many checkpoints to keep" now, so old configs keep working with count semantics.
     parser.add_argument(
         "--save_last_n_epochs",

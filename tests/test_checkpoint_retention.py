@@ -1,9 +1,9 @@
 """Unified checkpoint retention: keep the last N checkpoints, epoch- or step-based.
 
 Regression coverage for the retention overhaul: ``--save_last_n_checkpoints`` is a
-checkpoint count for both cadences, the legacy ``--save_last_n_{steps,epochs}`` flags
-alias onto it, and ``--save_last_n_checkpoints_state`` overrides / falls back the same
-way the old state flags did.
+checkpoint count for both cadences, the legacy ``--save_last_n_{steps,epochs}[_state]``
+flags alias onto it, and states are pruned in lockstep with their checkpoints —
+there is deliberately no separate state count.
 """
 
 from types import SimpleNamespace
@@ -14,7 +14,6 @@ from musubi_tuner.utils import train_utils
 def _args(**overrides):
     args = SimpleNamespace(
         save_last_n_checkpoints=None,
-        save_last_n_checkpoints_state=None,
         save_last_n_epochs=None,
         save_last_n_epochs_state=None,
         save_last_n_steps=None,
@@ -88,25 +87,28 @@ class TestLegacyAliases:
         assert train_utils.resolve_save_retention(args) == 2
 
 
-class TestStateRetention:
-    def test_state_flag_overrides_checkpoint_count(self):
-        args = _args(save_last_n_checkpoints=8, save_last_n_checkpoints_state=1, save_every_n_steps=400)
-        assert train_utils.resolve_save_retention(args, state=True) == 1
+class TestStateLockstep:
+    """States and their checkpoints share one count — no separate state knob."""
 
-    def test_state_falls_back_to_checkpoint_count(self):
+    def test_states_use_the_checkpoint_count(self):
         args = _args(save_last_n_checkpoints=8, save_every_n_steps=400)
-        assert train_utils.resolve_save_retention(args, state=True) == 8
+        # The state savers call the same get_remove_ckpt_no as checkpoint removal:
+        # one flag drives both.
+        assert train_utils.get_remove_ckpt_no(args, 3200, 400) == 0
 
-    def test_legacy_state_aliases_still_work(self):
+    def test_legacy_state_flags_fold_into_the_shared_count(self):
         args = _args(save_last_n_steps_state=2, save_every_n_steps=400)
-        assert train_utils.resolve_save_retention(args, state=True) == 2
+        assert train_utils.resolve_save_retention(args) == 2
         args = _args(save_last_n_epochs_state=3, save_every_n_epochs=1)
-        assert train_utils.resolve_save_retention(args, state=True) == 3
+        assert train_utils.resolve_save_retention(args) == 3
+
+    def test_new_flag_wins_over_legacy_state_flags(self):
+        args = _args(save_last_n_checkpoints=6, save_last_n_steps_state=2, save_every_n_steps=400)
+        assert train_utils.resolve_save_retention(args) == 6
 
     def test_no_retention_anywhere(self):
         args = _args()
         assert train_utils.resolve_save_retention(args) is None
-        assert train_utils.resolve_save_retention(args, state=True) is None
         assert train_utils.get_remove_ckpt_no(args, 10**6, 100) is None
 
 
@@ -193,7 +195,6 @@ class TestProjectConfigMigration:
             }
         )
         assert config.training.save_last_n_checkpoints == 5
-        assert config.training.save_last_n_checkpoints_state == 2
         assert config.full_finetune.save_last_n_checkpoints == 3
 
     def test_unified_value_wins_over_legacy(self):

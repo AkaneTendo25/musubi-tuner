@@ -292,29 +292,24 @@ def get_last_ckpt_name(model_name):
     return model_name + ".safetensors"
 
 
-def resolve_save_retention(args: argparse.Namespace, *, state: bool = False) -> int | None:
-    """Resolve how many checkpoints (or checkpoint states) to keep on disk.
+def resolve_save_retention(args: argparse.Namespace) -> int | None:
+    """Resolve how many checkpoints to keep on disk.
 
     Single source of truth for retention: ``--save_last_n_checkpoints`` wins; the
-    legacy ``--save_last_n_{steps,epochs}`` flags alias onto the same count when it
-    is not set. The value is a *checkpoint count*, never a step/epoch window, and it
-    behaves identically for epoch-based and step-based saving. With ``state=True``,
-    ``--save_last_n_checkpoints_state`` (or its legacy aliases) wins and falls back
-    to the plain checkpoint count.
+    legacy ``--save_last_n_{steps,epochs}[_state]`` flags alias onto the same count
+    when it is not set. The value is a *checkpoint count*, never a step/epoch window,
+    and it behaves identically for epoch-based and step-based saving. States are
+    saved and pruned in lockstep with their checkpoints, so there is deliberately no
+    separate state count: one flag, one synchronized history on disk.
     """
-    names = ["save_last_n_checkpoints", "save_last_n_steps", "save_last_n_epochs"]
-    if state:
-        names = [f"{name}_state" for name in names]
-    for name in names:
+    for name in ("save_last_n_checkpoints", "save_last_n_steps", "save_last_n_epochs", "save_last_n_steps_state", "save_last_n_epochs_state"):
         value = getattr(args, name, None)
         if value is not None:
             return value
-    if state:
-        return resolve_save_retention(args)  # states fall back to the checkpoint count
     return None
 
 
-def get_remove_ckpt_no(args: argparse.Namespace, current_no: int, save_every_n: int | None, *, state: bool = False) -> int | None:
+def get_remove_ckpt_no(args: argparse.Namespace, current_no: int, save_every_n: int | None) -> int | None:
     """Return the cadence slot to delete so only the last N checkpoints remain.
 
     Single retention core for both cadences: at each save, the checkpoint written
@@ -323,7 +318,7 @@ def get_remove_ckpt_no(args: argparse.Namespace, current_no: int, save_every_n: 
     ``save_last_n=8`` keeps 8 checkpoints even when they are 400 steps apart.
     Returns ``None`` when retention is disabled or nothing is old enough to remove.
     """
-    keep_n = resolve_save_retention(args, state=state)
+    keep_n = resolve_save_retention(args)
     if keep_n is None or not save_every_n:
         return None
 
@@ -367,7 +362,7 @@ def save_and_remove_state_on_epoch_end(
             logger.info("uploading state to huggingface.")
             huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
 
-        remove_epoch_no = get_remove_ckpt_no(args, epoch_no, args.save_every_n_epochs, state=True)
+        remove_epoch_no = get_remove_ckpt_no(args, epoch_no, args.save_every_n_epochs)
         if remove_epoch_no is not None:
             state_dir_old = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, remove_epoch_no))
             if os.path.exists(state_dir_old):
@@ -405,7 +400,7 @@ def save_and_remove_state_stepwise(
             huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
 
         # Same retention as the LoRA files, so a resume never finds a state newer than its checkpoint.
-        remove_step_no = get_remove_ckpt_no(args, step_no, args.save_every_n_steps, state=True) if apply_retention else None
+        remove_step_no = get_remove_ckpt_no(args, step_no, args.save_every_n_steps) if apply_retention else None
         if remove_step_no is not None:
             state_dir_old = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, remove_step_no))
             if os.path.exists(state_dir_old):

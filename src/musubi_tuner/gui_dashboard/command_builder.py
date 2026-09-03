@@ -853,8 +853,6 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
     if t.save_last_n_checkpoints is not None:
         cmd += ["--save_last_n_checkpoints", str(t.save_last_n_checkpoints)]
-    if t.save_last_n_checkpoints_state is not None:
-        cmd += ["--save_last_n_checkpoints_state", str(t.save_last_n_checkpoints_state)]
     if t.async_checkpoint_save:
         cmd.append("--async_checkpoint_save")
     if t.save_state:
@@ -2309,8 +2307,6 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
     if t.save_last_n_checkpoints is not None:
         cmd += ["--save_last_n_checkpoints", str(t.save_last_n_checkpoints)]
-    if t.save_last_n_checkpoints_state is not None:
-        cmd += ["--save_last_n_checkpoints_state", str(t.save_last_n_checkpoints_state)]
     if t.save_state:
         cmd.append("--save_state")
     if t.save_state_on_train_end:
@@ -3260,8 +3256,6 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
     if t.save_last_n_checkpoints is not None:
         cmd += ["--save_last_n_checkpoints", str(t.save_last_n_checkpoints)]
-    if t.save_last_n_checkpoints_state is not None:
-        cmd += ["--save_last_n_checkpoints_state", str(t.save_last_n_checkpoints_state)]
     if t.save_state:
         cmd.append("--save_state")
     if t.save_state_on_train_end:
@@ -3714,8 +3708,6 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
     if t.save_last_n_checkpoints is not None:
         cmd += ["--save_last_n_checkpoints", str(t.save_last_n_checkpoints)]
-    if t.save_last_n_checkpoints_state is not None:
-        cmd += ["--save_last_n_checkpoints_state", str(t.save_last_n_checkpoints_state)]
     if t.save_state:
         cmd.append("--save_state")
     if t.save_state_on_train_end:
