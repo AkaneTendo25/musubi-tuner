@@ -1000,6 +1000,17 @@ Two limitations. The rollout reaches its stop sigma in `--h3_rollout_steps` unif
 on a shifted schedule, so the supervised states approximate the sampler's rather than reproduce them. And the objective is
 established on Ref2VA; on FL2VA it has not been.
 
+#### Who walks the prefix
+
+Asking the teacher at a state the student produced is what makes the supervision on-policy, and it is also where a
+privileged teacher can be handed a conflicted input: with the keyframe channel the teacher sees a clean first frame beside
+content the student invented from a bare prompt, and its velocity there describes neither clip. `--h3_rollout_prefix
+teacher` walks the no-gradient prefix with the frozen privileged teacher instead, so the window starts from states the
+teacher's own trajectory produced and the student refines them for `--h3_rollout_window` sub-steps. A window of `1` is
+off-policy anchoring; a longer window moves back toward on-policy. It costs the same forwards. The reference channel is
+less exposed to the mismatch, since the reference is not a frame of the clip; the keyframe channel is the case it was
+added for.
+
 #### Field length floor
 
 The teacher term sets the *direction* of the guidance field at the supervised states. Its *length* -- how far the prompted
@@ -1422,6 +1433,8 @@ Every objective here is off unless its flag is given, and a run without them tra
 | `--h3_rollout_field_floor 0.0` | Experimental. Length floor on a frozen-null proxy of the guidance field at the supervised rollout states: `W * relu(1 - ‖g' - e‖ / ‖g - e‖)^2` with the frozen base's prompted `g` and empty `e` and the student's prompted `g'` at the same state. In the default `self` mode holds `‖g' - e‖` at no less than the checkpoint's field length and leaves the direction to the teacher term (see `--h3_rollout_field_floor_direction`); it does not bound the gap to the student's own empty branch, so pair it with `--h3_guidance_null_anchor_weight`. Requires `--h3_rollout_supervision` and `--cache_guidance_empty`; two extra no-gradient frozen forwards per supervised state. `0` disables. See [Field length floor](#field-length-floor). |
 | `--h3_rollout_field_floor_direction {self,teacher}` | Which direction the floor measures the student's field along. `self` (default) floors the plain length, whose gradient lengthens the field along the student's own current direction. `teacher` floors the projection of the student's field onto the privileged teacher's field at the same state, so lengthening in a wrong direction earns nothing and the gradient turns the field toward the teacher as it lengthens it. No extra forward. Needs the floor above `0`. |
 | `--h3_rollout_field_floor_sigma_max 1.0` | Apply the floor only at supervised states whose shifted video sigma is at most this value; states above it drop out of the floor's mean. Needs the floor above `0`. |
+| `--h3_rollout_field_cap 0.0` | Upper bound on the field-length ratio the floor scores: adds `relu(ratio - cap)^2` under the floor's weight, holding the field in a band `[1, cap]`. An over-long field shows as burnt colour and contrast, and once co-adapted into the weights it is not undone by an inference multiplier. Under `--h3_rollout_field_floor_direction teacher` the ratio is the signed projection onto the teacher's direction and the cap bounds that projection, not the field's total length. Needs the floor above `0` and a value above `1`. |
+| `--h3_rollout_prefix {student,teacher}` | Who walks the no-gradient prefix of the rollout. `student` (default) is on-policy. `teacher` walks it with the frozen privileged teacher and the student's window refines the states it reaches -- a hybrid policy that keeps the teacher off states the student built from a conditioning it does not share. Same forward count. |
 | `--h3_rollout_stop_min 0.0` | Lower bound of the rollout stop draw, on the coordinate the draw is made on (unshifted base, or the shifted video sigma under `--h3_rollout_stop_shifted`). Without the shifted stop, `--h3_timestep_focus_max` at or below it gives the data term and the rollout term disjoint base-sigma bands. `0` draws the whole range. |
 | `--h3_adapter_prompt_only` | Run every empty-prompt forward with the adapter off, so the student's empty branch is the frozen checkpoint's by construction. A guidance-distilled checkpoint never evaluates its empty branch at inference. Makes the live-null degeneracy impossible and `--h3_guidance_null_anchor_weight` redundant (the two are rejected together, as is `--h3_caption_dropout_rate` above `0`). See [Stability](#stability). |
 | `--h3_measured_variance_weighting curve.json` | Weight each sample's loss by the inverse of the target dispersion proxy measured at its shifted sigma, read off a `probe_g_curve` report (`raw^2 - g^2` per bucket and modality; a proxy, not a variance), normalised to mean 1 and capped by `--h3_measured_variance_weight_max` (default `4.0`). A heuristic sigma reweighting that changes the objective; composes multiplicatively with `--weighting_scheme`. See [Stability](#stability). |

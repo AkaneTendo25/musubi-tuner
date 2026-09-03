@@ -2947,3 +2947,78 @@ def test_measured_variance_weight_max_is_recorded(tmp_path):
     trainer = MiniMaxH3NetworkTrainer()
     trainer.handle_model_specific_args(args)
     assert trainer.extra_metadata(args)["ss_h3_measured_variance_weight_max"] == "2.5"
+
+
+# ---------------------------------------------------------------------------
+# Teacher-walked prefix and the field cap
+# ---------------------------------------------------------------------------
+
+
+def test_teacher_prefix_walks_the_no_grad_steps_frozen_and_privileged(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    backend, loss, _, _ = _run_step(
+        *_ROLLOUT_FLAGS, "--h3_rollout_steps", "2", "--h3_rollout_window", "1", "--h3_rollout_prefix", "teacher", teacher=teacher
+    )
+    loss.backward()
+    prefix = backend.calls[1:3]
+    teacher_signature = float(torch.full((4, 8), 0.75).mean())
+    # Frozen, privileged, no graph -- and the adapter is live again for the window.
+    assert [c["adapter"] for c in prefix] == [False, False]
+    assert [c["signature"] for c in prefix] == [teacher_signature, teacher_signature]
+    assert [c["grad"] for c in prefix] == [False, False]
+    window = backend.calls[3:]
+    assert [c["adapter"] for c in window] == [True, False]
+    assert len(backend.calls) == 1 + 2 + 2
+
+
+def test_student_prefix_is_the_default_and_unchanged(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    backend, _, _, _ = _run_step(*_ROLLOUT_FLAGS, "--h3_rollout_steps", "2", teacher=teacher)
+    student_signature = float(torch.full((4, 8), 0.25).mean())
+    assert [c["adapter"] for c in backend.calls[1:3]] == [True, True]
+    assert [c["signature"] for c in backend.calls[1:3]] == [student_signature, student_signature]
+
+
+def test_field_cap_penalises_an_over_long_field(tmp_path, monkeypatch):
+    class _LongFieldTransformer(_ScaleTransformer):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.5))
+
+    monkeypatch.setitem(globals(), "_ScaleTransformer", _LongFieldTransformer)
+    teacher = _teacher_file(tmp_path)
+    _, uncapped_loss, uncapped, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+    _, capped_loss, capped, _ = _run_step(*_FLOOR_FLAGS, "--h3_rollout_field_cap", "1.2", teacher=teacher)
+    assert uncapped["loss/rollout_field_floor"] == 0.0
+    assert capped["h3/rollout_field_ratio"] == pytest.approx(1.5)
+    assert capped["loss/rollout_field_floor"] == pytest.approx((1.5 - 1.2) ** 2)
+    assert float(capped_loss.detach()) == pytest.approx(float(uncapped_loss.detach()) + (1.5 - 1.2) ** 2)
+
+
+def test_field_cap_is_silent_inside_the_band(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, plain_loss, plain, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+    _, capped_loss, capped, _ = _run_step(*_FLOOR_FLAGS, "--h3_rollout_field_cap", "1.2", teacher=teacher)
+    # The stub field sits at ratio one half: below the floor, inside the cap.
+    assert capped["loss/rollout_field_floor"] == pytest.approx(plain["loss/rollout_field_floor"])
+    assert float(capped_loss.detach()) == pytest.approx(float(plain_loss.detach()))
+
+
+def test_field_cap_and_prefix_are_validated_and_recorded(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    with pytest.raises(ValueError, match="need --h3_rollout_field_floor above 0"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(
+            _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_field_cap", "1.2", teacher=teacher)
+        )
+    with pytest.raises(ValueError, match="above 1"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(
+            _flag_args(*_FLOOR_FLAGS, "--h3_rollout_field_cap", "0.9", teacher=teacher)
+        )
+    with pytest.raises(ValueError, match="requires --h3_rollout_supervision"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(_flag_args("--h3_rollout_prefix", "teacher"))
+    args = _flag_args(*_FLOOR_FLAGS, "--h3_rollout_field_cap", "1.25", "--h3_rollout_prefix", "teacher", teacher=teacher)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    metadata = trainer.extra_metadata(args)
+    assert metadata["ss_h3_rollout_field_cap"] == "1.25"
+    assert metadata["ss_h3_rollout_prefix"] == "teacher"

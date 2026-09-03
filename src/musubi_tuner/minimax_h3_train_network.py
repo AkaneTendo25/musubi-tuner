@@ -3812,6 +3812,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_rollout_field_floor_direction": getattr(args, "h3_rollout_field_floor_direction", "self") != "self",
             "--h3_rollout_field_floor_sigma_max": float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0)) != 1.0,
             "--h3_rollout_stop_min": float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0) != 0.0,
+            "--h3_rollout_prefix": getattr(args, "h3_rollout_prefix", "student") != "student",
+            "--h3_rollout_field_cap": float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0) != 0.0,
         }
         if not rollout:
             for flag, changed in flags.items():
@@ -3845,10 +3847,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         floor_sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
         if not math.isfinite(floor_sigma_max) or not 0 < floor_sigma_max <= 1:
             raise ValueError("--h3_rollout_field_floor_sigma_max must be finite and lie in (0, 1]")
-        if field_floor <= 0 and (getattr(args, "h3_rollout_field_floor_direction", "self") != "self" or floor_sigma_max != 1.0):
+        field_cap = float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)
+        if field_cap != 0.0 and (not math.isfinite(field_cap) or field_cap <= 1.0):
+            raise ValueError("--h3_rollout_field_cap must be finite and above 1 (0 disables it)")
+        if field_floor <= 0 and (
+            getattr(args, "h3_rollout_field_floor_direction", "self") != "self" or floor_sigma_max != 1.0 or field_cap != 0.0
+        ):
             raise ValueError(
-                "--h3_rollout_field_floor_direction and --h3_rollout_field_floor_sigma_max shape the field floor and "
-                "need --h3_rollout_field_floor above 0"
+                "--h3_rollout_field_floor_direction, --h3_rollout_field_floor_sigma_max and --h3_rollout_field_cap shape "
+                "the field floor and need --h3_rollout_field_floor above 0"
             )
         if field_floor > 0 and float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) <= 0:
             # The floor measures the student's prompted prediction against the
@@ -4152,9 +4159,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         the frozen base, adapter disabled -- with the privileged presentation that
         also shows the conditioner frames of the target clip.
 
-        Cost, per active step: ``steps`` no-grad forwards to reach the on-policy
-        state, then ``window`` grad forwards and ``window`` no-grad teacher
-        forwards. Gradient checkpointing applies to the grad forwards without
+        Cost, per active step: ``steps`` no-grad forwards to reach the supervised
+        state -- walked by the student (on-policy, default) or by the frozen
+        privileged teacher (``--h3_rollout_prefix teacher``) -- then ``window``
+        grad forwards and ``window`` no-grad teacher forwards. Gradient checkpointing applies to the grad forwards without
         anything extra: the transformer gates its checkpoint wrapper on
         ``torch.is_grad_enabled()``, which is exactly what separates the two
         populations here.
@@ -4205,21 +4213,46 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if audio_state is not None:
                 audio_state = euler_advance(audio_state, velocity.audio, float(audio_sigmas[index]), float(audio_sigmas[index + 1]))
 
-        # Reaching the on-policy state costs nothing but forwards: the policy is
-        # the current model, adapter included, and none of it is differentiated
-        # through. The whole prefix shares one swap bracket because it is
-        # contiguous; the window below cannot, since its trainable forwards must
-        # run on the training layout.
+        # Reaching the supervised state costs nothing but forwards: the prefix
+        # policy is the current model, adapter included (on-policy), or the frozen
+        # privileged teacher under --h3_rollout_prefix teacher, and none of it is
+        # differentiated through. The whole prefix shares one swap bracket because
+        # it is contiguous; the window below cannot, since its trainable forwards
+        # must run on the training layout.
+        teacher_prefix = getattr(args, "h3_rollout_prefix", "student") == "teacher"
         with (
             self._auxiliary_block_swap(transformer, auxiliary_block_swap),
             torch.no_grad(),
             int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
         ):
-            for index in range(args.h3_rollout_steps):
-                advance(
-                    index,
-                    self._predict(accelerator, transformer, batch, state_at(index), conditioning=conditioning, role="rollout"),
-                )
+            if teacher_prefix:
+                # The frozen privileged teacher walks to the anchor states; the
+                # student's window below refines them. Its stochastic conditioning
+                # draws are forked away from the student's stream, as for every
+                # other frozen forward.
+                with torch.random.fork_rng(devices=fork_devices):
+                    try:
+                        set_enabled(False)
+                        for index in range(args.h3_rollout_steps):
+                            advance(
+                                index,
+                                self._predict(
+                                    accelerator,
+                                    transformer,
+                                    teacher_presentation,
+                                    state_at(index),
+                                    conditioning="prompt",
+                                    role="rollout",
+                                ),
+                            )
+                    finally:
+                        set_enabled(True)
+            else:
+                for index in range(args.h3_rollout_steps):
+                    advance(
+                        index,
+                        self._predict(accelerator, transformer, batch, state_at(index), conditioning=conditioning, role="rollout"),
+                    )
 
         fused = bool(getattr(args, "h3_rollout_fused_teacher", False))
         pairs: list[tuple[H3ModelPrediction, H3ModelPrediction]] = []
@@ -5444,7 +5477,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     ).expand_as(valid)
                     valid = valid * in_band
                 scored = valid.sum().clamp_min(1.0)
-                rollout_field_floor = float(args.h3_rollout_field_floor) * (torch.relu(1.0 - ratios).pow(2) * valid).sum() / scored
+                band = torch.relu(1.0 - ratios).pow(2)
+                field_cap = float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)
+                if field_cap > 0:
+                    # Two-sided: an over-long field burns colour and, once
+                    # co-adapted into the weights, is not undone by an inference
+                    # multiplier, so it is held from above as well.
+                    band = band + torch.relu(ratios - field_cap).pow(2)
+                rollout_field_floor = float(args.h3_rollout_field_floor) * (band * valid).sum() / scored
                 loss = loss + rollout_field_floor
                 metrics["loss/rollout_field_floor"] = float(rollout_field_floor.detach())
                 metrics["h3/rollout_field_ratio"] = float((ratios.detach() * valid).sum() / scored)
@@ -5657,6 +5697,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_rollout_fused_teacher": str(bool(getattr(args, "h3_rollout_fused_teacher", False))),
             "ss_h3_rollout_field_floor": str(float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)),
             "ss_h3_rollout_field_floor_direction": str(getattr(args, "h3_rollout_field_floor_direction", "self")),
+            "ss_h3_rollout_field_cap": str(float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)),
+            "ss_h3_rollout_prefix": str(getattr(args, "h3_rollout_prefix", "student")),
             "ss_h3_rollout_field_floor_sigma_max": str(float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))),
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
             "ss_h3_dop_loss_weight": str(args.h3_dop_loss_weight),
@@ -6282,6 +6324,35 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "--h3_timestep_focus_max are unshifted base sigmas, and focus_max <= stop_min gives the data term and the "
             "rollout term disjoint noise bands; with it the two live on different coordinates and must be converted "
             "before any such claim. 0 (default) draws the whole range"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_prefix",
+        choices=("student", "teacher"),
+        default="student",
+        help=(
+            "who walks the no-gradient prefix of the rollout (the --h3_rollout_steps Euler steps from noise) before "
+            "the supervised window. 'student' (default) is on-policy: the adapter walks and the teacher is asked at "
+            "the states it reaches. 'teacher' walks the prefix with the FROZEN privileged teacher instead, so the "
+            "supervised window starts from states the teacher's own trajectory produced and the student refines "
+            "them for --h3_rollout_window sub-steps (a hybrid policy: a window of 1 is off-policy anchoring, a "
+            "longer window approaches on-policy). Asking the teacher at states the student made from a conditioning "
+            "it does not share (a clean keyframe beside content the student invented) hands it a conflicted input; "
+            "the teacher prefix avoids that. Same forward count"
+        ),
+    )
+    parser.add_argument(
+        "--h3_rollout_field_cap",
+        type=float,
+        default=0.0,
+        help=(
+            "upper bound on the field-length ratio the floor scores, as a multiple of the checkpoint's field length; "
+            "adds relu(ratio - cap)^2 under the floor's weight so the field is held in a band [1, cap] rather than "
+            "only from below. An over-long field shows as burnt colour and contrast, and a length that has been "
+            "co-adapted into the weights is not undone by an inference multiplier. Under "
+            "--h3_rollout_field_floor_direction teacher the ratio is the signed projection onto the teacher's direction, "
+            "and the cap bounds that projection rather than the field's total length. Requires --h3_rollout_field_floor "
+            "above 0 and a value above 1. 0 (default) disables the cap"
         ),
     )
     parser.add_argument(
