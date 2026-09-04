@@ -374,6 +374,10 @@ def _build_h3_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_image_mode", c.h3_image_mode]
     if c.h3_image_frame_count is not None:
         cmd += ["--h3_image_frame_count", str(c.h3_image_frame_count)]
+    if c.h3_loss_mask_pooling != "max":
+        cmd += ["--h3_loss_mask_pooling", c.h3_loss_mask_pooling]
+    if c.h3_reference_video_fps:
+        cmd += ["--reference_video_fps", str(c.h3_reference_video_fps)]
     _h3_cache_common_args(cmd, c)
     cmd += _split_cli_args(c.cache_latents_extra_args)
     return cmd
@@ -413,6 +417,14 @@ def _build_h3_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--cache_guidance_empty")
     if c.h3_dop_trigger and c.h3_dop_class_prompt:
         cmd += ["--h3_dop_trigger", c.h3_dop_trigger, "--h3_dop_class_prompt", c.h3_dop_class_prompt]
+    if c.h3_max_caption_tokens:
+        cmd += ["--h3_max_caption_tokens", str(c.h3_max_caption_tokens)]
+    if c.h3_keyframe_visuals:
+        cmd += ["--h3_keyframe_visuals", c.h3_keyframe_visuals]
+    if c.h3_qwen_control_dropout:
+        cmd.append("--h3_qwen_control_dropout")
+    if c.h3_reference_video_fps:
+        cmd += ["--reference_video_fps", str(c.h3_reference_video_fps)]
     _h3_cache_common_args(cmd, c)
     cmd += _split_cli_args(c.cache_text_extra_args)
     return cmd
@@ -508,6 +520,13 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
     ):
         for path in _split_cli_args(raw):
             cmd += [flag, path]
+    for flag, raw in (
+        ("--guide_image", s.h3_guide_images),
+        ("--guide_video", s.h3_guide_videos),
+        ("--guide_audio", s.h3_guide_audios),
+    ):
+        for guide in _split_cli_args(raw):
+            cmd += [flag, guide]
     if s.h3_reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(s.h3_reference_image_short_edge)]
     if s.h3_reference_image_size_mode != "short_edge":
@@ -554,6 +573,12 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--inductor_config", *_split_cli_args(s.h3_inductor_config)]
     if s.h3_fused_qk_norm_rope:
         cmd.append("--h3_fused_qk_norm_rope")
+    for multiplier in _split_cli_args(s.h3_learned_context_multipliers):
+        cmd += ["--h3_learned_context_multiplier", multiplier]
+    if s.h3_null_guidance_scale:
+        cmd += ["--h3_null_guidance_scale", str(s.h3_null_guidance_scale)]
+    if s.h3_inspect:
+        cmd.append("--inspect")
     cmd += _split_cli_args(s.extra_args)
     return cmd
 
@@ -686,6 +711,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--reference_video_short_edge", str(t.reference_video_short_edge)]
     if t.reference_video_max_pixels != 768 * 1344:
         cmd += ["--reference_video_max_pixels", str(t.reference_video_max_pixels)]
+    if t.reference_video_fps:
+        cmd += ["--reference_video_fps", str(t.reference_video_fps)]
     if t.h3_mask_mode != "off" or t.h3_mask_audio:
         if t.h3_mask_mode != "off":
             cmd += ["--h3_mask_mode", t.h3_mask_mode]
@@ -851,6 +878,10 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--save_every_n_epochs", str(t.save_every_n_epochs)]
     if t.save_every_n_steps:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+    if t.save_request_file:
+        cmd += ["--save_request_file", t.save_request_file]
+    if t.save_and_stop_request_file:
+        cmd += ["--save_and_stop_request_file", t.save_and_stop_request_file]
     if t.save_last_n_checkpoints is not None:
         cmd += ["--save_last_n_checkpoints", str(t.save_last_n_checkpoints)]
     if t.async_checkpoint_save:
@@ -937,6 +968,74 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--base_weights", *_split_cli_args(t.base_weights)]
     if t.base_weights_multiplier and not learned_context:
         cmd += ["--base_weights_multiplier", *_split_cli_args(t.base_weights_multiplier)]
+    # H3-specific advanced controls. Each field maps one-to-one to its public parser flag.
+    h3_values = (
+        (
+            ("h3_lora_targets", None),
+            ("h3_loss_mask_normalization", "weighted"),
+            ("h3_guidance_audio_scale", None),
+            ("h3_max_caption_tokens", 0),
+            ("h3_qwen_control_dropout_rate", 0.0),
+            ("h3_validation_rollout_probe", 0),
+            ("h3_validation_rollout_stop", 0.5),
+            ("h3_profile_steps", 0),
+            ("h3_rollout_teacher_config", None),
+            ("h3_rollout_teacher_privilege", "auto"),
+            ("h3_rollout_probability", 0.5),
+            ("h3_rollout_steps", 2),
+            ("h3_rollout_window", 1),
+            ("h3_rollout_teacher_magnitude_weight", 1.0),
+            ("h3_rollout_field_floor", 0.0),
+            ("h3_guidance_scale_sigma_max", 1.0),
+            ("h3_validation_multipliers", ""),
+            ("h3_adapter_ema_decay", 0.0),
+            ("h3_term_grad_every", 0),
+            ("h3_adapter_stats_every", 0),
+            ("h3_validation_bare_dataset_config", None),
+            ("h3_measured_variance_weighting", None),
+            ("h3_measured_variance_weight_max", 4.0),
+            ("h3_rollout_stop_min", 0.0),
+            ("h3_rollout_prefix", "student"),
+            ("h3_rollout_null_anchor_weight", 0.0),
+            ("h3_rollout_field_cap", 0.0),
+            ("h3_rollout_field_floor_direction", "self"),
+            ("h3_rollout_field_floor_sigma_max", 1.0),
+            ("h3_guidance_null_anchor_weight_end", None),
+            ("h3_guidance_null_anchor_weight", 0.0),
+            ("h3_guidance_null_anchor_probability", 1.0),
+            ("h3_compile_attention", "inline"),
+            ("h3_swiglu_chunk_rows", 0),
+            ("h3_checkpoint_keep", "none"),
+            ("h3_block_sparse_kv_fraction", 0.0),
+            ("h3_block_sparse_threshold", 0.0),
+            ("h3_block_sparse_start_block", 0),
+            ("h3_block_sparse_block_shape", None),
+        )
+        if not learned_context
+        else ()
+    )
+    for name, default in h3_values:
+        value = getattr(t, name)
+        if value is not None and value != default and value != "":
+            cmd += [f"--{name}", str(value)]
+    for name in (
+        ()
+        if learned_context
+        else (
+            "h3_audio_only_spatial_tokens",
+            "h3_validation_field_probe",
+            "h3_rollout_supervision",
+            "h3_rollout_stop_shifted",
+            "h3_rollout_fused_teacher",
+            "h3_validate_ema",
+            "h3_train_sigma_bins",
+            "h3_validation_std",
+            "h3_adapter_prompt_only",
+            "h3_fused_elementwise",
+        )
+    ):
+        if getattr(t, name):
+            cmd.append(f"--{name}")
     cmd += _split_cli_args(t.extra_args)
     return cmd
 
