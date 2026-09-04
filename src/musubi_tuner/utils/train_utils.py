@@ -292,27 +292,41 @@ def get_last_ckpt_name(model_name):
     return model_name + ".safetensors"
 
 
-def get_remove_epoch_no(args: argparse.Namespace, epoch_no: int):
-    if args.save_last_n_epochs is None:
+def resolve_save_retention(args: argparse.Namespace) -> int | None:
+    """Resolve how many checkpoints to keep on disk.
+
+    Single source of truth for retention: ``--save_last_n_checkpoints`` wins; the
+    legacy ``--save_last_n_{steps,epochs}[_state]`` flags alias onto the same count
+    when it is not set. The value is a *checkpoint count*, never a step/epoch window,
+    and it behaves identically for epoch-based and step-based saving. States are
+    saved and pruned in lockstep with their checkpoints, so there is deliberately no
+    separate state count: one flag, one synchronized history on disk.
+    """
+    for name in ("save_last_n_checkpoints", "save_last_n_steps", "save_last_n_epochs", "save_last_n_steps_state", "save_last_n_epochs_state"):
+        value = getattr(args, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def get_remove_ckpt_no(args: argparse.Namespace, current_no: int, save_every_n: int | None) -> int | None:
+    """Return the cadence slot to delete so only the last N checkpoints remain.
+
+    Single retention core for both cadences: at each save, the checkpoint written
+    ``N * save_every_n`` units ago (epochs or steps) falls out of the keep window.
+    ``N`` comes from :func:`resolve_save_retention` — a checkpoint count, so
+    ``save_last_n=8`` keeps 8 checkpoints even when they are 400 steps apart.
+    Returns ``None`` when retention is disabled or nothing is old enough to remove.
+    """
+    keep_n = resolve_save_retention(args)
+    if keep_n is None or not save_every_n:
         return None
 
-    remove_epoch_no = epoch_no - args.save_every_n_epochs * args.save_last_n_epochs
-    if remove_epoch_no < 0:
+    # e.g. if save_every_n_steps=400, save_last_n_checkpoints=3, at step 1600 remove step 400 (keeps 800, 1200, 1600)
+    remove_no = current_no - save_every_n * keep_n
+    if remove_no < 0:
         return None
-    return remove_epoch_no
-
-
-def get_remove_step_no(args: argparse.Namespace, step_no: int):
-    if args.save_last_n_steps is None:
-        return None
-
-    # calculate the step number to remove from the last_n_steps and save_every_n_steps
-    # e.g. if save_every_n_steps=10, save_last_n_steps=30, at step 50, keep 30 steps and remove step 10
-    remove_step_no = step_no - args.save_last_n_steps - 1
-    remove_step_no = remove_step_no - (remove_step_no % args.save_every_n_steps)
-    if remove_step_no < 0:
-        return None
-    return remove_step_no
+    return remove_no
 
 
 def save_and_remove_state_on_epoch_end(
@@ -348,9 +362,8 @@ def save_and_remove_state_on_epoch_end(
             logger.info("uploading state to huggingface.")
             huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
 
-        last_n_epochs = args.save_last_n_epochs_state if args.save_last_n_epochs_state else args.save_last_n_epochs
-        if last_n_epochs is not None:
-            remove_epoch_no = epoch_no - args.save_every_n_epochs * last_n_epochs
+        remove_epoch_no = get_remove_ckpt_no(args, epoch_no, args.save_every_n_epochs)
+        if remove_epoch_no is not None:
             state_dir_old = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, remove_epoch_no))
             if os.path.exists(state_dir_old):
                 logger.info(f"removing old state: {state_dir_old}")
@@ -386,19 +399,13 @@ def save_and_remove_state_stepwise(
             logger.info("uploading state to huggingface.")
             huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
 
-        last_n_steps = (
-            (args.save_last_n_steps_state if args.save_last_n_steps_state else args.save_last_n_steps) if apply_retention else None
-        )
-        if last_n_steps is not None:
-            # last_n_steps前のstep_noから、save_every_n_stepsの倍数のstep_noを計算して削除する
-            remove_step_no = step_no - last_n_steps - 1
-            remove_step_no = remove_step_no - (remove_step_no % args.save_every_n_steps)
-
-            if remove_step_no > 0:
-                state_dir_old = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, remove_step_no))
-                if os.path.exists(state_dir_old):
-                    logger.info(f"removing old state: {state_dir_old}")
-                    shutil.rmtree(state_dir_old)
+        # Same retention as the LoRA files, so a resume never finds a state newer than its checkpoint.
+        remove_step_no = get_remove_ckpt_no(args, step_no, args.save_every_n_steps) if apply_retention else None
+        if remove_step_no is not None:
+            state_dir_old = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, remove_step_no))
+            if os.path.exists(state_dir_old):
+                logger.info(f"removing old state: {state_dir_old}")
+                shutil.rmtree(state_dir_old)
     accelerator.wait_for_everyone()
 
 
