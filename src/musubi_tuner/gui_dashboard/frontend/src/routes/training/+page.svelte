@@ -1211,12 +1211,7 @@
 						</div>
 						{#if $advancedMode}
 						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.save_last_n_epochs" value={t.save_last_n_epochs ?? ''} oninput={(e) => update('save_last_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="All" tooltip="Only keep last N epoch checkpoints" />
-							<FormField type="number" fieldPath="training.save_last_n_steps" value={t.save_last_n_steps ?? ''} oninput={(e) => update('save_last_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="All" tooltip="Only keep last N step checkpoints" />
-						</div>
-						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.save_last_n_epochs_state" value={t.save_last_n_epochs_state ?? ''} oninput={(e) => update('save_last_n_epochs_state', e.target.value ? Number(e.target.value) : null)} placeholder="All" tooltip="Only keep last N epoch optimizer states" />
-							<FormField type="number" fieldPath="training.save_last_n_steps_state" value={t.save_last_n_steps_state ?? ''} oninput={(e) => update('save_last_n_steps_state', e.target.value ? Number(e.target.value) : null)} placeholder="All" tooltip="Only keep last N step optimizer states" />
+							<FormField type="number" fieldPath="training.save_last_n_checkpoints" value={t.save_last_n_checkpoints ?? ''} oninput={(e) => update('save_last_n_checkpoints', e.target.value ? Number(e.target.value) : null)} placeholder="All" tooltip="Keep only the last N checkpoints (and their matching states), whether saving by epoch or by step" />
 						</div>
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle label="Async checkpoint save" fieldPath="training.async_checkpoint_save" checked={t.async_checkpoint_save ?? false} onchange={(e) => update('async_checkpoint_save', e.target.checked)} tooltip="Snapshot periodic checkpoints to CPU and write them on a background thread. Reduces save pauses at the cost of roughly one checkpoint of additional system RAM; the final checkpoint and saved state stay synchronous." />

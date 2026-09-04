@@ -24,6 +24,8 @@ def _save_args(tmp_path):
         output_name="dataset",
         output_dir=str(tmp_path),
         save_state_to_huggingface=False,
+        save_last_n_checkpoints_state=None,
+        save_last_n_checkpoints=None,
         save_last_n_epochs_state=None,
         save_last_n_epochs=None,
         save_every_n_epochs=1,

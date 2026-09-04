@@ -711,28 +711,38 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--save_last_n_checkpoints",
+        type=int,
+        default=None,
+        help="keep only the last N checkpoints on disk (and their matching states), whether saving"
+        " every N epochs or every N steps / エポック保存でもステップ保存でも、最新N個のチェックポイント"
+        "（と対になるstate）だけを残す（古いものは削除する）",
+    )
+    # Hidden compatibility options. Model flags use corrected count semantics; state
+    # flags retain their state-only scope so old commands cannot delete model files.
+    parser.add_argument(
         "--save_last_n_epochs",
         type=int,
         default=None,
-        help="save last N checkpoints when saving every N epochs (remove older checkpoints) / 指定エポックごとにモデルを保存するとき最大Nエポック保存する（古いチェックポイントは削除する）",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--save_last_n_epochs_state",
         type=int,
         default=None,
-        help="save last N checkpoints of state (overrides the value of --save_last_n_epochs)/ 最大Nエポックstateを保存する（--save_last_n_epochsの指定を上書きする）",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--save_last_n_steps",
         type=int,
         default=None,
-        help="save checkpoints until N steps elapsed (remove older checkpoints if N steps elapsed) / 指定ステップごとにモデルを保存するとき、このステップ数経過するまで保存する（このステップ数経過したら削除する）",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--save_last_n_steps_state",
         type=int,
         default=None,
-        help="save states until N steps elapsed (remove older states if N steps elapsed, overrides --save_last_n_steps) / 指定ステップごとにstateを保存するとき、このステップ数経過するまで保存する（このステップ数経過したら削除する。--save_last_n_stepsを上書きする）",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--async_checkpoint_save",

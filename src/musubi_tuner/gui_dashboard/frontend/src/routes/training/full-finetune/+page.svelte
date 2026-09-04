@@ -842,9 +842,8 @@
 				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormField type="number" fieldPath="full_finetune.save_every_n_steps" value={t.save_every_n_steps ?? ''} oninput={(e) => update('save_every_n_steps', numberOrNull(e.target.value))} min={1} />
-					<FormField type="number" fieldPath="full_finetune.save_last_n_steps" value={t.save_last_n_steps ?? ''} oninput={(e) => update('save_last_n_steps', numberOrNull(e.target.value))} min={0} />
+					<FormField type="number" fieldPath="full_finetune.save_last_n_checkpoints" value={t.save_last_n_checkpoints ?? ''} oninput={(e) => update('save_last_n_checkpoints', numberOrNull(e.target.value))} min={0} tooltip="Keep only the last N checkpoints (and their matching states), whether saving by epoch or by step" />
 					<FormField type="number" fieldPath="full_finetune.save_every_n_epochs" value={t.save_every_n_epochs ?? ''} oninput={(e) => update('save_every_n_epochs', numberOrNull(e.target.value))} min={1} />
-					<FormField type="number" fieldPath="full_finetune.save_last_n_epochs" value={t.save_last_n_epochs ?? ''} oninput={(e) => update('save_last_n_epochs', numberOrNull(e.target.value))} min={0} />
 				</div>
 				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
 					<FormToggle fieldPath="full_finetune.save_state" checked={t.save_state ?? false} onchange={(e) => update('save_state', e.target.checked)} />
