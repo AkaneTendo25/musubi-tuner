@@ -1129,7 +1129,7 @@ class FineTuningTrainer:
                             if args.save_state:
                                 train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
 
-                            remove_step_no = train_utils.get_remove_ckpt_no(args, global_step, args.save_every_n_steps)
+                            remove_step_no = train_utils.get_remove_ckpt_no(args, global_step, args.save_every_n_steps, "steps")
                             if remove_step_no is not None:
                                 remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
                                 remove_model(remove_ckpt_name)
@@ -1162,7 +1162,7 @@ class FineTuningTrainer:
                     ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
                     save_model(ckpt_name, accelerator.unwrap_model(transformer), global_step, epoch + 1)
 
-                    remove_epoch_no = train_utils.get_remove_ckpt_no(args, epoch + 1, args.save_every_n_epochs)
+                    remove_epoch_no = train_utils.get_remove_ckpt_no(args, epoch + 1, args.save_every_n_epochs, "epochs")
                     if remove_epoch_no is not None:
                         remove_ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no)
                         remove_model(remove_ckpt_name)
@@ -1572,8 +1572,8 @@ def setup_parser() -> argparse.ArgumentParser:
         " every N epochs or every N steps / エポック保存でもステップ保存でも、最新N個のチェックポイント"
         "（と対になるstate）だけを残す（古いものは削除する）",
     )
-    # Legacy retention flags, kept as hidden aliases of --save_last_n_checkpoints: they all
-    # mean "how many checkpoints to keep" now, so old configs keep working with count semantics.
+    # Hidden compatibility options. Model flags use corrected count semantics; state
+    # flags retain their state-only scope so old commands cannot delete model files.
     parser.add_argument(
         "--save_last_n_epochs",
         type=int,

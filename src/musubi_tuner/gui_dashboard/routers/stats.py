@@ -661,22 +661,23 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
         # Total checkpoints
         save_every_n_steps = _coerce_int(training.get("save_every_n_steps", 0), 0)
         save_every_n_epochs = _coerce_int(training.get("save_every_n_epochs", 0), 0)
-        total_checkpoints = 1  # Final checkpoint
+        periodic_checkpoints = 0
 
         if save_every_n_steps and max_steps:
-            total_checkpoints += max_steps // save_every_n_steps
+            periodic_checkpoints = max_steps // save_every_n_steps
         elif save_every_n_epochs and total_epochs:
-            total_checkpoints += int(total_epochs) // save_every_n_epochs
+            periodic_checkpoints = int(total_epochs) // save_every_n_epochs
 
         # Apply keep_last limits
         keep_last = _coerce_int(
-            training.get("save_last_n_checkpoints")
-            or training.get("save_last_n_steps")
-            or training.get("save_last_n_epochs"),
+            training.get("save_last_n_checkpoints") or training.get("save_last_n_steps") or training.get("save_last_n_epochs"),
             0,
         )
         if keep_last:
-            total_checkpoints = min(total_checkpoints, keep_last)
+            periodic_checkpoints = min(periodic_checkpoints, keep_last)
+
+        # Periodic retention never removes the separately named final checkpoint.
+        total_checkpoints = periodic_checkpoints + 1
 
         total_storage_gb = (checkpoint_size_mb * total_checkpoints) / 1024
 

@@ -1630,10 +1630,9 @@ class ProjectConfig(BaseModel):
                     training["output_dir"] = get_ltx2_training_output_dir_default()
                 if not training.get("network_module"):
                     training["network_module"] = get_ltx2_training_network_module_default()
-                # Unified retention: legacy keep-last fields all meant "how many checkpoints
-                # to keep" — fold them into save_last_n_checkpoints. States are pruned in
-                # lockstep with their checkpoints, so there is only one count.
-                for legacy in ("save_last_n_steps", "save_last_n_epochs", "save_last_n_steps_state", "save_last_n_epochs_state"):
+                # Only model-retention fields can migrate safely. A legacy state-only
+                # value must not start deleting model checkpoints after an upgrade.
+                for legacy in ("save_last_n_steps", "save_last_n_epochs"):
                     value = training.pop(legacy, None)
                     if value is not None and training.get("save_last_n_checkpoints") is None:
                         training["save_last_n_checkpoints"] = value
@@ -1650,8 +1649,8 @@ class ProjectConfig(BaseModel):
                 full_finetune = dict(full_finetune)
                 if not full_finetune.get("output_dir"):
                     full_finetune["output_dir"] = get_ltx2_training_output_dir_default()
-                # Same retention fold as the training section above.
-                for legacy in ("save_last_n_steps", "save_last_n_epochs", "save_last_n_steps_state", "save_last_n_epochs_state"):
+                # Same safe model-retention fold as the training section above.
+                for legacy in ("save_last_n_steps", "save_last_n_epochs"):
                     value = full_finetune.pop(legacy, None)
                     if value is not None and full_finetune.get("save_last_n_checkpoints") is None:
                         full_finetune["save_last_n_checkpoints"] = value

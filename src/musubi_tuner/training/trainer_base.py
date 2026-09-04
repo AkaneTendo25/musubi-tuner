@@ -2505,7 +2505,9 @@ class NetworkTrainer:
 
                             if accelerator.is_main_process:
                                 remove_step_no = (
-                                    train_utils.get_remove_ckpt_no(args, global_step, args.save_every_n_steps) if scheduled_saving else None
+                                    train_utils.get_remove_ckpt_no(args, global_step, args.save_every_n_steps, "steps")
+                                    if scheduled_saving
+                                    else None
                                 )
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
@@ -2594,7 +2596,7 @@ class NetworkTrainer:
                         ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
                         save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1, allow_async=True)
 
-                        remove_epoch_no = train_utils.get_remove_ckpt_no(args, epoch + 1, args.save_every_n_epochs)
+                        remove_epoch_no = train_utils.get_remove_ckpt_no(args, epoch + 1, args.save_every_n_epochs, "epochs")
                         if remove_epoch_no is not None:
                             remove_ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no)
                             remove_model(remove_ckpt_name)
