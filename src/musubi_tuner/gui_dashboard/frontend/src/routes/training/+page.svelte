@@ -1482,8 +1482,88 @@
 		</div>
 
 		{#if $advancedMode}
+			{#if t.model_type === 'minimax_h3' && (t.h3_training_type || 'lora') === 'lora'}
+			<FormGroup title="MiniMax H3 · Complete Advanced Flags">
+				<div class="space-y-3 pt-2">
+					<div class="grid grid-cols-2 xl:grid-cols-4 gap-2">
+						<FormField fieldPath="training.h3_lora_targets" value={t.h3_lora_targets || ''} oninput={(e) => update('h3_lora_targets', e.target.value || null)} placeholder="Target patterns" />
+						<FormSelect fieldPath="training.h3_loss_mask_normalization" value={t.h3_loss_mask_normalization || 'weighted'} options={['weighted', 'full']} onchange={(e) => update('h3_loss_mask_normalization', e.target.value)} />
+						<FormField type="number" fieldPath="training.h3_guidance_audio_scale" value={t.h3_guidance_audio_scale ?? ''} oninput={(e) => update('h3_guidance_audio_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" step="0.1" />
+						<FormField type="number" fieldPath="training.reference_video_fps" value={t.reference_video_fps ?? 0} oninput={(e) => update('reference_video_fps', Number(e.target.value))} min={0} step="0.1" />
+						<FormField type="number" fieldPath="training.h3_max_caption_tokens" value={t.h3_max_caption_tokens ?? 0} oninput={(e) => update('h3_max_caption_tokens', Number(e.target.value))} min={0} />
+						<FormField type="number" fieldPath="training.h3_qwen_control_dropout_rate" value={t.h3_qwen_control_dropout_rate ?? 0} oninput={(e) => update('h3_qwen_control_dropout_rate', Number(e.target.value))} min={0} max={1} step="0.05" />
+						<FormField type="number" fieldPath="training.h3_profile_steps" value={t.h3_profile_steps ?? 0} oninput={(e) => update('h3_profile_steps', Number(e.target.value))} min={0} />
+						<FormField type="number" fieldPath="training.h3_term_grad_every" value={t.h3_term_grad_every ?? 0} oninput={(e) => update('h3_term_grad_every', Number(e.target.value))} min={0} />
+						<FormField type="number" fieldPath="training.h3_adapter_stats_every" value={t.h3_adapter_stats_every ?? 0} oninput={(e) => update('h3_adapter_stats_every', Number(e.target.value))} min={0} />
+						<FormField type="number" fieldPath="training.h3_adapter_ema_decay" value={t.h3_adapter_ema_decay ?? 0} oninput={(e) => update('h3_adapter_ema_decay', Number(e.target.value))} min={0} max={1} step="0.001" />
+					</div>
+					<div class="grid grid-cols-2 xl:grid-cols-5 gap-x-4 gap-y-1">
+						<FormToggle fieldPath="training.h3_audio_only_spatial_tokens" checked={t.h3_audio_only_spatial_tokens ?? false} onchange={(e) => update('h3_audio_only_spatial_tokens', e.target.checked)} />
+						<FormToggle fieldPath="training.h3_adapter_prompt_only" checked={t.h3_adapter_prompt_only ?? false} onchange={(e) => update('h3_adapter_prompt_only', e.target.checked)} />
+						<FormToggle fieldPath="training.h3_fused_elementwise" checked={t.h3_fused_elementwise ?? false} onchange={(e) => update('h3_fused_elementwise', e.target.checked)} />
+						<FormToggle fieldPath="training.h3_train_sigma_bins" checked={t.h3_train_sigma_bins ?? false} onchange={(e) => update('h3_train_sigma_bins', e.target.checked)} />
+						<FormToggle fieldPath="training.h3_validation_std" checked={t.h3_validation_std ?? false} onchange={(e) => update('h3_validation_std', e.target.checked)} />
+					</div>
+					<FormGroup title="Rollout supervision" collapsed={true}>
+						<div class="grid grid-cols-2 xl:grid-cols-4 gap-2 pt-2">
+							<FormToggle fieldPath="training.h3_rollout_supervision" checked={t.h3_rollout_supervision ?? false} onchange={(e) => update('h3_rollout_supervision', e.target.checked)} />
+							<PathInput fieldPath="training.h3_rollout_teacher_config" value={t.h3_rollout_teacher_config || ''} oninput={(e) => update('h3_rollout_teacher_config', e.target.value || null)} showFiles />
+							<FormSelect fieldPath="training.h3_rollout_teacher_privilege" value={t.h3_rollout_teacher_privilege || 'auto'} options={['auto', 'qwen', 'reference', 'keyframe', 'caption']} onchange={(e) => update('h3_rollout_teacher_privilege', e.target.value)} />
+							<FormSelect fieldPath="training.h3_rollout_prefix" value={t.h3_rollout_prefix || 'student'} options={['student', 'teacher']} onchange={(e) => update('h3_rollout_prefix', e.target.value)} />
+							<FormField type="number" fieldPath="training.h3_rollout_probability" value={t.h3_rollout_probability ?? 0.5} oninput={(e) => update('h3_rollout_probability', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormField type="number" fieldPath="training.h3_rollout_steps" value={t.h3_rollout_steps ?? 2} oninput={(e) => update('h3_rollout_steps', Number(e.target.value))} min={1} />
+							<FormField type="number" fieldPath="training.h3_rollout_window" value={t.h3_rollout_window ?? 1} oninput={(e) => update('h3_rollout_window', Number(e.target.value))} min={1} />
+							<FormField type="number" fieldPath="training.h3_rollout_stop_min" value={t.h3_rollout_stop_min ?? 0} oninput={(e) => update('h3_rollout_stop_min', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormField type="number" fieldPath="training.h3_rollout_teacher_magnitude_weight" value={t.h3_rollout_teacher_magnitude_weight ?? 1} oninput={(e) => update('h3_rollout_teacher_magnitude_weight', Number(e.target.value))} min={0} step="0.1" />
+							<FormField type="number" fieldPath="training.h3_rollout_null_anchor_weight" value={t.h3_rollout_null_anchor_weight ?? 0} oninput={(e) => update('h3_rollout_null_anchor_weight', Number(e.target.value))} min={0} step="0.1" />
+							<FormField type="number" fieldPath="training.h3_rollout_field_floor" value={t.h3_rollout_field_floor ?? 0} oninput={(e) => update('h3_rollout_field_floor', Number(e.target.value))} min={0} step="0.1" />
+							<FormField type="number" fieldPath="training.h3_rollout_field_cap" value={t.h3_rollout_field_cap ?? 0} oninput={(e) => update('h3_rollout_field_cap', Number(e.target.value))} min={0} step="0.1" />
+							<FormSelect fieldPath="training.h3_rollout_field_floor_direction" value={t.h3_rollout_field_floor_direction || 'self'} options={['self', 'teacher']} onchange={(e) => update('h3_rollout_field_floor_direction', e.target.value)} />
+							<FormField type="number" fieldPath="training.h3_rollout_field_floor_sigma_max" value={t.h3_rollout_field_floor_sigma_max ?? 1} oninput={(e) => update('h3_rollout_field_floor_sigma_max', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormToggle fieldPath="training.h3_rollout_stop_shifted" checked={t.h3_rollout_stop_shifted ?? false} onchange={(e) => update('h3_rollout_stop_shifted', e.target.checked)} />
+							<FormToggle fieldPath="training.h3_rollout_fused_teacher" checked={t.h3_rollout_fused_teacher ?? false} onchange={(e) => update('h3_rollout_fused_teacher', e.target.checked)} />
+						</div>
+					</FormGroup>
+					<FormGroup title="Guidance and measured variance" collapsed={true}>
+						<div class="grid grid-cols-2 xl:grid-cols-4 gap-2 pt-2">
+							<FormField type="number" fieldPath="training.h3_guidance_scale_sigma_max" value={t.h3_guidance_scale_sigma_max ?? 1} oninput={(e) => update('h3_guidance_scale_sigma_max', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormField type="number" fieldPath="training.h3_guidance_null_anchor_weight" value={t.h3_guidance_null_anchor_weight ?? 0} oninput={(e) => update('h3_guidance_null_anchor_weight', Number(e.target.value))} min={0} step="0.1" />
+							<FormField type="number" fieldPath="training.h3_guidance_null_anchor_weight_end" value={t.h3_guidance_null_anchor_weight_end ?? ''} oninput={(e) => update('h3_guidance_null_anchor_weight_end', e.target.value ? Number(e.target.value) : null)} placeholder="Constant" min={0} step="0.1" />
+							<FormField type="number" fieldPath="training.h3_guidance_null_anchor_probability" value={t.h3_guidance_null_anchor_probability ?? 1} oninput={(e) => update('h3_guidance_null_anchor_probability', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormField fieldPath="training.h3_measured_variance_weighting" value={t.h3_measured_variance_weighting || ''} oninput={(e) => update('h3_measured_variance_weighting', e.target.value || null)} placeholder="Disabled" />
+							<FormField type="number" fieldPath="training.h3_measured_variance_weight_max" value={t.h3_measured_variance_weight_max ?? 4} oninput={(e) => update('h3_measured_variance_weight_max', Number(e.target.value))} min={0} step="0.1" />
+						</div>
+					</FormGroup>
+					<FormGroup title="Validation probes" collapsed={true}>
+						<div class="grid grid-cols-2 xl:grid-cols-4 gap-2 pt-2">
+							<PathInput fieldPath="training.h3_validation_bare_dataset_config" value={t.h3_validation_bare_dataset_config || ''} oninput={(e) => update('h3_validation_bare_dataset_config', e.target.value || null)} showFiles />
+							<FormField fieldPath="training.h3_validation_multipliers" value={t.h3_validation_multipliers || ''} oninput={(e) => update('h3_validation_multipliers', e.target.value)} placeholder="1,2,4" />
+							<FormField type="number" fieldPath="training.h3_validation_rollout_probe" value={t.h3_validation_rollout_probe ?? 0} oninput={(e) => update('h3_validation_rollout_probe', Number(e.target.value))} min={0} />
+							<FormField type="number" fieldPath="training.h3_validation_rollout_stop" value={t.h3_validation_rollout_stop ?? 0.5} oninput={(e) => update('h3_validation_rollout_stop', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormToggle fieldPath="training.h3_validation_field_probe" checked={t.h3_validation_field_probe ?? false} onchange={(e) => update('h3_validation_field_probe', e.target.checked)} />
+							<FormToggle fieldPath="training.h3_validate_ema" checked={t.h3_validate_ema ?? false} onchange={(e) => update('h3_validate_ema', e.target.checked)} />
+						</div>
+					</FormGroup>
+					<FormGroup title="Sparse attention and checkpointing" collapsed={true}>
+						<div class="grid grid-cols-2 xl:grid-cols-4 gap-2 pt-2">
+							<FormSelect fieldPath="training.h3_compile_attention" value={t.h3_compile_attention || 'inline'} options={['inline', 'auto', 'opaque']} onchange={(e) => update('h3_compile_attention', e.target.value)} />
+							<FormSelect fieldPath="training.h3_checkpoint_keep" value={t.h3_checkpoint_keep || 'none'} options={['none', 'attention', 'qkv']} onchange={(e) => update('h3_checkpoint_keep', e.target.value)} />
+							<FormField type="number" fieldPath="training.h3_swiglu_chunk_rows" value={t.h3_swiglu_chunk_rows ?? 0} oninput={(e) => update('h3_swiglu_chunk_rows', Number(e.target.value))} min={0} />
+							<FormField type="number" fieldPath="training.h3_block_sparse_kv_fraction" value={t.h3_block_sparse_kv_fraction ?? 0} oninput={(e) => update('h3_block_sparse_kv_fraction', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormField type="number" fieldPath="training.h3_block_sparse_threshold" value={t.h3_block_sparse_threshold ?? 0} oninput={(e) => update('h3_block_sparse_threshold', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormField type="number" fieldPath="training.h3_block_sparse_start_block" value={t.h3_block_sparse_start_block ?? 0} oninput={(e) => update('h3_block_sparse_start_block', Number(e.target.value))} min={0} />
+							<FormField fieldPath="training.h3_block_sparse_block_shape" value={t.h3_block_sparse_block_shape || ''} oninput={(e) => update('h3_block_sparse_block_shape', e.target.value || null)} placeholder="1,8,16" />
+						</div>
+					</FormGroup>
+				</div>
+			</FormGroup>
+			{/if}
 			<FormGroup title="CLI Passthrough">
 				<div class="space-y-2 pt-2">
+					<div class="grid grid-cols-2 gap-2">
+						<PathInput fieldPath="training.save_request_file" value={t.save_request_file || ''} oninput={(e) => update('save_request_file', e.target.value || null)} showFiles tooltip="When this file exists, save at the next completed optimizer step and remove the request file." />
+						<PathInput fieldPath="training.save_and_stop_request_file" value={t.save_and_stop_request_file || ''} oninput={(e) => update('save_and_stop_request_file', e.target.value || null)} showFiles tooltip="When this file exists, finish the current step, save normally, stop, and remove the request file." />
+					</div>
 					<FormField fieldPath="training.accelerate_extra_args" value={t.accelerate_extra_args || ''} oninput={(e) => update('accelerate_extra_args', e.target.value)} placeholder="--num_processes 2 --main_process_port 29501" tooltip="Extra arguments appended to `accelerate launch` before the training script path." />
 					<FormField fieldPath="training.extra_args" value={t.extra_args || ''} oninput={(e) => update('extra_args', e.target.value)} placeholder="--flag value --other_flag" tooltip="Extra arguments appended to the MiniMax H3 training command." />
 				</div>

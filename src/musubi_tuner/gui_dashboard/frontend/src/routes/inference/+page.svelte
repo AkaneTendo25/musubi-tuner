@@ -680,6 +680,16 @@
 						<PathInput fieldPath="inference.output_dir" value={s.output_dir || 'output'} oninput={(e) => update('output_dir', e.target.value)} tooltip="Output directory" />
 						<FormField fieldPath="inference.output_name" value={s.output_name || 'ltx2_sample'} oninput={(e) => update('output_name', e.target.value)} tooltip="Output filename prefix" />
 						{#if $advancedMode}
+							{#if s.model_type === 'minimax_h3'}
+								<div class="grid grid-cols-2 gap-2">
+									<FormField fieldPath="inference.h3_guide_images" value={s.h3_guide_images || ''} oninput={(e) => update('h3_guide_images', e.target.value)} placeholder="FRAME:PATH (repeat with spaces)" tooltip="Repeatable --guide_image values." />
+									<FormField fieldPath="inference.h3_guide_videos" value={s.h3_guide_videos || ''} oninput={(e) => update('h3_guide_videos', e.target.value)} placeholder="FRAME:PATH (repeat with spaces)" tooltip="Repeatable --guide_video values." />
+									<FormField fieldPath="inference.h3_guide_audios" value={s.h3_guide_audios || ''} oninput={(e) => update('h3_guide_audios', e.target.value)} placeholder="FRAME:PATH (repeat with spaces)" tooltip="Repeatable --guide_audio values." />
+									<FormField fieldPath="inference.h3_learned_context_multipliers" value={s.h3_learned_context_multipliers || ''} oninput={(e) => update('h3_learned_context_multipliers', e.target.value)} placeholder="1.0 0.5" tooltip="One multiplier per learned context, in command-line order." />
+									<FormField type="number" fieldPath="inference.h3_null_guidance_scale" value={s.h3_null_guidance_scale ?? 0} oninput={(e) => update('h3_null_guidance_scale', Number(e.target.value))} min={0} step="0.1" tooltip="Sampling-time guidance against the base checkpoint's empty-prompt branch." />
+									<FormToggle fieldPath="inference.h3_inspect" checked={s.h3_inspect ?? false} onchange={(e) => update('h3_inspect', e.target.checked)} tooltip="Validate inputs and print checkpoint metadata without loading weights or generating." />
+								</div>
+							{/if}
 							{#if s.model_type !== 'minimax_h3'}
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="inference.use_precached_sample_latents" checked={s.use_precached_sample_latents ?? false} onchange={(e) => update('use_precached_sample_latents', e.target.checked)} tooltip="Use precached latent tensors for inference" />

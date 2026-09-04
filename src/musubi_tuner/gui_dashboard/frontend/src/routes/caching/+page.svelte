@@ -565,6 +565,12 @@
 				{#if $advancedMode}
 					<FormGroup title="Cache Latents CLI">
 						<div class="space-y-2 pt-2">
+							{#if caching.model_type === 'minimax_h3'}
+								<div class="grid grid-cols-2 gap-2">
+									<FormSelect fieldPath="caching.h3_loss_mask_pooling" value={caching.h3_loss_mask_pooling || 'max'} options={['max', 'average', 'nearest']} onchange={(e) => updateCaching('h3_loss_mask_pooling', e.target.value)} tooltip="Pooling used to reduce pixel loss masks to H3 latent resolution." />
+									<FormField type="number" fieldPath="caching.h3_reference_video_fps" value={caching.h3_reference_video_fps ?? 0} oninput={(e) => updateCaching('h3_reference_video_fps', Number(e.target.value))} min={0} step="0.1" tooltip="Reference-video sampling FPS. 0 keeps released truncation behavior." />
+								</div>
+							{/if}
 							<FormField fieldPath="caching.cache_latents_extra_args" value={caching.cache_latents_extra_args || ''} oninput={(e) => updateCaching('cache_latents_extra_args', e.target.value)} placeholder="--flag value --other_flag" tooltip="Extra arguments appended to the latent cache command. Use this for any CLI option without a dedicated dashboard control." />
 						</div>
 					</FormGroup>
@@ -652,6 +658,14 @@
 
 					<FormGroup title="Cache Text CLI">
 						<div class="space-y-2 pt-2">
+							{#if caching.model_type === 'minimax_h3'}
+								<div class="grid grid-cols-2 gap-2">
+									<FormField type="number" fieldPath="caching.h3_max_caption_tokens" value={caching.h3_max_caption_tokens ?? 0} oninput={(e) => updateCaching('h3_max_caption_tokens', Number(e.target.value))} min={0} tooltip="Maximum caption tokens; 0 keeps the complete caption." />
+									<FormField fieldPath="caching.h3_keyframe_visuals" value={caching.h3_keyframe_visuals || ''} oninput={(e) => updateCaching('h3_keyframe_visuals', e.target.value)} placeholder="first,last or frame indices" tooltip="Target frames shown to Qwen3-VL as visual spans." />
+									<FormField type="number" fieldPath="caching.h3_reference_video_fps" value={caching.h3_reference_video_fps ?? 0} oninput={(e) => updateCaching('h3_reference_video_fps', Number(e.target.value))} min={0} step="0.1" tooltip="Reference-video sampling FPS; keep equal to latent caching and training." />
+									<FormToggle fieldPath="caching.h3_qwen_control_dropout" checked={caching.h3_qwen_control_dropout ?? false} onchange={(e) => updateCaching('h3_qwen_control_dropout', e.target.checked)} tooltip="Also cache control-free Qwen conditioning for per-step control dropout." />
+								</div>
+							{/if}
 							<FormField fieldPath="caching.cache_text_extra_args" value={caching.cache_text_extra_args || ''} oninput={(e) => updateCaching('cache_text_extra_args', e.target.value)} placeholder="--flag value --other_flag" tooltip="Extra arguments appended to the text cache command. Use this for any CLI option without a dedicated dashboard control." />
 						</div>
 					</FormGroup>
