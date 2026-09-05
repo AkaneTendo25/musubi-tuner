@@ -857,6 +857,23 @@ def _anchor_probability(args) -> float:
     return 1.0 if value is None else float(value)
 
 
+def _step_video_sigma(inputs) -> float:
+    """The step's shifted video sigma as one number: the mean over frames and samples
+    of the per-frame sigma when jitter is on, else of the per-sample one."""
+    sigma = inputs.video_frame_sigma if getattr(inputs, "video_frame_sigma", None) is not None else inputs.video_sigma
+    return float(sigma.detach().float().reshape(-1).mean().item())
+
+
+def _null_anchor_sigma_active(args, inputs) -> bool:
+    """--h3_guidance_null_anchor_sigma_min: the anchor holds the empty branch only on
+    steps at or above this shifted sigma. The base's field is a high-sigma object
+    (nearly all of its length sits above sigma 0.8); below that the prompted and
+    empty predictions coincide, so anchoring the empty branch there pins the
+    prompted one as well, where the data term is teaching texture."""
+    sigma_min = float(getattr(args, "h3_guidance_null_anchor_sigma_min", 0.0) or 0.0)
+    return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
+
+
 def _null_anchor_weight_at(args, global_step: int) -> float:
     """The data-step null anchor's weight at this step: the configured weight, or a
     linear ramp from it to --h3_guidance_null_anchor_weight_end over --max_train_steps
@@ -3019,6 +3036,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_null_anchor_probability must be finite and lie in (0, 1]")
         if anchor_probability < 1.0 and anchor_weight <= 0:
             raise ValueError("--h3_guidance_null_anchor_probability requires --h3_guidance_null_anchor_weight above 0")
+        anchor_sigma_min = float(getattr(args, "h3_guidance_null_anchor_sigma_min", 0.0) or 0.0)
+        if not math.isfinite(anchor_sigma_min) or not 0 <= anchor_sigma_min < 1:
+            raise ValueError("--h3_guidance_null_anchor_sigma_min must be finite and lie in [0, 1)")
+        if anchor_sigma_min > 0 and anchor_weight <= 0:
+            raise ValueError("--h3_guidance_null_anchor_sigma_min requires --h3_guidance_null_anchor_weight above 0")
         if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
             raise ValueError("--h3_base_preservation_probability must be finite and lie in (0, 1]")
         if not math.isfinite(args.h3_dop_loss_weight) or args.h3_dop_loss_weight < 0:
@@ -4253,6 +4275,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_rollout_field_floor": float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) != 0.0,
             "--h3_rollout_field_floor_direction": getattr(args, "h3_rollout_field_floor_direction", "self") != "self",
             "--h3_rollout_field_floor_sigma_max": float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0)) != 1.0,
+            "--h3_rollout_field_floor_sigma_min": float(getattr(args, "h3_rollout_field_floor_sigma_min", 0.0) or 0.0) != 0.0,
             "--h3_rollout_stop_min": float(getattr(args, "h3_rollout_stop_min", 0.0) or 0.0) != 0.0,
             "--h3_rollout_teacher_magnitude_weight": float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0)) != 1.0,
             "--h3_rollout_prefix": getattr(args, "h3_rollout_prefix", "student") != "student",
@@ -4291,6 +4314,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         floor_sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
         if not math.isfinite(floor_sigma_max) or not 0 < floor_sigma_max <= 1:
             raise ValueError("--h3_rollout_field_floor_sigma_max must be finite and lie in (0, 1]")
+        floor_sigma_min = float(getattr(args, "h3_rollout_field_floor_sigma_min", 0.0) or 0.0)
+        if not math.isfinite(floor_sigma_min) or not 0 <= floor_sigma_min < 1:
+            raise ValueError("--h3_rollout_field_floor_sigma_min must be finite and lie in [0, 1)")
+        if floor_sigma_min >= floor_sigma_max:
+            raise ValueError("--h3_rollout_field_floor_sigma_min must lie below --h3_rollout_field_floor_sigma_max")
         rollout_anchor = float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0)
         if not math.isfinite(rollout_anchor) or rollout_anchor < 0:
             raise ValueError("--h3_rollout_null_anchor_weight must be finite and non-negative; 0 disables it")
@@ -4312,11 +4340,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "branch the field is measured against)"
             )
         if field_floor <= 0 and (
-            getattr(args, "h3_rollout_field_floor_direction", "self") != "self" or floor_sigma_max != 1.0 or field_cap != 0.0
+            getattr(args, "h3_rollout_field_floor_direction", "self") != "self"
+            or floor_sigma_max != 1.0
+            or floor_sigma_min != 0.0
+            or field_cap != 0.0
         ):
             raise ValueError(
-                "--h3_rollout_field_floor_direction, --h3_rollout_field_floor_sigma_max and --h3_rollout_field_cap shape "
-                "the field floor and need --h3_rollout_field_floor above 0"
+                "--h3_rollout_field_floor_direction, --h3_rollout_field_floor_sigma_max, --h3_rollout_field_floor_sigma_min "
+                "and --h3_rollout_field_cap shape the field floor and need --h3_rollout_field_floor above 0"
             )
         if (
             field_floor > 0
@@ -5629,6 +5660,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         null_anchor_active = (
             float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0
             and conditioning == "prompt"
+            and _null_anchor_sigma_active(args, inputs)
             and self._null_anchor_probability_active(accelerator, null_anchor_probability)
         )
         auxiliary_block_swap = (
@@ -6182,9 +6214,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # States above the sigma ceiling drop out of the mean, like
                 # unauthored samples.
                 sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
-                if sigma_max < 1.0:
+                sigma_min = float(getattr(args, "h3_rollout_field_floor_sigma_min", 0.0) or 0.0)
+                if sigma_max < 1.0 or sigma_min > 0.0:
                     in_band = torch.stack(
-                        [(sigma.reshape(-1)[:1] <= sigma_max).to(ratios.dtype).to(ratios.device) for sigma in rollout_video_sigmas]
+                        [
+                            ((sigma.reshape(-1)[:1] <= sigma_max) & (sigma.reshape(-1)[:1] >= sigma_min))
+                            .to(ratios.dtype)
+                            .to(ratios.device)
+                            for sigma in rollout_video_sigmas
+                        ]
                     ).expand_as(valid)
                     valid = valid * in_band
                 scored = valid.sum().clamp_min(1.0)
@@ -6283,7 +6321,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Present every step once the flag is on, so a run whose anchor never fired
             # is visible as a flat zero rather than as a missing tag nobody looks for.
             metrics["loss/guidance_null_anchor"] = 0.0
-        if float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0 and null_anchor_probability < 1.0:
+        if float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0 and (
+            null_anchor_probability < 1.0 or float(getattr(args, "h3_guidance_null_anchor_sigma_min", 0.0) or 0.0) > 0
+        ):
             metrics["h3/null_anchor_active"] = float(null_anchor_active)
         if use_crepa and self._crepa.active:
             crepa_loss, crepa_metrics = self._crepa.loss(
@@ -6514,6 +6554,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_null_anchor_weight": str(getattr(args, "h3_guidance_null_anchor_weight", 0.0)),
             "ss_h3_guidance_null_anchor_weight_end": str(getattr(args, "h3_guidance_null_anchor_weight_end", None)),
             "ss_h3_guidance_null_anchor_probability": str(_anchor_probability(args)),
+            "ss_h3_guidance_null_anchor_sigma_min": str(float(getattr(args, "h3_guidance_null_anchor_sigma_min", 0.0) or 0.0)),
             "ss_h3_rollout_supervision": str(bool(getattr(args, "h3_rollout_supervision", False))),
             "ss_h3_rollout_probability": str(args.h3_rollout_probability),
             "ss_h3_rollout_steps": str(args.h3_rollout_steps),
@@ -6538,6 +6579,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_rollout_null_anchor_weight": str(float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0)),
             "ss_h3_rollout_prefix": str(getattr(args, "h3_rollout_prefix", "student")),
             "ss_h3_rollout_field_floor_sigma_max": str(float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))),
+            "ss_h3_rollout_field_floor_sigma_min": str(float(getattr(args, "h3_rollout_field_floor_sigma_min", 0.0) or 0.0)),
             "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
             "ss_h3_dop_loss_weight": str(args.h3_dop_loss_weight),
             "ss_h3_dop_probability": str(args.h3_dop_probability),
@@ -7360,6 +7402,17 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h3_rollout_field_floor_sigma_min",
+        type=float,
+        default=0.0,
+        help=(
+            "apply the field floor only at supervised states whose SHIFTED video sigma is at least this value; "
+            "sub-steps below it are left out of the floor's mean. The base's field is nearly zero below sigma 0.5, "
+            "so a floor there is a ratio of two small numbers. Must lie below --h3_rollout_field_floor_sigma_max. "
+            "0 (default) applies it everywhere"
+        ),
+    )
+    parser.add_argument(
         "--h3_guidance_null_anchor_weight_end",
         type=float,
         default=None,
@@ -7395,6 +7448,21 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "evaluate the null anchor on this synchronized random fraction of prompted steps and divide the active "
             "term by it, so the expected gradient is the dense anchor's at a fraction of its two forwards a step "
             "(1.8x -> 1 + 0.8p). Its own random stream, like the other sparse branches. 1 (default) anchors every step"
+        ),
+    )
+    parser.add_argument(
+        "--h3_guidance_null_anchor_sigma_min",
+        type=float,
+        default=0.0,
+        help=(
+            "evaluate the null anchor only on prompted steps whose SHIFTED video sigma is at least this value; below "
+            "it the two anchor forwards are skipped and the term is zero. The anchor is one forward per step, so the "
+            "gate reads one number: the batch mean, and under --h3_frame_sigma_jitter the mean over frames as well, "
+            "while the guidance schedule stays per-frame. The base's "
+            "guidance field is a high-sigma object (its length against the empty prediction is about 0.05 of the "
+            "prediction below sigma 0.5 and 0.7 above 0.9), so at low sigma the anchor pins the prompted branch as "
+            "much as the empty one. Not a sparse estimator: nothing is rescaled. Reported as h3/null_anchor_active. "
+            "0 (default) anchors at every sigma"
         ),
     )
     parser.add_argument(

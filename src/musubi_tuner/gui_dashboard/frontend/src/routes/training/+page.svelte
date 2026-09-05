@@ -1520,6 +1520,7 @@
 							<FormField type="number" fieldPath="training.h3_rollout_field_cap" value={t.h3_rollout_field_cap ?? 0} oninput={(e) => update('h3_rollout_field_cap', Number(e.target.value))} min={0} step="0.1" />
 							<FormSelect fieldPath="training.h3_rollout_field_floor_direction" value={t.h3_rollout_field_floor_direction || 'self'} options={['self', 'teacher']} onchange={(e) => update('h3_rollout_field_floor_direction', e.target.value)} />
 							<FormField type="number" fieldPath="training.h3_rollout_field_floor_sigma_max" value={t.h3_rollout_field_floor_sigma_max ?? 1} oninput={(e) => update('h3_rollout_field_floor_sigma_max', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormField type="number" fieldPath="training.h3_rollout_field_floor_sigma_min" value={t.h3_rollout_field_floor_sigma_min ?? 0} oninput={(e) => update('h3_rollout_field_floor_sigma_min', Number(e.target.value))} min={0} max={1} step="0.05" />
 							<FormToggle fieldPath="training.h3_rollout_stop_shifted" checked={t.h3_rollout_stop_shifted ?? false} onchange={(e) => update('h3_rollout_stop_shifted', e.target.checked)} />
 							<FormToggle fieldPath="training.h3_rollout_fused_teacher" checked={t.h3_rollout_fused_teacher ?? false} onchange={(e) => update('h3_rollout_fused_teacher', e.target.checked)} />
 						</div>
@@ -1530,6 +1531,7 @@
 							<FormField type="number" fieldPath="training.h3_guidance_null_anchor_weight" value={t.h3_guidance_null_anchor_weight ?? 0} oninput={(e) => update('h3_guidance_null_anchor_weight', Number(e.target.value))} min={0} step="0.1" />
 							<FormField type="number" fieldPath="training.h3_guidance_null_anchor_weight_end" value={t.h3_guidance_null_anchor_weight_end ?? ''} oninput={(e) => update('h3_guidance_null_anchor_weight_end', e.target.value ? Number(e.target.value) : null)} placeholder="Constant" min={0} step="0.1" />
 							<FormField type="number" fieldPath="training.h3_guidance_null_anchor_probability" value={t.h3_guidance_null_anchor_probability ?? 1} oninput={(e) => update('h3_guidance_null_anchor_probability', Number(e.target.value))} min={0} max={1} step="0.05" />
+							<FormField type="number" fieldPath="training.h3_guidance_null_anchor_sigma_min" value={t.h3_guidance_null_anchor_sigma_min ?? 0} oninput={(e) => update('h3_guidance_null_anchor_sigma_min', Number(e.target.value))} min={0} max={1} step="0.05" />
 							<FormField fieldPath="training.h3_measured_variance_weighting" value={t.h3_measured_variance_weighting || ''} oninput={(e) => update('h3_measured_variance_weighting', e.target.value || null)} placeholder="Disabled" />
 							<FormField type="number" fieldPath="training.h3_measured_variance_weight_max" value={t.h3_measured_variance_weight_max ?? 4} oninput={(e) => update('h3_measured_variance_weight_max', Number(e.target.value))} min={0} step="0.1" />
 						</div>

@@ -2740,8 +2740,35 @@ def test_field_floor_sigma_ceiling_drops_the_states_above_it(tmp_path):
     assert float(loss.detach()) == pytest.approx(float(plain_loss.detach()))
 
 
+def test_field_floor_sigma_floor_drops_the_states_below_it(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    # The supervised states sit below a floor of 0.999, so nothing is scored.
+    _, loss, metrics, _ = _run_step(*_FLOOR_FLAGS, "--h3_rollout_field_floor_sigma_min", "0.999", teacher=teacher)
+    _, plain_loss, _, _ = _run_step(*_ROLLOUT_FLAGS, teacher=teacher)
+    assert metrics["loss/rollout_field_floor"] == 0.0
+    assert float(loss.detach()) == pytest.approx(float(plain_loss.detach()))
+    # A band that contains them scores them like the unbanded floor.
+    _, banded, banded_metrics, _ = _run_step(*_FLOOR_FLAGS, "--h3_rollout_field_floor_sigma_min", "0.01", teacher=teacher)
+    _, dense, dense_metrics, _ = _run_step(*_FLOOR_FLAGS, teacher=teacher)
+    assert banded_metrics["loss/rollout_field_floor"] == pytest.approx(dense_metrics["loss/rollout_field_floor"])
+    assert float(banded.detach()) == pytest.approx(float(dense.detach()))
+    bad = _flag_args(
+        *_FLOOR_FLAGS, "--h3_rollout_field_floor_sigma_min", "0.9", "--h3_rollout_field_floor_sigma_max", "0.8", teacher=teacher
+    )
+    with pytest.raises(ValueError, match="below --h3_rollout_field_floor_sigma_max"):
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(bad)
+    args = _flag_args(*_FLOOR_FLAGS, "--h3_rollout_field_floor_sigma_min", "0.8", teacher=teacher)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_rollout_field_floor_sigma_min"] == "0.8"
+
+
 def test_field_floor_shape_flags_require_the_floor(tmp_path):
-    for flag in (("--h3_rollout_field_floor_direction", "teacher"), ("--h3_rollout_field_floor_sigma_max", "0.9")):
+    for flag in (
+        ("--h3_rollout_field_floor_direction", "teacher"),
+        ("--h3_rollout_field_floor_sigma_max", "0.9"),
+        ("--h3_rollout_field_floor_sigma_min", "0.5"),
+    ):
         args = _flag_args(*_ROLLOUT_FLAGS, *flag, teacher=_teacher_file(tmp_path))
         with pytest.raises(ValueError, match="need --h3_rollout_field_floor above 0"):
             MiniMaxH3NetworkTrainer()._validate_rollout_args(args)
@@ -3283,6 +3310,38 @@ def test_sparse_null_anchor_skips_the_forwards_on_an_inactive_step_and_rescales_
     assert len(on_backend.calls) == 4
     assert on_metrics["loss/guidance_null_anchor"] == pytest.approx(dense_metrics["loss/guidance_null_anchor"] / 0.25)
     assert "h3/null_anchor_active" not in dense_metrics
+
+
+def test_null_anchor_sigma_gate_skips_the_forwards_below_the_threshold_and_does_not_rescale():
+    dense_backend, _, dense_metrics, _ = _run_step(*_ANCHOR_FLAGS)
+    # The stub batch sits at base timestep 0.5, shifted to a video sigma well inside (0, 1).
+    low_backend, low_loss, low_metrics, _ = _run_step(*_ANCHOR_FLAGS, "--h3_guidance_null_anchor_sigma_min", "0.999")
+    high_backend, _, high_metrics, _ = _run_step(*_ANCHOR_FLAGS, "--h3_guidance_null_anchor_sigma_min", "0.01")
+    _, plain_loss, _, _ = _run_step(*_ANCHOR_FLAGS[:-2])
+    # Below the threshold: no anchor forwards, term zero, loss is the plain step's.
+    assert low_metrics["loss/guidance_null_anchor"] == 0.0
+    assert low_metrics["h3/null_anchor_active"] == 0.0
+    assert len(low_backend.calls) == len(dense_backend.calls) - 2
+    assert float(low_loss.detach()) == pytest.approx(float(plain_loss.detach()))
+    # Above it: the dense anchor, unscaled.
+    assert high_metrics["h3/null_anchor_active"] == 1.0
+    assert len(high_backend.calls) == len(dense_backend.calls)
+    assert high_metrics["loss/guidance_null_anchor"] == pytest.approx(dense_metrics["loss/guidance_null_anchor"])
+    assert "h3/null_anchor_active" not in dense_metrics
+
+
+def test_null_anchor_sigma_gate_is_validated_and_recorded():
+    for bad in ("1", "-0.1"):
+        with pytest.raises(ValueError, match="anchor_sigma_min"):
+            MiniMaxH3NetworkTrainer().handle_model_specific_args(
+                _flag_args(*_ANCHOR_FLAGS, "--h3_guidance_null_anchor_sigma_min", bad)
+            )
+    with pytest.raises(ValueError, match="requires --h3_guidance_null_anchor_weight"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_flag_args("--h3_guidance_null_anchor_sigma_min", "0.8"))
+    args = _flag_args(*_ANCHOR_FLAGS, "--h3_guidance_null_anchor_sigma_min", "0.8")
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_guidance_null_anchor_sigma_min"] == "0.8"
 
 
 def test_sparse_null_anchor_is_validated_and_recorded():

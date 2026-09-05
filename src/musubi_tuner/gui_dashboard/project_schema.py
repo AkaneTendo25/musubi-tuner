@@ -376,9 +376,11 @@ class TrainingConfig(BaseModel):
     h3_rollout_field_cap: float = 0.0
     h3_rollout_field_floor_direction: Literal["self", "teacher"] = "self"
     h3_rollout_field_floor_sigma_max: float = 1.0
+    h3_rollout_field_floor_sigma_min: float = 0.0
     h3_guidance_null_anchor_weight_end: Optional[float] = None
     h3_guidance_null_anchor_weight: float = 0.0
     h3_guidance_null_anchor_probability: float = 1.0
+    h3_guidance_null_anchor_sigma_min: float = 0.0
     h3_fused_elementwise: bool = False
     h3_compile_attention: Literal["inline", "auto", "opaque"] = "inline"
     h3_swiglu_chunk_rows: int = 0
