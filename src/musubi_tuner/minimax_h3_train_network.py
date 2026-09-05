@@ -1701,6 +1701,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         self._trigger_pass = None
         self._trigger_items: dict[str, dict[str, dict[str, list[float]]]] = {"trig": {}, "bare": {}}
+        # The triggered pass keeps each item's prompted drift vector so the bare pass
+        # can project its own onto it: how much of the trigger's update the caption
+        # without the trigger received.
+        self._trigger_drift: dict[tuple, torch.Tensor] | None = {} if trigger_probe else None
+        self._trigger_leak: dict[int, list[tuple[float, float]]] = {}
 
         bins = validation_sigma_bins(
             args.validation_timestep_bins,
@@ -1835,6 +1840,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                                     )
                     finally:
                         self._trigger_pass = None
+                        # The stored drift vectors have served; the sweep and the
+                        # training steps that follow must not carry them.
+                        self._trigger_drift = None
                         self._restore_validation_pools(saved_pools)
                 sweep_metrics = self._validate_multiplier_sweep(
                     accelerator, args, transformer, network, bins, observed_modes, validation_tasks, validation_seed
@@ -2021,6 +2029,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         err_gains.append(b_bin - t_bin)
                 if err_gains:
                     metrics[f"val/trigger/err_gain/bin{b}"] = sum(err_gains) / len(err_gains)
+            leak = getattr(self, "_trigger_leak", None) or {}
+            if leak:
+                metrics["val/trigger/leak_pairs"] = float(sum(len(rows) for rows in leak.values()))
+                with_std("val/trigger/leak_share", [share for rows in leak.values() for share, _cos in rows])
+                with_std("val/trigger/leak_cos", [cos for rows in leak.values() for _share, cos in rows])
+                for b, rows in sorted(leak.items()):
+                    metrics[f"val/trigger/leak_share/bin{b}"] = sum(share for share, _cos in rows) / len(rows)
+                    metrics[f"val/trigger/leak_cos/bin{b}"] = sum(cos for _share, cos in rows) / len(rows)
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
@@ -2397,6 +2413,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return float(torch.dot(left, right)) / denominator
 
     @staticmethod
+    def _masked_projection(lhs, rhs, mask) -> tuple[float, float]:
+        """``lhs`` projected onto ``rhs`` over the authored elements: the share
+        ``<lhs, rhs> / <rhs, rhs>`` and the cosine between the two. Both 0 when
+        either is empty."""
+        left = lhs.float().flatten()
+        right = rhs.float().flatten().to(left.device)
+        if mask is not None:
+            valid = mask.to(device=left.device, dtype=torch.float32).expand_as(lhs).flatten()
+            left = left * valid
+            right = right * valid
+        right_norm = float(right.norm())
+        left_norm = float(left.norm())
+        if right_norm == 0.0 or left_norm == 0.0:
+            return 0.0, 0.0
+        dot = float(torch.dot(left, right))
+        return dot / (right_norm * right_norm), dot / (left_norm * right_norm)
+
+    @staticmethod
     def _masked_rms(tensor, mask):
         """Root mean square over the authored elements only."""
         if mask is None:
@@ -2762,6 +2796,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # branch still scores nothing here for doing so.
             if base_gap > 0.0:
                 self._prompted_drift_ratios.setdefault(sigma_bin.index, []).append(prompted_drift / base_gap)
+            drift_store = getattr(self, "_trigger_drift", None)
+            if drift_store is not None:
+                # The leak: the adapter's move on the caption WITHOUT the trigger,
+                # projected onto its move on the same item and state WITH it. A
+                # conditional concept leaves the bare prompt alone along that direction
+                # (share near 0); an unconditional one applies the same update to
+                # both (share near 1). drift_gain cannot tell these apart from a bare
+                # branch that merely moved elsewhere, e.g. toward the corpus.
+                drift_vector = adapted_pair[0] - base_pair[0]
+                # The validation noise is seeded from the dataset index, so the pair is
+                # only the same state when the bare set lists the items in the same
+                # order; an item found at another index pairs with nothing.
+                item_key = (batch_item_key(batch), dataset_index, sigma_bin.index, observed, self._step_reference_modality)
+                if getattr(self, "_trigger_pass", None) == "bare":
+                    triggered = drift_store.get(item_key)
+                    if triggered is not None:
+                        self._trigger_leak.setdefault(sigma_bin.index, []).append(
+                            self._masked_projection(drift_vector, triggered, video_mask)
+                        )
+                else:
+                    drift_store[item_key] = drift_vector
         if base_gap <= 0.0:
             # The base has no field to lose at this state, so a ratio would divide by
             # noise. Skipping keeps one degenerate item from dominating the average.
@@ -7279,8 +7334,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "further the adapter moves the prompted prediction with the trigger than without (as a share of the base's "
             "field), val/trigger/err_gain how much more it improves the fit with the trigger than without "
             "(val/velocity_err_rel without minus with). An adapter that learned the concept scores well above 0 on both; "
-            "one that only fitted the corpus scores about 0. Also reports val/trigger/drift_bare, val/trigger/err_rel_bare "
-            "and val/trigger/pairs. Needs --h3_validation_field_probe; LoRA runs only. Doubles the field-probe cost"
+            "one that only fitted the corpus scores about 0. val/trigger/leak_share is the adapter's move on the bare "
+            "caption projected onto its move with the trigger at the same state (0: the bare prompt got none of the "
+            "trigger's update, 1: all of it), val/trigger/leak_cos the cosine between the two moves. Also reports "
+            "val/trigger/drift_bare, val/trigger/err_rel_bare and val/trigger/pairs. Needs --h3_validation_field_probe; "
+            "LoRA runs only. Doubles the field-probe cost"
         ),
     )
     parser.add_argument(

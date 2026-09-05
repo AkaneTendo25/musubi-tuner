@@ -987,6 +987,13 @@ def test_trigger_probe_reports_the_conditional_gain_and_leaves_the_main_metrics_
     assert metrics["val/trigger/drift_bare"] == pytest.approx(0.0, abs=1e-6)
     assert metrics["val/trigger/drift_gain"] == pytest.approx(1.0 / 0.75, abs=1e-5)
     assert "val/trigger/drift_gain_std" in metrics
+    # The bare prompt did not move at all, so none of the trigger's update leaked to it.
+    assert metrics["val/trigger/leak_share"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["val/trigger/leak_cos"] == pytest.approx(0.0, abs=1e-6)
+    assert any(key.startswith("val/trigger/leak_share/bin") for key in metrics)
+    # Paired STATES (item x sigma bin), so at least one per paired item.
+    assert metrics["val/trigger/leak_pairs"] >= metrics["val/trigger/pairs"]
+    assert trainer._trigger_drift is None
     # The fit ratio: the adapter is worse than the base on the triggered items (2x vs
     # 1x of a unit-velocity target) and identical on the bare ones, so the gain is
     # negative here and exactly zero on the bare side.
