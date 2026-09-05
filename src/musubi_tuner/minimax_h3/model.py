@@ -108,6 +108,37 @@ def _use_cudnn_auto_dispatch(query: torch.Tensor, key: torch.Tensor, value: torc
     )
 
 
+SDPA_INT32_EXTENT = 2**31
+
+
+def view_element_extent(tensor: torch.Tensor) -> int:
+    """Indexing bound of a view: the largest ``size * stride`` over its dimensions.
+
+    Not the exact storage span of an arbitrary view (that sums ``(size - 1) * stride``);
+    for the fused-QKV value view it is ``batch * rows * 3 * inner_dim``, the address
+    range the memory-efficient SDPA backend computes in int32, and it can only err on
+    the side of copying slightly early.
+    """
+    if tensor.numel() == 0:
+        return 0
+    return max(size * stride for size, stride in zip(tensor.shape, tensor.stride()))
+
+
+def materialize_wide_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy a strided view whose storage extent exceeds the int32 range.
+
+    ``value`` reaches attention as a view into the fused QKV buffer (sequence stride
+    ``3 * inner_dim``), while Q and K come back fresh from their norms. The
+    memory-efficient SDPA backend computes KV block addresses in int32, so once the
+    view spans more than 2^31 elements (about 99.9k packed rows for H3) it reads
+    wrapped memory and the sample degrades to noise. Ordinary sizes pay nothing;
+    the copy only happens past that extent (kohya-ss/musubi-tuner#1089).
+    """
+    if tensor.is_contiguous() or view_element_extent(tensor) <= SDPA_INT32_EXTENT:
+        return tensor
+    return tensor.contiguous()
+
+
 class MiniMaxH3TokenTag(IntEnum):
     VIDEO = 0
     TEXT = 1
@@ -303,7 +334,7 @@ class MiniMaxH3Attention(nn.Module):
             query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
         query = query.unflatten(-1, (self.heads, self.head_dim))
         key = key.unflatten(-1, (self.heads, self.head_dim))
-        value = value.unflatten(-1, (self.heads, self.head_dim))
+        value = materialize_wide_view(value).unflatten(-1, (self.heads, self.head_dim))
         with h3_profile_scope("h3.rope"):
             query, key = self._norm_and_rotate(query, key, rotary_emb)
         return query, key, value
