@@ -1008,12 +1008,13 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
         if dop_weight > 0:
-            if not t.h3_dop_trigger.strip() or not t.h3_dop_class_prompt.strip():
+            bare_mode = t.h3_dop_caption_mode == "bare"
+            if not t.h3_dop_trigger.strip() or (not bare_mode and not t.h3_dop_class_prompt.strip()):
                 errors.append(
                     _make_issue(
                         "error",
                         "training.h3_dop_trigger",
-                        "H3 DOP requires both a trigger and class prompt.",
+                        "H3 DOP requires a trigger, and a class prompt unless the caption mode is bare.",
                         label="H3 DOP Trigger",
                         page="training",
                     )
@@ -1028,12 +1029,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         page="training",
                     )
                 )
-            if config.caching.h3_dop_trigger != t.h3_dop_trigger or config.caching.h3_dop_class_prompt != t.h3_dop_class_prompt:
+            if (
+                config.caching.h3_dop_trigger != t.h3_dop_trigger
+                or config.caching.h3_dop_class_prompt != t.h3_dop_class_prompt
+                or config.caching.h3_dop_caption_mode != t.h3_dop_caption_mode
+            ):
                 errors.append(
                     _make_issue(
                         "error",
                         "caching.h3_dop_trigger",
-                        "The H3 text-cache DOP trigger/class must match training.",
+                        "The H3 text-cache DOP trigger, class prompt and caption mode must match training.",
                         label="H3 DOP Cache",
                         page="caching",
                     )

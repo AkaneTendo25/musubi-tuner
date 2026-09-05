@@ -415,7 +415,9 @@ def _build_h3_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_text_visual_max_pixels", str(c.h3_text_visual_max_pixels)]
     if c.h3_cache_guidance_empty:
         cmd.append("--cache_guidance_empty")
-    if c.h3_dop_trigger and c.h3_dop_class_prompt:
+    if c.h3_dop_trigger and c.h3_dop_caption_mode == "bare":
+        cmd += ["--h3_dop_trigger", c.h3_dop_trigger, "--h3_dop_caption_mode", "bare"]
+    elif c.h3_dop_trigger and c.h3_dop_class_prompt:
         cmd += ["--h3_dop_trigger", c.h3_dop_trigger, "--h3_dop_class_prompt", c.h3_dop_class_prompt]
     if c.h3_max_caption_tokens:
         cmd += ["--h3_max_caption_tokens", str(c.h3_max_caption_tokens)]
@@ -762,14 +764,11 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         if t.h3_base_preservation_probability != 1.0:
             cmd += ["--h3_base_preservation_probability", str(t.h3_base_preservation_probability)]
     if not learned_context and t.h3_dop_loss_weight > 0:
-        cmd += [
-            "--h3_dop_loss_weight",
-            str(t.h3_dop_loss_weight),
-            "--h3_dop_trigger",
-            t.h3_dop_trigger,
-            "--h3_dop_class_prompt",
-            t.h3_dop_class_prompt,
-        ]
+        cmd += ["--h3_dop_loss_weight", str(t.h3_dop_loss_weight), "--h3_dop_trigger", t.h3_dop_trigger]
+        if t.h3_dop_caption_mode == "bare":
+            cmd += ["--h3_dop_caption_mode", "bare"]
+        else:
+            cmd += ["--h3_dop_class_prompt", t.h3_dop_class_prompt]
         if t.h3_dop_probability != 1.0:
             cmd += ["--h3_dop_probability", str(t.h3_dop_probability)]
     if t.h3_fuse_frozen_teachers:

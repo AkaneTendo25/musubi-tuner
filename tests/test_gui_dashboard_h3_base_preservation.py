@@ -1492,3 +1492,33 @@ def test_dashboard_accepts_automagic3_with_a_constant_schedule(tmp_path: Path) -
     report = validate_training_config(config)
 
     assert "training.lr_scheduler" not in report["field_warnings"]
+
+
+def test_h3_dop_bare_caption_mode_is_forwarded_without_a_class_prompt(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_dop_trigger = "sks"
+    config.caching.h3_dop_caption_mode = "bare"
+    config.training.h3_dop_trigger = "sks"
+    config.training.h3_dop_caption_mode = "bare"
+    config.training.h3_dop_loss_weight = 0.02
+
+    cache_command = build_cache_text_cmd(config)
+    cache_script = next(
+        index for index, value in enumerate(cache_command) if value.endswith("minimax_h3_cache_text_encoder_outputs.py")
+    )
+    cache_args = create_cache_text_parser().parse_args(cache_command[cache_script + 1 :])
+    train_command = build_training_cmd(config)
+    train_script = next(index for index, value in enumerate(train_command) if value.endswith("minimax_h3_train_network.py"))
+    train_args = create_parser().parse_args(train_command[train_script + 1 :])
+
+    assert cache_args.h3_dop_caption_mode == "bare"
+    assert cache_args.h3_dop_class_prompt == ""
+    assert train_args.h3_dop_caption_mode == "bare"
+    assert train_args.h3_dop_class_prompt == ""
+    report = validate_training_config(config)
+    assert "training.h3_dop_trigger" not in report["field_errors"]
+
+    config.caching.h3_dop_caption_mode = "class"
+    config.caching.h3_dop_class_prompt = "woman"
+    report = validate_training_config(config)
+    assert "caching.h3_dop_trigger" in report["field_errors"]

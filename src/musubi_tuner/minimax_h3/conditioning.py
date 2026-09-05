@@ -714,6 +714,7 @@ class MiniMaxH3ConditioningEncoder:
         include_qwen_control_dropout: bool = False,
         dop_trigger: str | None = None,
         dop_class_prompt: str | None = None,
+        dop_caption_mode: str = "class",
     ) -> tuple[dict[str, torch.Tensor], ...]:
         dtype_name = dtype_to_str(self.output_dtype)
         results = []
@@ -751,14 +752,14 @@ class MiniMaxH3ConditioningEncoder:
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
                 H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
-            if dop_trigger is not None and dop_class_prompt is not None:
+            if dop_trigger is not None:
                 if self.task in ("ref2va", "ref2va_omni"):
                     raise ValueError("H3 DOP conditioning is not supported for Ref2VA")
-                dop_caption = rewrite_dop_caption(item.caption, dop_trigger, dop_class_prompt)
+                dop_caption = rewrite_dop_caption(item.caption, dop_trigger, dop_class_prompt or "", dop_caption_mode)
                 dop_hidden, dop_tags = self._encode_prompt(dop_caption, images, references, qwen_controls=qwen_controls)
                 tensors[f"varlen_{H3_DOP_TEXT_HIDDEN_KEY}_{dtype_name}"] = dop_hidden
                 tensors[f"varlen_{H3_DOP_TEXT_TOKEN_TAGS_KEY}_int64"] = dop_tags
-                tensors[H3_DOP_CONFIG_CACHE_KEY] = dop_config_identity(dop_trigger, dop_class_prompt)
+                tensors[H3_DOP_CONFIG_CACHE_KEY] = dop_config_identity(dop_trigger, dop_class_prompt or "", dop_caption_mode)
             if aligned_guide_count:
                 tensors[H3_ALIGNED_GUIDE_COUNT_KEY] = torch.tensor(aligned_guide_count, dtype=torch.long)
             if self.keyframe_visuals:

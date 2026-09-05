@@ -173,6 +173,13 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--h3_dop_trigger", type=str, default="", help="standalone trigger replaced in the cached DOP caption")
     parser.add_argument("--h3_dop_class_prompt", type=str, default="", help="class phrase substituted for --h3_dop_trigger")
+    parser.add_argument(
+        "--h3_dop_caption_mode",
+        type=str,
+        default="class",
+        choices=["class", "bare"],
+        help="how the DOP caption is derived: class replaces the trigger with --h3_dop_class_prompt, bare removes it",
+    )
     add_image_training_arguments(parser, text_visual=True)
     return parser
 
@@ -190,7 +197,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--h3_text_visual_max_pixels must be non-negative")
     if args.h3_max_caption_tokens < 0:
         parser.error("--h3_max_caption_tokens must be non-negative")
-    if bool(args.h3_dop_trigger) != bool(args.h3_dop_class_prompt):
+    args.h3_dop_trigger = args.h3_dop_trigger.strip()
+    args.h3_dop_class_prompt = " ".join(args.h3_dop_class_prompt.split())
+    if args.h3_dop_caption_mode == "bare":
+        if args.h3_dop_class_prompt:
+            parser.error("--h3_dop_caption_mode bare takes no --h3_dop_class_prompt")
+        if not args.h3_dop_trigger:
+            parser.error("--h3_dop_caption_mode bare requires --h3_dop_trigger")
+    elif bool(args.h3_dop_trigger) != bool(args.h3_dop_class_prompt):
         parser.error("--h3_dop_trigger and --h3_dop_class_prompt must be supplied together")
     if args.h3_dop_trigger and args.task in {"ref2va", "ref2va_omni"}:
         parser.error("H3 DOP is not supported for Ref2VA")
@@ -240,6 +254,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 include_qwen_control_dropout=args.h3_qwen_control_dropout,
                 dop_trigger=args.h3_dop_trigger or None,
                 dop_class_prompt=args.h3_dop_class_prompt or None,
+                dop_caption_mode=args.h3_dop_caption_mode,
             ),
             len(batch),
             "conditioning encoder",
@@ -310,7 +325,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
                     if not torch.equal(
                         handle.get_tensor(H3_DOP_CONFIG_CACHE_KEY),
-                        dop_config_identity(args.h3_dop_trigger, args.h3_dop_class_prompt),
+                        dop_config_identity(args.h3_dop_trigger, args.h3_dop_class_prompt, args.h3_dop_caption_mode),
                     ):
                         return False
                 # The control-free twin is part of the cache identity in one

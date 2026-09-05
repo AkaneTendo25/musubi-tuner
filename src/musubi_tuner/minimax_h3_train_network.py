@@ -1340,6 +1340,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._velocity_error_ratios: dict[int, list[float]] = {}
         self._branch_drift: dict[int, list] = {}
         self._prompted_drift_ratios: dict[int, list[float]] = {}
+        self._base_branch_stats: dict[int, list[tuple[float, float, float, float]]] = {}
         self._validation_network = None
         self._adapter_network = None
         self._adapter_prompt_only = False
@@ -1746,6 +1747,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._rollout_probe_done = set()
         self._branch_drift = {}
         self._prompted_drift_ratios = {}
+        self._base_branch_stats = {}
 
         block_swap_active = bool(self.blocks_to_swap)
         transformer_was_training = transformer.training
@@ -1935,6 +1937,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         for bin_index, ratios in sorted(self._prompted_drift_ratios.items()):
             if ratios:
                 metrics[f"val/drift/prompted_rel/bin{bin_index}"] = sum(ratios) / len(ratios)
+        # Properties of the frozen base alone; constant over a run and reported for the
+        # reference check described at val/base in the docs.
+        base_stats = [row for rows in self._base_branch_stats.values() for row in rows]
+        if base_stats:
+            metrics["val/base/empty_rms"] = sum(row[0] for row in base_stats) / len(base_stats)
+            metrics["val/base/prompted_rms"] = sum(row[1] for row in base_stats) / len(base_stats)
+            metrics["val/base/cos_prompted_empty"] = sum(row[3] for row in base_stats) / len(base_stats)
+            field_rel = [row[2] / row[1] for row in base_stats if row[1] > 0.0]
+            if field_rel:
+                metrics["val/base/field_rel"] = sum(field_rel) / len(field_rel)
+            for bin_index, rows in sorted(self._base_branch_stats.items()):
+                metrics[f"val/base/empty_rms/bin{bin_index}"] = sum(row[0] for row in rows) / len(rows)
+                metrics[f"val/base/prompted_rms/bin{bin_index}"] = sum(row[1] for row in rows) / len(rows)
+                rel = [row[2] / row[1] for row in rows if row[1] > 0.0]
+                if rel:
+                    metrics[f"val/base/field_rel/bin{bin_index}"] = sum(rel) / len(rel)
+                metrics[f"val/base/cos_prompted_empty/bin{bin_index}"] = sum(row[3] for row in rows) / len(rows)
         pooled_drift = [ratio for ratios in self._prompted_drift_ratios.values() for ratio in ratios]
         with_std("val/drift/prompted_rel", pooled_drift)
         trigger_items = getattr(self, "_trigger_items", None) or {}
@@ -2663,6 +2682,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if adapted_prompted is not None and adapted_empty is not None:
             adapted_pair = (adapted_prompted.detach().cpu(), adapted_empty.detach().cpu())
         base_pair = self._field_base_branches.get(key)
+        if base_pair is not None:
+            # The base's own two branches, as a check that the empty-prompt reference every
+            # field metric and anchor measures against is a sane one: comparable in size to
+            # the prompted prediction, neither vanishing nor exploding, and not its copy.
+            base_stats = getattr(self, "_base_branch_stats", None)
+            if base_stats is None:
+                base_stats = self._base_branch_stats = {}
+            base_stats.setdefault(sigma_bin.index, []).append(
+                (
+                    self._masked_rms(base_pair[1], video_mask),
+                    self._masked_rms(base_pair[0], video_mask),
+                    self._masked_rms(base_pair[0] - base_pair[1], video_mask),
+                    self._masked_cosine(base_pair[0], base_pair[1], video_mask),
+                )
+            )
         if adapted_prompted is not None and inputs.video_target is not None:
             target = inputs.video_target.to(device=adapted_prompted.device, dtype=torch.float32)
             error, _ = masked_squared_error_sum(adapted_prompted.float(), target, video_mask)
@@ -2991,8 +3025,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_dop_loss_weight must be finite and non-negative")
         if not math.isfinite(args.h3_dop_probability) or not 0 < args.h3_dop_probability <= 1:
             raise ValueError("--h3_dop_probability must be finite and lie in (0, 1]")
+        args.h3_dop_trigger = args.h3_dop_trigger.strip()
+        args.h3_dop_class_prompt = " ".join(args.h3_dop_class_prompt.split())
         if args.h3_dop_loss_weight > 0:
-            if not args.h3_dop_trigger or not args.h3_dop_class_prompt:
+            if args.h3_dop_caption_mode == "bare":
+                if not args.h3_dop_trigger:
+                    raise ValueError("--h3_dop_loss_weight with --h3_dop_caption_mode bare requires --h3_dop_trigger")
+                if args.h3_dop_class_prompt:
+                    raise ValueError("--h3_dop_caption_mode bare takes no --h3_dop_class_prompt")
+            elif not args.h3_dop_trigger or not args.h3_dop_class_prompt:
                 raise ValueError("--h3_dop_loss_weight requires --h3_dop_trigger and --h3_dop_class_prompt")
             if args.h3_training_mode in {"ref2va", "ref2va_omni"}:
                 raise ValueError("H3 DOP is not supported for Ref2VA")
@@ -5563,15 +5604,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             ]
             if missing_dop:
                 raise KeyError(
-                    "H3 DOP requires text caches written with --h3_dop_trigger and --h3_dop_class_prompt; missing "
+                    "H3 DOP requires text caches written with --h3_dop_trigger and --h3_dop_class_prompt or --h3_dop_caption_mode bare; missing "
                     + ", ".join(missing_dop)
                 )
             cached_identity = batch[H3_DOP_CONFIG_KEY]
             if isinstance(cached_identity, (list, tuple)):
                 cached_identity = cached_identity[0]
             cached_identity = cached_identity.reshape(-1).cpu()
-            if not torch.equal(cached_identity, dop_config_identity(args.h3_dop_trigger, args.h3_dop_class_prompt)):
-                raise ValueError("H3 DOP cache identity does not match the requested trigger/class pair; re-cache conditioning")
+            if not torch.equal(
+                cached_identity, dop_config_identity(args.h3_dop_trigger, args.h3_dop_class_prompt, args.h3_dop_caption_mode)
+            ):
+                raise ValueError(
+                    "H3 DOP cache identity does not match the requested trigger, class prompt and caption mode; re-cache conditioning"
+                )
         # H2D-only LoRA rings self-heal at same-direction forward boundaries.
         # Classic swap (and the dense trainable ring) instead expects backward
         # to restore the training layout and must explicitly enter forward-only
@@ -6498,6 +6543,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_dop_probability": str(args.h3_dop_probability),
             "ss_h3_dop_trigger": args.h3_dop_trigger or "none",
             "ss_h3_dop_class_prompt": args.h3_dop_class_prompt or "none",
+            "ss_h3_dop_caption_mode": args.h3_dop_caption_mode,
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
             "ss_h3_sigma_sqrt_max_weight": str(args.h3_sigma_sqrt_max_weight),
@@ -7383,6 +7429,13 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--h3_dop_trigger", type=str, default="", help="trigger used to identify the matching DOP cache")
     parser.add_argument("--h3_dop_class_prompt", type=str, default="", help="class phrase used to identify the matching DOP cache")
+    parser.add_argument(
+        "--h3_dop_caption_mode",
+        type=str,
+        default="class",
+        choices=["class", "bare"],
+        help="DOP caption mode the text cache was written with: class (trigger replaced by the class prompt) or bare (trigger removed)",
+    )
     parser.add_argument(
         "--crepa",
         nargs="*",

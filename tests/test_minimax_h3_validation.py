@@ -994,6 +994,13 @@ def test_trigger_probe_reports_the_conditional_gain_and_leaves_the_main_metrics_
     assert metrics["val/trigger/err_gain"] == pytest.approx(1.0 - metrics["val/velocity_err_rel"], abs=1e-5)
     # The bare pass never touched the main pools.
     assert metrics["val/field"] == pytest.approx((2.0 - 0.25) / 0.75, abs=1e-5)
+    # The base alone: prompted 1x, empty 0.25x of the latents, so the field is 0.75 of the
+    # prompted RMS and the two branches are parallel.
+    assert metrics["val/base/field_rel"] == pytest.approx(0.75, abs=1e-5)
+    assert metrics["val/base/cos_prompted_empty"] == pytest.approx(1.0, abs=1e-5)
+    assert metrics["val/base/empty_rms"] == pytest.approx(0.25 * metrics["val/base/prompted_rms"], rel=1e-4)
+    for name in ("empty_rms", "prompted_rms", "field_rel", "cos_prompted_empty"):
+        assert any(key.startswith(f"val/base/{name}/bin") for key in metrics), name
 
 
 def test_trigger_probe_needs_the_field_probe():

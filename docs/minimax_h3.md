@@ -1069,8 +1069,12 @@ accelerate launch minimax_h3_train_network.py ... \
   --h3_dop_loss_weight 0.02 --h3_dop_probability 0.25
 ```
 
-The trigger must occur as a standalone term in every cached caption. The cache records an identity for the exact trigger/class
-pair and training rejects stale or mismatched caches. DOP is currently supported for the T2VA/FL2VA family, not Ref2VA. It adds
+With `--h3_dop_caption_mode bare` on both commands the trigger is removed instead of replaced, and no class prompt is
+given: `sks woman walking in a park` becomes `woman walking in a park` and `xyz style. A wide shot` becomes
+`A wide shot`. This is the form for a trigger that names a global look rather than a subject class.
+
+The trigger must occur as a standalone term in every cached caption. The cache records an identity for the exact trigger,
+class prompt and caption mode, and training rejects stale or mismatched caches. DOP is currently supported for the T2VA/FL2VA family, not Ref2VA. It adds
 one frozen and one trainable transformer pass on active steps; the trainable DOP pass is backpropagated before the ordinary pass
 so variable prompt lengths remain compatible with activation checkpointing and block swapping.
 
@@ -1629,6 +1633,7 @@ field metrics need `--h3_validation_field_probe` or `--h3_validation_rollout_pro
 | `val/velocity_err_rel` | field probe | Adapted error over the base's error on the same target. | below 1 |
 | `val/drift/prompted_rel` | field probe | Distance of the prompted prediction from the base's, relative to the base's field length. | below 0.8; near 1 means collapse |
 | `val/drift/empty` | field probe | Distance of the empty-prompt prediction from the base's. | near 0 with an anchor |
+| `val/base/empty_rms`, `val/base/prompted_rms`, `val/base/field_rel`, `val/base/cos_prompted_empty` (+ `/bin{k}`) | field probe | The frozen base alone: RMS of its empty-prompt and prompted predictions, field length over the prompted RMS, and the cosine between the two. A check of the reference every anchor and field metric uses. | constant over a run; empty RMS comparable to prompted RMS, cosine well below 1 |
 | `val/trigger/drift_gain`, `val/trigger/err_gain` | bare dataset config | Prompted drift with the trigger minus without; fit improvement with the trigger minus without. | above 0 when the concept is conditional; zero or negative when the change is unconditional |
 | `val/trigger/drift_gain/bin{k}`, `val/trigger/drift_bare`, `val/trigger/err_rel_bare`, `val/trigger/pairs` | bare dataset config | The same per sigma bin; the bare-caption values; the number of paired items. | — |
 | `val/rollout/field`, `val/rollout/field_cos` | rollout probe | Field length and direction at the states the adapted sampler reaches. | length above 0.5, cosine near 1; do not judge the floor by the length alone |
