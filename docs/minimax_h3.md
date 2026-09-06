@@ -50,6 +50,9 @@ Two released transformers, with different conditioning contracts:
   - [Sampling during FL2VA training](#sampling-during-fl2va-training)
   - [Diagnostics](#diagnostics)
   - [Train a learned context](#train-a-learned-context)
+    - [Without an existing dataset](#without-an-existing-dataset)
+    - [With an existing dataset](#with-an-existing-dataset)
+    - [Train](#train)
   - [Train a slider LoRA](#train-a-slider-lora)
   - [Full-parameter BF16 training](#full-parameter-bf16-training)
 - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
@@ -373,16 +376,20 @@ cache_directory = "/data/cache"
 target_frames = [39]
 ```
 
-The three directories must contain basename-matched files. To condition on video without audio, declare only
-`source_video_directory`; to condition only on audio, declare only `source_audio_directory`. Declare both and set
-`source_video_audio_paired = true` to combine them into one synchronized AV reference. To use the soundtrack embedded in each
-source video instead, declare `source_video_directory`, set `source_modalities = ["video", "audio"]`, and set
-`source_video_audio_embedded = true`; use `source_modalities = ["audio"]` instead to retain only that embedded soundtrack. Do
-not also declare `source_audio_directory`. A source directory may contain numbered
-same-modality references such as `X_0.png` and `X_1.png`. An audio-only reference set — a voice clip and a caption, with no image or video reference — is legal for training
-(**experimental**): the released inference distribution always pairs reference audio with an image or video, so a LoRA trained
-this way runs off the base model's reference statistics and needs careful validation. Inference guards are unchanged:
-`--reference_audio` still requires `--reference_image` or `--reference_video`.
+The three directories must contain basename-matched files. A source directory may contain numbered same-modality
+references such as `X_0.png` and `X_1.png`.
+
+- Video reference without audio: declare only `source_video_directory`.
+- Audio reference only: declare only `source_audio_directory`.
+- Separate video and audio files as one synchronized AV reference: declare both and set
+  `source_video_audio_paired = true`.
+- The soundtrack embedded in each source video: declare `source_video_directory`, set
+  `source_modalities = ["video", "audio"]` and `source_video_audio_embedded = true`; `source_modalities = ["audio"]`
+  keeps only that soundtrack. Do not also declare `source_audio_directory`.
+- Audio-only reference set (a voice clip and a caption, no image or video reference): accepted for training
+  (**experimental**). The released inference always pairs reference audio with an image or video, so such a LoRA runs off
+  the base model's reference statistics; validate it carefully. Inference guards are unchanged: `--reference_audio`
+  still requires `--reference_image` or `--reference_video`.
 
 Both caches record which reference files produced them, so swapping, reordering, or editing a reference rebuilds that item under
 `--skip_existing`.
@@ -488,19 +495,20 @@ baseline before relying on the recipe.
 ### Loss masks
 
 To restrict video or image loss to selected regions, set `loss_mask_directory` to a directory of masks with matching target
-basenames, or set `default_loss_mask_path` as a fallback. A JSONL item may override either with `loss_mask_path` (the alias
-`video_loss_mask_path` is also accepted). A mask may be a still image, video, or frame directory; still images repeat across the
-clip and shorter mask sequences repeat their last frame. White pixels contribute at full strength, black pixels do not,
-and grayscale values provide continuous weights between 0 and 1. The weighted loss is normalized by the sum of mask
-weights, so softening a mask changes the spatial emphasis without also changing the effective learning rate.
-During latent caching, `--h3_loss_mask_pooling max|average|nearest` controls how pixel weights are reduced to the H3 latent
-grid. `max` preserves small selected regions, `average` preserves their fractional coverage, and `nearest` samples without
-mixing neighboring values. Training defaults to `--h3_loss_mask_normalization weighted`; select `full` to divide by the full
-latent element count so reducing mask coverage also proportionally reduces total gradient strength. Changing the pooling
-mode invalidates matching masked latent caches automatically.
-Mask images with alpha use that channel automatically; `loss_mask_use_alpha = true` instead uses a target image's alpha when no
-external mask is available. `loss_mask_invert = true` reverses the mask. Masks are aligned
-with the target crop during caching and pooled over H3's 5/17-frame latent windows.
+basenames, or set `default_loss_mask_path` as a fallback. A JSONL item may override either with `loss_mask_path` (alias
+`video_loss_mask_path`).
+
+- A mask may be a still image, a video, or a frame directory. Still images repeat across the clip; shorter mask
+  sequences repeat their last frame. Mask images with alpha use that channel; `loss_mask_use_alpha = true` uses the
+  target image's alpha when no external mask exists; `loss_mask_invert = true` reverses the mask.
+- White pixels count at full strength, black pixels not at all, grayscale gives weights between 0 and 1. The loss is
+  normalized by the sum of mask weights, so softening a mask changes the spatial emphasis, not the effective
+  learning rate. `--h3_loss_mask_normalization full` divides by the full latent element count instead, so less
+  coverage also means less total gradient.
+- During latent caching `--h3_loss_mask_pooling max|average|nearest` reduces pixel weights to the latent grid: `max`
+  keeps small regions, `average` keeps their fractional coverage, `nearest` samples without mixing. Changing the
+  pooling mode invalidates matching masked latent caches. Masks are aligned with the target crop during caching and
+  pooled over H3's 5/17-frame latent windows.
 
 ```toml
 [general]
@@ -1019,7 +1027,7 @@ Every objective here is off unless its flag is given; a run that names none of t
 | `--h3_rollout_stop_shifted` | Draw the stop sigma uniformly on the shifted video schedule instead of the shared unshifted one. Video and audio stay synchronized either way. |
 | `--h3_rollout_fused_teacher` | Compute the student and teacher predictions for one supervised state in a single pass over the blocks, so each swapped block is streamed once per state instead of once per arm. May increase transient memory. Rejected together with `--h3_int8_attention aux` and with block-sparse attention (`--h3_block_sparse_kv_fraction` or `--h3_block_sparse_threshold` above `0`), whose per-sequence attention plan the fused pass cannot keep separate per arm. |
 | `--h3_rollout_field_floor 0.0` | Length floor on a frozen-null proxy of the guidance field at the supervised rollout states: `W * relu(1 - ‖g' - e‖ / ‖g - e‖)^2` with the frozen base's prompted `g` and empty `e` and the student's prompted `g'` at the same state. Details below. |
-| `--h3_rollout_teacher_magnitude_weight 1.0` | Below `1` the rollout teacher term is split in field space against the frozen empty branch: direction (the student's field rescaled to the teacher's field length, matched to the teacher's field; no gradient on the length) plus `M *` a separate magnitude term. `0` takes the teacher's direction only and leaves the field's length to the floor, removing the measured conflict between the two. Needs `--h3_rollout_field_floor` above `0`. See [Field length floor](#field-length-floor). |
+| `--h3_rollout_teacher_magnitude_weight 1.0` | Below `1` the rollout teacher term is split in field space against the frozen empty branch: direction (the student's field rescaled to the teacher's field length, matched to the teacher's field; no gradient on the length) plus `M *` a separate magnitude term. `0` takes the teacher's direction only and leaves the field's length to the floor, so the two terms do not oppose each other. Needs `--h3_rollout_field_floor` above `0`. See [Field length floor](#field-length-floor). |
 | `--h3_rollout_field_floor_direction {self,teacher}` | Which direction the floor measures the student's field along. `self` (default) floors the plain length, whose gradient lengthens the field along the student's own current direction. `teacher` floors the projection of the student's field onto the privileged teacher's field at the same state, so lengthening in a wrong direction earns nothing and the gradient turns the field toward the teacher as it lengthens it. No extra forward. Needs the floor above `0`. |
 | `--h3_rollout_field_floor_sigma_max 1.0` | Apply the floor only at supervised states whose shifted video sigma is at most this value; states above it drop out of the floor's mean. Needs the floor above `0`. |
 | `--h3_rollout_field_floor_sigma_min 0.0` | Apply the floor only at supervised states whose shifted video sigma is at least this value; states below it drop out of the floor's mean. Must lie below `--h3_rollout_field_floor_sigma_max`. Needs the floor above `0`. |
@@ -1385,7 +1393,9 @@ Measured on one H100 80 GB (batch 1, 39 frames, 640x640 buckets, T2VA captions, 
 | 48 | ordinary backward-capable swap | 9-10 s | 8.5 GiB | 10.5 GiB |
 
 The transformer keeps two of its 50 blocks resident, so `--blocks_to_swap` is capped at 48. Each swapped block frees about
-1 GiB. The ring at 48 costs about 40% more step time than at 8; the ordinary swap at 48 costs about 3.5x. Dense training currently supports one process/GPU. For Ref2VA, use the Ref2VA BF16 checkpoint, a `ref2va`
+1 GiB. The ring at 48 costs about 40% more step time than at 8; the ordinary swap at 48 costs about 3.5x.
+
+Dense training currently supports one process/GPU. For Ref2VA, use the Ref2VA BF16 checkpoint, a `ref2va`
 conditioning cache plus reference latents, and `--h3_training_mode ref2va`.
 
 ## Training a guidance-distilled model
@@ -1452,16 +1462,18 @@ The contrastive target with a fixed reference point. The empty-prompt prediction
 the target is normalised against it, and an anchor term holds the student's empty-prompt prediction at the frozen
 one.
 
-- **Applies to:** both checkpoints, same flags. Anchor weight 1.0 with a reference condition, 0.3 with a trigger
-  word.
+- **Applies to:** both checkpoints, same flags. Anchor weight 1.0 with a reference condition (Ref2VA); 0.5 with a
+  trigger word under the sigma gates (FL2VA).
 - **Advantages:** holds the field at a fixed reference point for the cost of one term. The anchor gradient is nearly
-  orthogonal to
-  the data gradient. What the adapter learns stays conditional on the prompt.
-- **Disadvantages:** with anchor 1.0 and a weak condition (one trigger word) the concept is not learned; anchor 0.3
-  learns it partially. Cost about **1.8x** on its own.
+  orthogonal to the data gradient. What the adapter learns stays conditional on the prompt.
+- **Disadvantages:** with a weak condition (one trigger word) the anchor also suppresses the concept unless it is
+  limited to high sigma: without the sigma gates anchor 1.0 learns no concept and anchor 0.3 learns it partially; with
+  the gates at 0.9 the concept is weaker than H-OPSD's but close. Cost about **1.8x** on its own, less with the gates.
 - **Flags:** `--h3_guidance_loss_form normalized`, `--h3_guidance_null_source frozen`,
-  `--h3_guidance_null_anchor_weight W`; optionally `--h3_guidance_null_anchor_weight_end` (linear ramp of the weight
-  over training), `--h3_guidance_null_anchor_probability`, `--h3_guidance_loss_schedule constant`,
+  `--h3_guidance_null_anchor_weight W`; on FL2VA `--h3_guidance_null_anchor_sigma_min 0.9` and
+  `--h3_rollout_field_floor_sigma_min 0.9` (anchor and floor only where the field lives); optionally
+  `--h3_guidance_null_anchor_weight_end` (linear ramp of the weight over training),
+  `--h3_guidance_null_anchor_probability`, `--h3_guidance_loss_schedule constant`,
   `--h3_caption_dropout_rate 0` (dropout trains the branch the anchor holds), `--h3_fuse_frozen_teachers` (only with
   `--h3_base_preservation_loss_weight` above 0, whose teacher it batches into the same forward; rejected otherwise).
 
@@ -1579,13 +1591,13 @@ The frozen-null target with the anchor, rollout supervision against a privileged
 together. The anchor fixes the reference point, the teacher sets the direction, the floor holds the length.
 
 - **Applies to:** both checkpoints. Ref2VA: reference privilege, anchor 1.0, direction-only teacher. FL2VA: keyframe
-  privilege, anchor 0.3.
+  privilege, anchor 0.5 with the anchor and the floor gated to shifted sigma 0.9 and above.
 - **Advantages:** the only recipe that constrains length, direction and the null branch at once. Keeps a longer
   field than rollout supervision alone at the same output quality. What it learns stays conditional on the prompt.
 - **Disadvantages:** the highest cost, three to four forwards per step: about **2.2x** on FL2VA, **3.5x to 4x** on
   Ref2VA. The anchor limits how much of an unconditional change (a rendering style) can be learned: with a trigger
-  word, anchor 0.3 gives a partial concept, anchor 1.0 none. Reference conditioning takes anchor 1.0, a trigger word
-  0.3.
+  word the concept stays weaker than H-OPSD's even under the sigma gates, and without the gates anchor 0.3 gives a
+  partial concept and anchor 1.0 none. Reference conditioning takes anchor 1.0 at every sigma.
 - **Flags:** the union of the three sections above; the exact set is under *Current recommended settings*.
 
 #### Stability controls
@@ -1716,30 +1728,36 @@ quality, shorter field; the concept also shows up on prompts without the trigger
 Cheaper: drop the two `--h3_guidance_*` flags (pure D-OPSD), about 1.7x a plain step. Same fit, drift, field and
 conditionality; slightly weaker concept.
 
-**FL2VA, concept (e.g. a style or an identity) behind a trigger word: NAFP, anchor 0.3, sigma-gated.** About
-1.9x a plain step. Concept close to H-OPSD's but not equal, base output quality, field preserved, no concept on
-prompts without the trigger. The two `*_sigma_min` flags apply the null anchor and the field floor only at shifted
-video sigma 0.9 and above, where the base's guidance field lives; below it the anchor only suppressed texture.
-Training past the point where the concept has settled adds memorisation and artifacts. A LoRA multiplier above 1
-at inference adds artifacts, not concept.
+**FL2VA, concept (e.g. a style or an identity) behind a trigger word: NAFP, anchor 0.5, sigma-gated.** About
+1.9x a plain step. Weaker concept than H-OPSD, base output quality, field preserved, no concept on prompts without
+the trigger. The two `*_sigma_min` flags apply the null anchor and the field floor only at shifted video sigma 0.9
+and above, where the guidance field lives. Stop when the concept has settled: later checkpoints add memorisation
+and artifacts. Keep the LoRA multiplier at 1 at inference.
 
 ```shell
 --dit minimax_h3_fl2va_bf16.safetensors \
 --h3_rollout_supervision --h3_rollout_teacher_config teacher.toml --h3_rollout_teacher_privilege keyframe \
 --h3_rollout_probability 0.5 --h3_rollout_steps 2 --h3_rollout_window 1 --h3_rollout_fused_teacher \
 --h3_guidance_distillation_scale 5.0 --h3_guidance_loss_schedule constant --h3_guidance_loss_form normalized \
---h3_guidance_null_source frozen --h3_guidance_null_anchor_weight 0.3 --h3_caption_dropout_rate 0 \
+--h3_guidance_null_source frozen --h3_guidance_null_anchor_weight 0.5 --h3_caption_dropout_rate 0 \
 --h3_rollout_field_floor 0.3 \
 --h3_guidance_null_anchor_sigma_min 0.9 --h3_rollout_field_floor_sigma_min 0.9
 ```
 
-Variations. Without the two `*_sigma_min` flags, 2.2x a plain step: the same fit, drift and conditionality, weaker
-concept. Gate at 0.8: between the two. Gate at 0.93 or above: drift past 0.9, artifacts. Gating the anchor alone
-and leaving the floor everywhere: the same concept, higher drift. `--h3_guidance_scale_sigma_max 0.9`: better fit,
-shorter field, half the conditional gain (part of the concept leaks to prompts without the trigger).
-`--h3_rollout_steps 4 --h3_rollout_window 2`, 3x a plain step: no metric changes. The gates do not transfer to
-Ref2VA: there they cost transformation quality at equal cleanliness in blind pairs, so the Ref2VA recipe above
-keeps the anchor at every sigma.
+Variations.
+
+- Anchor weight: 0.3 gives the same concept with less conditionality and more drift; 1.0 is cleaner but the concept
+  weakens toward the base's own look.
+- Gate threshold: 0.8 sits between the gated and ungated recipes; 0.93 and above pushes `val/drift/prompted_rel`
+  past 0.9 and produces artifacts. Gating the anchor alone (floor at every sigma) keeps the concept and raises
+  drift.
+- Without the two `*_sigma_min` flags (anchor 0.3): 2.2x a plain step, the same fit, drift and conditionality,
+  weaker concept.
+- `--h3_guidance_scale_sigma_max 0.9`: better fit, shorter field, half the conditional gain; part of the concept
+  appears on prompts without the trigger.
+- `--h3_rollout_steps 4 --h3_rollout_window 2`: 3x a plain step, no metric changes.
+- Do not use the sigma gates on Ref2VA: they reduce transformation quality there. The Ref2VA recipe above keeps the
+  anchor at every sigma.
 
 ## Inference
 
