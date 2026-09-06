@@ -297,7 +297,7 @@ def test_teacher_without_any_privilege_is_rejected_before_the_model_loads(tmp_pa
     # Both escape routes are named, because auto measured both channels and
     # reporting only the one it fell back to would hide half the diagnosis.
     assert "qwen_control_*" in str(failure.value)
-    assert "--ref2va_variant_b" in str(failure.value)
+    assert "minimax_h3_prepare_rollout_teacher.py" in str(failure.value)
     assert cache.channel is None
 
 

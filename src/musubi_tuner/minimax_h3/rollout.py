@@ -537,7 +537,7 @@ class H3RolloutTeacherCache:
                 f"{len(degenerate_qwen)} of {len(self._paths)} teacher items declare qwen_control_* visuals that "
                 f"carry no information: {shown}{more}. The channel resolves on key names, so such a corpus would "
                 "otherwise train to completion with a teacher no better informed than the student. Re-cache the "
-                "teacher arm with real control visuals (experiments/nullfield/dopsd_prep.py)."
+                "teacher arm with real, non-empty control visuals."
             )
         self._channel = resolved
         # Entries read before the channel was known carried every optional key.
@@ -559,12 +559,11 @@ class H3RolloutTeacherCache:
         more = "" if len(unprivileged) <= 5 else f" (and {len(unprivileged) - 5} more)"
         fixes = {
             "qwen": (
-                "variant A -- re-cache the teacher arm with qwen_control_* assets in its TEXT cache "
-                "(experiments/nullfield/dopsd_prep.py)"
+                "Qwen teacher -- re-cache the teacher arm with real qwen_control_* assets in its TEXT cache"
             ),
             "reference": (
-                "variant B -- re-cache the teacher arm with extra target frames as references in its LATENT cache "
-                "(experiments/nullfield/dopsd_prep.py --ref2va --ref2va_variant_b)"
+                "reference teacher -- run minimax_h3_prepare_rollout_teacher.py, then cache its extra target frames "
+                "as references in a separate LATENT cache"
             ),
             "keyframe": (
                 "endpoint teacher -- re-cache the teacher arm's TEXT outputs with --task fl2va while the student keeps "

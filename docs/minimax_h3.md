@@ -1476,10 +1476,51 @@ steps run the plain data loss, or the guidance target when one is configured.
 
 ##### Building the teacher dataset
 
-Copy the training dataset config, add the privileged field, give it its own `cache_directory`. On the reference
-channel the teacher's source directory holds more references per clip than the student's, frames from the target
-included. On the caption or keyframe channel the clips are the same, so the teacher reads the student's latents and
-caches only its text presentation:
+Create the teacher view automatically:
+
+```shell
+python minimax_h3_prepare_rollout_teacher.py \
+  --student_config student.toml --output_dir /data/rollout_teacher --mode auto
+```
+
+`auto` selects `ref2va` when a directory dataset has `source_*_directory` references or a video JSONL has
+`control_path_N` references; otherwise it selects `fl2va`. Mixed FL2VA and Ref2VA rows must be prepared separately.
+The command writes `/data/rollout_teacher/teacher.toml` and prints the required next cache step.
+
+**Ref2VA (`reference` privilege).** The command copies every shared image reference and adds two uniformly spaced
+frames from each target video as teacher-only image references. Change the count with `--teacher_frames N`. It gives
+the teacher its own cache directory; run both normal cache commands on `teacher.toml` with `--task ref2va` and the
+same VAE and reference-sizing options used for the student. Do not point `latent_cache_directory` at the student
+cache: the teacher's reference bundle is intentionally different. Preparation fails before extraction if the result
+would exceed H3's limit of nine image references or twelve references in total.
+
+The generated layout is equivalent to:
+
+```text
+/data/student_references/       /data/rollout_teacher/references/dataset_0/
+  clip_0.png                      clip_0.png  # shared
+                                  clip_1.png  # target frame, teacher only
+                                  clip_2.png  # target frame, teacher only
+```
+
+Directory references match the target basename. For `clip.mp4`, use `clip.png` or numeric final suffixes such as
+`clip_0.png`, `clip_1.png`; `clip_reference.png` is invalid. The trainer compares the cached reference counts for
+every item. Merely adding source files without rebuilding the teacher latent cache still produces
+`no extra reference latents`.
+
+For a video JSONL, the command preserves its contiguous `control_path_N` references, resolves relative paths before
+moving the generated JSONL, and appends the extracted frames as new `control_path_N` entries. Each row must have a
+`video_path`.
+
+**FL2VA (`keyframe` privilege).** The command writes a teacher config whose `latent_cache_directory` points to the
+student's existing `t2va` cache and whose `cache_directory` is separate. Do not run the latent cacher again. Cache
+only the teacher text presentation with `--task fl2va`; the teacher then receives the target endpoints already stored
+in the shared latent cache while the student remains text-only.
+
+Train with the original student config and pass the generated config through `--h3_rollout_teacher_config`; select
+`--h3_rollout_teacher_privilege reference` for Ref2VA or `keyframe` for FL2VA.
+
+For reference, the generated FL2VA dataset row has this shape:
 
 ```toml
 [[datasets]]
@@ -1489,10 +1530,8 @@ latent_cache_directory = "/data/cache/fl2va"           # the student's latents, 
 target_frames = [124]
 ```
 
-Cache the teacher config with the same two cache commands and the same sizing options as the training set. Under
-`--skip_existing` the latent command skips items whose cache is present and valid. A dataset that borrows its latents through
-`latent_cache_directory` never purges that directory, with or without the flag. A keyframe teacher
-needs a text cache made with the keyframe task (`--task fl2va` or `i2va`); a reference teacher caches both halves.
+Preparation is separate from training because frame choice defines the teacher's privileged information and must stay
+inspectable and reproducible. Training consumes cached tensors and does not reopen or modify source videos.
 
 #### Field length floor
 
