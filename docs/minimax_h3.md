@@ -1716,10 +1716,12 @@ quality, shorter field; the concept also shows up on prompts without the trigger
 Cheaper: drop the two `--h3_guidance_*` flags (pure D-OPSD), about 1.7x a plain step. Same fit, drift, field and
 conditionality; slightly weaker concept.
 
-**FL2VA, concept (e.g. a style or an identity) behind a trigger word: NAFP, anchor 0.3.** About 2.2x a plain
-step. Weaker concept than H-OPSD, base output quality, field preserved, no concept on prompts without the
-trigger. Training past the point where the concept has settled adds memorisation and artifacts. A LoRA
-multiplier above 1 at inference adds artifacts, not concept.
+**FL2VA, concept (e.g. a style or an identity) behind a trigger word: NAFP, anchor 0.3, sigma-gated.** About
+1.9x a plain step. Concept close to H-OPSD's but not equal, base output quality, field preserved, no concept on
+prompts without the trigger. The two `*_sigma_min` flags apply the null anchor and the field floor only at shifted
+video sigma 0.9 and above, where the base's guidance field lives; below it the anchor only suppressed texture.
+Training past the point where the concept has settled adds memorisation and artifacts. A LoRA multiplier above 1
+at inference adds artifacts, not concept.
 
 ```shell
 --dit minimax_h3_fl2va_bf16.safetensors \
@@ -1727,12 +1729,17 @@ multiplier above 1 at inference adds artifacts, not concept.
 --h3_rollout_probability 0.5 --h3_rollout_steps 2 --h3_rollout_window 1 --h3_rollout_fused_teacher \
 --h3_guidance_distillation_scale 5.0 --h3_guidance_loss_schedule constant --h3_guidance_loss_form normalized \
 --h3_guidance_null_source frozen --h3_guidance_null_anchor_weight 0.3 --h3_caption_dropout_rate 0 \
---h3_rollout_field_floor 0.3
+--h3_rollout_field_floor 0.3 \
+--h3_guidance_null_anchor_sigma_min 0.9 --h3_rollout_field_floor_sigma_min 0.9
 ```
 
-Variations. `--h3_guidance_scale_sigma_max 0.9`, same cost: better fit, shorter field, half the conditional gain
-(part of the concept leaks to prompts without the trigger). `--h3_rollout_steps 4 --h3_rollout_window 2`, 3x a
-plain step: no metric changes. Both together: conditionality gone.
+Variations. Without the two `*_sigma_min` flags, 2.2x a plain step: the same fit, drift and conditionality, weaker
+concept. Gate at 0.8: between the two. Gate at 0.93 or above: drift past 0.9, artifacts. Gating the anchor alone
+and leaving the floor everywhere: the same concept, higher drift. `--h3_guidance_scale_sigma_max 0.9`: better fit,
+shorter field, half the conditional gain (part of the concept leaks to prompts without the trigger).
+`--h3_rollout_steps 4 --h3_rollout_window 2`, 3x a plain step: no metric changes. The gates do not transfer to
+Ref2VA: there they cost transformation quality at equal cleanliness in blind pairs, so the Ref2VA recipe above
+keeps the anchor at every sigma.
 
 ## Inference
 
