@@ -3797,3 +3797,27 @@ def test_null_anchor_weight_end_needs_a_start_weight():
     args = _flag_args("--h3_guidance_null_anchor_weight_end", "0.2")
     with pytest.raises(ValueError, match="needs --h3_guidance_null_anchor_weight above 0"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+_ADDITIVE_FLAGS = (
+    "--h3_guidance_distillation_scale",
+    "3.0",
+    "--h3_guidance_loss_schedule",
+    "constant",
+    "--h3_guidance_loss_form",
+    "additive",
+    "--h3_guidance_null_source",
+    "frozen",
+)
+
+
+def test_additive_form_runs_one_more_frozen_forward_and_fits_the_transplanted_target():
+    frozen_flags = (*_NORMALIZED_FLAGS[:4], "--h3_guidance_null_source", "frozen")
+    normalized_backend, normalized_loss, _, _ = _run_step(*frozen_flags)
+    additive_backend, additive_loss, metrics, _ = _run_step(*_ADDITIVE_FLAGS)
+    # prompt (grad) + frozen empty + frozen prompted, against prompt + frozen empty.
+    assert len(additive_backend.calls) == len(normalized_backend.calls) + 1
+    frozen_prompted = [c for c in additive_backend.calls if c["conditioning"] == "prompt" and not c["grad"]]
+    assert len(frozen_prompted) == 1 and frozen_prompted[0]["adapter"] is False
+    assert torch.isfinite(additive_loss)
+    assert float(additive_loss.detach()) != pytest.approx(float(normalized_loss.detach()))

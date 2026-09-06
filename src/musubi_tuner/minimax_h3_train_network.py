@@ -109,6 +109,7 @@ from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
     cfg_zero_rescaled_empty,
     contrastive_guidance_target,
+    additive_guidance_target,
     guidance_consistent_prediction,
     guidance_scale_for_sigma,
     joint_prediction_loss,
@@ -2319,6 +2320,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             stream="model-forward",
         )
         seed_validation_forward(forward_seed)
+        base_prediction = None
         if args.h3_guidance_distillation_scale is not None:
             missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
             if missing_empty:
@@ -2328,17 +2330,42 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # must use the same INT8-attention calibration or validation measures
             # a different model than training optimizes.
             int8_context = getattr(transformer, "int8_attention_context", None)
-            with (
-                torch.random.fork_rng(devices=fork_devices),
-                int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
-            ):
-                empty_prediction = self._predict(
-                    accelerator,
-                    transformer,
-                    batch,
-                    inputs,
-                    conditioning="empty",
+            if args.h3_guidance_loss_form == "additive":
+                # The additive target is built from the FROZEN base's two branches;
+                # validation mirrors training: both forwards with the adapter off,
+                # each from the same RNG state.
+                validation_network = getattr(self, "_validation_network", None)
+                base_toggle = (
+                    self._runtime_network_toggle(accelerator, validation_network, "--h3_guidance_loss_form additive")
+                    if validation_network is not None
+                    else None
                 )
+                with (
+                    torch.random.fork_rng(devices=fork_devices),
+                    torch.no_grad(),
+                    int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                ):
+                    if base_toggle is not None:
+                        base_toggle(False)
+                    try:
+                        with torch.random.fork_rng(devices=fork_devices):
+                            empty_prediction = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                        base_prediction = self._predict(accelerator, transformer, batch, inputs, conditioning="prompt")
+                    finally:
+                        if base_toggle is not None:
+                            base_toggle(True)
+            else:
+                with (
+                    torch.random.fork_rng(devices=fork_devices),
+                    int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                ):
+                    empty_prediction = self._predict(
+                        accelerator,
+                        transformer,
+                        batch,
+                        inputs,
+                        conditioning="empty",
+                    )
         prediction = self._predict(
             accelerator,
             transformer,
@@ -2347,7 +2374,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             conditioning="prompt",
         )
         if args.h3_guidance_distillation_scale is not None:
-            prediction, loss_inputs = self._guidance_loss_inputs(args, prediction, empty_prediction, inputs)
+            prediction, loss_inputs = self._guidance_loss_inputs(
+                args, prediction, empty_prediction, inputs, base_prediction=base_prediction
+            )
         else:
             loss_inputs = inputs
 
@@ -3006,6 +3035,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise FileNotFoundError(f"--h3_overlay_weights file not found: {overlay_weights}")
         if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
+        if args.h3_guidance_loss_form == "additive":
+            if args.h3_guidance_distillation_scale is None:
+                raise ValueError("--h3_guidance_loss_form additive requires --h3_guidance_distillation_scale")
+            if args.h3_guidance_null_source != "frozen":
+                raise ValueError(
+                    "--h3_guidance_loss_form additive transplants the FROZEN base's field and needs "
+                    "--h3_guidance_null_source frozen"
+                )
+            if args.h3_guidance_cfg_zero:
+                raise ValueError("--h3_guidance_cfg_zero has no meaning for the additive form")
         self._validate_rollout_args(args)
         if args.h3_guidance_null_source != "live" and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_null_source requires --h3_guidance_distillation_scale")
@@ -5040,7 +5079,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return 0.5 * (lower + upper)
         return self._draw_guidance_scale(accelerator, int(inputs.video_sigma.shape[0]))
 
-    def _guidance_loss_inputs(self, args, prediction, empty_prediction, inputs, accelerator=None):
+    def _guidance_loss_inputs(self, args, prediction, empty_prediction, inputs, accelerator=None, base_prediction=None):
         configured_scale = self._configured_guidance_scale(args, accelerator, inputs)
         per_sample = isinstance(configured_scale, torch.Tensor)
         video_sigma = inputs.video_frame_sigma if inputs.video_frame_sigma is not None else inputs.video_sigma
@@ -5074,6 +5113,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             args.h3_guidance_loss_schedule,
             sigma_max=float(getattr(args, "h3_guidance_scale_sigma_max", 1.0)),
         )
+        if args.h3_guidance_loss_form == "additive":
+            # The base's own field, transplanted onto the plain data target:
+            # target = v_data + (S - 1) * (base(prompt) - base(empty)), both branches
+            # frozen. The student is fitted to the data plus a fixed guidance
+            # increment, so the amplification never runs through its own moving
+            # prediction (the normalized form) or through the data's distance from
+            # the null (the contrastive form). What the adapter learns is the data
+            # residual on top of the base's field, not a re-amplified one.
+            if base_prediction is None:
+                raise ValueError("--h3_guidance_loss_form additive needs the frozen base's prompted prediction")
+            true_target = H3ModelPrediction(inputs.video_target, inputs.audio_target)
+            target = additive_guidance_target(
+                true_target,
+                base_prediction,
+                empty_prediction,
+                video_scale,
+                audio_guidance_scale=audio_scale,
+            )
+            return prediction, replace(inputs, video_target=target.video, audio_target=target.audio)
         if args.h3_guidance_loss_form == "contrastive":
             true_target = H3ModelPrediction(inputs.video_target, inputs.audio_target)
             if args.h3_guidance_cfg_zero:
@@ -5773,6 +5831,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     finally:
                         set_enabled(True)
 
+            base_prediction = None
+            if fused_teachers_completed and args.h3_guidance_loss_form == "additive":
+                # The fused pass already evaluated the frozen prompted branch for
+                # base preservation; the additive target reuses it.
+                base_prediction = reference_prediction
             if use_guidance and not fused_teachers_completed:
                 missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
                 if missing_empty:
@@ -5800,13 +5863,28 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     if null_set_enabled is not None:
                         null_set_enabled(False)
                     try:
-                        empty_prediction = self._predict(
-                            accelerator,
-                            transformer,
-                            batch,
-                            inputs,
-                            conditioning="empty",
-                        )
+                        # An inner fork so the empty forward's draws are undone before
+                        # the prompted one: both frozen branches, and the student
+                        # forward after them, then see the same stochastic conditioning.
+                        with torch.random.fork_rng(devices=fork_devices):
+                            empty_prediction = self._predict(
+                                accelerator,
+                                transformer,
+                                batch,
+                                inputs,
+                                conditioning="empty",
+                            )
+                        if args.h3_guidance_loss_form == "additive":
+                            # The additive target also needs the frozen base's
+                            # PROMPTED prediction at this state: one more no-grad
+                            # forward inside the same adapter-off bracket.
+                            base_prediction = self._predict(
+                                accelerator,
+                                transformer,
+                                batch,
+                                inputs,
+                                conditioning="prompt",
+                            )
                     finally:
                         if null_set_enabled is not None:
                             null_set_enabled(True)
@@ -5943,7 +6021,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         loss_inputs = inputs
         if use_guidance:
             prediction, loss_inputs = self._guidance_loss_inputs(
-                args, prediction, empty_prediction, inputs, accelerator=accelerator
+                args, prediction, empty_prediction, inputs, accelerator=accelerator, base_prediction=base_prediction
             )
 
         video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
@@ -7037,11 +7115,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--h3_guidance_loss_form",
-        choices=("normalized", "contrastive"),
+        choices=("normalized", "contrastive", "additive"),
         default="normalized",
         help=(
             "normalized applies flow loss to the reconstructed conditional field; contrastive applies the equivalent "
-            "scale-squared loss magnitude of a direct extrapolated target"
+            "scale-squared loss magnitude of a direct extrapolated target; additive fits the prediction to the data "
+            "target plus (S - 1) times the FROZEN base's own field (base prompted minus base empty at the same state), "
+            "so the guidance increment is transplanted rather than re-amplified from the student. Costs one more "
+            "no-grad forward; needs --h3_guidance_null_source frozen"
         ),
     )
     parser.add_argument(

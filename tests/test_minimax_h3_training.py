@@ -7381,3 +7381,46 @@ def test_masked_rms_survives_a_fully_masked_item():
     trainer = MiniMaxH3NetworkTrainer()
 
     assert trainer._masked_rms(torch.tensor([[1.0, 2.0]]), torch.tensor([[False, False]])) == 0.0
+
+
+def test_h3_additive_guidance_form_transplants_the_frozen_base_field():
+    args = _h3_flag_args(
+        "--h3_guidance_distillation_scale",
+        "4.0",
+        "--h3_guidance_loss_schedule",
+        "constant",
+        "--h3_guidance_loss_form",
+        "additive",
+        "--h3_guidance_null_source",
+        "frozen",
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    latents = torch.randn(2, 4, 1, 2, 2)
+    audio = torch.randn(2, 2, 8, 3)
+    inputs = prepare_joint_noisy_inputs(
+        latents, audio, torch.randn_like(latents), torch.randn_like(audio), torch.tensor([0.4, 0.7])
+    )
+    prediction = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
+    empty = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
+    base = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
+    corrected, loss_inputs = trainer._guidance_loss_inputs(
+        args, prediction, empty, inputs, accelerator=_FakeAccelerator(), base_prediction=base
+    )
+    # The prediction is fitted as is; the target carries the base's field at (S - 1).
+    assert corrected is prediction
+    assert torch.allclose(loss_inputs.video_target, inputs.video_target + 3.0 * (base.video - empty.video))
+    assert torch.allclose(loss_inputs.audio_target, inputs.audio_target + 3.0 * (base.audio - empty.audio))
+    with pytest.raises(ValueError, match="frozen base"):
+        trainer._guidance_loss_inputs(args, prediction, empty, inputs, accelerator=_FakeAccelerator())
+
+
+def test_h3_additive_guidance_form_is_validated():
+    with pytest.raises(ValueError, match="requires --h3_guidance_distillation_scale"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _h3_flag_args("--h3_guidance_loss_form", "additive", "--h3_guidance_null_source", "frozen")
+        )
+    with pytest.raises(ValueError, match="frozen"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _h3_flag_args("--h3_guidance_distillation_scale", "4.0", "--h3_guidance_loss_form", "additive")
+        )
