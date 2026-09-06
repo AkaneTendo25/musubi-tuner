@@ -1373,7 +1373,19 @@ For the trainable ring, add:
 ```
 
 Pinned CPU allocation is substantial and depends on `--blocks_to_swap`; use ordinary backward-capable block swap when the host
-cannot provide it. Dense training currently supports one process/GPU. For Ref2VA, use the Ref2VA BF16 checkpoint, a `ref2va`
+cannot provide it.
+
+Measured on one H100 80 GB (batch 1, 39 frames, 640x640 buckets, T2VA captions, FL2VA checkpoint, Adafactor with
+`--adafactor_triton`, gradient checkpointing; `peak allocated` and `peak reserved` from the trainer's own dense-step log):
+
+| Swap | Scheme | Step time | Peak allocated | Peak reserved |
+| --- | --- | --- | --- | --- |
+| 8 | trainable ring, ring size 2 | 2.6 s | 56.6 GiB | 58.7 GiB |
+| 48 (maximum) | trainable ring, ring size 2 | 3.7 s | 8.5 GiB | 10.4 GiB |
+| 48 | ordinary backward-capable swap | 9-10 s | 8.5 GiB | 10.5 GiB |
+
+The transformer keeps two of its 50 blocks resident, so `--blocks_to_swap` is capped at 48. Each swapped block frees about
+1 GiB. The ring at 48 costs about 40% more step time than at 8; the ordinary swap at 48 costs about 3.5x. Dense training currently supports one process/GPU. For Ref2VA, use the Ref2VA BF16 checkpoint, a `ref2va`
 conditioning cache plus reference latents, and `--h3_training_mode ref2va`.
 
 ## Training a guidance-distilled model
