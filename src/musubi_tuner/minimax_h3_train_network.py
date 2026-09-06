@@ -5115,12 +5115,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         if args.h3_guidance_loss_form == "additive":
             # The base's own field, transplanted onto the plain data target:
-            # target = v_data + (S - 1) * (base(prompt) - base(empty)), both branches
-            # frozen. The student is fitted to the data plus a fixed guidance
-            # increment, so the amplification never runs through its own moving
-            # prediction (the normalized form) or through the data's distance from
-            # the null (the contrastive form). What the adapter learns is the data
-            # residual on top of the base's field, not a re-amplified one.
+            # target = v_data + (1 - 1/S) * (base(prompt) - base(empty)), both
+            # branches frozen (the base's prompted prediction is already guided, so
+            # its field is scaled down by 1/S to the conditional before the data
+            # residual is taken). The student is fitted to the base's guided
+            # prediction plus the data residual, so the amplification never runs
+            # through its own moving prediction (the normalized form) or through
+            # the data's distance from the null (the contrastive form).
             if base_prediction is None:
                 raise ValueError("--h3_guidance_loss_form additive needs the frozen base's prompted prediction")
             true_target = H3ModelPrediction(inputs.video_target, inputs.audio_target)
@@ -7120,8 +7121,9 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "normalized applies flow loss to the reconstructed conditional field; contrastive applies the equivalent "
             "scale-squared loss magnitude of a direct extrapolated target; additive fits the prediction to the data "
-            "target plus (S - 1) times the FROZEN base's own field (base prompted minus base empty at the same state), "
-            "so the guidance increment is transplanted rather than re-amplified from the student. Costs one more "
+            "target plus (1 - 1/S) times the FROZEN base's own field (base prompted minus base empty at the same "
+            "state; the prompted branch is already guided), so the guidance increment is transplanted rather than "
+            "re-amplified from the student. Costs one more "
             "no-grad forward; needs --h3_guidance_null_source frozen"
         ),
     )

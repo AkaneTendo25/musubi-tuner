@@ -7407,10 +7407,10 @@ def test_h3_additive_guidance_form_transplants_the_frozen_base_field():
     corrected, loss_inputs = trainer._guidance_loss_inputs(
         args, prediction, empty, inputs, accelerator=_FakeAccelerator(), base_prediction=base
     )
-    # The prediction is fitted as is; the target carries the base's field at (S - 1).
+    # The prediction is fitted as is; the target carries the base's (already guided) field at (1 - 1/S).
     assert corrected is prediction
-    assert torch.allclose(loss_inputs.video_target, inputs.video_target + 3.0 * (base.video - empty.video))
-    assert torch.allclose(loss_inputs.audio_target, inputs.audio_target + 3.0 * (base.audio - empty.audio))
+    assert torch.allclose(loss_inputs.video_target, inputs.video_target + 0.75 * (base.video - empty.video))
+    assert torch.allclose(loss_inputs.audio_target, inputs.audio_target + 0.75 * (base.audio - empty.audio))
     with pytest.raises(ValueError, match="frozen base"):
         trainer._guidance_loss_inputs(args, prediction, empty, inputs, accelerator=_FakeAccelerator())
 
