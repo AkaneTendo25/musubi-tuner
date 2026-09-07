@@ -1007,6 +1007,109 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        two_teacher_weight = float(t.h3_two_teacher_loss_weight)
+        if not math.isfinite(two_teacher_weight) or two_teacher_weight < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_two_teacher_loss_weight",
+                    "H3 two-teacher loss weight must be finite and non-negative.",
+                    label="H3 Two-Teacher Loss Weight",
+                    page="training",
+                )
+            )
+        elif two_teacher_weight > 0:
+            if not t.h3_two_teacher_weights.strip():
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_two_teacher_weights",
+                        "H3 two-teacher distillation requires the styled teacher's LoRA.",
+                        label="H3 Two-Teacher Weights",
+                        page="training",
+                    )
+                )
+            if not t.h3_dop_trigger.strip() or t.h3_dop_caption_mode != "bare":
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_two_teacher_loss_weight",
+                        "H3 two-teacher distillation needs a trigger-free text cache: set the DOP trigger and the bare caption mode.",
+                        label="H3 Two-Teacher Loss Weight",
+                        page="training",
+                    )
+                )
+            if t.h3_training_mode in {"ref2va", "ref2va_omni"}:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_two_teacher_loss_weight",
+                        "H3 two-teacher distillation is not supported for Ref2VA.",
+                        label="H3 Two-Teacher Loss Weight",
+                        page="training",
+                    )
+                )
+            for field, message in (
+                ("h3_adapter_prompt_only", "H3 two-teacher distillation does not combine with prompt-only adapter forwards."),
+                ("h3_rollout_supervision", "H3 two-teacher distillation does not combine with rollout supervision."),
+            ):
+                if getattr(t, field, False):
+                    errors.append(
+                        _make_issue(
+                            "error",
+                            "training.h3_two_teacher_loss_weight",
+                            message,
+                            label="H3 Two-Teacher Loss Weight",
+                            page="training",
+                        )
+                    )
+            if t.h3_guidance_distillation_scale is not None:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_two_teacher_loss_weight",
+                        "H3 two-teacher distillation does not combine with guidance distillation.",
+                        label="H3 Two-Teacher Loss Weight",
+                        page="training",
+                    )
+                )
+            if config.caching.h3_dop_trigger != t.h3_dop_trigger or config.caching.h3_dop_caption_mode != t.h3_dop_caption_mode:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "caching.h3_dop_trigger",
+                        "The cached trigger and caption mode must match the ones two-teacher distillation trains with.",
+                        label="H3 DOP Trigger",
+                        page="caching",
+                    )
+                )
+        for name, label in (
+            ("h3_two_teacher_multiplier", "H3 Two-Teacher Multiplier"),
+            ("h3_two_teacher_bare_weight", "H3 Two-Teacher Bare Weight"),
+            ("h3_two_teacher_data_weight", "H3 Two-Teacher Data Weight"),
+        ):
+            value = float(getattr(t, name))
+            if not math.isfinite(value) or value < 0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"training.{name}",
+                        f"{label} must be finite and non-negative.",
+                        label=label,
+                        page="training",
+                    )
+                )
+        two_teacher_sigma_min = float(t.h3_two_teacher_sigma_min)
+        if not math.isfinite(two_teacher_sigma_min) or not 0 <= two_teacher_sigma_min < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_two_teacher_sigma_min",
+                    "H3 two-teacher sigma minimum must be finite and lie in [0, 1).",
+                    label="H3 Two-Teacher Sigma Minimum",
+                    page="training",
+                )
+            )
         dop_sigma_min = float(t.h3_dop_sigma_min)
         if not math.isfinite(dop_sigma_min) or not 0 <= dop_sigma_min < 1:
             errors.append(

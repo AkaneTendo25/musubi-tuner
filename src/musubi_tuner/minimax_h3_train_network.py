@@ -883,6 +883,13 @@ def _dop_sigma_active(args, inputs) -> bool:
     return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
 
 
+def _two_teacher_sigma_active(args, inputs) -> bool:
+    """--h3_two_teacher_sigma_min: distil only on steps at or above this shifted
+    video sigma."""
+    sigma_min = float(getattr(args, "h3_two_teacher_sigma_min", 0.0) or 0.0)
+    return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
+
+
 def _null_anchor_weight_at(args, global_step: int) -> float:
     """The data-step null anchor's weight at this step: the configured weight, or a
     linear ramp from it to --h3_guidance_null_anchor_weight_end over --max_train_steps
@@ -1396,6 +1403,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._rollout_probability_generator: torch.Generator | None = None
         self._preservation_probability_generator: torch.Generator | None = None
         self._dop_probability_generator: torch.Generator | None = None
+        self._teacher_network = None
         self._rollout_noise_generator: torch.Generator | None = None
         self._rollout_teacher: H3RolloutTeacherCache | None = None
         self._rollout_data_err: dict[int, list[float]] = {}
@@ -3149,11 +3157,42 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_dop_loss_weight must be finite and non-negative")
         if not math.isfinite(args.h3_dop_probability) or not 0 < args.h3_dop_probability <= 1:
             raise ValueError("--h3_dop_probability must be finite and lie in (0, 1]")
+        args.h3_dop_trigger = args.h3_dop_trigger.strip()
+        args.h3_dop_class_prompt = " ".join(args.h3_dop_class_prompt.split())
+        two_teacher_weight = float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0)
+        if not math.isfinite(two_teacher_weight) or two_teacher_weight < 0:
+            raise ValueError("--h3_two_teacher_loss_weight must be finite and non-negative")
+        two_teacher_sigma_min = float(getattr(args, "h3_two_teacher_sigma_min", 0.0) or 0.0)
+        if not math.isfinite(two_teacher_sigma_min) or not 0.0 <= two_teacher_sigma_min < 1.0:
+            raise ValueError("--h3_two_teacher_sigma_min must be finite and lie in [0, 1)")
+        for name in ("h3_two_teacher_bare_weight", "h3_two_teacher_data_weight", "h3_two_teacher_multiplier"):
+            value = float(getattr(args, name, 0.0) or 0.0)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"--{name} must be finite and non-negative")
+        if two_teacher_weight > 0:
+            if not getattr(args, "h3_two_teacher_weights", None):
+                raise ValueError("--h3_two_teacher_loss_weight requires --h3_two_teacher_weights")
+            if getattr(args, "h3_adapter_prompt_only", False):
+                raise ValueError("--h3_two_teacher_loss_weight is rejected with --h3_adapter_prompt_only")
+            if args.h3_training_mode in {"ref2va", "ref2va_omni"}:
+                raise ValueError("--h3_two_teacher_loss_weight is not supported for Ref2VA")
+            if not args.h3_dop_trigger or args.h3_dop_caption_mode != "bare":
+                raise ValueError(
+                    "--h3_two_teacher_loss_weight needs the trigger-free presentation: cache it with --h3_dop_trigger "
+                    "and --h3_dop_caption_mode bare and pass the same values here"
+                )
+            # Both of these assemble the optimized loss themselves -- the rollout
+            # replaces the video objective, sparse guidance rescales it -- so the
+            # distillation mixture would be discarded rather than composed.
+            if getattr(args, "h3_rollout_supervision", False):
+                raise ValueError("--h3_two_teacher_loss_weight is rejected with --h3_rollout_supervision")
+            if args.h3_guidance_distillation_scale is not None:
+                raise ValueError("--h3_two_teacher_loss_weight is rejected with --h3_guidance_distillation_scale")
+        elif getattr(args, "h3_two_teacher_weights", None):
+            raise ValueError("--h3_two_teacher_weights requires --h3_two_teacher_loss_weight above 0")
         dop_sigma_min = float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0)
         if not math.isfinite(dop_sigma_min) or not 0.0 <= dop_sigma_min < 1.0:
             raise ValueError("--h3_dop_sigma_min must be finite and lie in [0, 1)")
-        args.h3_dop_trigger = args.h3_dop_trigger.strip()
-        args.h3_dop_class_prompt = " ".join(args.h3_dop_class_prompt.split())
         if args.h3_dop_loss_weight > 0:
             if args.h3_dop_caption_mode == "bare":
                 if not args.h3_dop_trigger:
@@ -3644,6 +3683,66 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         accelerator.register_save_state_pre_hook(save_crepa_state)
         accelerator.register_load_state_pre_hook(load_crepa_state)
 
+    def _install_frozen_lora(self, path, multiplier, accelerator, transformer, label: str):
+        """Load ``path`` as a live, frozen LoRA network applied on top of the trainable one.
+
+        Shared by ``--h3_overlay_weights`` and ``--h3_two_teacher_weights``; see
+        :meth:`install_overlay_weights` for why the correction stays a separate
+        live module instead of being merged.
+        """
+        from musubi_tuner.networks import lora_minimax_h3
+
+        weights_sd = self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3")
+        network = lora_minimax_h3.create_arch_network_from_weights(
+            multiplier,
+            weights_sd,
+            unet=transformer,
+            for_inference=False,
+        )
+        matched = {lora.lora_name for lora in network.text_encoder_loras + network.unet_loras}
+        unmatched = sorted({key.split(".")[0] for key in weights_sd if "." in key} - matched)
+        if unmatched:
+            raise ValueError(
+                f"{path}: {len(unmatched)} of {len(weights_sd)} tensors have no matching module and would be applied "
+                "to nothing; a live overlay is never partially applied. Its key convention is probably not the one "
+                f"this project expects (`lora_unet_<module_path_with_underscores>.lora_down.weight`), e.g. "
+                f"{', '.join(unmatched[:3])}"
+            )
+        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+        info = network.load_state_dict(weights_sd, False)
+        if info.missing_keys:
+            raise ValueError(f"{path}: {label} LoRA is missing {len(info.missing_keys)} tensor(s), e.g. {info.missing_keys[:3]}")
+        # fp32 matches the trainable network, which stays fp32 and relies on
+        # autocast for the matmul dtype, so both deltas are computed alike.
+        network.to(device=accelerator.device, dtype=torch.float32)
+        network.requires_grad_(False)
+        network.eval()
+        ranks = sorted({int(lora.lora_dim) for lora in network.unet_loras})
+        alphas = sorted({float(lora.alpha.item()) for lora in network.unet_loras})
+        accelerator.print(
+            f"MiniMax H3 live {label} from {path}: {len(network.unet_loras)} module(s) matched, "
+            f"rank={ranks if len(ranks) > 1 else ranks[0]}, alpha={alphas if len(alphas) > 1 else alphas[0]}, "
+            f"multiplier={multiplier}; frozen, never merged, excluded from checkpoints"
+        )
+        return network
+
+    def install_teacher_weights(self, args, accelerator, transformer):
+        """Attach ``--h3_two_teacher_weights`` as a frozen teacher, left DISABLED.
+
+        Unlike the overlay, this network is not part of the model the adapter is
+        trained inside: it is switched on for the styled teacher's forward alone
+        and off everywhere else, so no other objective sees it.
+        """
+        path = getattr(args, "h3_two_teacher_weights", None)
+        if not path:
+            return None
+        teacher = self._install_frozen_lora(
+            path, float(getattr(args, "h3_two_teacher_multiplier", 1.0)), accelerator, transformer, "two-teacher teacher"
+        )
+        teacher.set_enabled(False)
+        self._teacher_network = teacher
+        return teacher
+
     def install_overlay_weights(self, args, accelerator, transformer):
         """Attach ``--h3_overlay_weights`` as a live, frozen LoRA overlay.
 
@@ -3669,40 +3768,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         path = getattr(args, "h3_overlay_weights", None)
         if not path:
             return None
-        from musubi_tuner.networks import lora_minimax_h3
-
-        weights_sd = self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3")
-        multiplier = float(getattr(args, "h3_overlay_weights_multiplier", 1.0))
-        overlay = lora_minimax_h3.create_arch_network_from_weights(
-            multiplier,
-            weights_sd,
-            unet=transformer,
-            for_inference=False,
-        )
-        matched = {lora.lora_name for lora in overlay.text_encoder_loras + overlay.unet_loras}
-        unmatched = sorted({key.split(".")[0] for key in weights_sd if "." in key} - matched)
-        if unmatched:
-            raise ValueError(
-                f"{path}: {len(unmatched)} of {len(weights_sd)} tensors have no matching module and would be applied "
-                "to nothing; a live overlay is never partially applied. Its key convention is probably not the one "
-                f"this project expects (`lora_unet_<module_path_with_underscores>.lora_down.weight`), e.g. "
-                f"{', '.join(unmatched[:3])}"
-            )
-        overlay.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
-        info = overlay.load_state_dict(weights_sd, False)
-        if info.missing_keys:
-            raise ValueError(f"{path}: overlay LoRA is missing {len(info.missing_keys)} tensor(s), e.g. {info.missing_keys[:3]}")
-        # fp32 matches the trainable network, which stays fp32 and relies on
-        # autocast for the matmul dtype, so both deltas are computed alike.
-        overlay.to(device=accelerator.device, dtype=torch.float32)
-        overlay.requires_grad_(False)
-        overlay.eval()
-        ranks = sorted({int(lora.lora_dim) for lora in overlay.unet_loras})
-        alphas = sorted({float(lora.alpha.item()) for lora in overlay.unet_loras})
-        accelerator.print(
-            f"MiniMax H3 live overlay from {path}: {len(overlay.unet_loras)} module(s) matched, "
-            f"rank={ranks if len(ranks) > 1 else ranks[0]}, alpha={alphas if len(alphas) > 1 else alphas[0]}, "
-            f"multiplier={multiplier}; frozen, never merged, excluded from checkpoints"
+        overlay = self._install_frozen_lora(
+            path, float(getattr(args, "h3_overlay_weights_multiplier", 1.0)), accelerator, transformer, "overlay"
         )
         self._overlay_network = overlay
         return overlay
@@ -3716,6 +3783,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise TypeError("H3 preservation losses require a network with set_enabled()")
         if args is not None:
             self.install_overlay_weights(args, accelerator, transformer)
+            self.install_teacher_weights(args, accelerator, transformer)
         del args, network, transformer
         if self._crepa is None:
             return trainable_params
@@ -5754,7 +5822,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         )
         dop_reference_prediction = None
-        if dop_active:
+        teacher_styled_prediction = None
+        two_teacher_bare_loss = None
+        two_teacher_active = (
+            float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
+            and self._teacher_network is not None
+            and conditioning == "prompt"
+            and _two_teacher_sigma_active(args, inputs)
+        )
+        if dop_active or two_teacher_active:
             missing_dop = [
                 key for key in (H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY, H3_DOP_CONFIG_KEY) if key not in batch
             ]
@@ -5791,7 +5867,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         auxiliary_block_swap = (
             bool(self.blocks_to_swap)
             and not getattr(self, "_block_swap_h2d_only", False)
-            and (use_guidance or preservation_active or dop_active or null_anchor_active)
+            and (use_guidance or preservation_active or dop_active or null_anchor_active or two_teacher_active)
         )
         if auxiliary_block_swap:
             # Teacher branches have no backward pass. Classic block swap in
@@ -5961,15 +6037,45 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             )
                     finally:
                         set_enabled(True)
+            if two_teacher_active:
+                set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_two_teacher_loss_weight")
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                int8_context = getattr(transformer, "int8_attention_context", None)
+
+                def teacher_forward(cond, styled: bool):
+                    # Every teacher arm starts from the same RNG state as the
+                    # student passes below, so the stochastic conditioning rows
+                    # are shared and the two targets differ only by the prompt
+                    # and by which frozen adapter is live.
+                    with torch.random.fork_rng(devices=fork_devices):
+                        set_enabled(False)
+                        self._teacher_network.set_enabled(styled)
+                        try:
+                            with (
+                                torch.no_grad(),
+                                int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                            ):
+                                return self._predict(accelerator, transformer, batch, inputs, conditioning=cond)
+                        finally:
+                            self._teacher_network.set_enabled(False)
+                            set_enabled(True)
+
+                # The styled teacher under the trigger, and the untouched base
+                # under the trigger-free presentation: the two targets the
+                # student is asked to hold at the same state.
+                teacher_styled_prediction = teacher_forward(conditioning, True)
+                teacher_bare_prediction = teacher_forward("dop", False)
             if dop_active and not _dop_sigma_active(args, inputs):
                 dop_active = False
             if dop_active:
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_dop_loss_weight")
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                int8_context = getattr(transformer, "int8_attention_context", None)
+                # The frozen arm starts from the same RNG state as the trainable
+                # DOP pass below, so both sample the same stochastic conditioning rows.
                 with torch.random.fork_rng(devices=fork_devices):
                     set_enabled(False)
                     try:
-                        int8_context = getattr(transformer, "int8_attention_context", None)
                         with torch.no_grad(), int8_context(auxiliary=True) if callable(int8_context) else nullcontext():
                             dop_reference_prediction = self._predict(accelerator, transformer, batch, inputs, conditioning="dop")
                     finally:
@@ -6015,6 +6121,47 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             dop_term = (args.h3_dop_loss_weight / args.h3_dop_probability) * dop_preservation.loss
             accelerator.backward(dop_term * auxiliary_backward_scale)
             del dop_prediction
+
+        if two_teacher_active:
+            # The bare arm is an auxiliary graph backpropagated before the primary
+            # forward, for the same reason the DOP pass is: it keeps classic block
+            # swapping valid and bounds activation memory when the rewritten prompt
+            # has a different packed length.
+            # Forked like the teacher arms: this pass must leave the RNG where it
+            # found it, so the primary forward below starts from the same state the
+            # styled teacher was evaluated at and the two arms of each pair share
+            # their stochastic conditioning rows.
+            with torch.random.fork_rng(devices=[accelerator.device] if accelerator.device.type == "cuda" else []):
+                two_teacher_bare_prediction = self._predict(accelerator, transformer, batch, inputs, conditioning="dop")
+            two_teacher_video_mask = self._mask_to_loss(
+                self._extension_masked(
+                    batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3
+                ),
+                inputs.video_target,
+                None if self._step_mask is None else self._step_mask.video_latent,
+                axis=-3,
+            )
+            two_teacher_audio_mask = self._mask_to_loss(
+                self._extension_masked(
+                    batch.get("audio_loss_mask"), inputs.audio_target, self._active_extension_audio_latents, axis=-1
+                ),
+                inputs.audio_target,
+                None if self._step_mask is None else self._step_mask.audio_latent,
+                axis=-1,
+            )
+            two_teacher_bare_loss = joint_prediction_loss(
+                two_teacher_bare_prediction,
+                teacher_bare_prediction,
+                video_mask=two_teacher_video_mask,
+                audio_mask=two_teacher_audio_mask,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight,
+                audio_weight=0.0 if observed == "audio" else args.h3_audio_loss_weight,
+            ).loss
+            bare_term = float(args.h3_two_teacher_loss_weight) * float(args.h3_two_teacher_bare_weight) * two_teacher_bare_loss
+            accelerator.backward(bare_term * auxiliary_backward_scale)
+            del two_teacher_bare_prediction, teacher_bare_prediction
 
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
         if self._crepa is not None:
@@ -6122,6 +6269,29 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # auxiliary terms. Reported as the averaged loss whenever the optimized
         # loss differs from it.
         dense_loss = result.loss
+        two_teacher_trigger_loss = None
+        if two_teacher_active:
+            # The triggered arm reuses the primary forward: the student's own
+            # prediction at this state, matched to the styled teacher's. The data
+            # objective survives only at --h3_two_teacher_data_weight, which is 0
+            # for pure distillation.
+            two_teacher_trigger_loss = joint_prediction_loss(
+                raw_prediction,
+                teacher_styled_prediction,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            ).loss
+            loss = float(args.h3_two_teacher_data_weight) * loss + float(args.h3_two_teacher_loss_weight) * two_teacher_trigger_loss
+        if float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0:
+            metrics["h3/two_teacher_active"] = float(two_teacher_active)
+            metrics["loss/two_teacher_trigger"] = (
+                0.0 if two_teacher_trigger_loss is None else float(two_teacher_trigger_loss.detach())
+            )
+            metrics["loss/two_teacher_bare"] = 0.0 if two_teacher_bare_loss is None else float(two_teacher_bare_loss.detach())
         rollout_replaced = False
         rollout_main_objective = None
         rollout_field_floor = None
@@ -6486,6 +6656,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             or dop_term is not None
             or rollout_replaced
             or null_anchor is not None
+            or two_teacher_trigger_loss is not None
         ):
             average_loss = loss
             if base_preservation_term is not None:
@@ -6505,6 +6676,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 average_loss = average_loss - rollout_field_floor
             if rollout_null_anchor is not None:
                 average_loss = average_loss - rollout_null_anchor
+            if two_teacher_trigger_loss is not None:
+                # Distillation SWAPS the objective on the steps it is active on, so
+                # the reported average goes back to the ordinary data loss the same
+                # run would have logged without the flag; otherwise active and
+                # inactive steps would be averaged in different units.
+                average_loss = (
+                    average_loss
+                    - float(args.h3_two_teacher_data_weight) * dense_loss
+                    - float(args.h3_two_teacher_loss_weight) * two_teacher_trigger_loss
+                    + dense_loss
+                )
             if rollout_replaced:
                 # The rollout SWAPS the objective on a drawn subset of steps
                 # rather than estimating one objective sparsely, so nothing is
@@ -6733,6 +6915,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_dop_trigger": args.h3_dop_trigger or "none",
             "ss_h3_dop_class_prompt": args.h3_dop_class_prompt or "none",
             "ss_h3_dop_caption_mode": args.h3_dop_caption_mode,
+            "ss_h3_two_teacher_weights": str(getattr(args, "h3_two_teacher_weights", None) or "none"),
+            "ss_h3_two_teacher_loss_weight": str(float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0)),
+            "ss_h3_two_teacher_bare_weight": str(float(getattr(args, "h3_two_teacher_bare_weight", 1.0))),
+            "ss_h3_two_teacher_data_weight": str(float(getattr(args, "h3_two_teacher_data_weight", 0.0) or 0.0)),
+            "ss_h3_two_teacher_sigma_min": str(float(getattr(args, "h3_two_teacher_sigma_min", 0.0) or 0.0)),
+            "ss_h3_two_teacher_multiplier": str(float(getattr(args, "h3_two_teacher_multiplier", 1.0))),
             "ss_h3_dop_sigma_min": str(float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0)),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
@@ -7658,6 +7846,51 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default="class",
         choices=["class", "bare"],
         help="DOP caption mode the text cache was written with: class (trigger replaced by the class prompt) or bare (trigger removed)",
+    )
+    parser.add_argument(
+        "--h3_two_teacher_weights",
+        type=str,
+        default=None,
+        help=(
+            "LoRA of the styled teacher for two-teacher distillation: a frozen second adapter, live only on the "
+            "teacher's own forward. Needs --h3_two_teacher_loss_weight above 0"
+        ),
+    )
+    parser.add_argument(
+        "--h3_two_teacher_multiplier",
+        type=float,
+        default=1.0,
+        help="strength of --h3_two_teacher_weights on its forward (default 1.0)",
+    )
+    parser.add_argument(
+        "--h3_two_teacher_loss_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "two-teacher distillation: at each supervised state the student is matched to the styled teacher under "
+            "the trigger and to the frozen base under the trigger-free presentation. Off at 0"
+        ),
+    )
+    parser.add_argument(
+        "--h3_two_teacher_bare_weight",
+        type=float,
+        default=1.0,
+        help="relative weight of the trigger-free arm against the triggered one (default 1.0)",
+    )
+    parser.add_argument(
+        "--h3_two_teacher_data_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "multiplier on the ordinary data objective while two-teacher distillation is on; 0 (default) trains on "
+            "the two teachers alone"
+        ),
+    )
+    parser.add_argument(
+        "--h3_two_teacher_sigma_min",
+        type=float,
+        default=0.0,
+        help="distil only on steps whose shifted video sigma is at least this value (0 = every step)",
     )
     parser.add_argument(
         "--h3_dop_sigma_min",

@@ -638,6 +638,22 @@
 					</div>
 				</div>
 
+				<!-- Two-teacher distillation -->
+				{#if $projectConfig?.training?.model_type === 'minimax_h3'}
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[12px] font-semibold mb-1" style="color: var(--text-primary);">H3 Two-Teacher Distillation</div>
+					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">At each supervised state the adapter is matched to a frozen styled teacher LoRA under the trigger and to the untouched base under the trigger-free caption. Needs the same trigger-free text cache as DOP (trigger set, caption mode bare).</p>
+					<div class="grid grid-cols-2 gap-2">
+						<FormField fieldPath="training.h3_two_teacher_weights" value={$projectConfig?.training?.h3_two_teacher_weights || ''} oninput={(e) => updateTraining('h3_two_teacher_weights', e.target.value)} placeholder="/path/to/teacher.safetensors" tooltip="LoRA of the styled teacher; frozen, live only on the teacher's forward" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_loss_weight" value={$projectConfig?.training?.h3_two_teacher_loss_weight ?? 0.0} oninput={(e) => updateTraining('h3_two_teacher_loss_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Weight of the distillation objective; 0 disables it" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_bare_weight" value={$projectConfig?.training?.h3_two_teacher_bare_weight ?? 1.0} oninput={(e) => updateTraining('h3_two_teacher_bare_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Relative weight of the trigger-free arm" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_data_weight" value={$projectConfig?.training?.h3_two_teacher_data_weight ?? 0.0} oninput={(e) => updateTraining('h3_two_teacher_data_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Multiplier on the ordinary data objective; 0 trains on the teachers alone" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_sigma_min" value={$projectConfig?.training?.h3_two_teacher_sigma_min ?? 0} oninput={(e) => updateTraining('h3_two_teacher_sigma_min', Number(e.target.value))} min={0} max={0.99} step="0.05" tooltip="Distil only at or above this shifted video sigma" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_multiplier" value={$projectConfig?.training?.h3_two_teacher_multiplier ?? 1.0} oninput={(e) => updateTraining('h3_two_teacher_multiplier', Number(e.target.value))} min={0} step="0.1" tooltip="Strength of the teacher LoRA on its forward" />
+					</div>
+				</div>
+				{/if}
+
 				<!-- DOP -->
 				{#if $projectConfig?.training?.model_type === 'minimax_h3'}
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">

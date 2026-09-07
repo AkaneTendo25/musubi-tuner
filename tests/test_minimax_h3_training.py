@@ -7490,3 +7490,152 @@ def test_h3_dop_sigma_min_is_validated():
     args.h3_dop_sigma_min = 1.0
     with pytest.raises(ValueError, match="h3_dop_sigma_min"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+class _TeacherNetwork:
+    """Frozen second adapter: records its toggle history and scales predictions."""
+
+    def __init__(self, transformer):
+        self.transformer = transformer
+        self.events = []
+        self.enabled = False
+
+    def set_enabled(self, enabled):
+        self.events.append(enabled)
+        self.enabled = enabled
+        self.transformer.teacher_enabled = enabled
+
+
+def _two_teacher_step(args, backend, teacher=None, timesteps=(0.5,)):
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer._base_preservation_active = lambda accelerator, probability: False
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    trainer._teacher_network = _TeacherNetwork(transformer) if teacher is None else teacher
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": list(timesteps),
+        H3_DOP_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_DOP_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+        H3_DOP_CONFIG_KEY: [dop_config_identity("sks", "", "bare")],
+    }
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+    return trainer._teacher_network, network, backend, metrics
+
+
+def _two_teacher_args(**overrides):
+    args = create_parser().parse_args([])
+    args.h3_two_teacher_weights = "teacher.safetensors"
+    args.h3_two_teacher_loss_weight = 1.0
+    args.h3_dop_trigger = "sks"
+    args.h3_dop_caption_mode = "bare"
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_h3_two_teacher_runs_four_arms_and_toggles_both_adapters():
+    teacher, network, backend, metrics = _two_teacher_step(_two_teacher_args(), _StochasticPreservationBackend())
+
+    # styled teacher (trigger), base (bare), student (bare, graded), then the primary forward.
+    assert backend.calls == [("prompt", False), ("dop", False), ("dop", True), ("prompt", True)]
+    # The teacher is live for its own forward only, and off again straight after.
+    assert teacher.events == [True, False, False, False]
+    # The student adapter is off for both teacher arms and on for its own.
+    assert network.events == [False, True, False, True]
+    assert metrics["h3/two_teacher_active"] == 1.0
+    assert metrics["loss/two_teacher_trigger"] > 0
+    assert metrics["loss/two_teacher_bare"] >= 0
+
+
+def test_h3_two_teacher_arms_share_one_rng_state():
+    _, _, backend, _ = _two_teacher_step(_two_teacher_args(), _StochasticPreservationBackend())
+    # All four arms, the primary forward included: each pair is compared at the
+    # same stochastic conditioning rows, so no arm may advance the state.
+    assert len(backend.random_draws) == 4
+    assert all(draw == pytest.approx(backend.random_draws[0]) for draw in backend.random_draws)
+
+
+def test_h3_two_teacher_sigma_gate_skips_low_sigma_steps():
+    args = _two_teacher_args(h3_two_teacher_sigma_min=0.9)
+    _, _, backend, metrics = _two_teacher_step(args, _StochasticPreservationBackend(), timesteps=(0.2,))
+    assert backend.calls == [("prompt", True)]
+    assert metrics["h3/two_teacher_active"] == 0.0
+    assert metrics["loss/two_teacher_trigger"] == 0.0
+
+
+def test_h3_two_teacher_data_weight_scales_the_ordinary_objective():
+    args = _two_teacher_args(h3_two_teacher_data_weight=0.0)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer._base_preservation_active = lambda accelerator, probability: False
+    trainer.backend = _StochasticPreservationBackend()
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    trainer._teacher_network = _TeacherNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_DOP_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_DOP_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+        H3_DOP_CONFIG_KEY: [dop_config_identity("sks", "", "bare")],
+    }
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    # With the data weight at zero the optimized loss is the distillation term alone.
+    assert float(loss) == pytest.approx(metrics["loss/two_teacher_trigger"], rel=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"h3_two_teacher_weights": None}, "requires --h3_two_teacher_weights"),
+        ({"h3_dop_trigger": ""}, "trigger-free presentation"),
+        ({"h3_adapter_prompt_only": True}, "h3_adapter_prompt_only"),
+        ({"h3_training_mode": "ref2va"}, "not supported for Ref2VA"),
+        ({"h3_two_teacher_sigma_min": 1.0}, "h3_two_teacher_sigma_min"),
+        ({"h3_two_teacher_loss_weight": -1.0}, "h3_two_teacher_loss_weight"),
+        ({"h3_dop_caption_mode": "class"}, "trigger-free presentation"),
+        ({"h3_rollout_supervision": True}, "h3_rollout_supervision"),
+        ({"h3_guidance_distillation_scale": 3.5}, "h3_guidance_distillation_scale"),
+    ],
+)
+def test_h3_two_teacher_arguments_are_validated(overrides, match):
+    args = _two_teacher_args(**overrides)
+    with pytest.raises(ValueError, match=match):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_two_teacher_weights_alone_are_rejected():
+    args = create_parser().parse_args([])
+    args.h3_two_teacher_weights = "teacher.safetensors"
+    with pytest.raises(ValueError, match="requires --h3_two_teacher_loss_weight"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)

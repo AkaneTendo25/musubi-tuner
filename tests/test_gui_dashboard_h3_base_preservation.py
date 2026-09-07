@@ -1522,3 +1522,30 @@ def test_h3_dop_bare_caption_mode_is_forwarded_without_a_class_prompt(tmp_path: 
     config.caching.h3_dop_class_prompt = "woman"
     report = validate_training_config(config)
     assert "caching.h3_dop_trigger" in report["field_errors"]
+
+
+def test_h3_two_teacher_is_forwarded_to_the_trainer(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_dop_trigger = "sks"
+    config.caching.h3_dop_caption_mode = "bare"
+    config.training.h3_dop_trigger = "sks"
+    config.training.h3_dop_caption_mode = "bare"
+    config.training.h3_two_teacher_weights = "teacher.safetensors"
+    config.training.h3_two_teacher_loss_weight = 1.0
+    config.training.h3_two_teacher_sigma_min = 0.5
+    config.training.h3_two_teacher_bare_weight = 2.0
+
+    train_command = build_training_cmd(config)
+    train_script = next(index for index, value in enumerate(train_command) if value.endswith("minimax_h3_train_network.py"))
+    train_args = create_parser().parse_args(train_command[train_script + 1 :])
+
+    assert train_args.h3_two_teacher_weights == "teacher.safetensors"
+    assert train_args.h3_two_teacher_loss_weight == pytest.approx(1.0)
+    assert train_args.h3_two_teacher_sigma_min == pytest.approx(0.5)
+    assert train_args.h3_two_teacher_bare_weight == pytest.approx(2.0)
+    assert train_args.h3_two_teacher_data_weight == pytest.approx(0.0)
+    # The trigger-free presentation is shared with DOP, and DOP itself is off here:
+    # the caption arguments must still reach the trainer or it refuses to start.
+    assert train_args.h3_dop_trigger == "sks"
+    assert train_args.h3_dop_caption_mode == "bare"
+    assert train_args.h3_dop_loss_weight == pytest.approx(0.0)

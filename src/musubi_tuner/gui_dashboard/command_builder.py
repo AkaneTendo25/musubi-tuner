@@ -763,16 +763,35 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_base_preservation_loss_weight", str(t.h3_base_preservation_loss_weight)]
         if t.h3_base_preservation_probability != 1.0:
             cmd += ["--h3_base_preservation_probability", str(t.h3_base_preservation_probability)]
-    if not learned_context and t.h3_dop_loss_weight > 0:
-        cmd += ["--h3_dop_loss_weight", str(t.h3_dop_loss_weight), "--h3_dop_trigger", t.h3_dop_trigger]
+    # The trigger-free presentation is shared: DOP and two-teacher distillation both
+    # read it, so the caption arguments are emitted whenever either one is on.
+    if not learned_context and (t.h3_dop_loss_weight > 0 or t.h3_two_teacher_loss_weight > 0):
+        cmd += ["--h3_dop_trigger", t.h3_dop_trigger]
         if t.h3_dop_caption_mode == "bare":
             cmd += ["--h3_dop_caption_mode", "bare"]
         else:
             cmd += ["--h3_dop_class_prompt", t.h3_dop_class_prompt]
+    if not learned_context and t.h3_dop_loss_weight > 0:
+        cmd += ["--h3_dop_loss_weight", str(t.h3_dop_loss_weight)]
         if t.h3_dop_probability != 1.0:
             cmd += ["--h3_dop_probability", str(t.h3_dop_probability)]
         if t.h3_dop_sigma_min != 0.0:
             cmd += ["--h3_dop_sigma_min", str(t.h3_dop_sigma_min)]
+    if not learned_context and t.h3_two_teacher_loss_weight > 0:
+        cmd += [
+            "--h3_two_teacher_weights",
+            t.h3_two_teacher_weights,
+            "--h3_two_teacher_loss_weight",
+            str(t.h3_two_teacher_loss_weight),
+        ]
+        for flag, value, default in (
+            ("--h3_two_teacher_multiplier", t.h3_two_teacher_multiplier, 1.0),
+            ("--h3_two_teacher_bare_weight", t.h3_two_teacher_bare_weight, 1.0),
+            ("--h3_two_teacher_data_weight", t.h3_two_teacher_data_weight, 0.0),
+            ("--h3_two_teacher_sigma_min", t.h3_two_teacher_sigma_min, 0.0),
+        ):
+            if value != default:
+                cmd += [flag, str(value)]
     if t.h3_fuse_frozen_teachers:
         cmd.append("--h3_fuse_frozen_teachers")
     if t.h3_overlay_weights:

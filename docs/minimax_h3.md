@@ -1006,7 +1006,7 @@ Every objective here is off unless its flag is given; a run that names none of t
 
 | Option | Purpose |
 | --- | --- |
-| `--h3_guidance_distillation_scale S` | Guidance-consistent objective using cached empty-text conditioning at scale `S`. `--h3_guidance_loss_form` selects `normalized`, `contrastive` or `additive`; for the same predictions and scale, the contrastive form is `S²` larger. `additive` fits the prediction to the data target plus `(1-1/S)` times the frozen base's own guided field (needs `--h3_guidance_null_source frozen`, one more no-grad forward). |
+| `--h3_guidance_distillation_scale S` | Guidance-consistent objective using cached empty-text conditioning at scale `S`. `--h3_guidance_loss_form` selects `normalized`, `contrastive` or `additive`; for the same predictions and scale, the contrastive form is `S²` larger. `additive` fits the prediction to the data target plus `(1-1/S)` times the frozen base's own guided field (needs `--h3_guidance_null_source frozen`, one more no-grad forward). The conditional increment then comes from the base rather than from the adapter, which leaves the adapter only the residual to learn: expect the cleanest preservation numbers of the three forms and the weakest concept, and do not pick it for a global look. |
 | `--h3_guidance_scale_range 2.5,3.5` | Draw the distillation scale uniformly in `[LOWER, UPPER]`, once per micro-batch sample and step, instead of pinning one value; the adapter then learns a family of guidance strengths rather than a single point. Replaces `--h3_guidance_distillation_scale` and is rejected alongside it. Details below. |
 | `--h3_guidance_distillation_probability 0.5` | Evaluate the empty-conditioning branch on a synchronized random fraction of batches, skipping its extra forward on the rest, and scale the guidance correction by `1 / probability`. `1` (default) applies the objective every batch; smaller values preserve the expected loss, but rare larger corrections are not optimizer-equivalent to applying the dense objective every step. |
 | `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
@@ -1047,7 +1047,13 @@ Every objective here is off unless its flag is given; a run that names none of t
 | `--h3_adapter_ema_decay 0.0` | Keep an exponential moving average of the adapter's trainable parameters, updated after every optimizer step, and save it beside each scheduled checkpoint as `<output_name>-ema-step<N>.safetensors` (an ordinary adapter file). Damps the step-to-step swing between competing terms without changing the objective. `--h3_validate_ema` validates the average instead of the live adapter. |
 | `--h3_dop_loss_weight 0.0` | Differential Output Preservation, off at the default: penalizes LoRA drift from the frozen base under a trigger-free rewrite of each caption. |
 | `--h3_dop_probability 1.0` | Evaluate DOP on a synchronized random fraction of prompt-conditioned batches and inverse-probability scale its loss. |
-| `--h3_dop_sigma_min 0.0` | Evaluate DOP only on steps whose shifted video sigma is at least this value; below it the DOP forwards are skipped. Not rescaled. |
+| `--h3_dop_sigma_min 0.0` | Evaluate DOP (either form) only on steps whose shifted video sigma is at least this value; below it the DOP forwards are skipped. Not rescaled. |
+| `--h3_two_teacher_weights teacher.safetensors` | Two-teacher distillation: a frozen second adapter, live only on the styled teacher's own forward. See [Two-teacher distillation](#two-teacher-distillation). |
+| `--h3_two_teacher_loss_weight 0.0` | Weight of the distillation objective; `0` (default) disables it. On active steps the adapter is matched to the styled teacher under the trigger and to the untouched base under the trigger-free caption, at the same state. Two no-grad forwards and one gradient-carrying forward beyond the ordinary step. |
+| `--h3_two_teacher_bare_weight 1.0` | Relative weight of the trigger-free arm against the triggered one. |
+| `--h3_two_teacher_data_weight 0.0` | Multiplier on the ordinary data objective while distillation is on. `0` (default) trains on the two teachers alone. |
+| `--h3_two_teacher_sigma_min 0.0` | Distil only on steps whose shifted video sigma is at least this value. |
+| `--h3_two_teacher_multiplier 1.0` | Strength of the teacher LoRA on its forward. |
 | `--crepa` | Temporal representation alignment for video training. |
 
 **`--h3_guidance_scale_range`.** `LOWER` must exceed `1`. The draw uses its own distributed-synchronized generator, so adding it leaves every other random branch of a seeded run untouched; validation reads the midpoint so its loss stays comparable across evaluations. Composes with the sparse probability and with both loss forms and schedules.
@@ -1084,10 +1090,52 @@ With `--h3_dop_caption_mode bare` on both commands the trigger is removed instea
 given: `sks woman walking in a park` becomes `woman walking in a park` and `xyz style. A wide shot` becomes
 `A wide shot`. This is the form for a trigger that names a global look rather than a subject class.
 
+The `mse` form holds the whole trigger-free prediction at the frozen base's. The `projection` form charges the
+trigger-free caption only for the share of the *trigger's* update it received above `tau` and leaves the rest of
+its prediction free. Which of the two to reach for depends on where the concept lives: `projection` removes the
+component the two captions share, so a concept carried by that shared component goes with it, and the stronger the
+weight the less of it survives. Judge it on renders rather than on the trigger metrics, which improve either way. `--h3_dop_sigma_min` restricts either form to steps at or above a shifted video sigma; the
+threshold is a plain cut on the step's sigma and does not rescale the term.
+
 The trigger must occur as a standalone term in every cached caption. The cache records an identity for the exact trigger,
-class prompt and caption mode, and training rejects stale or mismatched caches. DOP is currently supported for the T2VA/FL2VA family, not Ref2VA. It adds
-one frozen and one trainable transformer pass on active steps; the trainable DOP pass is backpropagated before the ordinary pass
+class prompt and caption mode, and training rejects stale or mismatched caches. DOP is currently supported for the T2VA/FL2VA family, not Ref2VA. The `mse`
+form adds one frozen and one trainable transformer pass on active steps, the `projection` form three frozen and one
+trainable; the trainable DOP pass is backpropagated before the ordinary pass
 so variable prompt lengths remain compatible with activation checkpointing and block swapping.
+
+#### Two-teacher distillation
+
+The adapter is fitted to two frozen targets instead of to the data: under the trigger it is matched to a styled
+teacher (a LoRA that already carries the concept, applied to the same base), and under the trigger-free version of
+the same caption to the untouched base. Both targets are taken at the same noisy state, so the pair states the
+intended behaviour directly: this prompt moves, that prompt does not.
+
+The teacher is a second frozen LoRA network on the same transformer, switched on for its own forward and off
+everywhere else. It is never merged, never optimized, and never written to a checkpoint.
+
+```shell
+python minimax_h3_cache_text_encoder_outputs.py ... \
+  --h3_dop_trigger "xyz style" --h3_dop_caption_mode bare
+
+accelerate launch minimax_h3_train_network.py ... \
+  --h3_dop_trigger "xyz style" --h3_dop_caption_mode bare \
+  --h3_two_teacher_weights styled_teacher.safetensors --h3_two_teacher_loss_weight 1.0
+```
+
+The trigger-free presentation comes from the DOP text cache, so cache it with `--h3_dop_trigger` and
+`--h3_dop_caption_mode bare` and pass the same values to training; the cache identity is checked before the first
+step, as it is for DOP. Supported for the T2VA/FL2VA family, not Ref2VA;
+rejected with `--h3_adapter_prompt_only`. The trigger-free arm is backpropagated before the ordinary pass, so
+variable prompt lengths stay compatible with activation checkpointing and block swapping. Reports
+`loss/two_teacher_trigger`, `loss/two_teacher_bare` and `h3/two_teacher_active`.
+
+On the steps distillation is active, `--h3_two_teacher_data_weight 0` leaves the clips supplying the states and the
+two teachers supplying the targets; a value above `0` mixes the data objective back in. Steps the objective does not
+cover -- caption-dropout steps, and steps below `--h3_two_teacher_sigma_min` -- train the ordinary objective as
+usual.
+
+Rejected with `--h3_rollout_supervision` and with `--h3_guidance_distillation_scale`: both assemble the optimized
+loss themselves, so the distillation mixture would be replaced rather than composed.
 
 #### CREPA
 
@@ -1601,6 +1649,27 @@ together. The anchor fixes the reference point, the teacher sets the direction, 
   partial concept and anchor 1.0 none. Reference conditioning takes anchor 1.0 at every sigma.
 - **Flags:** the union of the three sections above; the exact set is under *Current recommended settings*.
 
+#### Two-teacher distillation
+
+The adapter is fitted to two frozen targets at the same noisy state instead of to the data: under the trigger it is
+matched to a styled teacher, a separately trained adapter that already carries the concept on the same base; under
+the trigger-free version of the same caption it is matched to the untouched base. The clips supply the states, not
+the targets.
+
+- **Applies to:** the T2VA/FL2VA family. Rejected for Ref2VA, and rejected together with `--h3_rollout_supervision`,
+  `--h3_guidance_distillation_scale` and `--h3_adapter_prompt_only`.
+- **Advantages:** states the intended behaviour directly rather than penalising the trigger-free branch, so the
+  concept is not traded away to buy conditionality. The trigger-free prediction stays at the base's. No teacher
+  dataset and no rollout: the objective needs only the trigger-free text cache. About **1.6x** a plain step, less
+  than the recipes it replaces.
+- **Disadvantages:** needs a styled teacher, so a full pipeline is two runs, and the concept it can reach is the
+  teacher's. The states should come from a corpus related to the concept; unrelated clips transfer it weakly.
+- **Flags:** `--h3_two_teacher_weights`, `--h3_two_teacher_loss_weight`; optionally
+  `--h3_two_teacher_bare_weight`, `--h3_two_teacher_data_weight`, `--h3_two_teacher_sigma_min`,
+  `--h3_two_teacher_multiplier`. Needs a text cache written with `--h3_dop_trigger` and
+  `--h3_dop_caption_mode bare`, and the same values passed to training. See
+  [Two-teacher distillation](#two-teacher-distillation) under the auxiliary objectives for the caching command.
+
 #### Stability controls
 
 Optional additions to any recipe above, either checkpoint.
@@ -1762,6 +1831,30 @@ Variations.
 - `--h3_rollout_steps 4 --h3_rollout_window 2`: 3x a plain step, no metric changes.
 - Do not use the sigma gates on Ref2VA: they reduce transformation quality there. The Ref2VA recipe above keeps the
   anchor at every sigma.
+
+**FL2VA, a concept behind a trigger word, in two runs: two-teacher distillation.** About 1.6x a plain step for the
+second run. Keeps the styled teacher's concept while leaving the trigger-free prediction at the base's, which the
+single-run recipe above does not. Run it in two stages.
+
+First train the teacher: any recipe that gives a clean concept on this checkpoint will do, including the
+unconditional H-OPSD recipe above. Then cache the trigger-free presentation and distil:
+
+```shell
+python minimax_h3_cache_text_encoder_outputs.py ... \
+  --h3_dop_trigger "xyz style" --h3_dop_caption_mode bare
+
+accelerate launch minimax_h3_train_network.py ... \
+  --dit minimax_h3_fl2va_bf16.safetensors \
+  --h3_dop_trigger "xyz style" --h3_dop_caption_mode bare \
+  --h3_two_teacher_weights styled_teacher.safetensors \
+  --h3_two_teacher_loss_weight 1.0 --h3_two_teacher_bare_weight 2.0 --h3_two_teacher_data_weight 0.0
+```
+
+Variations. `--h3_two_teacher_bare_weight 1.0` weights the two arms equally and leaves a little more of the
+trigger's update on trigger-free prompts. `--h3_two_teacher_data_weight` above `0` mixes the ordinary data
+objective back in, which is what to reach for if the teacher's concept is weaker than the clips'. Train the states
+on the concept's own corpus: an unrelated corpus carries the concept across but leaves more of it on trigger-free
+prompts.
 
 ## Inference
 
