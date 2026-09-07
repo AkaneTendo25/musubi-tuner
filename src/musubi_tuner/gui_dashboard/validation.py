@@ -1019,12 +1019,33 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
         elif two_teacher_weight > 0:
-            if not t.h3_two_teacher_weights.strip():
+            if int(t.h3_two_teacher_snapshot_step or 0) < 0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_two_teacher_snapshot_step",
+                        "H3 two-teacher snapshot step must not be negative.",
+                        label="H3 Two-Teacher Snapshot Step",
+                        page="training",
+                    )
+                )
+            if t.h3_two_teacher_snapshot_step and t.h3_two_teacher_weights.strip():
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_two_teacher_snapshot_step",
+                        "H3 two-teacher distillation takes one teacher: the snapshot step trains its own, so clear "
+                        "the teacher LoRA path.",
+                        label="H3 Two-Teacher Snapshot Step",
+                        page="training",
+                    )
+                )
+            if not t.h3_two_teacher_snapshot_step and not t.h3_two_teacher_weights.strip():
                 errors.append(
                     _make_issue(
                         "error",
                         "training.h3_two_teacher_weights",
-                        "H3 two-teacher distillation requires the styled teacher's LoRA.",
+                        "H3 two-teacher distillation requires the concept teacher's LoRA.",
                         label="H3 Two-Teacher Weights",
                         page="training",
                     )
@@ -1049,21 +1070,24 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         page="training",
                     )
                 )
-            for field, message in (
-                ("h3_adapter_prompt_only", "H3 two-teacher distillation does not combine with prompt-only adapter forwards."),
-                ("h3_rollout_supervision", "H3 two-teacher distillation does not combine with rollout supervision."),
-            ):
+            # Under the snapshot step these two are the acquisition phase and stand
+            # down when the teacher is frozen, so only the single-phase form rejects
+            # them; this mirrors the trainer's own rule.
+            rejected = [("h3_adapter_prompt_only", "prompt-only adapter forwards")]
+            if not t.h3_two_teacher_snapshot_step:
+                rejected.append(("h3_rollout_supervision", "rollout supervision"))
+            for field, what in rejected:
                 if getattr(t, field, False):
                     errors.append(
                         _make_issue(
                             "error",
                             "training.h3_two_teacher_loss_weight",
-                            message,
+                            f"H3 two-teacher distillation does not combine with {what}.",
                             label="H3 Two-Teacher Loss Weight",
                             page="training",
                         )
                     )
-            if t.h3_guidance_distillation_scale is not None:
+            if t.h3_guidance_distillation_scale is not None and not t.h3_two_teacher_snapshot_step:
                 errors.append(
                     _make_issue(
                         "error",

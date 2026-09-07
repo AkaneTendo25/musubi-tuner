@@ -778,12 +778,13 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         if t.h3_dop_sigma_min != 0.0:
             cmd += ["--h3_dop_sigma_min", str(t.h3_dop_sigma_min)]
     if not learned_context and t.h3_two_teacher_loss_weight > 0:
-        cmd += [
-            "--h3_two_teacher_weights",
-            t.h3_two_teacher_weights,
-            "--h3_two_teacher_loss_weight",
-            str(t.h3_two_teacher_loss_weight),
-        ]
+        # The curriculum takes the teacher from this run, so it is the one form
+        # that carries no --h3_two_teacher_weights.
+        if t.h3_two_teacher_snapshot_step:
+            cmd += ["--h3_two_teacher_snapshot_step", str(t.h3_two_teacher_snapshot_step)]
+        else:
+            cmd += ["--h3_two_teacher_weights", t.h3_two_teacher_weights]
+        cmd += ["--h3_two_teacher_loss_weight", str(t.h3_two_teacher_loss_weight)]
         for flag, value, default in (
             ("--h3_two_teacher_multiplier", t.h3_two_teacher_multiplier, 1.0),
             ("--h3_two_teacher_bare_weight", t.h3_two_teacher_bare_weight, 1.0),

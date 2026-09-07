@@ -326,6 +326,7 @@ class TrainingConfig(BaseModel):
     h3_two_teacher_data_weight: float = 0.0
     h3_two_teacher_sigma_min: float = 0.0
     h3_dop_sigma_min: float = 0.0
+    h3_two_teacher_snapshot_step: int = 0
     h3_overlay_weights: str = ""
     h3_overlay_weights_multiplier: float = 1.0
     h3_attn_auto_dispatch: bool = False

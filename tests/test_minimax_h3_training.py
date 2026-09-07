@@ -93,7 +93,7 @@ from musubi_tuner.minimax_h3_cache_dino_features import (
     _save_features,
     dino_cache_path,
 )
-from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
+from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, _two_teacher_curriculum, create_parser
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.networks import lora_minimax_h3
 
@@ -2983,6 +2983,10 @@ class _FakeAccelerator:
     @staticmethod
     def unwrap_model(model):
         return model
+
+    @staticmethod
+    def print(*args, **kwargs):
+        pass
 
     @staticmethod
     def backward(loss):
@@ -7565,7 +7569,7 @@ def test_h3_two_teacher_data_weight_scales_the_ordinary_objective():
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"h3_two_teacher_weights": None}, "requires --h3_two_teacher_weights"),
+        ({"h3_two_teacher_weights": None}, "requires a teacher"),
         ({"h3_dop_trigger": ""}, "trigger-free presentation"),
         ({"h3_adapter_prompt_only": True}, "h3_adapter_prompt_only"),
         ({"h3_training_mode": "ref2va"}, "not supported for Ref2VA"),
@@ -7580,6 +7584,138 @@ def test_h3_two_teacher_arguments_are_validated(overrides, match):
     args = _two_teacher_args(**overrides)
     with pytest.raises(ValueError, match=match):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+class _SnapshotNetwork(_ToggleNetwork):
+    """A trainable network that can hand out its own weights, as the real one can."""
+
+    def __init__(self, transformer):
+        super().__init__(transformer)
+        self.snapshots = 0
+
+    def snapshot_weights(self, dtype):
+        self.snapshots += 1
+        return {"lora_unet_x.lora_down.weight": torch.ones(2, 2, dtype=dtype)}
+
+
+def _curriculum_trainer(network, transformer):
+    trainer = MiniMaxH3NetworkTrainer()
+    installed = []
+
+    def fake_frozen(weights_sd, multiplier, accelerator, transformer_, label, source):
+        installed.append((dict(weights_sd), multiplier, label, source))
+        return _TeacherNetwork(transformer_)
+
+    trainer._frozen_lora_from_weights = fake_frozen
+    return trainer, installed
+
+
+def test_h3_two_teacher_curriculum_snapshots_the_student_once_at_the_step():
+    args = _two_teacher_args(h3_two_teacher_weights=None, h3_two_teacher_snapshot_step=3)
+    transformer = _ScaleTransformer()
+    network = _SnapshotNetwork(transformer)
+    trainer, installed = _curriculum_trainer(network, transformer)
+    accelerator = _FakeAccelerator()
+    # global_step is the index of the step that just finished, so the snapshot
+    # lands once three updates are done and never again.
+    for step in range(6):
+        trainer.snapshot_teacher(args, accelerator, network, transformer, step)
+    assert network.snapshots == 1
+    assert len(installed) == 1
+    assert trainer._teacher_network is not None
+    assert "step 3" in installed[0][3]
+
+
+def test_h3_two_teacher_curriculum_refuses_a_resume_past_the_boundary():
+    """The teacher is not checkpointed, so resuming past the switch would freeze a different adapter."""
+    args = _two_teacher_args(h3_two_teacher_weights=None, h3_two_teacher_snapshot_step=3)
+    transformer = _ScaleTransformer()
+    network = _SnapshotNetwork(transformer)
+    trainer, _ = _curriculum_trainer(network, transformer)
+    with pytest.raises(ValueError, match="already passed by this resumed run"):
+        trainer.snapshot_teacher(args, _FakeAccelerator(), network, transformer, 7)
+    assert network.snapshots == 0
+
+
+def test_h3_two_teacher_curriculum_checks_the_boundary_against_the_resolved_length():
+    """--max_train_epochs rewrites max_train_steps after the arguments were validated."""
+    args = _two_teacher_args(h3_two_teacher_weights=None, h3_two_teacher_snapshot_step=400, max_train_steps=200)
+    transformer = _ScaleTransformer()
+    network = _SnapshotNetwork(transformer)
+    trainer, _ = _curriculum_trainer(network, transformer)
+    with pytest.raises(ValueError, match="leaves no routing phase"):
+        trainer.snapshot_teacher(args, _FakeAccelerator(), network, transformer, 0)
+
+
+def test_h3_two_teacher_curriculum_is_inert_without_the_flag():
+    args = _two_teacher_args()
+    transformer = _ScaleTransformer()
+    network = _SnapshotNetwork(transformer)
+    trainer, installed = _curriculum_trainer(network, transformer)
+    for step in range(4):
+        trainer.snapshot_teacher(args, _FakeAccelerator(), network, transformer, step)
+    assert network.snapshots == 0
+    assert installed == []
+    assert trainer._teacher_network is None
+
+
+def test_h3_two_teacher_curriculum_stands_the_acquisition_objectives_down():
+    """Before the snapshot the run trains the concept; after it, it routes."""
+    args = _two_teacher_args(
+        h3_two_teacher_weights=None,
+        h3_two_teacher_snapshot_step=1,
+        h3_rollout_supervision=True,
+        h3_guidance_distillation_scale=3.5,
+    )
+    assert _two_teacher_curriculum(args)
+    trainer = MiniMaxH3NetworkTrainer()
+    assert trainer._teacher_network is None  # acquisition: the teacher does not exist yet
+    trainer._teacher_network = object()
+    # the loss reads exactly this pair, and the two objectives never coincide
+    assert _two_teacher_curriculum(args) and trainer._teacher_network is not None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"h3_two_teacher_snapshot_step": -1}, "must not be negative"),
+        ({"h3_two_teacher_snapshot_step": 5, "h3_two_teacher_weights": "teacher.safetensors"}, "rejected with"),
+        (
+            {"h3_two_teacher_snapshot_step": 5, "h3_two_teacher_weights": None, "h3_two_teacher_loss_weight": 0.0},
+            "requires --h3_two_teacher_loss_weight",
+        ),
+        (
+            {"h3_two_teacher_snapshot_step": 500, "h3_two_teacher_weights": None, "max_train_steps": 500},
+            "leaves no routing phase",
+        ),
+        (
+            {"h3_two_teacher_snapshot_step": 5, "h3_two_teacher_weights": None, "scale_weight_norms": 1.0},
+            "rejected with --scale_weight_norms",
+        ),
+    ],
+)
+def test_h3_two_teacher_snapshot_step_is_validated(overrides, match):
+    args = _two_teacher_args(**overrides)
+    with pytest.raises(ValueError, match=match):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("objective", ["rollout", "guidance"])
+def test_h3_two_teacher_curriculum_allows_the_acquisition_objective(objective, tmp_path):
+    """Phase-separated, so the combination one run needs is no longer rejected."""
+    acquisition = {"h3_guidance_distillation_scale": 3.5}
+    if objective == "rollout":
+        config = tmp_path / "teacher.toml"
+        config.write_text("")
+        acquisition = {"h3_rollout_supervision": True, "h3_rollout_teacher_config": str(config)}
+    args = _two_teacher_args(
+        h3_two_teacher_weights=None,
+        h3_two_teacher_snapshot_step=500,
+        max_train_steps=1000,
+        sdpa=True,
+        **acquisition,
+    )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def test_h3_two_teacher_weights_alone_are_rejected():

@@ -889,6 +889,20 @@ def _two_teacher_sigma_active(args, inputs) -> bool:
     return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
 
 
+def _two_teacher_curriculum(args) -> bool:
+    """True when --h3_two_teacher_snapshot_step folds the two-run recipe into one.
+
+    The two-run form trains the concept, saves it, and distils from that file. The
+    dependency between the two is an ordering one, so one process can serve it: up
+    to the snapshot step the run trains the concept with its ordinary objective, at
+    that step the adapter is copied in memory as the frozen teacher, and after it
+    the objective is the two-teacher one. The student carries its own weights across
+    the switch, which is the warm start the second run of the two-command form does
+    not get.
+    """
+    return int(getattr(args, "h3_two_teacher_snapshot_step", 0) or 0) > 0
+
+
 def _null_anchor_weight_at(args, global_step: int) -> float:
     """The data-step null anchor's weight at this step: the configured weight, or a
     linear ramp from it to --h3_guidance_null_anchor_weight_end over --max_train_steps
@@ -3130,9 +3144,35 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             value = float(getattr(args, name, 0.0) or 0.0)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"--{name} must be finite and non-negative")
+        snapshot_step = int(getattr(args, "h3_two_teacher_snapshot_step", 0) or 0)
+        if snapshot_step < 0:
+            raise ValueError("--h3_two_teacher_snapshot_step must not be negative")
+        if snapshot_step > 0:
+            if getattr(args, "h3_two_teacher_weights", None):
+                raise ValueError(
+                    "--h3_two_teacher_snapshot_step takes the teacher from this run's own adapter, so it is rejected "
+                    "with --h3_two_teacher_weights; pass one or the other"
+                )
+            if two_teacher_weight <= 0:
+                raise ValueError("--h3_two_teacher_snapshot_step requires --h3_two_teacher_loss_weight above 0")
+            if getattr(args, "scale_weight_norms", None):
+                # Max-norm regularization rescales the adapter after the
+                # post-optimizer hook the snapshot is taken in, so the teacher
+                # would be the unclamped weights while the student and any
+                # checkpoint at that step carry the clamped ones.
+                raise ValueError("--h3_two_teacher_snapshot_step is rejected with --scale_weight_norms")
+            total = 0 if getattr(args, "max_train_epochs", None) else int(getattr(args, "max_train_steps", 0) or 0)
+            if total and snapshot_step >= total:
+                raise ValueError(
+                    f"--h3_two_teacher_snapshot_step {snapshot_step} leaves no routing phase: it must be below "
+                    f"--max_train_steps ({total})"
+                )
         if two_teacher_weight > 0:
-            if not getattr(args, "h3_two_teacher_weights", None):
-                raise ValueError("--h3_two_teacher_loss_weight requires --h3_two_teacher_weights")
+            if not getattr(args, "h3_two_teacher_weights", None) and snapshot_step <= 0:
+                raise ValueError(
+                    "--h3_two_teacher_loss_weight requires a teacher: --h3_two_teacher_weights for the two-run form, "
+                    "or --h3_two_teacher_snapshot_step for the one-run curriculum"
+                )
             if getattr(args, "h3_adapter_prompt_only", False):
                 raise ValueError("--h3_two_teacher_loss_weight is rejected with --h3_adapter_prompt_only")
             if args.h3_training_mode in {"ref2va", "ref2va_omni"}:
@@ -3144,11 +3184,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 )
             # Both of these assemble the optimized loss themselves -- the rollout
             # replaces the video objective, sparse guidance rescales it -- so the
-            # distillation mixture would be discarded rather than composed.
-            if getattr(args, "h3_rollout_supervision", False):
-                raise ValueError("--h3_two_teacher_loss_weight is rejected with --h3_rollout_supervision")
-            if args.h3_guidance_distillation_scale is not None:
-                raise ValueError("--h3_two_teacher_loss_weight is rejected with --h3_guidance_distillation_scale")
+            # distillation mixture would be discarded rather than composed. The
+            # curriculum is the exception and the reason one run is possible: they
+            # are the acquisition phase's objective and stand down at the snapshot,
+            # so they never reach the same step as the routing loss.
+            if snapshot_step <= 0:
+                if getattr(args, "h3_rollout_supervision", False):
+                    raise ValueError(
+                        "--h3_two_teacher_loss_weight is rejected with --h3_rollout_supervision; with "
+                        "--h3_two_teacher_snapshot_step the rollout is the acquisition phase and is allowed"
+                    )
+                if args.h3_guidance_distillation_scale is not None:
+                    raise ValueError(
+                        "--h3_two_teacher_loss_weight is rejected with --h3_guidance_distillation_scale; with "
+                        "--h3_two_teacher_snapshot_step the guidance loss is the acquisition phase and is allowed"
+                    )
         elif getattr(args, "h3_two_teacher_weights", None):
             raise ValueError("--h3_two_teacher_weights requires --h3_two_teacher_loss_weight above 0")
         dop_sigma_min = float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0)
@@ -3466,6 +3516,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
         if sync_gradients:
             self._update_adapter_ema(args, accelerator, network, global_step)
+            self.snapshot_teacher(args, accelerator, network, transformer, global_step)
         if self._h3_profiler is None or not sync_gradients:
             return
         self._h3_profiler.step()
@@ -3651,9 +3702,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         :meth:`install_overlay_weights` for why the correction stays a separate
         live module instead of being merged.
         """
+        weights_sd = self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3")
+        return self._frozen_lora_from_weights(weights_sd, multiplier, accelerator, transformer, label, str(path))
+
+    def _frozen_lora_from_weights(self, weights_sd, multiplier, accelerator, transformer, label: str, source: str):
+        """Attach ``weights_sd`` as a live, frozen LoRA on top of the trainable one.
+
+        Split out of :meth:`_install_frozen_lora` so the curriculum can build a
+        teacher from the student's own weights without a checkpoint round-trip;
+        ``snapshot_weights`` produces exactly the key convention a saved adapter
+        has, so both callers hand this the same shape.
+        """
         from musubi_tuner.networks import lora_minimax_h3
 
-        weights_sd = self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3")
+        path = source
         network = lora_minimax_h3.create_arch_network_from_weights(
             multiplier,
             weights_sd,
@@ -3687,11 +3749,63 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         return network
 
+    def snapshot_teacher(self, args, accelerator, network, transformer, global_step: int) -> bool:
+        """Freeze the student as the two-teacher teacher once the curriculum says so.
+
+        Called from the post-optimizer hook, where ``global_step`` is still the
+        index of the step that just finished, so the snapshot lands after
+        ``--h3_two_teacher_snapshot_step`` completed updates. Idempotent: the
+        teacher is installed once and its presence is what switches the phase, so
+        no step counter has to agree with the loss function about the boundary.
+        """
+        if not _two_teacher_curriculum(args) or self._teacher_network is not None or network is None:
+            return False
+        boundary = int(args.h3_two_teacher_snapshot_step)
+        # max_train_steps is recomputed from --max_train_epochs after the arguments
+        # were validated, so the only place the boundary can be checked against the
+        # length the run will actually have is here, on the first update.
+        total = int(getattr(args, "max_train_steps", 0) or 0)
+        if total and boundary >= total:
+            raise ValueError(f"--h3_two_teacher_snapshot_step {boundary} leaves no routing phase: this run is {total} steps")
+        if int(global_step) + 1 < boundary:
+            return False
+        if int(global_step) + 1 > boundary:
+            # The phase is carried by the teacher's existence and the teacher is not
+            # checkpointed, so a resume past the boundary would snapshot the student
+            # again, at the resumed step, against a different target than the run it
+            # continues. Refuse rather than train something else under the same name.
+            raise ValueError(
+                f"--h3_two_teacher_snapshot_step {boundary} was already passed by this resumed run (now at step "
+                f"{int(global_step) + 1}) and the frozen teacher is not part of a checkpoint. Resume the routing "
+                "phase as the two-command form instead: pass the boundary checkpoint as --h3_two_teacher_weights "
+                "and drop --h3_two_teacher_snapshot_step"
+            )
+        unwrapped = accelerator.unwrap_model(network)
+        snapshot = getattr(unwrapped, "snapshot_weights", None)
+        if not callable(snapshot):
+            raise TypeError("--h3_two_teacher_snapshot_step requires a network with snapshot_weights()")
+        weights_sd = {key: value.to(device="cpu", dtype=torch.float32) for key, value in snapshot(torch.float32).items()}
+        accelerator.print(
+            f"MiniMax H3 two-teacher curriculum: acquisition phase ended at step {int(global_step) + 1}; "
+            "the adapter is now frozen as the teacher and the objective switches to routing"
+        )
+        teacher = self._frozen_lora_from_weights(
+            weights_sd,
+            float(getattr(args, "h3_two_teacher_multiplier", 1.0)),
+            accelerator,
+            transformer,
+            "two-teacher snapshot",
+            f"student snapshot at step {int(global_step) + 1}",
+        )
+        teacher.set_enabled(False)
+        self._teacher_network = teacher
+        return True
+
     def install_teacher_weights(self, args, accelerator, transformer):
         """Attach ``--h3_two_teacher_weights`` as a frozen teacher, left DISABLED.
 
         Unlike the overlay, this network is not part of the model the adapter is
-        trained inside: it is switched on for the styled teacher's forward alone
+        trained inside: it is switched on for the concept teacher's forward alone
         and off everywhere else, so no other objective sees it.
         """
         path = getattr(args, "h3_two_teacher_weights", None)
@@ -5724,7 +5838,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         # A dropped step is already unconditional, so there is no guided field to
         # invert and both branches would evaluate the same empty prompt.
-        use_guidance = args.h3_guidance_distillation_scale is not None and conditioning == "prompt"
+        # After the curriculum's snapshot the concept is supplied by the frozen
+        # teacher, so the objectives that were acquiring it stand down. Their
+        # presence in the same command is what makes one run possible; they never
+        # run in the same step as the routing loss.
+        routing_phase = _two_teacher_curriculum(args) and self._teacher_network is not None
+        use_guidance = args.h3_guidance_distillation_scale is not None and conditioning == "prompt" and not routing_phase
         # Sparse guidance skips the empty forward entirely on an inactive step and
         # falls back to the ordinary velocity objective for that step.
         if use_guidance:
@@ -5737,7 +5856,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # there is no privileged null field to distil into a dropped step's
         # unconditional branch. Such a step keeps the ordinary data objective,
         # exactly as the guidance branch stands down on one.
-        rollout_active = bool(getattr(args, "h3_rollout_supervision", False)) and conditioning == "prompt"
+        rollout_active = bool(getattr(args, "h3_rollout_supervision", False)) and conditioning == "prompt" and not routing_phase
         if rollout_active:
             rollout_active = (
                 self._rollout_supervision_active(accelerator, args.h3_rollout_probability)
@@ -5763,7 +5882,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         )
         dop_reference_prediction = None
-        teacher_styled_prediction = None
+        teacher_concept_prediction = None
         two_teacher_bare_loss = None
         two_teacher_active = (
             float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
@@ -5967,14 +6086,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
                 int8_context = getattr(transformer, "int8_attention_context", None)
 
-                def teacher_forward(cond, styled: bool):
+                def teacher_forward(cond, concept: bool):
                     # Every teacher arm starts from the same RNG state as the
                     # student passes below, so the stochastic conditioning rows
                     # are shared and the two targets differ only by the prompt
                     # and by which frozen adapter is live.
                     with torch.random.fork_rng(devices=fork_devices):
                         set_enabled(False)
-                        self._teacher_network.set_enabled(styled)
+                        self._teacher_network.set_enabled(concept)
                         try:
                             with (
                                 torch.no_grad(),
@@ -5985,10 +6104,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             self._teacher_network.set_enabled(False)
                             set_enabled(True)
 
-                # The styled teacher under the trigger, and the untouched base
+                # The concept teacher under the trigger, and the untouched base
                 # under the trigger-free presentation: the two targets the
                 # student is asked to hold at the same state.
-                teacher_styled_prediction = teacher_forward(conditioning, True)
+                teacher_concept_prediction = teacher_forward(conditioning, True)
                 teacher_bare_prediction = teacher_forward("dop", False)
             if dop_active and not _dop_sigma_active(args, inputs):
                 dop_active = False
@@ -6054,7 +6173,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # has a different packed length.
             # Forked like the teacher arms: this pass must leave the RNG where it
             # found it, so the primary forward below starts from the same state the
-            # styled teacher was evaluated at and the two arms of each pair share
+            # concept teacher was evaluated at and the two arms of each pair share
             # their stochastic conditioning rows.
             with torch.random.fork_rng(devices=[accelerator.device] if accelerator.device.type == "cuda" else []):
                 two_teacher_bare_prediction = self._predict(accelerator, transformer, batch, inputs, conditioning="dop")
@@ -6197,12 +6316,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         two_teacher_trigger_loss = None
         if two_teacher_active:
             # The triggered arm reuses the primary forward: the student's own
-            # prediction at this state, matched to the styled teacher's. The data
+            # prediction at this state, matched to the concept teacher's. The data
             # objective survives only at --h3_two_teacher_data_weight, which is 0
             # for pure distillation.
             two_teacher_trigger_loss = joint_prediction_loss(
                 raw_prediction,
-                teacher_styled_prediction,
+                teacher_concept_prediction,
                 video_mask=effective_video_mask,
                 audio_mask=effective_audio_mask,
                 balance=args.h3_loss_balance,
@@ -6845,6 +6964,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_two_teacher_bare_weight": str(float(getattr(args, "h3_two_teacher_bare_weight", 1.0))),
             "ss_h3_two_teacher_data_weight": str(float(getattr(args, "h3_two_teacher_data_weight", 0.0) or 0.0)),
             "ss_h3_two_teacher_sigma_min": str(float(getattr(args, "h3_two_teacher_sigma_min", 0.0) or 0.0)),
+            "ss_h3_two_teacher_snapshot_step": str(int(getattr(args, "h3_two_teacher_snapshot_step", 0) or 0)),
             "ss_h3_two_teacher_multiplier": str(float(getattr(args, "h3_two_teacher_multiplier", 1.0))),
             "ss_h3_dop_sigma_min": str(float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0)),
             "ss_h3_shift_video": str(args.h3_shift_video),
@@ -7773,7 +7893,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "LoRA of the styled teacher for two-teacher distillation: a frozen second adapter, live only on the "
+            "LoRA of the concept teacher for two-teacher distillation: a frozen second adapter, live only on the "
             "teacher's own forward. Needs --h3_two_teacher_loss_weight above 0"
         ),
     )
@@ -7788,7 +7908,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "two-teacher distillation: at each supervised state the student is matched to the styled teacher under "
+            "two-teacher distillation: at each supervised state the student is matched to the concept teacher under "
             "the trigger and to the frozen base under the trigger-free presentation. Off at 0"
         ),
     )
@@ -7805,6 +7925,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "multiplier on the ordinary data objective while two-teacher distillation is on; 0 (default) trains on "
             "the two teachers alone"
+        ),
+    )
+    parser.add_argument(
+        "--h3_two_teacher_snapshot_step",
+        type=int,
+        default=0,
+        help=(
+            "fold the two-run recipe into one: train the concept with the ordinary objective for this many steps, "
+            "then freeze the adapter in memory as the two-teacher teacher and switch to the routing objective for the "
+            "rest of the run (0 = off, use --h3_two_teacher_weights instead)"
         ),
     )
     parser.add_argument(
