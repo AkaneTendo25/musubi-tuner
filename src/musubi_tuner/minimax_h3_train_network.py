@@ -875,6 +875,14 @@ def _null_anchor_sigma_active(args, inputs) -> bool:
     return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
 
 
+def _dop_sigma_active(args, inputs) -> bool:
+    """--h3_dop_sigma_min: DOP runs only on steps at or above this shifted video
+    sigma. The trigger's update lands at high sigma (the base's field lives there);
+    below it the bare and triggered predictions coincide and DOP pins texture."""
+    sigma_min = float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0)
+    return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
+
+
 def _null_anchor_weight_at(args, global_step: int) -> float:
     """The data-step null anchor's weight at this step: the configured weight, or a
     linear ramp from it to --h3_guidance_null_anchor_weight_end over --max_train_steps
@@ -3141,6 +3149,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_dop_loss_weight must be finite and non-negative")
         if not math.isfinite(args.h3_dop_probability) or not 0 < args.h3_dop_probability <= 1:
             raise ValueError("--h3_dop_probability must be finite and lie in (0, 1]")
+        dop_sigma_min = float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0)
+        if not math.isfinite(dop_sigma_min) or not 0.0 <= dop_sigma_min < 1.0:
+            raise ValueError("--h3_dop_sigma_min must be finite and lie in [0, 1)")
         args.h3_dop_trigger = args.h3_dop_trigger.strip()
         args.h3_dop_class_prompt = " ".join(args.h3_dop_class_prompt.split())
         if args.h3_dop_loss_weight > 0:
@@ -5950,6 +5961,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             )
                     finally:
                         set_enabled(True)
+            if dop_active and not _dop_sigma_active(args, inputs):
+                dop_active = False
             if dop_active:
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_dop_loss_weight")
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
@@ -6720,6 +6733,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_dop_trigger": args.h3_dop_trigger or "none",
             "ss_h3_dop_class_prompt": args.h3_dop_class_prompt or "none",
             "ss_h3_dop_caption_mode": args.h3_dop_caption_mode,
+            "ss_h3_dop_sigma_min": str(float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0)),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
             "ss_h3_sigma_sqrt_max_weight": str(args.h3_sigma_sqrt_max_weight),
@@ -7644,6 +7658,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default="class",
         choices=["class", "bare"],
         help="DOP caption mode the text cache was written with: class (trigger replaced by the class prompt) or bare (trigger removed)",
+    )
+    parser.add_argument(
+        "--h3_dop_sigma_min",
+        type=float,
+        default=0.0,
+        help="evaluate DOP only on steps whose shifted video sigma is at least this value (0 = every step); not rescaled",
     )
     parser.add_argument(
         "--crepa",

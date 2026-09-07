@@ -319,6 +319,7 @@ class TrainingConfig(BaseModel):
     h3_dop_trigger: str = ""
     h3_dop_class_prompt: str = ""
     h3_dop_caption_mode: Literal["class", "bare"] = "class"
+    h3_dop_sigma_min: float = 0.0
     h3_overlay_weights: str = ""
     h3_overlay_weights_multiplier: float = 1.0
     h3_attn_auto_dispatch: bool = False

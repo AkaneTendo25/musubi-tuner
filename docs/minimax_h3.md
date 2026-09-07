@@ -1047,6 +1047,7 @@ Every objective here is off unless its flag is given; a run that names none of t
 | `--h3_adapter_ema_decay 0.0` | Keep an exponential moving average of the adapter's trainable parameters, updated after every optimizer step, and save it beside each scheduled checkpoint as `<output_name>-ema-step<N>.safetensors` (an ordinary adapter file). Damps the step-to-step swing between competing terms without changing the objective. `--h3_validate_ema` validates the average instead of the live adapter. |
 | `--h3_dop_loss_weight 0.0` | Differential Output Preservation, off at the default: penalizes LoRA drift from the frozen base under a trigger-free rewrite of each caption. |
 | `--h3_dop_probability 1.0` | Evaluate DOP on a synchronized random fraction of prompt-conditioned batches and inverse-probability scale its loss. |
+| `--h3_dop_sigma_min 0.0` | Evaluate DOP only on steps whose shifted video sigma is at least this value; below it the DOP forwards are skipped. Not rescaled. |
 | `--crepa` | Temporal representation alignment for video training. |
 
 **`--h3_guidance_scale_range`.** `LOWER` must exceed `1`. The draw uses its own distributed-synchronized generator, so adding it leaves every other random branch of a seeded run untouched; validation reads the midpoint so its loss stays comparable across evaluations. Composes with the sparse probability and with both loss forms and schedules.

@@ -771,6 +771,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--h3_dop_class_prompt", t.h3_dop_class_prompt]
         if t.h3_dop_probability != 1.0:
             cmd += ["--h3_dop_probability", str(t.h3_dop_probability)]
+        if t.h3_dop_sigma_min != 0.0:
+            cmd += ["--h3_dop_sigma_min", str(t.h3_dop_sigma_min)]
     if t.h3_fuse_frozen_teachers:
         cmd.append("--h3_fuse_frozen_teachers")
     if t.h3_overlay_weights:

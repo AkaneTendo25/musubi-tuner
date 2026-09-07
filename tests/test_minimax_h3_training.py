@@ -7424,3 +7424,69 @@ def test_h3_additive_guidance_form_is_validated():
         MiniMaxH3NetworkTrainer().handle_model_specific_args(
             _h3_flag_args("--h3_guidance_distillation_scale", "4.0", "--h3_guidance_loss_form", "additive")
         )
+
+
+def test_h3_dop_sigma_gate_skips_low_sigma_steps():
+    args = create_parser().parse_args([])
+    args.h3_dop_loss_weight = 0.1
+    args.h3_dop_trigger = "sks"
+    args.h3_dop_class_prompt = "woman"
+    args.h3_dop_sigma_min = 0.9
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer._base_preservation_active = lambda accelerator, probability: False
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch_keys = {
+        H3_DOP_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_DOP_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+        H3_DOP_CONFIG_KEY: [dop_config_identity("sks", "woman")],
+    }
+
+    # t = 0.2 shifts to sigma 0.75: below the gate, so no DOP forwards at all.
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    _, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        {"timesteps": [0.2], **batch_keys},
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    assert backend.calls == [("prompt", True)]
+    assert metrics["h3/dop_active"] == 0.0
+
+    # t = 0.5 shifts to sigma 0.92: active.
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    _, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        {"timesteps": [0.5], **batch_keys},
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    assert backend.calls == [("dop", False), ("dop", True), ("prompt", True)]
+    assert metrics["h3/dop_active"] == 1.0
+
+
+def test_h3_dop_sigma_min_is_validated():
+    args = create_parser().parse_args([])
+    args.h3_dop_sigma_min = 1.0
+    with pytest.raises(ValueError, match="h3_dop_sigma_min"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)

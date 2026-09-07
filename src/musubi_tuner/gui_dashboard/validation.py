@@ -1007,6 +1007,17 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        dop_sigma_min = float(t.h3_dop_sigma_min)
+        if not math.isfinite(dop_sigma_min) or not 0 <= dop_sigma_min < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_dop_sigma_min",
+                    "H3 DOP sigma minimum must be finite and lie in [0, 1).",
+                    label="H3 DOP Sigma Minimum",
+                    page="training",
+                )
+            )
         if dop_weight > 0:
             bare_mode = t.h3_dop_caption_mode == "bare"
             if not t.h3_dop_trigger.strip() or (not bare_mode and not t.h3_dop_class_prompt.strip()):
