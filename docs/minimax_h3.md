@@ -1102,18 +1102,12 @@ so variable prompt lengths remain compatible with activation checkpointing and b
 
 #### Two-teacher distillation
 
-The adapter is fitted to two frozen targets instead of to the data: under the trigger it is matched to a concept
-teacher (a LoRA that already carries the concept, applied to the same base), and under the trigger-free version of
-the same caption to the untouched base. Both targets are taken at the same noisy state, so the pair states the
-intended behaviour directly: this prompt moves, that prompt does not.
+The adapter is fitted to two frozen targets at the same noisy state instead of to the data: the concept teacher
+under the trigger, the untouched base under the trigger-free version of the same caption. The teacher is a second
+frozen LoRA on the same transformer, live only on its own forward; it is never merged, never optimized and never
+written to a checkpoint. The concept it carries may be anything an adapter holds.
 
-Nothing in the objective is specific to what the teacher carries. It needs a caption that can be presented with and
-without the trigger, and a teacher that carries the concept cleanly on this base; the concept itself may be a style,
-a subject, a motion or anything else an adapter can hold. Only the measurements behind the recipe below are from a
-style corpus.
-
-The teacher is a second frozen LoRA network on the same transformer, switched on for its own forward and off
-everywhere else. It is never merged, never optimized, and never written to a checkpoint.
+Two forms. Two commands, with a teacher trained beforehand:
 
 ```shell
 python minimax_h3_cache_text_encoder_outputs.py ... \
@@ -1124,32 +1118,34 @@ accelerate launch minimax_h3_train_network.py ... \
   --h3_two_teacher_weights teacher.safetensors --h3_two_teacher_loss_weight 1.0
 ```
 
-`--h3_two_teacher_snapshot_step N` runs both phases in one command instead. Up to step `N` the run trains the
-concept with whatever objective it is configured with, at step `N` the adapter is copied in memory as the teacher,
-and the rest of the run is the distillation above. The student keeps its own weights across the switch, so the
-triggered arm starts already fitted and the trigger-free arm does the work. The acquisition objectives
-(`--h3_rollout_supervision`, `--h3_guidance_distillation_scale`) are accepted alongside in this form only: they
-stand down at the snapshot and never reach the same step as the distillation loss.
+One command, with `--h3_two_teacher_snapshot_step N` in place of `--h3_two_teacher_weights`: the run trains the
+concept up to step `N`, freezes the adapter as the teacher, and distils for the rest of the run. The student keeps
+its weights across the switch. The teacher is written to `<output_dir>/<output_name>-teacher-step<N>.safetensors`.
 
-The frozen teacher is not part of a checkpoint, so a run resumed past the boundary would freeze a different
-adapter than the run it continues. That is refused with a message rather than trained: resume the distillation
-phase as the two-command form, passing the boundary checkpoint as `--h3_two_teacher_weights`. Rejected with
-`--scale_weight_norms`, whose rescaling lands after the snapshot is taken.
+Requirements.
 
-The trigger-free presentation comes from the DOP text cache, so cache it with `--h3_dop_trigger` and
-`--h3_dop_caption_mode bare` and pass the same values to training; the cache identity is checked before the first
-step, as it is for DOP. Supported for the T2VA/FL2VA family, not Ref2VA;
-rejected with `--h3_adapter_prompt_only`. The trigger-free arm is backpropagated before the ordinary pass, so
-variable prompt lengths stay compatible with activation checkpointing and block swapping. Reports
-`loss/two_teacher_trigger`, `loss/two_teacher_bare` and `h3/two_teacher_active`.
+- Text cached with `--h3_dop_trigger` and `--h3_dop_caption_mode bare`, the same values passed to training. The
+  cache identity is checked before the first step.
+- T2VA/FL2VA only. Rejected for Ref2VA and with `--h3_adapter_prompt_only`.
+- `--h3_two_teacher_weights` and `--h3_two_teacher_snapshot_step` are mutually exclusive; one of them is required.
+- `--h3_rollout_supervision` and `--h3_guidance_distillation_scale` are rejected, except under
+  `--h3_two_teacher_snapshot_step`, where they run before the switch and stand down at it.
+- `--h3_two_teacher_snapshot_step` is rejected with `--scale_weight_norms`, and must be below the run's resolved
+  step count.
+- A run resumed past the snapshot step is refused: the teacher is not in the checkpoint. Continue as the
+  two-command form, passing the boundary checkpoint as `--h3_two_teacher_weights`.
 
-On the steps distillation is active, `--h3_two_teacher_data_weight 0` leaves the clips supplying the states and the
-two teachers supplying the targets; a value above `0` mixes the data objective back in. Steps the objective does not
-cover -- caption-dropout steps, and steps below `--h3_two_teacher_sigma_min` -- train the ordinary objective as
-usual.
+Behaviour. `--h3_two_teacher_data_weight 0` trains on the two teachers alone; above `0` it mixes the ordinary data
+objective back in. Caption-dropout steps and steps below `--h3_two_teacher_sigma_min` train the ordinary objective.
+After the snapshot step, further training changes the routing, not the concept, which is fixed at the teacher's.
+The trigger-free arm is backpropagated before the ordinary pass, so variable prompt lengths stay compatible with
+activation checkpointing and block swapping. Reports `loss/two_teacher_trigger`, `loss/two_teacher_bare` and
+`h3/two_teacher_active`.
 
-Rejected with `--h3_rollout_supervision` and with `--h3_guidance_distillation_scale`: both assemble the optimized
-loss themselves, so the distillation mixture would be replaced rather than composed.
+Limits. The concept the result reaches is the teacher's. States from a corpus unrelated to the concept transfer it
+weakly. Measurements behind the recipe are from one style corpus on FL2VA, and the trigger-free behaviour is measured
+on that corpus's held-out clips, not on captions from outside it. `--h3_two_teacher_snapshot_step` has not been
+measured against the two-command form.
 
 #### CREPA
 
@@ -1665,22 +1661,19 @@ together. The anchor fixes the reference point, the teacher sets the direction, 
 
 #### Two-teacher distillation
 
-The adapter is fitted to two frozen targets at the same noisy state instead of to the data: under the trigger it is
-matched to a concept teacher, a separately trained adapter that already carries the concept on the same base; under
-the trigger-free version of the same caption it is matched to the untouched base. The clips supply the states, not
-the targets.
+The adapter is fitted to two frozen targets at the same noisy state instead of to the data: a concept teacher
+under the trigger, the untouched base under the trigger-free version of the same caption. The clips supply the
+states, not the targets.
 
-- **Applies to:** the T2VA/FL2VA family, and to any concept an adapter can carry; nothing in the objective is
-  style-specific. Rejected for Ref2VA and with `--h3_adapter_prompt_only`. Rejected together with
-  `--h3_rollout_supervision` and `--h3_guidance_distillation_scale`, except under
-  `--h3_two_teacher_snapshot_step`, where those are the acquisition phase and stand down at the snapshot.
-- **Advantages:** states the intended behaviour directly rather than penalising the trigger-free branch, so the
-  concept is not traded away to buy conditionality. The trigger-free prediction stays at the base's. No teacher
-  dataset and no rollout: the objective needs only the trigger-free text cache. About **1.6x** a plain step, less
-  than the recipes it replaces.
-- **Disadvantages:** needs a teacher that already carries the concept, and the concept it can reach is the
-  teacher's. Two phases, either as two commands or as one with `--h3_two_teacher_snapshot_step`. The states should
-  come from a corpus related to the concept; unrelated clips transfer it weakly.
+- **Applies to:** the T2VA/FL2VA family, any concept an adapter can carry. Rejected for Ref2VA and with
+  `--h3_adapter_prompt_only`. Rejected with `--h3_rollout_supervision` and `--h3_guidance_distillation_scale`,
+  except under `--h3_two_teacher_snapshot_step`, which runs them before the switch.
+- **Advantages:** on the concept's own held-out clips the trigger-free prediction stays at the base's, and the
+  concept keeps the teacher's strength.
+  No teacher dataset and no rollout: only the trigger-free text cache. About **1.6x** a plain step.
+- **Disadvantages:** needs a teacher, so two phases, as two commands or one with
+  `--h3_two_teacher_snapshot_step`. The concept reached is the teacher's. States from a corpus unrelated to the
+  concept transfer it weakly.
 - **Flags:** `--h3_two_teacher_weights`, `--h3_two_teacher_loss_weight`; optionally
   `--h3_two_teacher_bare_weight`, `--h3_two_teacher_data_weight`, `--h3_two_teacher_sigma_min`,
   `--h3_two_teacher_multiplier`, `--h3_two_teacher_snapshot_step`. Needs a text cache written with `--h3_dop_trigger` and
@@ -1850,11 +1843,10 @@ Variations.
   anchor at every sigma.
 
 **FL2VA, a concept behind a trigger word: two-teacher distillation.** About 1.6x a plain step for the
-distillation phase. Keeps the teacher's concept while leaving the trigger-free prediction at the base's, which the
-single-phase recipe above does not. Two phases, as two commands or as one.
+distillation phase. Keeps the teacher's concept with the trigger-free prediction at the base's.
 
-First train the teacher: any recipe that gives a clean concept on this checkpoint will do, including the
-unconditional H-OPSD recipe above. Then cache the trigger-free presentation and distil:
+The teacher is any adapter with a clean concept on this checkpoint, including the unconditional H-OPSD recipe
+above. Cache the trigger-free presentation, then distil:
 
 ```shell
 python minimax_h3_cache_text_encoder_outputs.py ... \
@@ -1867,7 +1859,7 @@ accelerate launch minimax_h3_train_network.py ... \
   --h3_two_teacher_loss_weight 1.0 --h3_two_teacher_bare_weight 2.0 --h3_two_teacher_data_weight 0.0
 ```
 
-Or in one command, with the acquisition objective in the same line and the phase boundary at step 1000:
+Or in one command, with the boundary at step 1000:
 
 ```shell
 accelerate launch minimax_h3_train_network.py ... \
@@ -1878,13 +1870,13 @@ accelerate launch minimax_h3_train_network.py ... \
   --h3_two_teacher_loss_weight 1.0 --h3_two_teacher_bare_weight 2.0 --h3_two_teacher_data_weight 0.0
 ```
 
-Pick the boundary where the concept has stopped improving; the two-command form's own split is the starting point.
+Set the boundary where the concept stops improving. Steps after it change the routing, not the concept. Too low
+caps the result at a weaker teacher; recover by rerunning the distillation as two commands against
+`<output_dir>/<output_name>-teacher-step<N>.safetensors` or any acquisition checkpoint.
 
-Variations. `--h3_two_teacher_bare_weight 1.0` weights the two arms equally and leaves a little more of the
-trigger's update on trigger-free prompts. `--h3_two_teacher_data_weight` above `0` mixes the ordinary data
-objective back in, which is what to reach for if the teacher's concept is weaker than the clips'. Train the states
-on the concept's own corpus: an unrelated corpus carries the concept across but leaves more of it on trigger-free
-prompts.
+Variations. `--h3_two_teacher_bare_weight 1.0` weights the two arms equally and leaves more of the trigger's update
+on trigger-free prompts. `--h3_two_teacher_data_weight` above `0` mixes the ordinary data objective back in; use it
+when the teacher's concept is weaker than the clips'. Train the states on the concept's own corpus.
 
 ## Inference
 

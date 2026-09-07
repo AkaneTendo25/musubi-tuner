@@ -3785,9 +3785,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if not callable(snapshot):
             raise TypeError("--h3_two_teacher_snapshot_step requires a network with snapshot_weights()")
         weights_sd = {key: value.to(device="cpu", dtype=torch.float32) for key, value in snapshot(torch.float32).items()}
+        # The teacher is what the rest of the run is fitted to, so it is written out
+        # rather than kept only in memory: it makes the boundary auditable, and a
+        # boundary that turns out wrong can be retried as the two-command form
+        # against this file or against any acquisition checkpoint, without
+        # repeating the acquisition phase.
+        teacher_name = f"{args.output_name or 'h3'}-teacher-step{int(global_step) + 1:08d}.safetensors"
+        try:
+            from musubi_tuner.utils import async_save
+
+            teacher_path = os.path.join(args.output_dir, teacher_name)
+            async_save.write_state_dict_file(weights_sd, teacher_path, None)
+            written = teacher_path
+        except Exception as error:  # a failed side-effect must not lose the run
+            logger.warning(f"MiniMax H3 two-teacher curriculum: could not write {teacher_name}: {error}")
+            written = "memory only"
         accelerator.print(
             f"MiniMax H3 two-teacher curriculum: acquisition phase ended at step {int(global_step) + 1}; "
-            "the adapter is now frozen as the teacher and the objective switches to routing"
+            f"the adapter is now frozen as the teacher ({written}) and the objective switches to routing"
         )
         teacher = self._frozen_lora_from_weights(
             weights_sd,

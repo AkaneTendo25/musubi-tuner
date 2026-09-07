@@ -7626,6 +7626,36 @@ def test_h3_two_teacher_curriculum_snapshots_the_student_once_at_the_step():
     assert "step 3" in installed[0][3]
 
 
+def test_h3_two_teacher_curriculum_writes_the_teacher_beside_the_checkpoints(tmp_path):
+    """A boundary that turns out wrong is retried against this file, not by retraining."""
+    args = _two_teacher_args(
+        h3_two_teacher_weights=None,
+        h3_two_teacher_snapshot_step=2,
+        output_dir=str(tmp_path),
+        output_name="run",
+    )
+    transformer = _ScaleTransformer()
+    network = _SnapshotNetwork(transformer)
+    trainer, _ = _curriculum_trainer(network, transformer)
+    trainer.snapshot_teacher(args, _FakeAccelerator(), network, transformer, 1)
+    assert (tmp_path / "run-teacher-step00000002.safetensors").is_file()
+
+
+def test_h3_two_teacher_curriculum_survives_an_unwritable_teacher_path():
+    """The snapshot is what training needs; the file beside it is a convenience."""
+    args = _two_teacher_args(
+        h3_two_teacher_weights=None,
+        h3_two_teacher_snapshot_step=2,
+        output_dir="/nonexistent-directory-for-the-h3-curriculum-test",
+        output_name="run",
+    )
+    transformer = _ScaleTransformer()
+    network = _SnapshotNetwork(transformer)
+    trainer, _ = _curriculum_trainer(network, transformer)
+    assert trainer.snapshot_teacher(args, _FakeAccelerator(), network, transformer, 1)
+    assert trainer._teacher_network is not None
+
+
 def test_h3_two_teacher_curriculum_refuses_a_resume_past_the_boundary():
     """The teacher is not checkpointed, so resuming past the switch would freeze a different adapter."""
     args = _two_teacher_args(h3_two_teacher_weights=None, h3_two_teacher_snapshot_step=3)
