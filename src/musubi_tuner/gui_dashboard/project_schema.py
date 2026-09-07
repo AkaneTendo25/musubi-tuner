@@ -307,7 +307,7 @@ class TrainingConfig(BaseModel):
     h3_guidance_distillation_scale: Optional[float] = None
     h3_guidance_scale_range: Optional[str] = None
     h3_guidance_distillation_probability: float = 1.0
-    h3_guidance_loss_form: Literal["normalized", "contrastive", "additive"] = "normalized"
+    h3_guidance_loss_form: Literal["normalized", "contrastive"] = "normalized"
     h3_guidance_loss_schedule: Literal["sigma", "constant"] = "sigma"
     h3_guidance_null_source: Literal["live", "frozen"] = "live"
     h3_guidance_cfg_zero: bool = False

@@ -5223,13 +5223,6 @@ def validate_slider_config(config: ProjectConfig) -> dict[str, Any]:
         )
     if t.h3_guidance_loss_form == "contrastive" and not guidance_enabled:
         error("training.h3_guidance_loss_form", "Contrastive H3 guidance loss requires a guidance scale.")
-    if t.h3_guidance_loss_form == "additive":
-        if not guidance_enabled:
-            error("training.h3_guidance_loss_form", "Additive H3 guidance loss requires a guidance scale.")
-        if t.h3_guidance_null_source != "frozen":
-            error("training.h3_guidance_loss_form", "Additive H3 guidance loss requires the frozen null source.")
-        if t.h3_guidance_cfg_zero:
-            error("training.h3_guidance_loss_form", "Additive H3 guidance loss does not combine with CFG-zero.")
     if guidance_enabled and float(t.network_dropout or 0.0) > 0:
         error("training.network_dropout", "H3 guidance training is incompatible with network dropout.")
     preservation_weight = float(t.h3_base_preservation_loss_weight)

@@ -663,6 +663,7 @@
 						<FormField fieldPath="training.h3_dop_trigger" value={$projectConfig?.training?.h3_dop_trigger || ''} oninput={(e) => updateTraining('h3_dop_trigger', e.target.value)} placeholder="sks" tooltip="Standalone trigger in each caption." />
 						<FormField fieldPath="training.h3_dop_class_prompt" value={$projectConfig?.training?.h3_dop_class_prompt || ''} oninput={(e) => updateTraining('h3_dop_class_prompt', e.target.value)} placeholder="woman" tooltip="Class phrase replacing the trigger." />
 						<FormField type="number" fieldPath="training.h3_dop_loss_weight" value={$projectConfig?.training?.h3_dop_loss_weight ?? 0.0} oninput={(e) => updateTraining('h3_dop_loss_weight', Number(e.target.value))} step="0.01" min={0} tooltip="Zero disables H3 DOP." />
+						<FormField type="number" fieldPath="training.h3_dop_sigma_min" value={$projectConfig?.training?.h3_dop_sigma_min ?? 0} oninput={(e) => updateTraining('h3_dop_sigma_min', Number(e.target.value))} min={0} max={0.99} step="0.05" tooltip="Evaluate DOP only on steps at or above this shifted video sigma; 0 = every step" />
 						<FormField type="number" fieldPath="training.h3_dop_probability" value={$projectConfig?.training?.h3_dop_probability ?? 1.0} oninput={(e) => updateTraining('h3_dop_probability', Number(e.target.value))} step="0.05" min={0.01} max={1} tooltip="Fraction of steps using DOP; active losses are inverse-probability scaled." />
 					</div>
 				</div>

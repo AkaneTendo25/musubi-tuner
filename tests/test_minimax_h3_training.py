@@ -7383,47 +7383,36 @@ def test_masked_rms_survives_a_fully_masked_item():
     assert trainer._masked_rms(torch.tensor([[1.0, 2.0]]), torch.tensor([[False, False]])) == 0.0
 
 
-def test_h3_additive_guidance_form_transplants_the_frozen_base_field():
-    args = _h3_flag_args(
-        "--h3_guidance_distillation_scale",
-        "4.0",
-        "--h3_guidance_loss_schedule",
-        "constant",
-        "--h3_guidance_loss_form",
-        "additive",
-        "--h3_guidance_null_source",
-        "frozen",
-    )
+def _dop_step(args, backend, timesteps=(0.5,)):
     trainer = MiniMaxH3NetworkTrainer()
-    trainer.handle_model_specific_args(args)
-    latents = torch.randn(2, 4, 1, 2, 2)
-    audio = torch.randn(2, 2, 8, 3)
-    inputs = prepare_joint_noisy_inputs(
-        latents, audio, torch.randn_like(latents), torch.randn_like(audio), torch.tensor([0.4, 0.7])
+    trainer.dit_dtype = torch.float32
+    trainer._base_preservation_active = lambda accelerator, probability: False
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": list(timesteps),
+        H3_DOP_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_DOP_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+        H3_DOP_CONFIG_KEY: [dop_config_identity("sks", "woman")],
+    }
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
-    prediction = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
-    empty = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
-    base = H3ModelPrediction(torch.randn(2, 4, 1, 2, 2), torch.randn(2, 2, 8, 3))
-    corrected, loss_inputs = trainer._guidance_loss_inputs(
-        args, prediction, empty, inputs, accelerator=_FakeAccelerator(), base_prediction=base
-    )
-    # The prediction is fitted as is; the target carries the base's (already guided) field at (1 - 1/S).
-    assert corrected is prediction
-    assert torch.allclose(loss_inputs.video_target, inputs.video_target + 0.75 * (base.video - empty.video))
-    assert torch.allclose(loss_inputs.audio_target, inputs.audio_target + 0.75 * (base.audio - empty.audio))
-    with pytest.raises(ValueError, match="frozen base"):
-        trainer._guidance_loss_inputs(args, prediction, empty, inputs, accelerator=_FakeAccelerator())
-
-
-def test_h3_additive_guidance_form_is_validated():
-    with pytest.raises(ValueError, match="requires --h3_guidance_distillation_scale"):
-        MiniMaxH3NetworkTrainer().handle_model_specific_args(
-            _h3_flag_args("--h3_guidance_loss_form", "additive", "--h3_guidance_null_source", "frozen")
-        )
-    with pytest.raises(ValueError, match="frozen"):
-        MiniMaxH3NetworkTrainer().handle_model_specific_args(
-            _h3_flag_args("--h3_guidance_distillation_scale", "4.0", "--h3_guidance_loss_form", "additive")
-        )
+    loss.backward()
+    return network, metrics
 
 
 def test_h3_dop_sigma_gate_skips_low_sigma_steps():
@@ -7432,55 +7421,14 @@ def test_h3_dop_sigma_gate_skips_low_sigma_steps():
     args.h3_dop_trigger = "sks"
     args.h3_dop_class_prompt = "woman"
     args.h3_dop_sigma_min = 0.9
-    trainer = MiniMaxH3NetworkTrainer()
-    trainer.dit_dtype = torch.float32
-    trainer._base_preservation_active = lambda accelerator, probability: False
-    transformer = _ScaleTransformer()
-    network = _ToggleNetwork(transformer)
-    video = torch.zeros(1, 24, 2, 2, 2)
-    batch_keys = {
-        H3_DOP_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
-        H3_DOP_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
-        H3_DOP_CONFIG_KEY: [dop_config_identity("sks", "woman")],
-    }
-
-    # t = 0.2 shifts to sigma 0.75: below the gate, so no DOP forwards at all.
     backend = _StochasticPreservationBackend()
-    trainer.backend = backend
-    _, metrics = trainer.process_batch(
-        args,
-        _FakeAccelerator(),
-        transformer,
-        network,
-        {"timesteps": [0.2], **batch_keys},
-        video,
-        torch.ones_like(video),
-        None,
-        torch.float32,
-        torch.float32,
-        None,
-        0,
-    )
+    # t = 0.2 shifts to sigma 0.75: below the gate, no DOP forwards at all.
+    _, metrics = _dop_step(args, backend, timesteps=(0.2,))
     assert backend.calls == [("prompt", True)]
     assert metrics["h3/dop_active"] == 0.0
-
-    # t = 0.5 shifts to sigma 0.92: active.
     backend = _StochasticPreservationBackend()
-    trainer.backend = backend
-    _, metrics = trainer.process_batch(
-        args,
-        _FakeAccelerator(),
-        transformer,
-        network,
-        {"timesteps": [0.5], **batch_keys},
-        video,
-        torch.ones_like(video),
-        None,
-        torch.float32,
-        torch.float32,
-        None,
-        0,
-    )
+    # t = 0.5 shifts to sigma 0.92: active.
+    _, metrics = _dop_step(args, backend, timesteps=(0.5,))
     assert backend.calls == [("dop", False), ("dop", True), ("prompt", True)]
     assert metrics["h3/dop_active"] == 1.0
 

@@ -38,7 +38,9 @@ def _matching_references(target_stem: str, directory: Path) -> list[Path]:
             continue
         suffix = path.stem.rsplit("_", 1)[-1]
         if not suffix.isdigit():
-            raise ValueError(f"reference {path} matches target {target_stem!r} but its final underscore suffix is not numeric")
+            raise ValueError(
+                f"reference {path} matches target {target_stem!r} but its final underscore suffix is not numeric"
+            )
         matches.append((int(suffix) + 1, path))
     return [path for _, path in sorted(matches, key=lambda item: (item[0], item[1].name))]
 
@@ -177,7 +179,9 @@ def _prepare_ref2va(
             extractor(target, [teacher_refs / name for name in names])
             teacher_count = len(_matching_references(target.stem, teacher_refs))
             if teacher_count <= len(shared):
-                raise RuntimeError(f"teacher item {target.stem!r} has {teacher_count} references, student has {len(shared)}")
+                raise RuntimeError(
+                    f"teacher item {target.stem!r} has {teacher_count} references, student has {len(shared)}"
+                )
 
         dataset["source_image_directory"] = str(teacher_refs)
         modalities = list(dataset.get("source_modalities") or [])
@@ -281,7 +285,8 @@ def prepare_teacher(
         raise ValueError("mode must be auto, fl2va, or ref2va")
     if resolved_mode != detected_mode:
         raise ValueError(
-            f"--mode {resolved_mode} conflicts with the detected {detected_mode} student dataset; fix the config or use --mode auto"
+            f"--mode {resolved_mode} conflicts with the detected {detected_mode} student dataset; "
+            "fix the config or use --mode auto"
         )
 
     destination = output_dir / "teacher.toml"

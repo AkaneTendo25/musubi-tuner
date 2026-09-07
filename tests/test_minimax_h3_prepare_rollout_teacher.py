@@ -65,7 +65,9 @@ def test_prepare_ref2va_copies_shared_and_adds_target_frames(tmp_path: Path):
         for index, destination in enumerate(destinations):
             destination.write_bytes(f"frame {index}".encode())
 
-    teacher_config, mode = prepare_teacher(config, tmp_path / "teacher", teacher_frames=2, extractor=fake_extract)
+    teacher_config, mode = prepare_teacher(
+        config, tmp_path / "teacher", teacher_frames=2, extractor=fake_extract
+    )
 
     result = toml.load(teacher_config)["datasets"][0]
     teacher_refs = Path(result["source_image_directory"])
@@ -127,7 +129,9 @@ def test_prepare_ref2va_jsonl_preserves_references_and_appends_frames(tmp_path: 
         for destination in destinations:
             destination.write_bytes(b"frame")
 
-    teacher_config, mode = prepare_teacher(config, tmp_path / "teacher", teacher_frames=2, extractor=fake_extract)
+    teacher_config, mode = prepare_teacher(
+        config, tmp_path / "teacher", teacher_frames=2, extractor=fake_extract
+    )
 
     dataset = toml.load(teacher_config)["datasets"][0]
     teacher_row = json.loads(Path(dataset["video_jsonl_file"]).read_text(encoding="utf-8"))

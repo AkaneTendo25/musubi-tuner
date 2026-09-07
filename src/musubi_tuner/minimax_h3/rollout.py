@@ -558,7 +558,9 @@ class H3RolloutTeacherCache:
         shown = ", ".join(unprivileged[:5])
         more = "" if len(unprivileged) <= 5 else f" (and {len(unprivileged) - 5} more)"
         fixes = {
-            "qwen": ("Qwen teacher -- re-cache the teacher arm with real qwen_control_* assets in its TEXT cache"),
+            "qwen": (
+                "Qwen teacher -- re-cache the teacher arm with real qwen_control_* assets in its TEXT cache"
+            ),
             "reference": (
                 "reference teacher -- run minimax_h3_prepare_rollout_teacher.py, then cache its extra target frames "
                 "as references in a separate LATENT cache"

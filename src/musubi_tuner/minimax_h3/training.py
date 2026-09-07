@@ -363,49 +363,6 @@ def contrastive_guidance_target(
     )
 
 
-def additive_guidance_target(
-    target: H3ModelPrediction,
-    base_prompted: H3ModelPrediction,
-    base_empty: H3ModelPrediction,
-    guidance_scale: float | torch.Tensor,
-    *,
-    audio_guidance_scale: float | torch.Tensor | None = None,
-) -> H3ModelPrediction:
-    """``data + (1 - 1/scale) * (base_prompted - base_empty)``: the plain data target with the
-    frozen base's own guidance field transplanted onto it.
-
-    The base's prompted prediction is already the GUIDED field ``g = u + s (c - u)``, so
-    ``g - u`` carries the implied scale; the target is the base's guided prediction plus the
-    data residual against the base's de-guided conditional, ``g + (data - c)`` with
-    ``c = u + (g - u) / scale``, which is the expression above. At scale 1 it is the data
-    target bit for bit."""
-    audio_guidance_scale = guidance_scale if audio_guidance_scale is None else audio_guidance_scale
-    video_scale = (
-        _expand_scale_values(guidance_scale, target.video)
-        if isinstance(guidance_scale, torch.Tensor) and target.video is not None
-        else guidance_scale
-    )
-    audio_scale = (
-        _expand_scale_values(audio_guidance_scale, target.audio)
-        if isinstance(audio_guidance_scale, torch.Tensor) and target.audio is not None
-        else audio_guidance_scale
-    )
-
-    def transplanted(data, prompted, empty, scale):
-        if data is None:
-            return None
-        if not isinstance(scale, torch.Tensor) and float(scale) == 1.0:
-            return data
-        if prompted is None or empty is None:
-            raise ValueError("additive guidance target needs both frozen base branches")
-        return data + (1.0 - 1.0 / scale) * (prompted.detach() - empty.detach())
-
-    return H3ModelPrediction(
-        video=transplanted(target.video, base_prompted.video, base_empty.video, video_scale),
-        audio=transplanted(target.audio, base_prompted.audio, base_empty.audio, audio_scale),
-    )
-
-
 def _broadcast_mask(mask: torch.Tensor | None, target: torch.Tensor) -> torch.Tensor:
     if mask is None:
         return torch.ones_like(target, dtype=torch.bool)

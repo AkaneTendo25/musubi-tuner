@@ -426,7 +426,8 @@ class MiniMaxH3AudioBigVGANDecoder(nn.Module):
         for index in range(self.num_upsamples):
             hidden_states = self.ups[index][0](hidden_states)
             residual = sum(
-                self.resblocks[index * self.num_kernels + block_index](hidden_states) for block_index in range(self.num_kernels)
+                self.resblocks[index * self.num_kernels + block_index](hidden_states)
+                for block_index in range(self.num_kernels)
             )
             hidden_states = residual / self.num_kernels
         hidden_states = self.conv_post(self.activation_post(hidden_states))

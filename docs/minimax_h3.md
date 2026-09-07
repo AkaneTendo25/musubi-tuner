@@ -1006,7 +1006,7 @@ Every objective here is off unless its flag is given; a run that names none of t
 
 | Option | Purpose |
 | --- | --- |
-| `--h3_guidance_distillation_scale S` | Guidance-consistent objective using cached empty-text conditioning at scale `S`. `--h3_guidance_loss_form` selects `normalized`, `contrastive` or `additive`; for the same predictions and scale, the contrastive form is `S²` larger. `additive` fits the prediction to the data target plus `(1-1/S)` times the frozen base's own guided field (needs `--h3_guidance_null_source frozen`, one more no-grad forward). The conditional increment then comes from the base rather than from the adapter, which leaves the adapter only the residual to learn: expect the cleanest preservation numbers of the three forms and the weakest concept, and do not pick it for a global look. |
+| `--h3_guidance_distillation_scale S` | Guidance-consistent objective using cached empty-text conditioning at scale `S`. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; for the same predictions and scale, the contrastive form is `S²` larger. |
 | `--h3_guidance_scale_range 2.5,3.5` | Draw the distillation scale uniformly in `[LOWER, UPPER]`, once per micro-batch sample and step, instead of pinning one value; the adapter then learns a family of guidance strengths rather than a single point. Replaces `--h3_guidance_distillation_scale` and is rejected alongside it. Details below. |
 | `--h3_guidance_distillation_probability 0.5` | Evaluate the empty-conditioning branch on a synchronized random fraction of batches, skipping its extra forward on the rest, and scale the guidance correction by `1 / probability`. `1` (default) applies the objective every batch; smaller values preserve the expected loss, but rare larger corrections are not optimizer-equivalent to applying the dense objective every step. |
 | `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
@@ -1090,17 +1090,13 @@ With `--h3_dop_caption_mode bare` on both commands the trigger is removed instea
 given: `sks woman walking in a park` becomes `woman walking in a park` and `xyz style. A wide shot` becomes
 `A wide shot`. This is the form for a trigger that names a global look rather than a subject class.
 
-The `mse` form holds the whole trigger-free prediction at the frozen base's. The `projection` form charges the
-trigger-free caption only for the share of the *trigger's* update it received above `tau` and leaves the rest of
-its prediction free. Which of the two to reach for depends on where the concept lives: `projection` removes the
-component the two captions share, so a concept carried by that shared component goes with it, and the stronger the
-weight the less of it survives. Judge it on renders rather than on the trigger metrics, which improve either way. `--h3_dop_sigma_min` restricts either form to steps at or above a shifted video sigma; the
-threshold is a plain cut on the step's sigma and does not rescale the term.
+DOP holds the whole trigger-free prediction at the frozen base's. `--h3_dop_sigma_min` restricts it to steps at
+or above a shifted video sigma; the threshold is a plain cut on the step's sigma and does not rescale the term.
 
 The trigger must occur as a standalone term in every cached caption. The cache records an identity for the exact trigger,
-class prompt and caption mode, and training rejects stale or mismatched caches. DOP is currently supported for the T2VA/FL2VA family, not Ref2VA. The `mse`
-form adds one frozen and one trainable transformer pass on active steps, the `projection` form three frozen and one
-trainable; the trainable DOP pass is backpropagated before the ordinary pass
+class prompt and caption mode, and training rejects stale or mismatched caches. DOP is currently supported for the T2VA/FL2VA family, not Ref2VA. It adds
+one frozen and one trainable transformer pass on active steps; the trainable DOP pass is
+backpropagated before the ordinary pass
 so variable prompt lengths remain compatible with activation checkpointing and block swapping.
 
 #### Two-teacher distillation

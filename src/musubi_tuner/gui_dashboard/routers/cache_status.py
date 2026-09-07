@@ -280,7 +280,9 @@ def _scan_entry(
 
     row.latent_count = _matched_source_count(latent_stems, source_keys)
     row.text_count = _matched_source_count(text_stems, source_keys)
-    row.audio_count = row.latent_count if audio_embedded and require_audio else _matched_source_count(audio_stems, source_keys)
+    row.audio_count = (
+        row.latent_count if audio_embedded and require_audio else _matched_source_count(audio_stems, source_keys)
+    )
     row.dino_count = len(dino_files)
 
     row.missing_latent = max(row.source_count - row.latent_count, 0)
