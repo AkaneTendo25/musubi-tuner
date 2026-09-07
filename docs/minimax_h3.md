@@ -1630,9 +1630,10 @@ The training loss does not show the loss of amplification. Three validation metr
 held-out set every `--validate_every_n_steps`, without rendering:
 
 - `val/drift/prompted_rel`: how far the prompted prediction moved from the base model's, relative to the base's
-  field length. The empty-prompt branch cancels out, so no preservation term can inflate it. Below about 0.8 the
-  output shows no visible damage; around 1 and above it shows artifacts. In between it depends on the recipe: an
-  anchored adapter reaches artifacts at a lower value than an unanchored one.
+  field length. The empty-prompt branch cancels out, so no preservation term can inflate it. The value at which
+  artifacts appear is dataset dependent; 0.8 is a starting point for the threshold, and around 1 and above the output
+  shows artifacts. Between the two it also depends on the recipe: an anchored adapter can reach artifacts at a lower
+  value than an unanchored one. Calibrate the threshold on renders of the first run.
 - `val/rollout/field` and `val/rollout/field_cos`: field length and direction at the states the adapted model's own
   sampler reaches. A plain LoRA drops the length to about a third of the base's within a few hundred steps. The
   floor raises the length directly; judge it by the cosine.
@@ -1658,7 +1659,7 @@ field metrics need `--h3_validation_field_probe` or `--h3_validation_rollout_pro
 | `val/loss` | validation | Held-out loss. | decreasing |
 | `val/field`, `val/field_cos`, `val/field_dist` | field probe | Field length over the base's, cosine to the base's field, and a combined distance, at noised data states. | length near 1, cosine near 1, distance near 0 |
 | `val/velocity_err_rel` | field probe | Adapted error over the base's error on the same target. | below 1 |
-| `val/drift/prompted_rel` | field probe | Distance of the prompted prediction from the base's, relative to the base's field length. | below 0.8; near 1 means collapse |
+| `val/drift/prompted_rel` | field probe | Distance of the prompted prediction from the base's, relative to the base's field length. | below a dataset-dependent threshold (0.8 as a starting point); near 1 means collapse |
 | `val/drift/empty` | field probe | Distance of the empty-prompt prediction from the base's. | near 0 with an anchor |
 | `val/base/empty_rms`, `val/base/prompted_rms`, `val/base/field_rel`, `val/base/cos_prompted_empty` (+ `/bin{k}`) | field probe | The frozen base alone: RMS of its empty-prompt and prompted predictions, field length over the prompted RMS, and the cosine between the two. A check of the reference every anchor and field metric uses. | constant over a run; empty RMS comparable to prompted RMS, cosine well below 1 |
 | `val/trigger/drift_gain`, `val/trigger/err_gain` | bare dataset config | Prompted drift with the trigger minus without; fit improvement with the trigger minus without. | above 0 when the concept is conditional; zero or negative when the change is unconditional |
@@ -1673,14 +1674,16 @@ field metrics need `--h3_validation_field_probe` or `--h3_validation_rollout_pro
 | `h3/*_active`, `h3/caption_dropped`, `h3/no_active_target` | the corresponding flag | 1.0 on steps where that path fired (guidance branch, base preservation, DOP, null anchor, rollout, caption or control dropout); `no_active_target` flags a step with nothing to supervise. | means track the configured probabilities; `no_active_target` never |
 | `*_std` | `--h3_validation_std` | Per-clip standard deviation of the pooled metric. | — |
 
-Checkpoint selection: take the step at which `val/drift/prompted_rel` is still below 0.8 and
-`val/rollout/field_cos` is still high while `val/velocity_err_rel` has stopped improving, then confirm on renders.
-Training past that point adds memorisation of the training clips, not concept quality.
+Checkpoint selection: take the step at which `val/drift/prompted_rel` is still below the threshold and
+`val/rollout/field_cos` is still high while `val/velocity_err_rel` has stopped improving, then confirm on renders at
+the geometry you generate at. Training past that point adds memorisation of the training clips, not concept quality.
+The number of steps this takes depends on the dataset: with few clips it comes in a few hundred steps.
 
 ### Current recommended settings
 
-Step count depends on the dataset. Validate every 250 steps and pick the checkpoint by the rule in *Metrics*.
-Hardware flags (block swap, attention backend, precision) are left out.
+Weights, thresholds and step counts below are starting points; they depend on the dataset. Validate every 250 steps
+and pick the checkpoint by the rule in *Metrics*. Hardware flags (block swap, attention backend, precision) are left
+out.
 
 Common flags:
 
