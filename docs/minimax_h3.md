@@ -1142,10 +1142,9 @@ The trigger-free arm is backpropagated before the ordinary pass, so variable pro
 activation checkpointing and block swapping. Reports `loss/two_teacher_trigger`, `loss/two_teacher_bare` and
 `h3/two_teacher_active`.
 
-Limits. The concept the result reaches is the teacher's. States from a corpus unrelated to the concept transfer it
-weakly. Measurements behind the recipe are from one style corpus on FL2VA, and the trigger-free behaviour is measured
-on that corpus's held-out clips, not on captions from outside it. `--h3_two_teacher_snapshot_step` has not been
-measured against the two-command form.
+Limits. The concept is bounded by the teacher's and lands below it. States from a corpus unrelated to the concept
+transfer it weakly. Trigger-free behaviour on captions outside the training corpus, and the equivalence of
+`--h3_two_teacher_snapshot_step` to the two-command form, are not established.
 
 #### CREPA
 
@@ -1668,12 +1667,11 @@ states, not the targets.
 - **Applies to:** the T2VA/FL2VA family, any concept an adapter can carry. Rejected for Ref2VA and with
   `--h3_adapter_prompt_only`. Rejected with `--h3_rollout_supervision` and `--h3_guidance_distillation_scale`,
   except under `--h3_two_teacher_snapshot_step`, which runs them before the switch.
-- **Advantages:** on the concept's own held-out clips the trigger-free prediction stays at the base's, and the
-  concept keeps the teacher's strength.
-  No teacher dataset and no rollout: only the trigger-free text cache. About **1.6x** a plain step.
+- **Advantages:** the trigger-free prediction stays at the base's. No teacher dataset and no rollout: only the
+  trigger-free text cache. About **1.6x** a plain step.
 - **Disadvantages:** needs a teacher, so two phases, as two commands or one with
-  `--h3_two_teacher_snapshot_step`. The concept reached is the teacher's. States from a corpus unrelated to the
-  concept transfer it weakly.
+  `--h3_two_teacher_snapshot_step`. The concept is bounded by the teacher's and lands below it. States from a
+  corpus unrelated to the concept transfer it weakly.
 - **Flags:** `--h3_two_teacher_weights`, `--h3_two_teacher_loss_weight`; optionally
   `--h3_two_teacher_bare_weight`, `--h3_two_teacher_data_weight`, `--h3_two_teacher_sigma_min`,
   `--h3_two_teacher_multiplier`, `--h3_two_teacher_snapshot_step`. Needs a text cache written with `--h3_dop_trigger` and
@@ -1856,7 +1854,7 @@ accelerate launch minimax_h3_train_network.py ... \
   --dit minimax_h3_fl2va_bf16.safetensors \
   --h3_dop_trigger "xyz style" --h3_dop_caption_mode bare \
   --h3_two_teacher_weights teacher.safetensors \
-  --h3_two_teacher_loss_weight 1.0 --h3_two_teacher_bare_weight 2.0 --h3_two_teacher_data_weight 0.0
+  --h3_two_teacher_loss_weight 1.0 --h3_two_teacher_bare_weight 1.0 --h3_two_teacher_data_weight 0.25
 ```
 
 Or in one command, with the boundary at step 1000:
@@ -1867,16 +1865,16 @@ accelerate launch minimax_h3_train_network.py ... \
   --h3_dop_trigger "xyz style" --h3_dop_caption_mode bare \
   --h3_rollout_supervision --h3_rollout_teacher_config teacher.toml --h3_guidance_distillation_scale 3.5 \
   --h3_two_teacher_snapshot_step 1000 \
-  --h3_two_teacher_loss_weight 1.0 --h3_two_teacher_bare_weight 2.0 --h3_two_teacher_data_weight 0.0
+  --h3_two_teacher_loss_weight 1.0 --h3_two_teacher_bare_weight 1.0 --h3_two_teacher_data_weight 0.25
 ```
 
 Set the boundary where the concept stops improving. Steps after it change the routing, not the concept. Too low
 caps the result at a weaker teacher; recover by rerunning the distillation as two commands against
 `<output_dir>/<output_name>-teacher-step<N>.safetensors` or any acquisition checkpoint.
 
-Variations. `--h3_two_teacher_bare_weight 1.0` weights the two arms equally and leaves more of the trigger's update
-on trigger-free prompts. `--h3_two_teacher_data_weight` above `0` mixes the ordinary data objective back in; use it
-when the teacher's concept is weaker than the clips'. Train the states on the concept's own corpus.
+Variations. `--h3_two_teacher_bare_weight` above `1.0` lowers the leak further and costs concept strength.
+`--h3_two_teacher_data_weight 0.0` trains on the two teachers alone, at the same cleanliness and slightly less
+concept. Train the states on the concept's own corpus.
 
 ## Inference
 
