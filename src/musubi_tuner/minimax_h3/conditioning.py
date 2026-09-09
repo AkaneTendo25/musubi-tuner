@@ -639,6 +639,15 @@ class MiniMaxH3ConditioningEncoder:
         return [Image.fromarray(content[frame].astype(np.uint8)) for frame in frames]
 
     def _images_for_item(self, item: Any) -> list[Image.Image] | None:
+        if getattr(item, "h3_one_frame", False) and getattr(item, "h3_condition_paths", ()):
+            if self.task != "fl2va":
+                raise ValueError("MiniMax H3 timed one-frame controls require --task fl2va")
+            width, height = item.bucket_size
+            images = []
+            for path in item.h3_condition_paths:
+                with Image.open(path) as image:
+                    images.append(image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS))
+            return images
         if self.task == "t2va":
             return self._keyframe_visual_images(item) if self.keyframe_visuals else None
         if self.task in ("ref2va", "ref2va_omni"):

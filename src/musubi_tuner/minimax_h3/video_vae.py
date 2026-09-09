@@ -654,6 +654,9 @@ class MiniMaxH3VideoDecoderModel(nn.Module):
         num_tokens = latents.shape[2] + self.token_drop
         pad_tokens = (-num_tokens) % chunk_size
         num_chunks = (num_tokens + pad_tokens) // chunk_size - int(self.token_drop > 0)
+        if num_chunks < 1:
+            pad_tokens += chunk_size
+            num_chunks = 1
         if pad_tokens:
             latents = torch.cat((latents, latents[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)), dim=2)
 
@@ -691,9 +694,16 @@ class MiniMaxH3VideoDecoderModel(nn.Module):
         mean = self.latents_mean.view(1, -1, 1, 1, 1)
         std = self.latents_std.view(1, -1, 1, 1, 1)
         latents = latents.float() * std + mean
+        one_frame = latents.shape[2] == 1
+        if one_frame:
+            # The temporal decoder needs context. A repeated token avoids the
+            # severe scanline/color artifacts of decoding a solo token.
+            latents = latents.repeat(1, 1, 2, 1, 1)
         device = latents.device
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
             video = self._decode_temporal(latents)
+        if one_frame:
+            video = video[:, :, :1]
         pixel_mean = video.new_tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(1, 3, 1, 1, 1)
         pixel_std = video.new_tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(1, 3, 1, 1, 1)
         return (video.float() * pixel_std + pixel_mean).clamp(0.0, 1.0)

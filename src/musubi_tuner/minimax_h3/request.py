@@ -81,11 +81,17 @@ class H3GenerationRequest:
     frame_count_override: int | None = None
     selected_frame: int = 0
     guides: tuple[H3Guide, ...] = field(default_factory=tuple)
+    condition_images: tuple[Path, ...] = field(default_factory=tuple)
+    one_frame_target_index: int | None = None
+    one_frame_control_indices: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "output", Path(self.output))
         object.__setattr__(self, "references", tuple(self.references))
         object.__setattr__(self, "guides", tuple(self.guides))
+        object.__setattr__(self, "condition_images", tuple(Path(path) for path in self.condition_images))
+        if self.one_frame_control_indices is not None:
+            object.__setattr__(self, "one_frame_control_indices", tuple(self.one_frame_control_indices))
         self.validate()
 
     def canvas_reference(self) -> Path | None:
@@ -99,6 +105,8 @@ class H3GenerationRequest:
 
         Returns ``None`` for a text-only request, which has nothing to adapt to.
         """
+        if self.condition_images:
+            return self.condition_images[0]
         for role in (ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME, ReferenceRole.KEYFRAME, ReferenceRole.REFERENCE):
             for reference in self._with_role(role):
                 if reference.kind is ReferenceKind.IMAGE:
@@ -115,10 +123,9 @@ class H3GenerationRequest:
         if self.frame_count_override is not None and (
             isinstance(self.frame_count_override, bool)
             or not isinstance(self.frame_count_override, int)
-            or self.frame_count_override < 5
-            or (self.frame_count_override - 5) % 17
+            or (self.frame_count_override != 1 and (self.frame_count_override < 5 or (self.frame_count_override - 5) % 17))
         ):
-            raise ValueError("frame_count_override must satisfy frame_count % 17 == 5")
+            raise ValueError("frame_count_override must be 1 or satisfy frame_count % 17 == 5")
         if isinstance(self.selected_frame, bool) or not isinstance(self.selected_frame, int) or self.selected_frame < 0:
             raise ValueError("selected_frame must be a non-negative integer")
         if self.ratio not in SUPPORTED_RATIOS:
@@ -127,8 +134,35 @@ class H3GenerationRequest:
         first_frames = self._with_role(ReferenceRole.FIRST_FRAME)
         last_frames = self._with_role(ReferenceRole.LAST_FRAME)
         keyframes = self._with_role(ReferenceRole.KEYFRAME)
+        ordinary = self._with_role(ReferenceRole.REFERENCE)
         if len(first_frames) > 1 or len(last_frames) > 1:
             raise ValueError("at most one first-frame and one last-frame image are supported")
+        if self.one_frame_target_index is not None:
+            if self.frame_count_override != 1:
+                raise ValueError("one-frame placement requires frame_count_override=1")
+            if (
+                isinstance(self.one_frame_target_index, bool)
+                or not isinstance(self.one_frame_target_index, int)
+                or self.one_frame_target_index < 0
+            ):
+                raise ValueError("one-frame target index must be a non-negative integer")
+            if keyframes or self.guides:
+                raise ValueError("one-frame generation cannot combine with keyframes or guides")
+            controls = self.condition_images or tuple(ref.path for ref in (*first_frames, *last_frames))
+            if self.condition_images and (first_frames or last_frames):
+                raise ValueError("one-frame controls use condition_images or first/last aliases, not both")
+            if ordinary and controls:
+                raise ValueError("one-frame generation cannot mix FL2VA controls with Ref2VA references")
+            if controls and (self.one_frame_control_indices is None or len(self.one_frame_control_indices) != len(controls)):
+                raise ValueError("one-frame controls require one control index per image")
+            if not controls and self.one_frame_control_indices is not None:
+                raise ValueError("one-frame control indices require condition images")
+            if self.one_frame_control_indices is not None and any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in self.one_frame_control_indices
+            ):
+                raise ValueError("one-frame control indices must be non-negative integers")
+        elif self.condition_images or self.one_frame_control_indices is not None:
+            raise ValueError("condition_images require one-frame placement")
         latent_frames = self.temporal_shape.video_latent_frames
         indices = [self.resolve_keyframe_index(ref.latent_index) for ref in keyframes]
         if len(set(indices)) != len(indices):
@@ -146,7 +180,6 @@ class H3GenerationRequest:
         if len(set(guide_indices)) != len(guide_indices):
             raise ValueError("each pixel frame may begin only one guide")
 
-        ordinary = self._with_role(ReferenceRole.REFERENCE)
         counts = {kind: sum(ref.kind is kind for ref in ordinary) for kind in ReferenceKind}
         if counts[ReferenceKind.IMAGE] > 9:
             raise ValueError("at most 9 reference images are supported")
@@ -160,6 +193,7 @@ class H3GenerationRequest:
             raise ValueError("reference audio requires at least one reference image or video")
         if check_files:
             paths = [ref.path for ref in self.references]
+            paths.extend(self.condition_images)
             paths.extend(path for guide in self.guides for path in (guide.image, guide.video, guide.audio) if path is not None)
             missing = [str(path) for path in paths if not path.is_file()]
             if missing:
@@ -181,7 +215,7 @@ class H3GenerationRequest:
         roles = {ref.role for ref in self.references}
         if ReferenceRole.REFERENCE in roles:
             return "reference"
-        if roles & {ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME, ReferenceRole.KEYFRAME}:
+        if self.condition_images or roles & {ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME, ReferenceRole.KEYFRAME}:
             return "first_last_frame"
         return "text_to_video"
 

@@ -283,6 +283,10 @@ def _h3_dataset_entry_to_dict(entry) -> dict:
         d["target_modalities"] = ["video", "audio"] if entry.h3_target_modalities == "av" else [entry.h3_target_modalities]
     if entry.h3_image_frame_count is not None:
         d["h3_image_frame_count"] = int(entry.h3_image_frame_count)
+    if entry.fp_1f_clean_indices is not None:
+        d["fp_1f_clean_indices"] = [int(value) for value in entry.fp_1f_clean_indices]
+    if entry.fp_1f_target_index is not None:
+        d["fp_1f_target_index"] = int(entry.fp_1f_target_index)
     if entry.multiple_target:
         d["multiple_target"] = True
     source_modalities = []

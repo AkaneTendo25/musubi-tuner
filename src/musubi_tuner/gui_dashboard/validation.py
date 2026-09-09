@@ -10,6 +10,7 @@ from typing import Any
 
 from musubi_tuner.gui_dashboard.cli_defaults import get_ltx2_training_network_module_default
 from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
+from musubi_tuner.minimax_h3.one_frame import parse_one_frame_options
 
 try:
     from musubi_tuner.ltx2_av_cross_grad_surgery import parse_av_cross_grad_surgery_args
@@ -417,6 +418,47 @@ def _validate_h3_dataset_entry(
                 page="dataset",
             )
         )
+    if entry.fp_1f_clean_indices is not None:
+        if entry.type != "image":
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.fp_1f_clean_indices",
+                    f"{label}: one-frame control indices are valid only for image datasets.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+        if not entry.fp_1f_clean_indices or any(value < 0 for value in entry.fp_1f_clean_indices):
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.fp_1f_clean_indices",
+                    f"{label}: one-frame control indices must be a non-empty list of non-negative integers.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+        if entry.fp_1f_target_index is None:
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.fp_1f_target_index",
+                    f"{label}: timed one-frame controls require an explicit target index.",
+                    label=label,
+                    page="dataset",
+                )
+            )
+    if entry.fp_1f_target_index is not None and entry.fp_1f_target_index < 0:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.fp_1f_target_index",
+                f"{label}: one-frame target index must be non-negative.",
+                label=label,
+                page="dataset",
+            )
+        )
     if entry.type in {"video", "audio"} and (entry.target_frames < 5 or (entry.target_frames - 5) % 17 != 0):
         errors.append(
             _make_issue(
@@ -454,7 +496,7 @@ def _validate_h3_dataset_entry(
 
 def _h3_required_vaes(config: ProjectConfig) -> tuple[bool, bool]:
     requires_video = False
-    requires_audio = False
+    requires_audio = bool(config.caching.h3_one_frame)
     rows = list(config.dataset.datasets or []) + list(config.dataset.validation_datasets or [])
     for entry in rows:
         target_mode = "video" if entry.type == "image" else "audio" if entry.type == "audio" else entry.h3_target_modalities
@@ -735,6 +777,19 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
     if t.model_type == "minimax_h3":
+        if (
+            any(entry.fp_1f_clean_indices is not None for entry in (*config.dataset.datasets, *config.dataset.validation_datasets))
+            and not t.h3_one_frame
+        ):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_one_frame",
+                    "Datasets with fp_1f_clean_indices require H3 one-frame training.",
+                    label="H3 One Frame",
+                    page="training",
+                )
+            )
         allowed_h3_timestep_sampling = {"uniform", "sigmoid", "shift", "logsnr", "sigma"}
         if t.h3_timestep_sampling not in allowed_h3_timestep_sampling:
             errors.append(
@@ -4256,6 +4311,19 @@ def validate_cache_latents_config(config: ProjectConfig) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     if c.model_type == "minimax_h3":
         requires_video, requires_audio = _h3_required_vaes(config)
+        if (
+            any(entry.fp_1f_clean_indices is not None for entry in (*config.dataset.datasets, *config.dataset.validation_datasets))
+            and not c.h3_one_frame
+        ):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_one_frame",
+                    "Datasets with fp_1f_clean_indices require H3 one-frame caching.",
+                    label="H3 One Frame",
+                    page="caching",
+                )
+            )
         if requires_video and not _has_text(c.h3_video_vae):
             errors.append(
                 _make_issue(
@@ -4305,6 +4373,16 @@ def validate_cache_latents_config(config: ProjectConfig) -> dict[str, Any]:
                     "caching.h3_image_mode",
                     "H3 conditioned-image caching requires the FL2VA task.",
                     label="H3 Image Mode",
+                    page="caching",
+                )
+            )
+        if c.h3_one_frame and c.h3_image_mode != "none":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_one_frame",
+                    "H3 native one-frame caching cannot be combined with legacy conditioned-image mode.",
+                    label="H3 One Frame",
                     page="caching",
                 )
             )
@@ -4433,6 +4511,16 @@ def validate_cache_text_config(config: ProjectConfig) -> dict[str, Any]:
                     "caching.h3_image_mode",
                     "H3 conditioned-image text caching requires the FL2VA task.",
                     label="H3 Image Mode",
+                    page="caching",
+                )
+            )
+        if c.h3_one_frame and c.h3_image_mode != "none":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_one_frame",
+                    "H3 native one-frame caching cannot be combined with legacy conditioned-image mode.",
+                    label="H3 One Frame",
                     page="caching",
                 )
             )
@@ -4610,7 +4698,7 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
         for field, fallback, label in required_components:
             if not _has_text(getattr(i, field)) and not _has_text(fallback):
                 errors.append(_make_issue("error", f"inference.{field}", f"{label} is required.", label=label, page="inference"))
-        if not 5 <= i.h3_duration <= 15:
+        if not i.h3_one_frame and not 5 <= i.h3_duration <= 15:
             errors.append(
                 _make_issue(
                     "error",
@@ -4620,6 +4708,59 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
                     page="inference",
                 )
             )
+        if i.h3_one_frame and i.h3_image_mode != "none":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_one_frame",
+                    "H3 native one-frame inference cannot be combined with legacy conditioned-image mode.",
+                    label="H3 One Frame",
+                    page="inference",
+                )
+            )
+        condition_images = [line.strip() for line in i.h3_condition_images.splitlines() if line.strip()]
+        aliases = [path for path in (i.h3_first_frame.strip(), i.h3_last_frame.strip()) if path] if i.h3_one_frame else []
+        if condition_images and aliases:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_condition_images",
+                    "Use ordered condition images or the first/last aliases, not both.",
+                    label="Condition Images",
+                    page="inference",
+                )
+            )
+        condition_count = len(condition_images or aliases)
+        if condition_count and not i.h3_one_frame:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_condition_images",
+                    "One-frame condition images require H3 one-frame inference.",
+                    label="Condition Images",
+                    page="inference",
+                )
+            )
+        if i.h3_one_frame:
+            try:
+                _, control_indices = parse_one_frame_options(i.h3_one_frame_options)
+                if condition_count and (control_indices is None or len(control_indices) != condition_count):
+                    raise ValueError(
+                        f"one-frame inference has {condition_count} condition images but "
+                        f"{0 if control_indices is None else len(control_indices)} control indices"
+                    )
+                if not condition_count and control_indices is not None:
+                    raise ValueError("one-frame control indices require condition images")
+            except ValueError as exc:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "inference.h3_one_frame_options",
+                        str(exc),
+                        label="One Frame Options",
+                        page="inference",
+                    )
+                )
         if (i.width is None) != (i.height is None):
             errors.append(
                 _make_issue(

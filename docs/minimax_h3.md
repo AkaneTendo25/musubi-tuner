@@ -69,6 +69,7 @@ Two released transformers, with different conditioning contracts:
   - [Current recommended settings](#current-recommended-settings)
 - [Inference](#inference)
   - [Use a learned context](#use-a-learned-context)
+- [One-frame images and ordered FL2VA controls](#one-frame-images-and-ordered-fl2va-controls)
 - [Training dashboard](#training-dashboard)
 
 ## Quick start
@@ -1946,6 +1947,59 @@ context. Learned contexts can be used together with `--lora_weight`.
 
 The saved file also uses ComfyUI's H3 embedding format. Place it in a ComfyUI embeddings directory and use
 `embedding:my_context` in the prompt.
+
+## One-frame images and ordered FL2VA controls
+
+Use `--frame_count 1` to generate a PNG with a single target video latent. One-frame generation is experimental; three or more FL2VA controls are also experimental. Compare results with one or two controls before choosing a dataset layout.
+
+Add these options to the [inference command](#inference), using the FL2VA checkpoint:
+
+```bash
+  --height 512 --width 512 --frame_count 1 \
+  --condition_image /images/a.png \
+  --condition_image /images/b.png \
+  --condition_image /images/c.png \
+  --one_frame "target_index=24,control_index=0;48;96" \
+  --output result.png
+```
+
+Conditions are an ordered list: the first image is `<Picture 1>`, the second is `<Picture 2>`, and so on. The list order is preserved even when its timestamps are not sorted. `--first_frame` and `--last_frame` can instead supply the first two slots; do not combine these aliases with `--condition_image`.
+
+`target_index` and `control_index` use non-negative pixel-frame indices at 24 fps. Supply exactly one control index per image. The target defaults to index 0 when no placement is given. Controls require explicit placement. A control at the target's timestamp encourages copying that image; use the same relative positions in training and inference. Use the model's picture alignment caption format to describe the relationship between the images and the target.
+
+For a plain image, omit the condition images and control indices. Ref2VA image references use the usual `--reference_image` option and can set `--one_frame "target_index=24"`. Standalone audio references and video keyframe/guide options cannot be used in one-frame mode. Audio is not decoded for PNG output.
+
+For training, use:
+
+```toml
+[[datasets]]
+image_directory = "/data/targets"
+control_directory = "/data/controls"
+cache_directory = "/data/cache"
+caption_extension = ".txt"
+resolution = [512, 512]
+batch_size = 1
+fp_1f_clean_indices = [0, 48, 96]
+fp_1f_target_index = 24
+```
+
+Match `target.png` with `target_0.png`, `target_1.png`, and `target_2.png` in the control directory. Image JSONL records can use `control_path_0`, `control_path_1`, and further numbered paths. Every record must have exactly as many controls as configured indices. Controls are converted to RGB and resized to the target bucket; alpha is not a mask. `fp_1f_target_index` is required with timed controls.
+
+Add `--one_frame --task fl2va` to both [cache commands](#train-fl2va), and `--one_frame --h3_training_mode fl2va` to training. Latent caching requires both `--vae` and `--audio_vae`.
+
+For plain image training, omit controls and their indices and use `--task t2va` for caching. For Ref2VA, omit `fp_1f_clean_indices`, use image controls as untimed references, cache with `--task ref2va`, and train with `--h3_training_mode ref2va`. One-frame mode is separate from `--h3_image_mode`, which constructs a short video target.
+
+Training sample lines use repeatable `--ci` and placement through `--of`:
+
+```text
+Caption with numbered pictures --w 512 --h 512 --f 1 --s 30 --ci /images/a.png --ci /images/b.png --ci /images/c.png --of target_index=24,control_index=0;48;96
+```
+
+`--i` and `--ei` are the two-slot aliases and cannot be mixed with `--ci`.
+
+`--skip_existing` rebuilds outdated one-frame latent caches; legacy endpoint caches require re-caching. Changing only timestamps rebuilds latents; changing control files also rebuilds text embeddings. Existing video caches retain their format.
+
+In the dashboard, enable **One-frame images** for caching and training, then set the image dataset's control and target indices. For generation, enable **One-frame image**, enter the ordered condition paths and frame positions, and choose an output name; the output is a PNG.
 
 ## Training dashboard
 

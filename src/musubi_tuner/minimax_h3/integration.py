@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import re
 import time
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
@@ -43,6 +44,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_KEYFRAME_VISUAL_LAST,
     H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
+    H3_ONE_FRAME_TARGET_INDEX_KEY,
+    H3_ONE_FRAME_CONTROL_INDICES_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
     H3_REFERENCE_ALIGNED_KEY,
@@ -585,6 +588,15 @@ class _NativeGenerator:
     ) -> tuple[list[Image.Image], tuple[str | int, ...]]:
         images = []
         anchors = []
+        if request.one_frame_target_index is not None:
+            for path in request.condition_images:
+                with Image.open(path) as image:
+                    images.append(prepare_keyframe_image(image, height, width, stretch=True))
+            for reference in request.references:
+                if reference.role in (ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME, ReferenceRole.KEYFRAME):
+                    with Image.open(reference.path) as image:
+                        images.append(prepare_keyframe_image(image, height, width, stretch=True))
+            return images, ()
         for reference in request.references:
             if reference.role is ReferenceRole.FIRST_FRAME:
                 with Image.open(reference.path) as image:
@@ -1004,6 +1016,10 @@ class _NativeGenerator:
             device=self.device,
             condition_seed=request.seed,
         )
+        if request.one_frame_target_index is not None:
+            base_kwargs["one_frame_target_index"] = request.one_frame_target_index
+            if references is None:
+                base_kwargs["one_frame_control_indices"] = request.one_frame_control_indices
         if self.null_guidance_scale > 0:
             if self._null_conditioning is None:
                 raise RuntimeError("MiniMax H3 null guidance: the null presentation was not encoded")
@@ -1645,6 +1661,21 @@ class _NativeTrainingBackend:
         else:
             audio_rows = pack_audio_latents(audio_hidden_states)
             num_audio_latents = int(audio_hidden_states.shape[-1])
+        one_frame_target_index, one_frame_control_indices, one_frame_rows = self._one_frame_cache(
+            batch,
+            latent_frames=latent_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            patch_size=patch_size,
+            device=model_device,
+            dtype=present.dtype,
+        )
+        if one_frame_control_indices and (self.mode != "fl2va" or task != "fl2va"):
+            raise ValueError("H3 timed one-frame controls require FL2VA training and --task fl2va text caches")
+        if one_frame_target_index is not None and (
+            condition_video_anchors or guide_geometries or extension_video_frames or extension_audio_latents
+        ):
+            raise ValueError("H3 one-frame timing cannot be combined with video keyframes, guides, or extension")
         if self.mode in ("ref2va", "ref2va_omni"):
             references, reference_video, reference_audio = self._reference_cache(
                 batch,
@@ -1671,6 +1702,7 @@ class _NativeTrainingBackend:
                 keyframe_anchors=condition_video_anchors,
                 guides=guide_geometries,
                 spatial_density_scale=spatial_density_scale,
+                one_frame_target_index=one_frame_target_index,
             )
             condition_video_timestep = torch.maximum(
                 video_timestep.reshape(1).to(model_device, torch.float32),
@@ -1818,6 +1850,10 @@ class _NativeTrainingBackend:
             )
         elif task in ("i2va", "fl2va", "l2va"):
             anchors = {"i2va": ("first",), "fl2va": ("first", "last"), "l2va": ("last",)}[task]
+            if one_frame_target_index is not None:
+                if not one_frame_control_indices:
+                    raise ValueError("H3 one-frame FL2VA cache is missing ordered controls; re-cache latents")
+                anchors = ()
             layout = build_t2va_packed_sequence(
                 text_tags,
                 num_latent_frames=latent_frames,
@@ -1827,14 +1863,20 @@ class _NativeTrainingBackend:
                 patch_size=patch_size,
                 keyframe_anchors=anchors,
                 spatial_density_scale=spatial_density_scale,
+                one_frame_target_index=one_frame_target_index,
+                one_frame_control_indices=one_frame_control_indices if one_frame_target_index is not None else None,
             )
-            keyframe_rows = self._keyframe_cache(
-                batch,
-                anchors=anchors,
-                rows_per_anchor=layout.num_condition_video_rows // len(anchors),
-                row_width=video_rows.shape[-1],
-                device=model_device,
-                dtype=video_rows.dtype,
+            keyframe_rows = (
+                one_frame_rows
+                if one_frame_target_index is not None
+                else self._keyframe_cache(
+                    batch,
+                    anchors=anchors,
+                    rows_per_anchor=layout.num_condition_video_rows // len(anchors),
+                    row_width=video_rows.shape[-1],
+                    device=model_device,
+                    dtype=video_rows.dtype,
+                )
             )
             keyframe_rows = 0.999 * keyframe_rows + 0.001 * torch.randn_like(keyframe_rows)
             video_rows = torch.cat((keyframe_rows[None], video_rows), dim=1)
@@ -1911,6 +1953,7 @@ class _NativeTrainingBackend:
                 keyframe_anchors=anchors if duplicate_context else (),
                 num_condition_audio_latents=extension_audio_latents if duplicate_context else 0,
                 spatial_density_scale=spatial_density_scale,
+                one_frame_target_index=one_frame_target_index,
             )
             condition_video_timestep = None
             condition_audio_timestep = None
@@ -2054,6 +2097,41 @@ class _NativeTrainingBackend:
             },
             decode=decode,
         )
+
+    def _one_frame_cache(self, batch, *, latent_frames, latent_height, latent_width, patch_size, device, dtype):
+        """Read ordered image controls without assigning video endpoint roles."""
+        control_keys = [key for key in batch if key.startswith("latents_cond_")]
+        has_target = H3_ONE_FRAME_TARGET_INDEX_KEY in batch
+        if not has_target:
+            if control_keys or H3_ONE_FRAME_CONTROL_INDICES_KEY in batch:
+                raise ValueError("H3 one-frame cache lacks target timing; re-cache latents")
+            return None, (), None
+        if latent_frames != 1:
+            raise ValueError("H3 one-frame cache requires exactly one target latent frame")
+        if any(key.startswith(("latents_first", "latents_last")) for key in batch) or H3_KEYFRAME_VIDEO_ROWS_KEY in batch:
+            raise ValueError("H3 legacy one-frame endpoint cache is unsupported; re-cache latents")
+        target = self._one_conditioning_item(batch, H3_ONE_FRAME_TARGET_INDEX_KEY, expected_ndim=0)
+        if target.dtype != torch.int64 or int(target) < 0:
+            raise ValueError("H3 one-frame target index must be a non-negative int64 scalar")
+        if H3_ONE_FRAME_CONTROL_INDICES_KEY not in batch:
+            if control_keys:
+                raise ValueError("H3 one-frame controls lack time indices; re-cache latents")
+            return int(target), (), None
+        indices = self._one_conditioning_item(batch, H3_ONE_FRAME_CONTROL_INDICES_KEY, expected_ndim=1)
+        if indices.dtype != torch.int64 or bool((indices < 0).any()):
+            raise ValueError("H3 one-frame control indices must be non-negative int64 values")
+        expected_keys = [f"latents_cond_{index:03d}" for index in range(indices.numel())]
+        if set(control_keys) != set(expected_keys) or any(
+            re.fullmatch(r"latents_cond_\d{3,}", key) is None for key in control_keys
+        ):
+            raise ValueError("H3 one-frame control slots must be contiguous and match the control indices; re-cache latents")
+        rows = []
+        for key in expected_keys:
+            latent = self._one_conditioning_item(batch, key, expected_ndim=4)
+            if latent.shape != (VIDEO_LATENT_CHANNELS, 1, latent_height, latent_width):
+                raise ValueError("H3 one-frame control latents must match the target canvas and contain one frame")
+            rows.append(patchify_video_latents(latent[None].to(device=device, dtype=dtype), patch_size)[0])
+        return int(target), tuple(int(value) for value in indices), torch.cat(rows) if rows else None
 
     def _keyframe_cache(
         self,
@@ -2361,6 +2439,18 @@ class _NativeLatentEncoder:
             latents = self.audio_encoder.encode(waveform.to(device=device, dtype=torch.float32).unsqueeze(1))
         return latents.to(self.output_dtype)
 
+    def _one_frame_silence(self) -> torch.Tensor:
+        if self.audio_encoder is None:
+            raise ValueError("MiniMax H3 one-frame latent caching requires --audio_vae for the silence placeholder")
+        cached = getattr(self, "_one_frame_silence_latents", None)
+        if cached is None:
+            waveform = torch.zeros(2, temporal_shape(1).audio_samples, dtype=torch.float32)
+            cached = self._encode_reference_audio(waveform).detach().cpu()
+            if cached.shape != (2, AUDIO_LATENT_CHANNELS, 2):
+                raise ValueError("H3 one-frame silence must encode to two audio latent frames")
+            self._one_frame_silence_latents = cached
+        return cached
+
     def _encode_references(self, item: Any) -> dict[str, torch.Tensor]:
         references = prepare_references(
             item,
@@ -2488,6 +2578,7 @@ class _NativeLatentEncoder:
                 results.append(tensors)
                 continue
             conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
+            one_frame = bool(getattr(item, "h3_one_frame", False))
             is_image = target.modality is MediaModality.IMAGE and not conditioned_image
             video = self._encode_video(item.content, is_image=is_image)
             video_frame_count = IMAGE_FRAME_COUNT if is_image else int(item.content.shape[0])
@@ -2499,10 +2590,27 @@ class _NativeLatentEncoder:
                 )
             frame_shape = "x".join(str(value) for value in video.shape[-3:])
             tensors = {f"latents_{frame_shape}_{dtype_name}": video}
+            if one_frame:
+                if not is_image or video.shape[1] != 1:
+                    raise ValueError("H3 one-frame caching requires a single image target")
+                tensors.update(
+                    {
+                        f"{H3_AUDIO_LATENTS_KEY}_2x32x2_{dtype_name}": self._one_frame_silence(),
+                        H3_AUDIO_LOSS_MASK_KEY: torch.zeros(2, dtype=torch.bool),
+                    }
+                )
+                width, height = item.bucket_size
+                for index, path in enumerate(item.h3_condition_paths):
+                    with Image.open(path) as image:
+                        content = np.asarray(image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)).copy()
+                    control = self._encode_reference_video(content, image=True)
+                    if control.shape != video.shape:
+                        raise ValueError("H3 one-frame control VAE output must match the target canvas")
+                    tensors[f"latents_cond_{index:03d}_{frame_shape}_{dtype_name}"] = control
             video_loss_mask = self._video_loss_mask(item, tuple(int(value) for value in video.shape[-3:]))
             if video_loss_mask is not None:
                 tensors["video_loss_mask"] = video_loss_mask
-            if target_mode != "video" and (not is_image or target.metadata.get("audio_path")):
+            if not one_frame and target_mode != "video" and (not is_image or target.metadata.get("audio_path")):
                 audio_frame_count = int(target.metadata.get("audio_frame_count", video_frame_count))
                 expected = temporal_shape(audio_frame_count)
                 audio, audio_mask = self._encode_audio(item)

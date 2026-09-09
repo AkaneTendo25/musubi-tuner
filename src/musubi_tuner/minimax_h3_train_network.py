@@ -65,10 +65,13 @@ from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
     denoise_fl2va,
+    denoise_ref2va,
     encode_keyframe_images,
+    encode_reference_media,
     prepare_keyframe_image,
     save_av_mp4,
 )
+from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.masking import (
     CONDITIONING_MASK_BATCH_KEY as H3_CONDITIONING_MASK_KEY,
 )
@@ -102,6 +105,7 @@ from musubi_tuner.minimax_h3.references import (
     REFERENCE_VIDEO_SHORT_EDGE,
     validate_reference_video_fps,
     validate_reference_video_sizing,
+    prepare_references,
 )
 from musubi_tuner.minimax_h3.training import (
     H3FusedArm,
@@ -136,6 +140,52 @@ logger = logging.getLogger(__name__)
 
 _SAMPLE_KEYFRAME_ROWS = "_h3_keyframe_rows"
 _SAMPLE_KEYFRAME_ANCHORS = "_h3_keyframe_anchors"
+
+
+def _parse_one_frame_sample_options(value: str | None) -> tuple[int, tuple[int, ...] | None]:
+    """Parse the generation CLI's ``--of target_index=N,control_index=A;B`` form."""
+    if value is None:
+        return 0, None
+    options: dict[str, str] = {}
+    for item in value.split(","):
+        key, separator, raw = item.strip().partition("=")
+        if not separator or key not in {"target_index", "control_index"} or key in options:
+            raise ValueError("MiniMax H3 sample --of must be target_index=N[,control_index=A;B]")
+        options[key] = raw.strip()
+    try:
+        target_index = int(options.get("target_index", "0"))
+        controls = tuple(int(index) for index in options["control_index"].split(";")) if "control_index" in options else None
+    except ValueError as error:
+        raise ValueError("MiniMax H3 sample --of indices must be integers") from error
+    if target_index < 0 or (controls is not None and (not controls or any(index < 0 for index in controls))):
+        raise ValueError("MiniMax H3 sample --of indices must be nonnegative")
+    return target_index, controls
+
+
+def _one_frame_sample_inputs(parameter: dict) -> tuple[int, tuple[int, ...] | None, list[str]]:
+    """Resolve ordered controls while keeping --i/--ei as aliases for the first two slots."""
+    target_index, control_indices = _parse_one_frame_sample_options(parameter.get("one_frame"))
+    controls = parameter.get("control_image_path")
+    alias_controls = [path for path in (parameter.get("image_path"), parameter.get("end_image_path")) if path]
+    if controls is not None and alias_controls:
+        raise ValueError("MiniMax H3 one-frame sample cannot combine --ci with --i/--ei")
+    if controls is None:
+        controls = alias_controls
+    if not isinstance(controls, list) or not controls or not all(isinstance(path, str) and path.strip() for path in controls):
+        raise ValueError("MiniMax H3 one-frame FL2VA sample requires one or more control images (--ci, or --i/--ei)")
+    if control_indices is None or len(control_indices) != len(controls):
+        raise ValueError("MiniMax H3 one-frame sample requires one control_index per condition image")
+    return target_index, control_indices, controls
+
+
+def _require_one_frame_opt_in(args: argparse.Namespace, batch: dict, video_latents: torch.Tensor | None) -> None:
+    if "one_frame_target_index" not in batch:
+        return
+    if video_latents is None or video_latents.ndim != 5 or video_latents.shape[2] != 1:
+        raise ValueError("MiniMax H3 one-frame index metadata requires a single-frame target latent")
+    if not getattr(args, "one_frame", False):
+        raise ValueError("MiniMax H3 one-frame cache requires --one_frame")
+
 
 _DIRECT_SIGMA_SAMPLING = {
     "uniform",
@@ -2186,7 +2236,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         spatial_tokens = bool(args.h3_audio_only_spatial_tokens and not has_video and has_audio)
         if spatial_tokens:
             video_latents = self._build_audio_only_spatial_tokens(audio_latents)
-        is_image = has_video and not has_audio and video_latents.shape[2] == 1
+        # Indexed one-frame caches carry the two-latent silence placeholder as
+        # their audio stream. They still use the image schedule; audio presence
+        # must not turn them back into short-video training.
+        is_image = has_video and video_latents.shape[2] == 1
+        _require_one_frame_opt_in(args, batch, video_latents)
         if len(observed_modes) == 1 and observed_modes[0] is not None and not (has_video and has_audio):
             raise ValueError("H3 observed-modality validation requires cached video and audio targets")
 
@@ -3456,10 +3510,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
         if args.sample_prompts:
-            if args.h3_training_mode != "fl2va":
+            if args.h3_training_mode != "fl2va" and not getattr(args, "one_frame", False):
                 raise ValueError(
-                    "MiniMax H3 training-time sampling currently supports only FL2VA; "
-                    "use minimax_h3_generate_video.py for Ref2VA samples"
+                    "MiniMax H3 training-time Ref2VA sampling requires --one_frame; "
+                    "use minimax_h3_generate_video.py for Ref2VA video samples"
                 )
             required = {
                 "--text_encoder": args.text_encoder,
@@ -3893,7 +3947,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         encoder = create_conditioning_encoder(
             text_encoder=Path(args.text_encoder),
             tokenizer=Path(args.tokenizer),
-            task="t2va",
+            task="ref2va" if args.h3_training_mode in ("ref2va", "ref2va_omni") else "t2va",
             device=str(accelerator.device),
             dtype="bfloat16",
             quantization=args.text_encoder_quantization,
@@ -3907,26 +3961,85 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             width = prompt.get("width", 320)
             images = []
             anchors = []
-            if prompt.get("image_path"):
-                with Image.open(prompt["image_path"]) as image:
-                    images.append(prepare_keyframe_image(image, height, width, stretch=True))
-                anchors.append("first")
-            if prompt.get("end_image_path"):
-                with Image.open(prompt["end_image_path"]) as image:
-                    images.append(prepare_keyframe_image(image, height, width, stretch=False))
-                anchors.append("last")
-            prompt.update(encoder.encode_prompt(prompt.get("prompt", ""), images))
+            requested_frames = int(prompt.get("frame_count", 124))
+            if args.h3_training_mode in ("ref2va", "ref2va_omni"):
+                if requested_frames != 1:
+                    raise ValueError("MiniMax H3 Ref2VA training samples currently require --f 1")
+                reference_paths = prompt.get("reference_path")
+                if not isinstance(reference_paths, list) or not reference_paths:
+                    raise ValueError("MiniMax H3 Ref2VA one-frame sample requires at least one --ref image")
+                if prompt.get("image_path") or prompt.get("end_image_path") or prompt.get("control_image_path"):
+                    raise ValueError("MiniMax H3 Ref2VA sample uses --ref rather than --i/--ei/--ci")
+                target_index, control_indices = _parse_one_frame_sample_options(prompt.get("one_frame"))
+                if control_indices is not None:
+                    raise ValueError("MiniMax H3 Ref2VA one-frame sample does not accept control_index")
+                references = tuple(
+                    MediaAsset(Path(path), MediaModality.IMAGE, "reference", stream_index=index)
+                    for index, path in enumerate(reference_paths)
+                )
+                item = SimpleNamespace(
+                    h3_media_assets=references,
+                    frame_count=1,
+                    bucket_size=(width, height),
+                )
+                prompt["_h3_prepared_references"] = prepare_references(
+                    item,
+                    args.reference_image_short_edge,
+                    args.reference_image_size_mode,
+                    args.reference_image_max_pixels,
+                    args.reference_video_short_edge,
+                    args.reference_video_max_pixels,
+                    args.reference_video_fps,
+                )
+                prompt["one_frame_target_index"] = target_index
+            elif requested_frames == 1:
+                target_index, control_indices, control_paths = _one_frame_sample_inputs(prompt)
+                for path in control_paths:
+                    with Image.open(path) as image:
+                        images.append(prepare_keyframe_image(image, height, width, stretch=True))
+                anchors.extend(f"cond_{index:03d}" for index in range(len(images)))
+                prompt["one_frame_target_index"] = target_index
+                prompt["one_frame_control_indices"] = control_indices
+            else:
+                if prompt.get("one_frame") is not None or prompt.get("control_image_path"):
+                    raise ValueError("MiniMax H3 sample --of/--ci options require --f 1")
+                if prompt.get("image_path"):
+                    with Image.open(prompt["image_path"]) as image:
+                        images.append(prepare_keyframe_image(image, height, width, stretch=True))
+                    anchors.append("first")
+                if prompt.get("end_image_path"):
+                    with Image.open(prompt["end_image_path"]) as image:
+                        images.append(prepare_keyframe_image(image, height, width, stretch=False))
+                    anchors.append("last")
+            if args.h3_training_mode in ("ref2va", "ref2va_omni"):
+                prompt.update(encoder.encode_reference_prompt(prompt.get("prompt", ""), prompt["_h3_prepared_references"]))
+            else:
+                prompt.update(encoder.encode_prompt(prompt.get("prompt", ""), images))
             prompt[_SAMPLE_KEYFRAME_ANCHORS] = tuple(anchors)
             prepared_images.append(images)
         encoder.close()
         del encoder
         gc.collect()
         clean_memory_on_device(accelerator.device)
-        all_images = [image for images in prepared_images for image in images]
+        all_images = (
+            [] if args.h3_training_mode in ("ref2va", "ref2va_omni") else [image for images in prepared_images for image in images]
+        )
         encoded = iter(encode_keyframe_images(Path(args.vae), all_images, accelerator.device))
         for prompt, images in zip(prompts, prepared_images):
-            rows = [next(encoded) for _ in images]
-            prompt[_SAMPLE_KEYFRAME_ROWS] = torch.cat(rows) if rows else None
+            if args.h3_training_mode in ("ref2va", "ref2va_omni"):
+                # Ref2VA conditions retain their own geometry, so encode them
+                # through the reference path rather than the target-canvas
+                # keyframe path used by FL2VA controls.
+                prompt["_h3_encoded_references"] = encode_reference_media(
+                    Path(args.vae),
+                    Path(args.audio_vae) if args.audio_vae else None,
+                    prompt.pop("_h3_prepared_references"),
+                    accelerator.device,
+                )
+                prompt[_SAMPLE_KEYFRAME_ROWS] = None
+            else:
+                rows = [next(encoded) for _ in images]
+                prompt[_SAMPLE_KEYFRAME_ROWS] = torch.cat(rows) if rows else None
         return prompts
 
     def _generate_sample(
@@ -3939,7 +4052,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         device = accelerator.device
         height = sample_parameter.get("height", 192)
         width = sample_parameter.get("width", 320)
-        frame_count = align_frame_count(sample_parameter.get("frame_count", 124))
+        requested_frame_count = int(sample_parameter.get("frame_count", 124))
+        frame_count = 1 if requested_frame_count == 1 else align_frame_count(requested_frame_count)
         sample_steps = sample_parameter.get("sample_steps", 20)
         seed = sample_parameter.get("seed", 42)
         generator = torch.Generator(device=device).manual_seed(seed)
@@ -3951,19 +4065,33 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
         denoise_started = time.perf_counter()
-        video_latents, audio_latents = denoise_fl2va(
-            transformer,
-            conditioning,
+        common_denoise = dict(
             height=height,
             width=width,
             frame_count=frame_count,
             num_inference_steps=sample_steps,
             generator=generator,
             device=device,
-            keyframe_rows=sample_parameter.get(_SAMPLE_KEYFRAME_ROWS),
-            keyframe_anchors=sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ()),
             condition_seed=seed,
+            one_frame_target_index=sample_parameter.get("one_frame_target_index"),
         )
+        references = sample_parameter.get("_h3_encoded_references")
+        if references is not None:
+            video_latents, audio_latents = denoise_ref2va(
+                transformer,
+                conditioning,
+                references,
+                **common_denoise,
+            )
+        else:
+            video_latents, audio_latents = denoise_fl2va(
+                transformer,
+                conditioning,
+                keyframe_rows=sample_parameter.get(_SAMPLE_KEYFRAME_ROWS),
+                keyframe_anchors=sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ()),
+                one_frame_control_indices=sample_parameter.get("one_frame_control_indices"),
+                **common_denoise,
+            )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         sample_metrics = {
@@ -3986,13 +4114,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             torch.cuda.reset_peak_memory_stats(device)
         decode_started = time.perf_counter()
         try:
-            media = decode_latents_sequentially(
-                decoder_bundle.video_decoder,
-                decoder_bundle.audio_decoder,
-                video_latents,
-                audio_latents,
-                device,
-            )
+            if frame_count == 1:
+                # The two-latent audio stream is only the model's structural
+                # placeholder in image mode. Decoding it wastes memory and can
+                # shorten the decoded video through AV duration alignment.
+                decoder_bundle.video_decoder.to(device).eval()
+                video = decoder_bundle.video_decoder.decode(video_latents.to(device)).cpu()
+                decoder_bundle.video_decoder.to("cpu")
+                clean_memory_on_device(device)
+                media = SimpleNamespace(video=video, audio=None)
+            else:
+                media = decode_latents_sequentially(
+                    decoder_bundle.video_decoder,
+                    decoder_bundle.audio_decoder,
+                    video_latents,
+                    audio_latents,
+                    device,
+                )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             sample_metrics["sequential_av_decode"] = {
@@ -4033,7 +4171,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         checkpoint = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
         prompt_index = sample_parameter.get("enum", 0)
         prefix = "" if args.output_name is None else args.output_name + "_"
-        output = Path(save_dir) / f"{prefix}{checkpoint}_{prompt_index:02d}_{timestamp}_{seed}.mp4"
+        suffix = ".png" if frame_count == 1 else ".mp4"
+        output = Path(save_dir) / f"{prefix}{checkpoint}_{prompt_index:02d}_{timestamp}_{seed}{suffix}"
+        if frame_count == 1:
+            pixels = (media.video[0, :, 0].permute(1, 2, 0).clamp(0, 1).numpy() * 255.0).round().astype("uint8")
+            Image.fromarray(pixels).save(output)
+            logger.info("Saved MiniMax H3 image sample to %s", output)
+            return
         save_av_mp4(
             media,
             output,
@@ -5751,7 +5895,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if audio_latents is not None
             else None
         )
-        is_image = has_video and not has_audio and video_latents.shape[2] == 1
+        # One-frame caches include a silent audio placeholder for packed-layout
+        # parity, but their target remains an image and uses the image schedule.
+        is_image = has_video and video_latents.shape[2] == 1
+        _require_one_frame_opt_in(args, batch, video_latents)
 
         observed = args.h3_observed_modality
         if observed == "random":
@@ -6878,6 +7025,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         return {
+            "ss_minimax_h3_one_frame": str(bool(getattr(args, "one_frame", False))),
             "ss_h3_training_mode": args.h3_training_mode,
             "ss_h3_lora_token_refiner": str(args.h3_lora_token_refiner),
             "ss_h3_lora_targets": str(args.h3_lora_targets or "default"),
@@ -7000,6 +7148,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=("fl2va", "ref2va", "ref2va_omni"),
         default="fl2va",
         help="select FL2VA, strict Ref2VA, or experimental zero-or-more-reference Ref2VA training",
+    )
+    parser.add_argument(
+        "--one_frame",
+        action="store_true",
+        help="accept MiniMax H3 one-frame caches with explicit target/control frame indices",
     )
     parser.add_argument(
         "--h3_lora_token_refiner",

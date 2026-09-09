@@ -238,6 +238,8 @@ def build_t2va_packed_sequence(
     keyframe_anchors: tuple[str | int, ...] = (),
     num_condition_audio_latents: int = 0,
     spatial_density_scale: float = 1.0,
+    one_frame_target_index: int | None = None,
+    one_frame_control_indices: tuple[int, ...] | None = None,
 ) -> MiniMaxH3PackedSequence:
     """Build FL2VA's ``[text | keyframes | condition audio | target audio | target video]`` layout.
 
@@ -281,8 +283,26 @@ def build_t2va_packed_sequence(
     num_text_rows = int(text_token_tags.shape[0])
     # "first" and an explicit index 0 name the same coordinate, so they collide;
     # "last" names the final pixel frame and never collides with an index.
+    if one_frame_target_index is not None:
+        if num_latent_frames != 1:
+            raise ValueError("H3 one-frame time placement requires exactly one target latent frame")
+        if isinstance(one_frame_target_index, bool) or not isinstance(one_frame_target_index, int) or one_frame_target_index < 0:
+            raise ValueError("H3 one-frame target index must be a non-negative integer")
+        if one_frame_control_indices is None:
+            if keyframe_anchors:
+                raise ValueError("H3 one-frame controls require one control index per condition")
+            one_frame_control_indices = ()
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in one_frame_control_indices):
+            raise ValueError("H3 one-frame control indices must be non-negative integers")
+    elif one_frame_control_indices is not None:
+        raise ValueError("H3 one-frame control indices require a target index")
+
     anchor_identities: list[object] = []
-    for anchor in keyframe_anchors:
+    anchors_to_resolve = one_frame_control_indices if one_frame_target_index is not None else keyframe_anchors
+    for anchor in anchors_to_resolve:
+        if one_frame_target_index is not None:
+            anchor_identities.append(anchor)
+            continue
         if isinstance(anchor, bool) or not isinstance(anchor, (str, int)):
             raise ValueError("H3 keyframe anchors must be 'first', 'last', or a latent frame index")
         if anchor == "first":
@@ -296,10 +316,11 @@ def build_t2va_packed_sequence(
             anchor_identities.append(int(resolved_anchor))
         else:
             raise ValueError("H3 keyframe anchors must be 'first', 'last', or a latent frame index")
-    if len(set(anchor_identities)) != len(anchor_identities):
+    if one_frame_target_index is None and len(set(anchor_identities)) != len(anchor_identities):
         raise ValueError("H3 keyframe anchors must be unique")
 
-    num_condition_video_rows = len(keyframe_anchors) * rows_per_frame
+    condition_count = len(one_frame_control_indices) if one_frame_control_indices is not None else len(keyframe_anchors)
+    num_condition_video_rows = condition_count * rows_per_frame
     num_condition_audio_rows = _AUDIO_CHANNELS * num_condition_audio_latents
     num_audio_rows = num_condition_audio_rows + _AUDIO_CHANNELS * num_audio_latents
     num_video_rows = num_latent_frames * rows_per_frame
@@ -323,13 +344,19 @@ def build_t2va_packed_sequence(
 
     latent_starts = _temporal_position_grid(num_latent_frames, float(num_text_rows)) if num_latent_frames else None
     for index, identity in enumerate(anchor_identities):
-        if identity == "last":
+        if one_frame_target_index is not None:
+            anchor_time = float(num_text_rows) + _ROPE_FRAME_RESCALE * int(identity)
+        elif identity == "last":
             anchor_time = float(num_text_rows) + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
         else:
             anchor_time = float(latent_starts[identity])
         rows = slice(condition_start + index * rows_per_frame, condition_start + (index + 1) * rows_per_frame)
         position_ids[rows, 0] = anchor_time
         position_ids[rows, 1:] = frame_grid
+
+    target_origin = float(num_text_rows)
+    if one_frame_target_index is not None:
+        target_origin += _ROPE_FRAME_RESCALE * one_frame_target_index
 
     # Condition audio duplicates the target's opening span and therefore shares
     # its coordinates. Shifting the complete target by the context length would
@@ -338,19 +365,20 @@ def build_t2va_packed_sequence(
         position_ids,
         slice(audio_start, target_audio_start),
         num_condition_audio_latents,
-        float(num_text_rows),
+        target_origin,
         width_grid,
     )
     _fill_audio_positions(
         position_ids,
         slice(target_audio_start, video_start),
         num_audio_latents,
-        float(num_text_rows),
+        target_origin,
         width_grid,
     )
 
     video_positions = torch.empty(num_latent_frames, rows_per_frame, 3, dtype=torch.float64)
-    video_positions[:, :, 0] = _temporal_position_grid(num_latent_frames, float(num_text_rows))[:, None]
+    target_times = _temporal_position_grid(num_latent_frames, target_origin)
+    video_positions[:, :, 0] = target_times[:, None]
     video_positions[:, :, 1:] = frame_grid[None]
     position_ids[video_start:] = video_positions.reshape(-1, 3)
     return MiniMaxH3PackedSequence(
@@ -377,6 +405,7 @@ def build_ref2va_packed_sequence(
     keyframe_anchors: tuple[str | int, ...] = (),
     guides: tuple[MiniMaxH3GuideGeometry, ...] = (),
     spatial_density_scale: float = 1.0,
+    one_frame_target_index: int | None = None,
 ) -> MiniMaxH3PackedSequence:
     """Build ``[text | references | guides | target audio | target video]``.
 
@@ -410,6 +439,11 @@ def build_ref2va_packed_sequence(
             if observed != expected:
                 raise ValueError(f"aligned H3 video reference geometry {observed} must match target geometry {expected}")
     density_scale = _validated_density_scale(spatial_density_scale)
+    if one_frame_target_index is not None:
+        if num_latent_frames != 1:
+            raise ValueError("H3 one-frame time placement requires exactly one target latent frame")
+        if isinstance(one_frame_target_index, bool) or not isinstance(one_frame_target_index, int) or one_frame_target_index < 0:
+            raise ValueError("H3 one-frame target index must be a non-negative integer")
     if (keyframe_anchors or guides) and num_latent_frames == 0:
         raise ValueError("H3 keyframe conditioning requires a video target")
 
@@ -502,6 +536,8 @@ def build_ref2va_packed_sequence(
         else:
             rotary_time += max(float(reference.num_audio_latents), _temporal_position_span(reference.num_latent_frames))
     target_time = rotary_time
+    if one_frame_target_index is not None:
+        target_time += _ROPE_FRAME_RESCALE * one_frame_target_index
     rotary_time = float(num_text_rows)
     for reference in references:
         if reference.kind == 0:

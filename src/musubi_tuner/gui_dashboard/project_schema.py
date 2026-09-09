@@ -119,6 +119,8 @@ class DatasetEntry(BaseModel):
     # MiniMax H3 dataset controls. They are ignored by non-H3 builders.
     h3_target_modalities: Literal["av", "video", "audio"] = "av"
     h3_image_frame_count: Optional[int] = None
+    fp_1f_clean_indices: Optional[list[int]] = None
+    fp_1f_target_index: Optional[int] = None
     multiple_target: bool = False
     source_image_directory: str = ""
     source_video_directory: str = ""
@@ -158,6 +160,7 @@ class CachingConfig(BaseModel):
     h3_text_visual_max_pixels: int = 0
     h3_image_mode: Literal["none", "first", "first_last"] = "none"
     h3_image_frame_count: Optional[int] = None
+    h3_one_frame: bool = False
     h3_cache_guidance_empty: bool = False
     h3_dop_trigger: str = ""
     h3_dop_class_prompt: str = ""
@@ -269,6 +272,7 @@ class TrainingConfig(BaseModel):
     h3_model: str = ""
     h3_training_type: Literal["lora", "learned_context", "slider"] = "lora"
     h3_training_mode: Literal["fl2va", "ref2va", "ref2va_omni"] = "fl2va"
+    h3_one_frame: bool = False
     h3_learned_context_init: str = ""
     h3_learned_context_init_prompt: str = ""
     h3_learned_context_composition: Literal["prepend", "replace"] = "prepend"
@@ -1275,6 +1279,9 @@ class InferenceConfig(BaseModel):
     h3_text_visual_max_pixels: int = 0
     h3_image_mode: Literal["none", "first", "first_last"] = "none"
     h3_image_frame_count: int = 5
+    h3_one_frame: bool = False
+    h3_condition_images: str = ""
+    h3_one_frame_options: str = ""
     h3_select_frame: int = 0
     h3_duration: int = 5
     h3_ratio: Literal["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"] = "16:9"

@@ -93,6 +93,11 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["one_frame"] = m.group(1).strip()
                 continue
 
+            m = re.match(r"ref (.+)", parg, re.IGNORECASE)
+            if m:
+                prompt_dict.setdefault("reference_path", []).append(m.group(1).strip())
+                continue
+
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)

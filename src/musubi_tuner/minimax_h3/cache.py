@@ -26,6 +26,11 @@ from musubi_tuner.minimax_h3.references import (
     validate_reference_video_sizing,
 )
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
+from musubi_tuner.minimax_h3.image_training import (
+    H3_ONE_FRAME_CACHE_FORMAT,
+    H3_ONE_FRAME_CONTROL_INDICES_KEY,
+    H3_ONE_FRAME_TARGET_INDEX_KEY,
+)
 
 H3_AUDIO_LATENTS_KEY = "latents_audio"
 H3_AUDIO_LOSS_MASK_KEY = "audio_loss_mask"
@@ -255,6 +260,15 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
     Modality-only caches omit the unused target tensor entirely.
     """
     cache_tensors = _validated_cache_tensors(item_info, tensors, operation="latent encoder")
+    if getattr(item_info, "h3_one_frame", False):
+        target_index = int(item_info.h3_one_frame_target_index)
+        control_indices = tuple(int(value) for value in item_info.h3_one_frame_control_indices)
+        cache_tensors[f"{H3_ONE_FRAME_TARGET_INDEX_KEY}_int64"] = torch.tensor(target_index, dtype=torch.long)
+        if control_indices:
+            cache_tensors[f"{H3_ONE_FRAME_CONTROL_INDICES_KEY}_int64"] = torch.tensor(control_indices, dtype=torch.long)
+        metadata = dict(getattr(item_info, "h3_cache_metadata", {}))
+        metadata["h3_cache_format"] = H3_ONE_FRAME_CACHE_FORMAT
+        item_info.h3_cache_metadata = metadata
     primary_latents = [key for key in cache_tensors if re.fullmatch(r"latents_\d+x\d+x\d+_.+", key)]
     target_mode = getattr(item_info, "h3_target_mode", "av")
     if len(primary_latents) > 1 or (target_mode != "audio" and len(primary_latents) != 1):
@@ -264,8 +278,13 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
         getattr(asset, "role", None) == "target" and getattr(asset, "modality", None) is MediaModality.IMAGE
         for asset in getattr(item_info, "h3_media_assets", ())
     )
-    audio_required = target_mode in {"av", "audio"} and not is_image
-    if len(audio_latents) > 1 or (audio_required and not audio_latents) or (target_mode == "video" and audio_latents):
+    one_frame = bool(getattr(item_info, "h3_one_frame", False))
+    audio_required = one_frame or (target_mode in {"av", "audio"} and not is_image)
+    if (
+        len(audio_latents) > 1
+        or (audio_required and not audio_latents)
+        or (target_mode == "video" and audio_latents and not one_frame)
+    ):
         raise ValueError(
             f"H3 latent cache for {item_info.item_key} must contain exactly one "
             "latents_audio_2x32xT_<dtype> tensor unless it is an image item"

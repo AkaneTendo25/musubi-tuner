@@ -478,6 +478,8 @@ def denoise_fl2va(
     init_audio: torch.Tensor | None = None,
     denoise_strength: float = 1.0,
     null_guidance: H3NullGuidance | None = None,
+    one_frame_target_index: int | None = None,
+    one_frame_control_indices: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate FL2VA joint latents with optional first/last keyframe conditioning.
 
@@ -510,7 +512,8 @@ def denoise_fl2va(
     if text_tags.shape != (text_hidden.shape[0],) or text_tags.dtype != torch.long:
         raise ValueError("MiniMax H3 conditioning tags must be int64 with one entry per text row")
     rows_per_anchor = (latent_height // config.patch_size[1]) * (latent_width // config.patch_size[2])
-    expected_keyframe_rows = len(keyframe_anchors) * rows_per_anchor
+    condition_count = len(one_frame_control_indices) if one_frame_control_indices is not None else len(keyframe_anchors)
+    expected_keyframe_rows = condition_count * rows_per_anchor
     keyframe_width = config.in_channels * config.patch_size[0] * config.patch_size[1] * config.patch_size[2]
     if expected_keyframe_rows:
         if keyframe_rows is None or keyframe_rows.shape != (expected_keyframe_rows, keyframe_width):
@@ -518,7 +521,7 @@ def denoise_fl2va(
             raise ValueError(f"MiniMax H3 keyframe rows have shape {actual}, expected {(expected_keyframe_rows, keyframe_width)}")
         keyframe_rows = _augment_keyframe_rows(keyframe_rows, rows_per_anchor, condition_seed).to(device)
     elif keyframe_rows is not None:
-        raise ValueError("MiniMax H3 keyframe rows require first/last anchors")
+        raise ValueError("MiniMax H3 keyframe rows require condition anchors")
     layout = build_t2va_packed_sequence(
         text_tags,
         num_latent_frames=shape.video_latent_frames,
@@ -526,7 +529,9 @@ def denoise_fl2va(
         latent_width=latent_width,
         num_audio_latents=shape.audio_latent_frames,
         patch_size=tuple(config.patch_size),
-        keyframe_anchors=keyframe_anchors,
+        keyframe_anchors=keyframe_anchors if one_frame_control_indices is None else tuple(range(condition_count)),
+        one_frame_target_index=one_frame_target_index,
+        one_frame_control_indices=one_frame_control_indices,
     )
     text_hidden = text_hidden[None].to(device)
     token_tags = layout.token_tags.to(device)
@@ -638,6 +643,7 @@ def denoise_ref2va(
     init_audio: torch.Tensor | None = None,
     denoise_strength: float = 1.0,
     null_guidance: H3NullGuidance | None = None,
+    one_frame_target_index: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate joint AV latents with ordered Ref2VA image, video, and audio context.
 
@@ -682,6 +688,7 @@ def denoise_ref2va(
         patch_size=patch_size,
         keyframe_anchors=keyframe_anchors,
         guides=guide_geometries,
+        one_frame_target_index=one_frame_target_index,
     )
     video_width = config.in_channels * patch_size[0] * patch_size[1] * patch_size[2]
     expected_reference_video_rows = sum(geometry.num_video_rows(patch_size) for geometry in references.geometries)

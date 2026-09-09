@@ -368,6 +368,9 @@ def _build_h3_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--vae", c.h3_video_vae]
     if c.h3_audio_vae:
         cmd += ["--audio_vae", c.h3_audio_vae]
+    cmd += ["--task", c.h3_task]
+    if c.h3_one_frame:
+        cmd.append("--one_frame")
     if c.vae_dtype:
         cmd += ["--vae_dtype", c.vae_dtype]
     if c.h3_image_mode != "none":
@@ -407,6 +410,8 @@ def _build_h3_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_text_encoder_blocks_to_stream", str(c.h3_text_encoder_blocks_to_stream)]
     if c.h3_nvfp4_scaled_mm:
         cmd.append("--h3_nvfp4_scaled_mm")
+    if c.h3_one_frame:
+        cmd.append("--one_frame")
     if c.h3_image_mode != "none":
         cmd += ["--h3_image_mode", c.h3_image_mode]
     if c.h3_image_frame_count is not None:
@@ -438,7 +443,7 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
     output_dir = Path(s.output_dir or "output")
     output_name = s.output_name or "h3_sample"
     output_path = output_dir / output_name
-    if s.h3_image_mode != "none":
+    if s.h3_one_frame or s.h3_image_mode != "none":
         if output_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
             output_path = output_path.with_suffix(".png")
     elif output_path.suffix.lower() not in {".mp4", ".mov", ".webm"}:
@@ -453,11 +458,18 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
         s.prompt,
         "--output",
         str(output_path),
-        "--duration",
-        str(s.h3_duration),
         "--ratio",
         s.h3_ratio,
     ]
+    if s.h3_one_frame:
+        cmd += ["--frame_count", "1"]
+        cmd.append("--one_frame")
+        if s.h3_one_frame_options.strip():
+            cmd.append(s.h3_one_frame_options.strip())
+        for path in (line.strip() for line in s.h3_condition_images.splitlines() if line.strip()):
+            cmd += ["--condition_image", path]
+    else:
+        cmd += ["--duration", str(s.h3_duration)]
     for flag, value in (
         ("--text_encoder", s.h3_text_encoder or c.h3_text_encoder),
         ("--tokenizer", s.h3_tokenizer or c.h3_tokenizer),
@@ -659,6 +671,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--h3_lora_token_refiner")
     if t.h3_training_mode != "fl2va":
         cmd += ["--h3_training_mode", t.h3_training_mode]
+    if t.h3_one_frame:
+        cmd.append("--one_frame")
     if t.h3_loss_balance != "modality":
         cmd += ["--h3_loss_balance", t.h3_loss_balance]
     if t.h3_video_loss_weight != 1.0:

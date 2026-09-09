@@ -12,15 +12,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo, VideoDataset
-from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos
+from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos, resize_image_to_bucket
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
 from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
 from musubi_tuner.minimax_h3.cache import QWEN_CONTROL_FINGERPRINT_KEY, QWEN_CONTROL_ROLE, qwen_control_fingerprint
-from musubi_tuner.minimax_h3.image_training import condition_paths, resample_image_targets, sample_fingerprint, validate_image_mode
+from musubi_tuner.minimax_h3.image_training import (
+    H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY,
+    H3_ONE_FRAME_LATENT_FINGERPRINT_KEY,
+    condition_paths,
+    one_frame_content_fingerprint,
+    one_frame_latent_fingerprint,
+    resample_image_targets,
+    sample_fingerprint,
+    validate_image_mode,
+)
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media_asset
 from musubi_tuner.minimax_h3.references import REFERENCE_FINGERPRINT_KEY, reference_fingerprint
 
@@ -79,6 +90,36 @@ def _modality_list(value: Any, key: str) -> tuple[str, ...] | None:
     if unknown:
         raise ValueError(f"{key} contains unsupported modalities: {unknown}")
     return modalities
+
+
+def _translate_one_frame_image_aliases(user_config: dict[str, Any]) -> dict[str, Any]:
+    """Accept Musubi's documented image keys only for explicit one-frame runs."""
+    translated = copy.deepcopy(user_config)
+    for index, dataset in enumerate(translated.get("datasets", [])):
+        image_directory = dataset.get("image_directory")
+        if image_directory is not None:
+            mixed = [key for key in (*TARGET_DIRECTORY_KEYS.values(), "target_modalities") if dataset.get(key) is not None]
+            if mixed:
+                raise ValueError(
+                    f"datasets[{index}] cannot mix one-frame image_directory with explicit H3 target keys: "
+                    + ", ".join(sorted(mixed))
+                )
+            dataset["target_image_directory"] = dataset.pop("image_directory")
+            dataset["target_modalities"] = ["image"]
+        elif dataset.get("image_jsonl_file") and dataset.get("target_modalities") is None:
+            dataset["target_modalities"] = ["image"]
+
+        control_directory = dataset.get("control_directory")
+        if control_directory is not None:
+            mixed = [key for key in (*SOURCE_DIRECTORY_KEYS.values(), "source_modalities") if dataset.get(key) is not None]
+            if mixed:
+                raise ValueError(
+                    f"datasets[{index}] cannot mix one-frame control_directory with explicit H3 source keys: "
+                    + ", ".join(sorted(mixed))
+                )
+            dataset["source_image_directory"] = dataset.pop("control_directory")
+            dataset["source_modalities"] = ["image"]
+    return translated
 
 
 def _normalize_explicit_modality_config(user_config: dict[str, Any]) -> dict[str, Any]:
@@ -728,6 +769,8 @@ class H3DatasetAdapter:
     """
 
     def __init__(self, user_config: dict[str, Any], args: Any | None = None):
+        if bool(getattr(args, "one_frame", False)):
+            user_config = _translate_one_frame_image_aliases(user_config)
         user_config = _normalize_explicit_modality_config(user_config)
         self.musubi_config = copy.deepcopy(user_config)
         self._targets: dict[str, _ResolvedTarget] = {}
@@ -740,12 +783,15 @@ class H3DatasetAdapter:
         self._target_audio_frame_counts: dict[str, int] = {}
         self._target_reference_probabilities: dict[str, tuple[float, float, float]] = {}
         self._image_frame_counts: dict[str, int] = {}
+        self._one_frame_settings: dict[tuple[str, str], tuple[int, tuple[int, ...]]] = {}
         # Authored conditioning masks: the observed region for --h3_mask_mode
         # dataset. They are applied to the packed rows at train time, so they
         # never enter the latent cache and never change its identity.
         self.conditioning_masks: dict[str, Path] = {}
         self.image_mode = str(getattr(args, "h3_image_mode", "none"))
         self.image_frame_count = getattr(args, "h3_image_frame_count", None)
+        self.one_frame = bool(getattr(args, "one_frame", False))
+        self.task = str(getattr(args, "task", getattr(args, "h3_training_mode", "t2va")))
         if self.image_mode not in {"none", "first", "first_last"}:
             raise ValueError("MiniMax H3 image mode must be none, first, or first_last")
         self.audio_datasets: list[H3AudioDataset] = []
@@ -904,6 +950,10 @@ class H3DatasetAdapter:
             target_audio_directory = source.get("target_audio_directory")
             caption_extension = _effective(source, general, "caption_extension")
             multiple_target = bool(_effective(source, general, "multiple_target"))
+            dataset_cache_directory = _effective(source, general, "cache_directory")
+            one_frame_cache_key = (
+                _normal_path(Path(dataset_cache_directory).expanduser().resolve()) if dataset_cache_directory else ""
+            )
 
             records: list[dict[str, Any]] | None = None
             if video_directory:
@@ -958,7 +1008,7 @@ class H3DatasetAdapter:
                     indexed.sort()
                     target_sources[target_path] = (primary, *(path for _, path in indexed)) if multiple_target else (primary,)
             elif image_jsonl_file:
-                records = _read_media_jsonl(image_jsonl_file, resolve_paths=self.image_mode != "none")
+                records = _read_media_jsonl(image_jsonl_file, resolve_paths=self.image_mode != "none" or self.one_frame)
                 target_paths = tuple(record.get("image_path") or record.get("image_path_0") for record in records)
                 if any(not target for target in target_paths):
                     raise ValueError("H3 image JSONL records must contain image_path or image_path_0")
@@ -987,6 +1037,44 @@ class H3DatasetAdapter:
                 clean["h3_image_frame_count"] = int(frame_count)
             else:
                 frame_count = None
+
+            one_frame_target_index = _effective(source, general, "fp_1f_target_index")
+            one_frame_control_indices_value = _effective(source, general, "fp_1f_clean_indices")
+            if one_frame_target_index is not None and (
+                isinstance(one_frame_target_index, bool) or not isinstance(one_frame_target_index, int)
+            ):
+                raise ValueError("fp_1f_target_index must be an integer")
+            if one_frame_control_indices_value is not None:
+                if not isinstance(one_frame_control_indices_value, list) or not one_frame_control_indices_value:
+                    raise ValueError("fp_1f_clean_indices must be a non-empty TOML array")
+                if any(isinstance(value, bool) or not isinstance(value, int) for value in one_frame_control_indices_value):
+                    raise ValueError("fp_1f_clean_indices must contain integers")
+            one_frame_control_indices = (
+                tuple(int(value) for value in one_frame_control_indices_value)
+                if one_frame_control_indices_value is not None
+                else ()
+            )
+            if self.one_frame:
+                if not (image_directory or image_jsonl_file):
+                    # Video datasets in a mixed TOML retain their ordinary behavior.
+                    one_frame_target_index = None
+                    one_frame_control_indices = ()
+                else:
+                    if self.image_mode != "none":
+                        raise ValueError("--one_frame cannot be combined with --h3_image_mode")
+                    if multiple_target:
+                        raise ValueError("MiniMax H3 one-frame image datasets do not support multiple_target")
+                    if one_frame_target_index is not None and int(one_frame_target_index) < 0:
+                        raise ValueError("fp_1f_target_index must be non-negative")
+                    if any(value < 0 for value in one_frame_control_indices):
+                        raise ValueError("fp_1f_clean_indices must contain non-negative frame indices")
+                    if one_frame_control_indices and one_frame_target_index is None:
+                        raise ValueError("timed one-frame controls require an explicit fp_1f_target_index")
+                    if one_frame_control_indices and self.task != "fl2va":
+                        raise ValueError("fp_1f_clean_indices one-frame controls require --task fl2va")
+                    if not one_frame_control_indices and self.task == "fl2va" and (control_directory or records):
+                        # Exact presence is checked after references are resolved below.
+                        pass
 
             if (
                 (control_directory or control_video_directory)
@@ -1043,6 +1131,19 @@ class H3DatasetAdapter:
                 if (image_directory or image_jsonl_file) and modality is not MediaModality.IMAGE:
                     raise ValueError(f"MiniMax H3 image datasets must resolve image targets, got {target}")
                 references, probabilities = _dataset_references(source, general, target, reference_paths.get(target, ()))
+                if self.one_frame and modality is MediaModality.IMAGE:
+                    if one_frame_control_indices:
+                        if len(references) != len(one_frame_control_indices):
+                            raise ValueError(
+                                f"MiniMax H3 one-frame target {target!r} has {len(references)} controls but "
+                                f"fp_1f_clean_indices has {len(one_frame_control_indices)} entries"
+                            )
+                        if any(reference.modality is not MediaModality.IMAGE for reference in references):
+                            raise ValueError("MiniMax H3 timed one-frame controls must all be images")
+                    elif self.task == "fl2va" and references:
+                        raise ValueError("FL2VA one-frame controls require fp_1f_clean_indices")
+                    elif self.task not in {"ref2va", "ref2va_omni"} and references:
+                        raise ValueError("untimed one-frame controls are Ref2VA references and require --task ref2va")
                 resolved = _ResolvedTarget(Path(target), references, qwen_control_paths.get(target, ()))
                 normal = _normal_path(target)
                 companion_audio = target_audio_paths.get(target)
@@ -1093,6 +1194,13 @@ class H3DatasetAdapter:
                         self._target_audio_paths[normal] = companion_audio
                     if companion_audio_frames is not None:
                         self._target_audio_frame_counts[normal] = companion_audio_frames
+                if self.one_frame and modality is MediaModality.IMAGE:
+                    settings_key = (normal, one_frame_cache_key)
+                    expected = (int(one_frame_target_index or 0), one_frame_control_indices)
+                    existing_settings = self._one_frame_settings.get(settings_key)
+                    if existing_settings is not None and existing_settings != expected:
+                        raise ValueError(f"conflicting one-frame time positions share cache_directory for target path: {target}")
+                    self._one_frame_settings[settings_key] = expected
             self._target_groups.append(tuple(_normal_path(target) for target in target_paths))
 
         self.requires_audio = (
@@ -1100,6 +1208,7 @@ class H3DatasetAdapter:
                 modality in {MediaModality.VIDEO, MediaModality.AUDIO} and self._target_modes[path] != "video"
                 for path, modality in self._target_modalities.items()
             )
+            or bool(self._one_frame_settings)
             or bool(self._target_audio_paths)
             or any(
                 reference.modality is MediaModality.AUDIO
@@ -1221,6 +1330,8 @@ class H3DatasetAdapter:
         raise KeyError(f"H3 dataset adapter cannot map ItemInfo key to source media: {item_key}")
 
     def attach(self, item: ItemInfo) -> tuple[MediaAsset, ...]:
+        if getattr(item, "_h3_media_attached_by", None) == id(self):
+            return item.h3_media_assets
         resolved, start_frame, frame_count = self._resolve_target(item.item_key)
         normal = _normal_path(resolved.path)
         modality = self._target_modalities[normal]
@@ -1258,7 +1369,54 @@ class H3DatasetAdapter:
                 start_seconds=start_frame / target_fps,
                 duration_seconds=frame_count / target_fps,
             )
-        if image_frame_count is not None:
+        cache_parents = set()
+        for attribute in ("latent_cache_path", "text_encoder_output_cache_path"):
+            cache_path = getattr(item, attribute, None)
+            if cache_path:
+                cache_parents.add(_normal_path(Path(cache_path).expanduser().resolve().parent))
+        matching_settings = [
+            settings
+            for (target_path, cache_directory), settings in self._one_frame_settings.items()
+            if target_path == normal and cache_directory in cache_parents
+        ]
+        if not matching_settings:
+            matching_settings = [
+                settings for (target_path, _), settings in self._one_frame_settings.items() if target_path == normal
+            ]
+        if len(set(matching_settings)) > 1:
+            raise ValueError(f"one-frame item has ambiguous cache_directory/time placement: {item.item_key}")
+        one_frame_settings = matching_settings[0] if matching_settings else None
+        if one_frame_settings is not None:
+            target_index, control_indices = one_frame_settings
+            controls = tuple(reference.path for reference in resolved.references) if control_indices else ()
+            item.h3_one_frame = True
+            item.h3_one_frame_target_index = target_index
+            item.h3_one_frame_control_indices = control_indices
+            item.h3_condition_paths = controls
+            item.h3_target_paths = self._target_source_paths[normal]
+            item.frame_count = 1
+            if control_indices:
+                resized_controls = []
+                bucket_width, bucket_height = (int(item.bucket_size[0]), int(item.bucket_size[1]))
+                for path in controls:
+                    with Image.open(path) as source:
+                        resized_controls.append(resize_image_to_bucket(source.convert("RGB"), (bucket_width, bucket_height)))
+                item.control_content = resized_controls
+            content_fingerprint = one_frame_content_fingerprint(
+                targets=item.h3_target_paths,
+                controls=controls,
+                original_size=item.original_size,
+                bucket_size=item.bucket_size,
+            )
+            item.h3_cache_metadata = {
+                H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY: content_fingerprint,
+                H3_ONE_FRAME_LATENT_FINGERPRINT_KEY: one_frame_latent_fingerprint(
+                    content_fingerprint, target_index, control_indices
+                ),
+            }
+            # Timed controls are FL2VA condition slots, not Ref2VA reference blocks.
+            assets = (target, *(() if control_indices else resolved.references), *resolved.qwen_controls)
+        elif image_frame_count is not None:
             controls = condition_paths(self.image_mode, tuple(reference.path for reference in resolved.references))
             if any(reference.modality is not MediaModality.IMAGE for reference in resolved.references):
                 raise ValueError("MiniMax H3 conditioned-image controls must all be images")
@@ -1284,6 +1442,7 @@ class H3DatasetAdapter:
             assets = (target, *resolved.references, *resolved.qwen_controls)
         validate_h3_media_assets(item.item_key, assets)
         item.h3_media_assets = assets
+        item._h3_media_attached_by = id(self)
         # Both fingerprints are optional and independent, so they are merged into
         # whatever the image-mode branch already recorded rather than replacing it.
         metadata = dict(getattr(item, "h3_cache_metadata", {}))

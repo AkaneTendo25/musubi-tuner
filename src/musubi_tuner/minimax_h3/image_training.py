@@ -15,9 +15,19 @@ from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
 
 H3_IMAGE_MODES = ("none", "first", "first_last")
 H3_TEXT_VISUAL_MAX_PIXELS = 0
+H3_ONE_FRAME_CACHE_FORMAT = "minimax-h3-one-frame-v2"
+H3_ONE_FRAME_TARGET_INDEX_KEY = "one_frame_target_index"
+H3_ONE_FRAME_CONTROL_INDICES_KEY = "one_frame_control_indices"
+H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY = "one_frame_content_fingerprint"
+H3_ONE_FRAME_LATENT_FINGERPRINT_KEY = "one_frame_latent_fingerprint"
 
 
 def add_image_training_arguments(parser: argparse.ArgumentParser, *, text_visual: bool = False) -> None:
+    parser.add_argument(
+        "--one_frame",
+        action="store_true",
+        help="accept image datasets as native one-frame H3 targets, optionally with timed FL2VA controls",
+    )
     parser.add_argument(
         "--h3_image_mode",
         choices=H3_IMAGE_MODES,
@@ -96,6 +106,30 @@ def file_identity(path: Path) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     stat = resolved.stat()
     return {"path": str(resolved), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def one_frame_content_fingerprint(
+    *, targets: Sequence[Path], controls: Sequence[Path], original_size: Sequence[int], bucket_size: Sequence[int]
+) -> str:
+    """Identity shared by latent and text caches; deliberately excludes time placement."""
+    descriptor = {
+        "format": H3_ONE_FRAME_CACHE_FORMAT,
+        "original_size": [int(value) for value in original_size],
+        "bucket_size": [int(value) for value in bucket_size[:2]],
+        "targets": [file_identity(path) for path in targets],
+        "controls": [file_identity(path) for path in controls],
+    }
+    return hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def one_frame_latent_fingerprint(content_fingerprint: str, target_index: int, control_indices: Sequence[int]) -> str:
+    descriptor = {
+        "format": H3_ONE_FRAME_CACHE_FORMAT,
+        "content": content_fingerprint,
+        "target_index": int(target_index),
+        "control_indices": [int(value) for value in control_indices],
+    }
+    return hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def sample_fingerprint(

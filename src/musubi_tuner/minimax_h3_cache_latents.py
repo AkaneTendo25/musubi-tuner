@@ -19,7 +19,14 @@ from musubi_tuner.minimax_h3.cache import (
     save_latent_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.dataset import TARGET_AUDIO_FINGERPRINT_KEY, attach_h3_media, create_h3_dataset_group
-from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
+from musubi_tuner.minimax_h3.image_training import (
+    H3_ONE_FRAME_CACHE_FORMAT,
+    H3_ONE_FRAME_CONTROL_INDICES_KEY,
+    H3_ONE_FRAME_LATENT_FINGERPRINT_KEY,
+    H3_ONE_FRAME_TARGET_INDEX_KEY,
+    add_image_training_arguments,
+    cache_matches_fingerprint,
+)
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_FINGERPRINT_KEY,
     REFERENCE_IMAGE_SHORT_EDGE,
@@ -37,6 +44,12 @@ H3_LOSS_MASK_POOLING_CODES = {"max": 0, "average": 1, "nearest": 2}
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Cache MiniMax H3 latents with Musubi's dataset and cache pipeline"
+    parser.add_argument(
+        "--task",
+        choices=("t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"),
+        default="t2va",
+        help="conditioning task used to interpret one-frame image controls",
+    )
     parser.add_argument(
         "--audio_vae",
         type=Path,
@@ -150,6 +163,26 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     def existing_cache_valid(item: ItemInfo, path: str) -> bool:
         attach_h3_media((item,), dataset_adapter)
+        if getattr(item, "h3_one_frame", False):
+            fingerprint = item.h3_cache_metadata[H3_ONE_FRAME_LATENT_FINGERPRINT_KEY]
+            if not cache_matches_fingerprint(path, fingerprint, H3_ONE_FRAME_LATENT_FINGERPRINT_KEY):
+                return False
+            try:
+                with safe_open(path, framework="pt", device="cpu") as handle:
+                    keys = set(handle.keys())
+                    if (handle.metadata() or {}).get("h3_cache_format") != H3_ONE_FRAME_CACHE_FORMAT:
+                        return False
+                    target_key = f"{H3_ONE_FRAME_TARGET_INDEX_KEY}_int64"
+                    if target_key not in keys or int(handle.get_tensor(target_key)) != item.h3_one_frame_target_index:
+                        return False
+                    control_key = f"{H3_ONE_FRAME_CONTROL_INDICES_KEY}_int64"
+                    expected = tuple(item.h3_one_frame_control_indices)
+                    if bool(expected) != (control_key in keys):
+                        return False
+                    if expected and tuple(int(value) for value in handle.get_tensor(control_key)) != expected:
+                        return False
+            except (OSError, RuntimeError, ValueError):
+                return False
         if args.h3_image_mode != "none" and not cache_matches_fingerprint(path, item.h3_cache_metadata["sample_fingerprint"]):
             return False
         target_audio_fingerprint = getattr(item, "h3_cache_metadata", {}).get(TARGET_AUDIO_FINGERPRINT_KEY)

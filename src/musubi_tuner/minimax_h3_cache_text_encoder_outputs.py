@@ -46,7 +46,11 @@ from musubi_tuner.minimax_h3.cache import (
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
-from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
+from musubi_tuner.minimax_h3.image_training import (
+    H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY,
+    add_image_training_arguments,
+    cache_matches_fingerprint,
+)
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_FINGERPRINT_KEY,
     REFERENCE_IMAGE_SHORT_EDGE,
@@ -264,6 +268,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     def existing_cache_valid(item: ItemInfo, path: str) -> bool:
         attach_h3_media((item,), dataset_adapter)
+        if getattr(item, "h3_one_frame", False) and not cache_matches_fingerprint(
+            path,
+            item.h3_cache_metadata[H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY],
+            H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY,
+        ):
+            return False
         if args.h3_image_mode != "none" and not cache_matches_fingerprint(path, item.h3_cache_metadata["sample_fingerprint"]):
             return False
         if reference_assets(item) and not cache_matches_fingerprint(

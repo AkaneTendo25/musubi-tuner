@@ -56,6 +56,8 @@ def align_frame_count(frame_count: int) -> int:
 def temporal_shape(frame_count: int, *, align: bool = False) -> H3TemporalShape:
     if not isinstance(frame_count, int) or isinstance(frame_count, bool):
         raise TypeError("H3 frame_count must be an integer")
+    if frame_count == IMAGE_FRAME_COUNT:
+        return H3TemporalShape(IMAGE_FRAME_COUNT, 1, 2)
     if align:
         frame_count = align_frame_count(frame_count)
     elif not is_valid_frame_count(frame_count):

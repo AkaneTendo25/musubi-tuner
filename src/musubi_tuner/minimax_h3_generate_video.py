@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from collections.abc import Sequence
 from pathlib import Path
 
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_generator
+from musubi_tuner.minimax_h3.one_frame import parse_one_frame_options
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
@@ -29,9 +31,11 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--vae", type=Path, help="MiniMax H3 video VAE checkpoint or component directory")
     parser.add_argument("--audio_vae", type=Path, help="MiniMax H3 audio VAE checkpoint or component directory")
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--prompt")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--from_file", type=Path, help="generate each prompt line into the output directory")
     parser.add_argument("--duration", type=int, default=5)
+    parser.add_argument("--frame_count", type=int, help="explicit pixel-frame count; 1 enables one-frame generation")
     parser.add_argument("--ratio", choices=SUPPORTED_RATIOS, default="16:9")
     parser.add_argument("--height", type=int, help="explicit non-native canvas height; requires --width")
     parser.add_argument("--width", type=int, help="explicit non-native canvas width; requires --height")
@@ -39,6 +43,20 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--first_frame")
     parser.add_argument("--last_frame")
+    parser.add_argument(
+        "--condition_image",
+        action="append",
+        default=[],
+        help="ordered one-frame FL2VA control; repeatable",
+    )
+    parser.add_argument(
+        "--one_frame",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="target_index=N,control_index=A;B",
+        help="generate one latent frame with optional 24 fps timeline placement",
+    )
     parser.add_argument(
         "--h3_image_mode",
         choices=("none", "first", "first_last"),
@@ -263,6 +281,11 @@ def _parse_guides(image_entries: list[str], video_entries: list[str], audio_entr
 def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
     first_frame = args.first_frame
     last_frame = args.last_frame
+    one_frame = args.frame_count == 1
+    if args.one_frame is not None and not one_frame:
+        raise ValueError("--one_frame placement options require --frame_count 1")
+    if one_frame and args.h3_image_mode != "none":
+        raise ValueError("--frame_count 1 cannot be combined with legacy --h3_image_mode")
     if args.h3_image_mode == "first":
         if not first_frame:
             raise ValueError("--h3_image_mode first requires --first_frame")
@@ -271,6 +294,11 @@ def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
         last_frame = first_frame
     elif args.h3_image_mode == "first_last" and (not first_frame or not last_frame):
         raise ValueError("--h3_image_mode first_last requires --first_frame and --last_frame")
+    if args.condition_image and (first_frame or last_frame):
+        raise ValueError("--condition_image cannot be combined with --first_frame/--last_frame")
+    target_index, control_indices = parse_one_frame_options(args.one_frame)
+    if args.condition_image and not one_frame:
+        raise ValueError("--condition_image requires --frame_count 1")
     references = make_references(
         first_frame=first_frame,
         last_frame=last_frame,
@@ -286,10 +314,68 @@ def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
         args.ratio,
         args.seed,
         references,
-        args.h3_image_frame_count if args.h3_image_mode != "none" else None,
+        args.frame_count if args.frame_count is not None else (args.h3_image_frame_count if args.h3_image_mode != "none" else None),
         args.h3_select_frame,
         _parse_guides(args.guide_image, args.guide_video, args.guide_audio),
+        tuple(Path(path) for path in args.condition_image),
+        target_index if one_frame else None,
+        control_indices if one_frame else None,
     )
+
+
+def parse_prompt_line(line: str) -> dict[str, object]:
+    """Parse upstream-compatible per-line ``--ci`` and ``--of`` controls."""
+    parts = ["", *line[2:].split(" --")] if line.startswith("--") else line.split(" --")
+    result: dict[str, object] = {}
+    if parts[0].strip():
+        result["prompt"] = parts[0].strip().replace("\\n", "\n")
+    condition_images: list[str] = []
+    references: list[str] = []
+    names = {
+        "i": "first_frame",
+        "ei": "last_frame",
+        "of": "one_frame",
+        "o": "output",
+        "d": "seed",
+        "f": "frame_count",
+        "w": "width",
+        "h": "height",
+        "s": "steps",
+        "duration": "duration",
+        "ratio": "ratio",
+    }
+    integer_options = {"d", "f", "w", "h", "s", "duration"}
+    for part in parts[1:]:
+        option, separator, value = part.strip().partition(" ")
+        value = value.strip()
+        if not separator or not value:
+            raise ValueError(f"MiniMax H3 prompt-line --{option} requires a value")
+        if option == "ci":
+            condition_images.append(value)
+        elif option == "ref":
+            references.append(value)
+        elif option in names:
+            result[names[option]] = int(value) if option in integer_options else value
+        else:
+            raise ValueError(f"MiniMax H3 prompt line has unknown option --{option}")
+    if condition_images:
+        result["condition_image"] = condition_images
+    if references:
+        result["reference_image"] = references
+    return result
+
+
+def apply_prompt_overrides(args: argparse.Namespace, overrides: dict[str, object], index: int) -> argparse.Namespace:
+    item = copy.deepcopy(args)
+    for name, value in overrides.items():
+        if name == "output":
+            output = Path(value)
+            value = output if output.is_absolute() else args.output / output
+        setattr(item, name, value)
+    if "output" not in overrides:
+        suffix = ".png" if item.frame_count == 1 else ".mp4"
+        item.output = args.output / f"{index:04d}{suffix}"
+    return item
 
 
 def generator_from_args(args: argparse.Namespace, request: H3GenerationRequest):
@@ -353,18 +439,48 @@ def main(argv: Sequence[str] | None = None) -> None:
     try:
         if args.fp8_base and args.int8_convrot_base:
             raise ValueError("--int8_convrot_base cannot be combined with --fp8_base")
+        if args.from_file:
+            if args.prompt:
+                raise ValueError("--from_file cannot be combined with --prompt")
+            args.output.mkdir(parents=True, exist_ok=True)
+            lines = args.from_file.read_text(encoding="utf-8").splitlines()
+            item_args = [
+                apply_prompt_overrides(args, parse_prompt_line(line.strip()), index)
+                for index, line in enumerate(lines)
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            if not item_args:
+                raise ValueError("--from_file contains no prompt lines")
+            requests = [request_from_args(item) for item in item_args]
+            for request in requests:
+                request.validate(check_files=True)
+                request.output.parent.mkdir(parents=True, exist_ok=True)
+            requirements = [("--text_encoder", args.text_encoder), ("--vae", args.vae)]
+            if any(request.frame_count_override != 1 for request in requests):
+                requirements.append(("--audio_vae", args.audio_vae))
+            missing = [name for name, value in requirements if value is None]
+            if missing:
+                raise ValueError("native H3 generation requires " + ", ".join(missing))
+            for item, request in zip(item_args, requests):
+                generator = generator_from_args(item, request)
+                generator.generate(request)
+                if not request.output.is_file():
+                    raise RuntimeError(f"H3 implementation returned without creating {request.output}")
+            return
+        if not args.prompt:
+            raise ValueError("--prompt is required unless --from_file is used")
         request = request_from_args(args)
         request.validate(check_files=True)
         image_suffixes = {".png", ".jpg", ".jpeg", ".webp"}
-        if args.output.suffix.lower() in image_suffixes and args.h3_image_mode == "none":
-            raise ValueError("image-file output requires --h3_image_mode first or first_last")
+        if args.output.suffix.lower() in image_suffixes and args.h3_image_mode == "none" and args.frame_count != 1:
+            raise ValueError("image-file output requires --frame_count 1 or --h3_image_mode first/first_last")
         if args.h3_text_visual_max_pixels < 0:
             raise ValueError("--h3_text_visual_max_pixels must be non-negative")
         inventory = inspect_checkpoint(args.model)
         if args.inspect:
             print(json.dumps({"mode": request.mode, "checkpoint": inventory.to_dict()}, indent=2))
             return
-        image_output = args.h3_image_mode != "none" and args.output.suffix.lower() in image_suffixes
+        image_output = (args.h3_image_mode != "none" or args.frame_count == 1) and args.output.suffix.lower() in image_suffixes
         required = {
             "--text_encoder": args.text_encoder,
             "--vae": args.vae,
