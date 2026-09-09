@@ -288,7 +288,14 @@
 								<FormField label="Visual max pixels" type="number" fieldPath="inference.h3_text_visual_max_pixels" value={s.h3_text_visual_max_pixels ?? 0} oninput={(e) => update('h3_text_visual_max_pixels', Number(e.target.value))} min={0} step={1024} tooltip="Cap pixels passed through Qwen3-VL visual conditioning. 0 uses the encoder default." />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
-								<FormField type="number" fieldPath="inference.h3_duration" value={s.h3_duration ?? 5} oninput={(e) => update('h3_duration', Number(e.target.value || 5))} min={5} max={15} tooltip="Video duration in seconds (5-15)" />
+								<FormToggle label="One-frame image" fieldPath="inference.h3_one_frame" checked={s.h3_one_frame ?? false} onchange={(e) => update('h3_one_frame', e.target.checked)} tooltip="Generate one image as a PNG. Three or more timed controls are experimental." />
+								<FormField type="number" fieldPath="inference.h3_duration" value={s.h3_duration ?? 5} oninput={(e) => update('h3_duration', Number(e.target.value || 5))} min={5} max={15} disabled={s.h3_one_frame} tooltip="Video duration in seconds (5-15)" />
+								{#if s.h3_one_frame}
+									<FormField label="Frame positions" fieldPath="inference.h3_one_frame_options" value={s.h3_one_frame_options || ''} oninput={(e) => update('h3_one_frame_options', e.target.value)} placeholder="target_index=24,control_index=0;48;96" tooltip="Positions in 24 fps pixel frames. Supply one control index per image, in list order." />
+									<label class="block text-xs">Condition images, one path per line
+										<textarea class="w-full mt-1 p-2 rounded" rows="3" style="background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-subtle);" value={s.h3_condition_images || ''} oninput={(e) => update('h3_condition_images', e.target.value)} placeholder="/images/first.png&#10;/images/middle.png&#10;/images/last.png"></textarea>
+									</label>
+								{/if}
 								<FormSelect fieldPath="inference.h3_ratio" value={s.h3_ratio || '16:9'} options={['adaptive', '21:9', '16:9', '4:3', '1:1', '3:4', '9:16']} onchange={(e) => update('h3_ratio', e.target.value)} tooltip="Output aspect ratio" />
 								<FormField label="Steps" type="number" fieldPath="inference.sample_steps" value={s.sample_steps ?? 20} oninput={(e) => update('sample_steps', Number(e.target.value || 20))} min={2} tooltip="Sigma grid points including terminal zero" />
 								<FormSelect label="DiT dtype" fieldPath="inference.h3_dtype" value={s.h3_dtype || 'bfloat16'} options={['bfloat16', 'float16', 'float32']} onchange={(e) => update('h3_dtype', e.target.value)} />

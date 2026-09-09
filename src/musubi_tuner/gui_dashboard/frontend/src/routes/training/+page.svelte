@@ -524,6 +524,7 @@
 							<FormSelect label="Training method" fieldPath="training.h3_training_type" value={t.h3_training_type || 'lora'} options={[{value:'lora',label:'LoRA adapter'},{value:'learned_context',label:'Learned context'},{value:'slider',label:'Slider LoRA'}]} onchange={(e) => update('h3_training_type', e.target.value)} tooltip="Train a normal H3 LoRA, freeze H3 and learn a Qwen context tensor, or train a controllable slider LoRA." />
 							<div class="grid grid-cols-2 gap-2">
 							<FormSelect fieldPath="training.h3_training_mode" value={t.h3_training_mode || 'fl2va'} options={['fl2va', 'ref2va', 'ref2va_omni']} onchange={(e) => update('h3_training_mode', e.target.value)} tooltip="FL2VA, strict reference conditioning, or experimental zero-or-more-reference training" />
+							<FormToggle label="One-frame images" fieldPath="training.h3_one_frame" checked={t.h3_one_frame ?? false} onchange={(e) => update('h3_one_frame', e.target.checked)} tooltip="Accept caches created with one-frame image mode, including ordered timed FL2VA controls." />
 								<FormSelect fieldPath="training.h3_loss_balance" value={t.h3_loss_balance || 'modality'} options={['modality', 'token']} onchange={(e) => update('h3_loss_balance', e.target.value)} tooltip="Balance video and audio loss by modality or token count" />
 							</div>
 							<div class="grid grid-cols-2 gap-2">

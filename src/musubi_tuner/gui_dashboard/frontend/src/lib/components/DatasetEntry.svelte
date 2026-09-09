@@ -185,6 +185,10 @@
 				/>
 				{#if !isVideo && !isAudio}
 					<div class="grid grid-cols-2 gap-3">
+						<FormField label="One-frame control indices" value={(entry.fp_1f_clean_indices || []).join(', ')} oninput={(e) => updateField('fp_1f_clean_indices', e.target.value.trim() ? e.target.value.split(/[,;\s]+/).filter(Boolean).map(Number) : null)} placeholder="0, 48, 96" tooltip="For one-frame FL2VA, one 24 fps pixel-frame index per control image, in file order. Leave empty for untimed references." />
+						<FormField label="One-frame target index" type="number" value={entry.fp_1f_target_index ?? ''} oninput={(e) => updateNumberField('fp_1f_target_index', e.target.value, true)} min={0} placeholder="24" tooltip="Required with timed controls. Enable one-frame images in caching and training." />
+					</div>
+					<div class="grid grid-cols-2 gap-3">
 						<FormField
 							label="Image Target Frames"
 							type="number"
