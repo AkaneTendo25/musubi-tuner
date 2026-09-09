@@ -984,6 +984,26 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_overlay_training_only and not t.h3_overlay_weights:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_overlay_training_only",
+                    "H3 training-only overlay mode requires an overlay LoRA path.",
+                    label="H3 Overlay Training Only",
+                    page="training",
+                )
+            )
+        if t.h3_overlay_training_only and (t.h3_validation_field_probe or t.h3_validation_rollout_probe > 0):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_overlay_training_only",
+                    "H3 training-only overlay mode cannot be used with validation field or rollout probes.",
+                    label="H3 Overlay Training Only",
+                    page="training",
+                )
+            )
         if t.h3_guidance_distillation_scale is not None or guidance_range is not None:
             scale = (
                 float(t.h3_guidance_distillation_scale) if t.h3_guidance_distillation_scale is not None else sum(guidance_range) / 2

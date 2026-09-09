@@ -58,7 +58,7 @@ Two released transformers, with different conditioning contracts:
 - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
   - [Methods](#methods)
     - [Plain LoRA](#plain-lora)
-    - [De-distilling adapter](#de-distilling-adapter---base_weights)
+    - [De-distilling adapter](#de-distilling-adapter)
     - [Contrastive guidance loss](#contrastive-guidance-loss)
     - [Frozen-null target with the null anchor](#frozen-null-target-with-the-null-anchor)
     - [Rollout supervision](#rollout-supervision)
@@ -834,8 +834,9 @@ Generic LoRAs passed through `--base_weights` are merged into the frozen base at
 
 `--h3_overlay_weights` applies a LoRA as a separate frozen module instead of merging it: base weights are not modified, so
 it also works on an INT8 ConvRot base. The overlay is excluded from the optimizer and from saved checkpoints, and is active
-on all forwards, including the base-preservation reference. `--h3_overlay_weights_multiplier` (default `1.0`, negative
-allowed) scales its delta. Incompatible with full fine-tuning.
+on all forwards by default, including previews and the base-preservation reference. Add `--h3_overlay_training_only`
+to disable it during previews while retaining the learned LoRA. Training and data-loss validation keep it active.
+`--h3_overlay_weights_multiplier` (default `1.0`, negative allowed) scales its delta. Incompatible with full fine-tuning.
 
 `--h3_adaln_rank` excludes the reduced AdaLN projections from quantization, so it composes with FP8 and with ConvRot INT8.
 
@@ -1485,21 +1486,32 @@ of the checkpoint's within a few hundred steps.
   prompt, the training resolution and length included. Cost **1x**, the reference for the ratios below.
 - **Flags:** none.
 
-#### De-distilling adapter (`--base_weights`)
+<a id="de-distilling-adapter---base_weights"></a>
 
-A separately trained adapter is merged into the frozen base for the duration of training, so the training base
-approximates an undistilled model. At inference the LoRA goes onto the stock checkpoint; the adapter is not needed
-and costs no extra forward. Public adapters for H3: `ostris/minimax_h3_training_adapter` on Hugging Face and
-`DiffSynth-Studio/MiniMax-H3-TrainingAdapter` on ModelScope (rank 64, used there via `--preset_lora_path`).
+#### De-distilling adapter
 
-- **Applies to:** both checkpoints. An adapter is trained against one checkpoint and used with that one.
-- **Advantages:** no change to the training loop or to inference; combines with any objective. Not with the two validation
-  probes: `--base_weights` is merged at load time and cannot be switched off for the frozen-base reference forward, so
-  `--h3_validation_field_probe` and `--h3_validation_rollout_probe` refuse it. Judge these runs by `val/loss` and renders.
-- **Disadvantages:** the adapter approximates the undistilled model, and its error goes into the LoRA. Cost about
-  **1x**.
-- **Flags:** `--base_weights adapter.safetensors` (repeatable), `--base_weights_multiplier`; optionally
-  `--h3_base_preservation_loss_weight` and `--h3_base_preservation_probability`.
+Use a frozen training adapter matched to the exact H3 checkpoint:
+
+```shell
+--h3_overlay_weights training_adapter.safetensors --h3_overlay_training_only
+```
+
+The adapter stays a separate live module, including on an INT8 ConvRot base: it is never merged, optimized, or
+included in the saved LoRA. It is active during training and data-loss validation, and disabled during previews;
+the learned LoRA stays active. Sampling restores the overlay's previous state even if generation fails.
+For final inference, load only the learned LoRA onto the original checkpoint.
+
+`--h3_overlay_weights_multiplier` sets the training adapter strength (default `1.0`). Omitting
+`--h3_overlay_training_only` keeps the overlay active during previews too. Full fine-tuning is unsupported.
+With training-only mode, `--h3_validation_field_probe` and `--h3_validation_rollout_probe` are unsupported;
+use data-loss validation and previews to evaluate the run.
+The adapter approximates undistilled behavior; it does not guarantee preservation of the checkpoint's behavior.
+It adds LoRA computation but no extra transformer forward. Available adapters include
+`ostris/minimax_h3_training_adapter` and `DiffSynth-Studio/MiniMax-H3-TrainingAdapter`; check checkpoint compatibility.
+
+Alternatively, `--base_weights adapter.safetensors` merges the adapter into the frozen training base at load time,
+with strength set by `--base_weights_multiplier`. This avoids live-overlay computation, but cannot disable the
+adapter for previews. The field and rollout validation probes reject merged base weights.
 
 #### Contrastive guidance loss
 

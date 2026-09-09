@@ -1419,6 +1419,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._recipe_probability_generator: torch.Generator | None = None
         self._qwen_control_dropout_generator: torch.Generator | None = None
         self._overlay_network = None
+        self._overlay_training_only = False
         self._h3_profiler: H3StepProfiler | None = None
         # The frozen base's field is a property of the checkpoint and the validation
         # item, not of the training run, so it is measured once and kept.
@@ -3082,10 +3083,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
         overlay_weights = getattr(args, "h3_overlay_weights", None)
         overlay_multiplier = float(getattr(args, "h3_overlay_weights_multiplier", 1.0))
+        self._overlay_training_only = bool(getattr(args, "h3_overlay_training_only", False))
         if not math.isfinite(overlay_multiplier):
             raise ValueError("--h3_overlay_weights_multiplier must be finite")
         if overlay_multiplier != 1.0 and not overlay_weights:
             raise ValueError("--h3_overlay_weights_multiplier requires --h3_overlay_weights")
+        if self._overlay_training_only and not overlay_weights:
+            raise ValueError("--h3_overlay_training_only requires --h3_overlay_weights")
+        if self._overlay_training_only and (
+            getattr(args, "h3_validation_field_probe", False) or int(getattr(args, "h3_validation_rollout_probe", 0) or 0) > 0
+        ):
+            raise ValueError(
+                "--h3_overlay_training_only cannot be combined with --h3_validation_field_probe or "
+                "--h3_validation_rollout_probe: those diagnostics label their disabled-adapter reference as the "
+                "stock checkpoint, but the live overlay remains part of that reference"
+            )
         if overlay_weights and not Path(overlay_weights).is_file():
             raise FileNotFoundError(f"--h3_overlay_weights file not found: {overlay_weights}")
         if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
@@ -3918,6 +3930,33 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._overlay_network = overlay
         return overlay
 
+    @contextmanager
+    def _preview_overlay_disabled(self):
+        """Temporarily remove only the frozen overlay from sample generation."""
+        overlay = self._overlay_network
+        if not self._overlay_training_only or overlay is None:
+            yield
+            return
+        modules = list(getattr(overlay, "text_encoder_loras", ())) + list(getattr(overlay, "unet_loras", ()))
+        if modules:
+            enabled = [bool(getattr(module, "enabled", True)) for module in modules]
+            overlay.set_enabled(False)
+            try:
+                yield
+            finally:
+                # Restore every module independently: is_enabled() deliberately
+                # collapses a mixed state and cannot reproduce it exactly.
+                for module, prior in zip(modules, enabled):
+                    module.enabled = prior
+            return
+        is_enabled = getattr(overlay, "is_enabled", None)
+        prior = bool(is_enabled()) if callable(is_enabled) else True
+        overlay.set_enabled(False)
+        try:
+            yield
+        finally:
+            overlay.set_enabled(prior)
+
     def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):
         if args is not None and (args.h3_base_preservation_loss_weight > 0 or args.h3_dop_loss_weight > 0):
             if network is None:
@@ -4076,22 +4115,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             one_frame_target_index=sample_parameter.get("one_frame_target_index"),
         )
         references = sample_parameter.get("_h3_encoded_references")
-        if references is not None:
-            video_latents, audio_latents = denoise_ref2va(
-                transformer,
-                conditioning,
-                references,
-                **common_denoise,
-            )
-        else:
-            video_latents, audio_latents = denoise_fl2va(
-                transformer,
-                conditioning,
-                keyframe_rows=sample_parameter.get(_SAMPLE_KEYFRAME_ROWS),
-                keyframe_anchors=sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ()),
-                one_frame_control_indices=sample_parameter.get("one_frame_control_indices"),
-                **common_denoise,
-            )
+        with self._preview_overlay_disabled():
+            if references is not None:
+                video_latents, audio_latents = denoise_ref2va(
+                    transformer,
+                    conditioning,
+                    references,
+                    **common_denoise,
+                )
+            else:
+                video_latents, audio_latents = denoise_fl2va(
+                    transformer,
+                    conditioning,
+                    keyframe_rows=sample_parameter.get(_SAMPLE_KEYFRAME_ROWS),
+                    keyframe_anchors=sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ()),
+                    one_frame_control_indices=sample_parameter.get("one_frame_control_indices"),
+                    **common_denoise,
+                )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         sample_metrics = {
@@ -7054,6 +7094,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_distillation_probability": str(args.h3_guidance_distillation_probability),
             "ss_h3_overlay_weights": str(getattr(args, "h3_overlay_weights", None) or "none"),
             "ss_h3_overlay_weights_multiplier": str(getattr(args, "h3_overlay_weights_multiplier", 1.0)),
+            "ss_h3_overlay_training_only": str(bool(getattr(args, "h3_overlay_training_only", False))),
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_guidance_loss_schedule": args.h3_guidance_loss_schedule,
             "ss_h3_guidance_null_source": args.h3_guidance_null_source,
@@ -7302,7 +7343,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "apply a LoRA (Musubi or Diffusers/PEFT keys) as a separate frozen module instead of merging it into the "
             "base weights; works on an INT8 ConvRot base, is excluded from the optimizer and saved checkpoints, and is "
-            "active on all forwards including the base-preservation reference"
+            "by default active on all forwards including samples and the base-preservation reference"
         ),
     )
     parser.add_argument(
@@ -7310,6 +7351,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="strength of --h3_overlay_weights (default 1.0); requires --h3_overlay_weights",
+    )
+    parser.add_argument(
+        "--h3_overlay_training_only",
+        action="store_true",
+        help=(
+            "keep --h3_overlay_weights active for training and data-loss validation, but disable only that frozen "
+            "overlay during sample generation; the trainable LoRA remains active"
+        ),
     )
     parser.add_argument(
         "--h3_guidance_distillation_probability",
