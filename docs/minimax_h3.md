@@ -190,6 +190,8 @@ This enables training on Ref2VA weights; concept quality and reference retention
 
 ### Choose an FL2VA task
 
+Text caching checks for missing or blank captions before loading Qwen and reports the affected files.
+
 The text-cache `--task` selects the conditioning presentation; the latent-cache command does not take `--task`. Pick the
 FL2VA row for your objective in the [Workflow chooser](#workflow-chooser).
 

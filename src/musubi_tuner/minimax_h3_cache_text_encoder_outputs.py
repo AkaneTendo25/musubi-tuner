@@ -16,12 +16,12 @@ from musubi_tuner.minimax_h3.backend import create_conditioning_encoder
 from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_IDS,
     H3_CONDITIONING_TASK_KEY,
-    H3_EMPTY_TEXT_HIDDEN_KEY,
-    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_DOP_CONFIG_CACHE_KEY,
     H3_DOP_CONFIG_KEY,
     H3_DOP_TEXT_HIDDEN_KEY,
     H3_DOP_TEXT_TOKEN_TAGS_KEY,
+    H3_EMPTY_TEXT_HIDDEN_KEY,
+    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
@@ -45,6 +45,7 @@ from musubi_tuner.minimax_h3.cache import (
     reference_variant_key,
     save_text_encoder_output_cache_minimax_h3,
 )
+from musubi_tuner.minimax_h3.caption_preflight import require_caption_preflight
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
 from musubi_tuner.minimax_h3.image_training import (
     H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY,
@@ -225,8 +226,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     logger.info("Load dataset config from %s", args.dataset_config)
     user_config = config_utils.load_user_config(args.dataset_config)
+    args.h3_caption_preflight = True
     dataset_group, dataset_adapter = create_h3_dataset_group(user_config, args)
     datasets = dataset_group.datasets
+
+    try:
+        report = require_caption_preflight(dataset_group)
+    except ValueError as error:
+        parser.error(str(error))
+    logger.info("Caption preflight passed: %d items", report.checked)
 
     all_cache_files, all_cache_paths = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
     encoder = create_conditioning_encoder(

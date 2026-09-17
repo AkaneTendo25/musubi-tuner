@@ -974,7 +974,10 @@ class H3DatasetAdapter:
                 records = _read_media_jsonl(video_jsonl_file)
                 target_paths = tuple(record["video_path"] for record in records)
             elif image_directory:
-                target_paths = list(glob_images(image_directory, caption_extension=caption_extension))
+                allow_captionless_images = getattr(args, "h3_caption_preflight", False) and not multiple_target
+                target_paths = list(
+                    glob_images(image_directory, caption_extension=None if allow_captionless_images else caption_extension)
+                )
                 all_images = tuple(Path(path) for path in glob_images(image_directory))
                 if self.image_mode != "none" and multiple_target and caption_extension:
                     existing = set(target_paths)
@@ -1483,12 +1486,20 @@ def create_h3_dataset_group(
         dataset for dataset, kind in zip(regular_config.get("datasets", []), adapter.dataset_kinds) if kind == "regular"
     ]
     regular_datasets = []
+    caption_extensions = {}
+    if not training and getattr(args, "h3_caption_preflight", False):
+        # Include missing sidecars in preflight instead of silently filtering them.
+        for index, config in enumerate(regular_config["datasets"]):
+            if config.get("image_directory") and not _effective(config, regular_config.get("general", {}), "multiple_target"):
+                caption_extensions[index] = _effective(config, regular_config.get("general", {}), "caption_extension")
     if regular_config["datasets"]:
         blueprint = BlueprintGenerator(ConfigSanitizer()).generate(
             regular_config,
             args,
             architecture=ARCHITECTURE_MINIMAX_H3,
         )
+        for index in caption_extensions:
+            blueprint.dataset_group.datasets[index].params.caption_extension = None
         regular_group = config_utils.generate_dataset_group_by_blueprint(
             blueprint.dataset_group,
             training=training,
@@ -1496,6 +1507,8 @@ def create_h3_dataset_group(
             shared_epoch=shared_epoch,
         )
         regular_datasets = list(regular_group.datasets)
+        for index, extension in caption_extensions.items():
+            regular_datasets[index].datasource.caption_extension = extension
     regular_iter = iter(regular_datasets)
     audio_iter = iter(adapter.audio_datasets)
     ordered_datasets = [next(audio_iter) if kind == "audio" else next(regular_iter) for kind in adapter.dataset_kinds]
