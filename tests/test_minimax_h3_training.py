@@ -1645,6 +1645,69 @@ def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
 
 
+@pytest.mark.parametrize("task", ["t2va", "i2va"])
+def test_ref2va_checkpoint_trains_fl2va_tasks_with_lora(monkeypatch, tmp_path, task):
+    from musubi_tuner.minimax_h3 import model_loader
+
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    source = MiniMaxH3Transformer(config)
+    checkpoint = tmp_path / "minimax_h3_ref2va_bf16.safetensors"
+    save_file(
+        {
+            name: tensor.detach().to(torch.float32 if name.startswith(model_loader._FP32_PREFIXES) else torch.bfloat16).contiguous()
+            for name, tensor in source.state_dict().items()
+        },
+        checkpoint,
+    )
+    # Tiny dimensions need an explicit config; resolution, dtype validation and
+    # strict checkpoint loading still follow the production loader.
+    monkeypatch.setattr(model_loader, "infer_transformer_config", lambda *_args, **_kwargs: config)
+    transformer = model_loader.load_transformer(checkpoint, mode="fl2va", loading_device="cpu")
+    transformer.float().requires_grad_(False)
+    network = lora_minimax_h3.create_arch_network(1.0, 2, 2.0, None, [], transformer)
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+    backend = _NativeTrainingBackend(transformer, mode="fl2va")
+    video = torch.randn(1, 4, 2, 2, 2)
+    audio = torch.randn(1, 2, 6, 1)
+    inputs = prepare_joint_noisy_inputs(video, audio, torch.randn_like(video), torch.randn_like(audio), torch.tensor([0.6]))
+    tags = [1, 1, 1] if task == "t2va" else [1, 0, 1]
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor(tags)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS[task])],
+    }
+    if task == "i2va":
+        batch[H3_KEYFRAME_VIDEO_ROWS_KEY] = [torch.randn(2, 16)]
+    prediction = backend.predict_training(
+        transformer, batch, inputs.video, inputs.audio, inputs.video_timestep, inputs.audio_timestep
+    )
+    loss = joint_velocity_loss(prediction, inputs).loss
+    loss.backward()
+
+    assert prediction.video.shape == video.shape
+    assert prediction.audio.shape == audio.shape
+    assert torch.isfinite(loss)
+    gradients = [module.lora_up.weight.grad for module in network.unet_loras]
+    assert gradients and all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(bool(gradient.abs().sum()) for gradient in gradients)
+    assert transformer.blocks[0].attn.qkv_proj.weight.grad is None
+
+
 @pytest.mark.parametrize("text_tags", ([1, 0, 1], [1, 0, 0, 1]))
 def test_native_h3_fl2va_conditioned_image_runs_single_latent_target(text_tags):
     config = MiniMaxH3TransformerConfig(

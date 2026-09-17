@@ -7188,7 +7188,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_training_mode",
         choices=("fl2va", "ref2va", "ref2va_omni"),
         default="fl2va",
-        help="select FL2VA, strict Ref2VA, or experimental zero-or-more-reference Ref2VA training",
+        help=(
+            "select the conditioning pipeline: fl2va for T2VA/I2VA/FL2VA/L2VA caches "
+            "(accepts an explicit FL2VA or Ref2VA checkpoint), ref2va for strict references, "
+            "or ref2va_omni for zero-or-more references"
+        ),
     )
     parser.add_argument(
         "--one_frame",

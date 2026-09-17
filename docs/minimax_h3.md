@@ -87,7 +87,8 @@ This page documents only the MiniMax H3 files, contracts, and commands that diff
 
 ## Workflow chooser
 
-Each training objective has a fixed dataset, conditioning-cache, and transformer contract. `--task` is passed to
+Each training objective has a dataset and conditioning-cache contract. The transformer column lists the default checkpoint family;
+FL2VA conditioning also accepts an explicitly selected Ref2VA checkpoint. `--task` is passed to
 `minimax_h3_cache_text_encoder_outputs.py`; the final column lists any additional required cache or trainer arguments.
 “None” means that no additional arguments are required.
 
@@ -120,8 +121,8 @@ Python 3.10–3.12. All files come from [Comfy-Org/MiniMax-H3](https://huggingfa
 
 | File | Needed for |
 | --- | --- |
-| [`diffusion_models/minimax_h3_fl2va_bf16.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_bf16.safetensors) | Everything except Ref2VA |
-| [`diffusion_models/minimax_h3_ref2va_bf16.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_ref2va_bf16.safetensors) | Ref2VA |
+| [`diffusion_models/minimax_h3_fl2va_bf16.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_bf16.safetensors) | Default for FL2VA conditioning |
+| [`diffusion_models/minimax_h3_ref2va_bf16.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_ref2va_bf16.safetensors) | Ref2VA conditioning; also accepts FL2VA conditioning when explicitly selected |
 | [`text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors) | Conditioning cache |
 | [`vae/minimax_h3_video_vae_fp16.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_video_vae_fp16.safetensors) | Video latents |
 | [`vae/minimax_h3_audio_vae_fp32.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_audio_vae_fp32.safetensors) | Audio latents |
@@ -153,8 +154,8 @@ Resulting layout:
 ├── diffusion_models/
 │   ├── minimax_h3_fl2va_bf16.safetensors
 │   ├── minimax_h3_fl2va_pruned_int8_convrot.safetensors  # optional
-│   ├── minimax_h3_ref2va_bf16.safetensors                # Ref2VA only
-│   └── minimax_h3_ref2va_pruned_int8_convrot.safetensors # optional, Ref2VA only
+│   ├── minimax_h3_ref2va_bf16.safetensors                # Ref2VA weights
+│   └── minimax_h3_ref2va_pruned_int8_convrot.safetensors # optional, pre-quantized Ref2VA
 ├── text_encoders/
 │   ├── qwen3vl_32b_minimax_h3_bf16.safetensors
 │   └── qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors      # optional
@@ -177,7 +178,15 @@ python minimax_h3_generate_video.py \
 
 ## Train FL2VA
 
-Use this workflow with `minimax_h3_fl2va_bf16.safetensors`. FL2VA covers text-only generation, target-derived first/last-frame conditioning, image targets, video targets, and audio targets. It does **not** accept arbitrary external media references; use [Train Ref2VA](#train-ref2va) for those.
+Use this workflow with `minimax_h3_fl2va_bf16.safetensors`, or pass an explicit Ref2VA checkpoint file to `--dit` to train directly on Ref2VA weights. FL2VA conditioning covers text-only generation, target-derived first/last-frame conditioning, image targets, video targets, and audio targets. It does **not** accept arbitrary external media references; use [Train Ref2VA](#train-ref2va) for those.
+
+For T2VA or I2VA training on Ref2VA, cache text with `--task t2va` or `--task i2va` and train with
+`--h3_training_mode fl2va --dit /models/MiniMax-H3/diffusion_models/minimax_h3_ref2va_bf16.safetensors`.
+The training mode selects conditioning, not the checkpoint family. The same selection works for `fl2va` and `l2va` caches,
+and for an explicit Ref2VA INT8 ConvRot file with the usual `--int8_convrot_base` option.
+Passing a model directory still selects the FL2VA checkpoint for this mode, so use the full Ref2VA file path.
+In the dashboard, select training mode `fl2va`, the desired cache task, and the Ref2VA model file.
+This enables training on Ref2VA weights; concept quality and reference retention need evaluation on the trained adapter.
 
 ### Choose an FL2VA task
 
@@ -1318,7 +1327,7 @@ accelerate launch minimax_h3_train_learned_context.py \
 
 Reduce `--blocks_to_swap` for faster training when more device memory is available.
 
-Use the checkpoint and `--h3_training_mode` of the cached conditioning family: `fl2va` for `t2va`/`i2va`/`fl2va`/`l2va` caches, `ref2va` or `ref2va_omni` for reference caches. Start around `1e-3` for a semantic initializer. Compare fixed
+Use `--h3_training_mode fl2va` for `t2va`/`i2va`/`fl2va`/`l2va` caches, with either the FL2VA checkpoint or an explicit Ref2VA checkpoint file; use `ref2va` or `ref2va_omni` with the Ref2VA checkpoint for reference caches. Start around `1e-3` for a semantic initializer. Compare fixed
 base and trained renders on held-out inputs; a lower training loss alone does not prove that the context transfers.
 
 Exactly one initializer is required:

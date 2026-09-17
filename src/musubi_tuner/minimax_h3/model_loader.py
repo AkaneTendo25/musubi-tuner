@@ -234,8 +234,13 @@ def resolve_transformer_checkpoint(source: Path, mode: H3TrainingMode, *, int8_c
     source = Path(source)
     expected_name = _CHECKPOINT_FILENAMES[mode][int8_convrot]
     if source.is_file():
-        other_mode = "ref2va" if mode == "fl2va" else "fl2va"
-        if other_mode in source.name.lower():
+        # Conditioning mode and checkpoint family are separate choices for an
+        # explicit file: Ref2VA weights can train with FL2VA's T2VA/I2VA inputs.
+        # Both families use the same transformer; normal tensor validation and
+        # strict loading below still enforce architecture and precision.
+        # Keep the reverse restriction: FL2VA weights are not enabled here for
+        # reference conditioning. Directory defaults remain mode-specific.
+        if mode != "fl2va" and "fl2va" in source.name.lower():
             raise ValueError(f"H3 mode {mode!r} cannot load {source.name!r}")
         return source
 
