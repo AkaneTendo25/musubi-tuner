@@ -2264,7 +2264,7 @@ def _latent_cache_predicate(monkeypatch, argv):
     monkeypatch.setattr(h3_cache_latents.config_utils, "load_user_config", lambda path: {})
     monkeypatch.setattr(h3_cache_latents, "create_h3_dataset_group", lambda config, args: (SimpleNamespace(datasets=[]), adapter))
     monkeypatch.setattr(h3_cache_latents, "create_latent_encoder", lambda **kwargs: SimpleNamespace())
-    monkeypatch.setattr(h3_cache_latents, "attach_h3_media", lambda batch, dataset_adapter: None)
+    monkeypatch.setattr(h3_cache_latents, "attach_h3_media", lambda batch, dataset_adapter, **kwargs: None)
     monkeypatch.setattr(h3_cache_latents.cache_latents, "encode_datasets", encode_datasets)
     h3_cache_latents.main(["--dataset_config", "dataset.toml", *argv])
     return captured["predicate"]
@@ -2321,7 +2321,7 @@ def _text_cache_predicate(monkeypatch, argv):
         "create_conditioning_encoder",
         lambda **kwargs: SimpleNamespace(conditioning_requires_content=False, close=lambda: None),
     )
-    monkeypatch.setattr(h3_cache_text, "attach_h3_media", lambda batch, dataset_adapter: None)
+    monkeypatch.setattr(h3_cache_text, "attach_h3_media", lambda batch, dataset_adapter, **kwargs: None)
     monkeypatch.setattr(h3_cache_text.cache_text_encoder_outputs, "prepare_cache_files_and_paths", lambda datasets: ({}, {}))
     monkeypatch.setattr(h3_cache_text.cache_text_encoder_outputs, "process_text_encoder_batches", process_text_encoder_batches)
     monkeypatch.setattr(h3_cache_text.cache_text_encoder_outputs, "post_process_cache_files", lambda *args, **kwargs: None)

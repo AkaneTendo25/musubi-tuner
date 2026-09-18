@@ -275,7 +275,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             save_text_encoder_output_cache_minimax_h3(item, tensors)
 
     def existing_cache_valid(item: ItemInfo, path: str) -> bool:
-        attach_h3_media((item,), dataset_adapter)
+        attach_h3_media((item,), dataset_adapter, decode_one_frame_controls=False)
         if getattr(item, "h3_one_frame", False) and not cache_matches_fingerprint(
             path,
             item.h3_cache_metadata[H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY],

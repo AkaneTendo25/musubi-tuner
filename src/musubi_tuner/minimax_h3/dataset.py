@@ -1332,7 +1332,7 @@ class H3DatasetAdapter:
                 return resolved, int(match.group("start")), int(match.group("frames"))
         raise KeyError(f"H3 dataset adapter cannot map ItemInfo key to source media: {item_key}")
 
-    def attach(self, item: ItemInfo) -> tuple[MediaAsset, ...]:
+    def attach(self, item: ItemInfo, *, decode_one_frame_controls: bool = True) -> tuple[MediaAsset, ...]:
         if getattr(item, "_h3_media_attached_by", None) == id(self):
             return item.h3_media_assets
         resolved, start_frame, frame_count = self._resolve_target(item.item_key)
@@ -1399,12 +1399,17 @@ class H3DatasetAdapter:
             item.h3_target_paths = self._target_source_paths[normal]
             item.frame_count = 1
             if control_indices:
-                resized_controls = []
-                bucket_width, bucket_height = (int(item.bucket_size[0]), int(item.bucket_size[1]))
-                for path in controls:
-                    with Image.open(path) as source:
-                        resized_controls.append(resize_image_to_bucket(source.convert("RGB"), (bucket_width, bucket_height)))
-                item.control_content = resized_controls
+                # ``decode_one_frame_controls=False`` serves the cache-validity
+                # probes: fingerprints read file identity, not pixels, and the
+                # latent encoder decodes its own copies from h3_condition_paths,
+                # so the resize here would be pure discarded work.
+                if decode_one_frame_controls:
+                    resized_controls = []
+                    bucket_width, bucket_height = (int(item.bucket_size[0]), int(item.bucket_size[1]))
+                    for path in controls:
+                        with Image.open(path) as source:
+                            resized_controls.append(resize_image_to_bucket(source.convert("RGB"), (bucket_width, bucket_height)))
+                    item.control_content = resized_controls
             content_fingerprint = one_frame_content_fingerprint(
                 targets=item.h3_target_paths,
                 controls=controls,
@@ -1445,7 +1450,11 @@ class H3DatasetAdapter:
             assets = (target, *resolved.references, *resolved.qwen_controls)
         validate_h3_media_assets(item.item_key, assets)
         item.h3_media_assets = assets
-        item._h3_media_attached_by = id(self)
+        if decode_one_frame_controls:
+            # Only a full attach marks the item resolved; a pixel-skipping probe
+            # leaves it unmarked so the encode path's attach redoes the work,
+            # pixels included, instead of silently inheriting the fast state.
+            item._h3_media_attached_by = id(self)
         # Both fingerprints are optional and independent, so they are merged into
         # whatever the image-mode branch already recorded rather than replacing it.
         metadata = dict(getattr(item, "h3_cache_metadata", {}))
@@ -1536,9 +1545,11 @@ def create_h3_dataset_group(
 def attach_h3_media(
     batch: Sequence[ItemInfo],
     adapter: H3DatasetAdapter,
+    *,
+    decode_one_frame_controls: bool = True,
 ) -> None:
     for item in batch:
-        adapter.attach(item)
+        adapter.attach(item, decode_one_frame_controls=decode_one_frame_controls)
 
 
 def validate_h3_media_assets(key: str, assets: tuple[MediaAsset, ...], *, check_files: bool = True) -> None:
