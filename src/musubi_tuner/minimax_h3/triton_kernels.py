@@ -51,7 +51,7 @@ if HAS_TRITON:
         tl.store(grad_projected + base, grad * value * silu_grad, mask=mask)
         tl.store(grad_projected + base + width, grad * silu, mask=mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["sequence"])
     def _indexed_adaln_rmsnorm_fwd(
         x,
         weight,
@@ -62,7 +62,7 @@ if HAS_TRITON:
         inv_rms,
         shift_stride,
         scale_stride,
-        sequence: tl.constexpr,
+        sequence,
         hidden: tl.constexpr,
         eps: tl.constexpr,
         block: tl.constexpr,
@@ -81,7 +81,7 @@ if HAS_TRITON:
         tl.store(output + row * hidden + offsets, result, mask=mask)
         tl.store(inv_rms + row, inverse)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["sequence"])
     def _indexed_adaln_rmsnorm_bwd(
         grad_output,
         x,
@@ -91,7 +91,7 @@ if HAS_TRITON:
         inv_rms,
         grad_x,
         scale_stride,
-        sequence: tl.constexpr,
+        sequence,
         hidden: tl.constexpr,
         block: tl.constexpr,
     ):
@@ -184,7 +184,7 @@ if HAS_TRITON:
             mask=row_mask[:, None],
         )
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["sequence"])
     def _rmsnorm_split_rope_fwd(
         x,
         weight,
@@ -198,7 +198,7 @@ if HAS_TRITON:
         stride_xd,
         stride_cs,
         stride_cd,
-        sequence: tl.constexpr,
+        sequence,
         heads: tl.constexpr,
         dim: tl.constexpr,
         rotary_dim: tl.constexpr,
@@ -229,7 +229,7 @@ if HAS_TRITON:
         tl.store(output + row * dim + offsets, result, mask=mask)
         tl.store(inv_rms + row, inverse)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["sequence"])
     def _rmsnorm_split_rope_bwd(
         grad_output,
         x,
@@ -244,7 +244,7 @@ if HAS_TRITON:
         stride_xd,
         stride_cs,
         stride_cd,
-        sequence: tl.constexpr,
+        sequence,
         heads: tl.constexpr,
         dim: tl.constexpr,
         rotary_dim: tl.constexpr,
@@ -287,7 +287,7 @@ if HAS_TRITON:
         dx = inverse * grad_normalized - values * (inverse * inverse * inverse / dim) * dot
         tl.store(grad_x + row * dim + offsets, dx, mask=mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["sequence"])
     def _combined_qk_fwd(
         q,
         k,
@@ -305,7 +305,7 @@ if HAS_TRITON:
         stride_d,
         stride_cs,
         stride_cd,
-        sequence: tl.constexpr,
+        sequence,
         heads: tl.constexpr,
         dim: tl.constexpr,
         rotary_dim: tl.constexpr,
@@ -344,7 +344,7 @@ if HAS_TRITON:
         tl.store(qinv + row, qi)
         tl.store(kinv + row, ki)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["sequence"])
     def _combined_qk_bwd(
         qgo,
         kgo,
@@ -364,7 +364,7 @@ if HAS_TRITON:
         stride_d,
         stride_cs,
         stride_cd,
-        sequence: tl.constexpr,
+        sequence,
         heads: tl.constexpr,
         dim: tl.constexpr,
         rotary_dim: tl.constexpr,
