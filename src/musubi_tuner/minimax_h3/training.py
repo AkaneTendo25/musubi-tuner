@@ -79,8 +79,15 @@ def _validate_sigma(sigma: torch.Tensor) -> None:
         raise TypeError("H3 sigma must be floating point")
     if sigma.ndim != 1:
         raise ValueError(f"H3 sigma must have shape [batch], got {tuple(sigma.shape)}")
-    if bool(((sigma < 0) | (sigma > 1)).any()):
-        raise ValueError("H3 sigma values must be in [0, 1]")
+    if sigma.device.type == "cpu":
+        if bool(((sigma < 0) | (sigma > 1)).any()):
+            raise ValueError("H3 sigma values must be in [0, 1]")
+    else:
+        # This runs on every training step and every rollout sub-step; reading
+        # the predicate on the host would stall the launch pipeline against the
+        # whole forward that precedes it. A device-side assert keeps the guard
+        # without the round-trip (the message surfaces as a CUDA assert).
+        torch._assert_async(((sigma >= 0) & (sigma <= 1)).all())
 
 
 def _shift_unchecked(sigma: torch.Tensor, shift: float) -> torch.Tensor:
@@ -218,8 +225,11 @@ def guidance_consistent_prediction(
     audio_guidance_scale = guidance_scale if audio_guidance_scale is None else audio_guidance_scale
     for scale in (guidance_scale, audio_guidance_scale):
         if isinstance(scale, torch.Tensor):
-            if bool((scale < 1.0).any()):
-                raise ValueError("H3 guidance distillation scale must be at least 1")
+            if scale.device.type == "cpu":
+                if bool((scale < 1.0).any()):
+                    raise ValueError("H3 guidance distillation scale must be at least 1")
+            else:
+                torch._assert_async((scale >= 1.0).all())
         elif scale < 1.0:
             raise ValueError("H3 guidance distillation scale must be at least 1")
     if (guided.video is None) != (empty.video is None) or (guided.audio is None) != (empty.audio is None):
@@ -304,8 +314,11 @@ def guidance_scale_for_sigma(
     if isinstance(configured_scale, torch.Tensor):
         if not configured_scale.is_floating_point():
             raise TypeError("H3 guidance distillation scale must be floating point")
-        if bool((configured_scale < 1.0).any()):
-            raise ValueError("H3 guidance distillation scale must be at least 1")
+        if configured_scale.device.type == "cpu":
+            if bool((configured_scale < 1.0).any()):
+                raise ValueError("H3 guidance distillation scale must be at least 1")
+        else:
+            torch._assert_async((configured_scale >= 1.0).all())
         scale: float | torch.Tensor = configured_scale.to(device=sigma.device, dtype=sigma.dtype)
     else:
         if configured_scale < 1.0:
@@ -395,15 +408,18 @@ def _modality_loss(
     mask: torch.Tensor | None,
     sample_weight: torch.Tensor | None,
     mask_normalization: str = "weighted",
-) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | float]:
+) -> tuple[torch.Tensor, torch.Tensor, int | torch.Tensor, torch.Tensor | float]:
     """Return ``(mean, weighted sum, valid element count, mean denominator)``.
 
     The element count stays a plain count for reporting and for deciding which
-    modalities are active. The denominator is what the mean actually divides by:
-    the element count when unweighted, and the sum of the per-element sample
-    weights over the valid elements when weighting is active. Dividing a
-    weighted numerator by an unweighted count would rescale the loss by the mean
-    sample weight instead of reweighting it, and would disagree with validation's
+    modalities are active; with a mask it is returned as a device tensor so the
+    whole loss graph is enqueued before :func:`_joint_loss` pays a single host
+    round-trip for both modalities. The denominator is what the mean actually
+    divides by: the element count when unweighted, and the sum of the
+    per-element sample weights over the valid elements when weighting is
+    active. Dividing a weighted numerator by an unweighted count would rescale
+    the loss by the mean sample weight instead of reweighting it, and would
+    disagree with validation's
     :func:`~musubi_tuner.minimax_h3.validation.masked_squared_error_sum`.
     """
     if prediction.shape != target.shape:
@@ -411,14 +427,16 @@ def _modality_loss(
     mask_weights = None if mask is None else _broadcast_mask(mask, target)
     if mask_weights is None:
         per_item_valid = None
-        elements = target.numel()
+        elements: int | torch.Tensor = target.numel()
     else:
-        # One reduction serves both the count and the per-item weight sum, so
-        # masked steps keep the single host round-trip they already paid.
         positive = mask_weights > 0
         per_item_valid = mask_weights.to(dtype=torch.float32).sum(dim=tuple(range(1, mask_weights.ndim)))
-        elements = int(positive.sum().item())
-    if elements == 0:
+        # A device tensor, not ``int(...)``: converting here would stall the
+        # host against every kernel enqueued so far, once per modality per loss
+        # call. An empty mask divides a zero masked sum by the clamped count
+        # and yields exactly the zero the early return used to produce.
+        elements = positive.sum()
+    if target.numel() == 0:
         zero = prediction.sum() * 0.0
         return zero, zero, 0, 0.0
 
@@ -497,6 +515,24 @@ def _joint_loss(
         audio_mean, audio_total, audio_elements, audio_denominator = (
             _modality_loss(*loss_args) if mask_normalization == "weighted" else _modality_loss(*loss_args, mask_normalization)
         )
+
+    if isinstance(video_elements, torch.Tensor) or isinstance(audio_elements, torch.Tensor):
+        # A masked modality returns its count as a device tensor; both counts
+        # are resolved with one host round-trip here, after every loss kernel of
+        # both modalities is enqueued. The mask-less and gated-out paths return
+        # host ints already and pay nothing.
+        device = video_elements.device if isinstance(video_elements, torch.Tensor) else audio_elements.device
+        pair = torch.stack(
+            (
+                video_elements
+                if isinstance(video_elements, torch.Tensor)
+                else torch.full((), video_elements, device=device, dtype=torch.long),
+                audio_elements
+                if isinstance(audio_elements, torch.Tensor)
+                else torch.full((), audio_elements, device=device, dtype=torch.long),
+            )
+        )
+        video_elements, audio_elements = (int(value) for value in pair.tolist())
 
     active_video_weight = video_weight if video_elements else 0.0
     active_audio_weight = audio_weight if audio_elements else 0.0

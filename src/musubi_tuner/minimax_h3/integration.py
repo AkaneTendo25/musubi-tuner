@@ -2090,6 +2090,10 @@ class _NativeTrainingBackend:
                 "timestep": timestep.to(model_device),
                 "timestep_indices": timestep_indices.to(model_device),
                 "token_tags": layout.token_tags.to(model_device),
+                # Resolved from the packer's CPU-side tags so ``_prepare`` does
+                # not pay a device round-trip for a predicate the host already
+                # knows (the packer itself never emits negative tags).
+                "token_tags_have_padding": bool((layout.token_tags < 0).any()),
                 "position_ids": layout.position_ids.to(model_device),
                 "video_indices": layout.video_indices.to(model_device),
                 "audio_indices": layout.audio_indices.to(model_device),

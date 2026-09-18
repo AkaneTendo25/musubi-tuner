@@ -210,7 +210,7 @@ def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch
     sin = sin[None, :, None, :]
     first, second = rotary.chunk(2, dim=-1)
     rotated = torch.cat((-second, first), dim=-1)
-    return torch.cat((rotary * cos + rotated * sin, passthrough), dim=-1).contiguous()
+    return torch.cat((rotary * cos + rotated * sin, passthrough), dim=-1)
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -1116,6 +1116,7 @@ class MiniMaxH3Transformer(nn.Module):
         audio_indices: torch.Tensor,
         text_indices: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        token_tags_have_padding: bool | None = None,
     ) -> MiniMaxH3TransformerOutput:
         state = self._prepare(
             video_hidden_states=video_hidden_states,
@@ -1129,6 +1130,7 @@ class MiniMaxH3Transformer(nn.Module):
             audio_indices=audio_indices,
             text_indices=text_indices,
             attention_mask=attention_mask,
+            token_tags_have_padding=token_tags_have_padding,
         )
         if self.reusable_activation_offloader is not None and torch.is_grad_enabled():
             self.reusable_activation_offloader.begin_forward()
@@ -1158,6 +1160,7 @@ class MiniMaxH3Transformer(nn.Module):
         audio_indices: torch.Tensor,
         text_indices: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        token_tags_have_padding: bool | None = None,
     ) -> MiniMaxH3PackedState:
         """Embed one packed sequence into the state the block loop advances."""
         with h3_profile_scope("h3.pack"):
@@ -1173,6 +1176,7 @@ class MiniMaxH3Transformer(nn.Module):
                 audio_indices,
                 text_indices,
                 attention_mask,
+                token_tags_have_padding,
             )
 
     def _prepare_packed(
@@ -1188,6 +1192,7 @@ class MiniMaxH3Transformer(nn.Module):
         audio_indices: torch.Tensor,
         text_indices: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        token_tags_have_padding: bool | None = None,
     ) -> MiniMaxH3PackedState:
         sequence_length = position_ids.shape[0]
         if position_ids.shape != (sequence_length, 3):
@@ -1195,7 +1200,11 @@ class MiniMaxH3Transformer(nn.Module):
         if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
             raise ValueError("token_tags and timestep_indices must match the packed sequence length")
 
-        self._refresh_block_sparse_plan(position_ids, token_tags)
+        # A pairwise attention mask forces every block onto the dense path, so
+        # the plan the refresh builds could never be consulted; skip its host
+        # syncs (nonzero/unique) in that case.
+        if attention_mask is None:
+            self._refresh_block_sparse_plan(position_ids, token_tags)
         rotary_emb = self.rope(position_ids)
         video = self.video_patch_proj(video_hidden_states.to(self.video_patch_proj.weight.dtype))
         audio = self.audio_patch_proj(audio_hidden_states.to(self.audio_patch_proj.weight.dtype))
@@ -1225,7 +1234,15 @@ class MiniMaxH3Transformer(nn.Module):
                     f"H3 attention mask must be [{sequence_length}, {sequence_length}], got {tuple(attention_mask.shape)}"
                 )
             attention_mask = attention_mask.to(device=hidden_states.device)
-        if bool(is_padding.any()):
+        if token_tags_have_padding is None:
+            # No host-side knowledge of the tags: read the predicate from the
+            # device (one round-trip per forward). The in-repo packer never
+            # emits negative tags and passes the flag computed from its CPU-side
+            # tensor, so training skips this entirely.
+            has_padding = bool(is_padding.any())
+        else:
+            has_padding = token_tags_have_padding
+        if has_padding:
             padding_mask = is_padding[None, :] == is_padding[:, None]
             attention_mask = padding_mask if attention_mask is None else attention_mask & padding_mask
 
