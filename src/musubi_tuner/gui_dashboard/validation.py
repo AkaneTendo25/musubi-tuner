@@ -906,13 +906,13 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
-        selected_attention_backends = sum(bool(value) for value in (t.sdpa, t.flash_attn, t.flash3))
+        selected_attention_backends = sum(bool(value) for value in (t.sdpa, t.flash_attn, t.flash3, t.flash4))
         if selected_attention_backends > 1:
             errors.append(
                 _make_issue(
                     "error",
                     "training.flash_attn",
-                    "Choose one H3 attention backend: SDPA, FlashAttention 2, or FlashAttention 3.",
+                    "Choose one H3 attention backend: SDPA or FlashAttention 2, 3, or 4.",
                     label="H3 Attention Backend",
                     page="training",
                 )

@@ -634,7 +634,9 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--network_dim", str(t.network_dim)]
         if t.network_alpha != 1:
             cmd += ["--network_alpha", str(t.network_alpha)]
-    if t.flash3:
+    if t.flash4:
+        cmd.append("--flash4")
+    elif t.flash3:
         cmd.append("--flash3")
     elif t.flash_attn:
         cmd.append("--flash_attn")

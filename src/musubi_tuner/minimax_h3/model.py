@@ -267,7 +267,7 @@ class MiniMaxH3AdaLNProjection(nn.Module):
 class MiniMaxH3Attention(nn.Module):
     def __init__(self, hidden_size: int, heads: int, head_dim: int, qk_norm_eps: float, attention_mode: str = "torch"):
         super().__init__()
-        if attention_mode not in {"torch", "flash", "flash3"}:
+        if attention_mode not in {"torch", "flash", "flash3", "flash4"}:
             raise ValueError(f"unsupported MiniMax H3 attention mode: {attention_mode}")
         self.heads = heads
         self.head_dim = head_dim
@@ -378,7 +378,7 @@ class MiniMaxH3Attention(nn.Module):
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
             hidden_states = int8_attention(query, key, value).transpose(1, 2).flatten(2, 3)
-        elif self.attention_mode in {"flash", "flash3"} and attention_mask is None:
+        elif self.attention_mode in {"flash", "flash3", "flash4"} and attention_mask is None:
             hidden_states = musubi_attention(
                 [query, key, value],
                 attn_params=AttentionParams.create_attention_params(self.attention_mode, False),

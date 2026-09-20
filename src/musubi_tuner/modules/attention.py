@@ -24,6 +24,11 @@ except ImportError:
         flash_attn_3_func = None
 
 try:
+    from flash_attn.cute import flash_attn_func as flash_attn_4_func
+except ImportError:
+    flash_attn_4_func = None
+
+try:
     from sageattention import sageattn, sageattn_varlen
 except ImportError:
     sageattn_varlen = None
@@ -310,6 +315,27 @@ def attention(
             q, k, v = None, None, None
         else:
             x = flash_attn_3_func(q, k, v)  # B, L, H, D
+            q, k, v = None, None, None
+
+    elif attn_params.attn_mode == "flash4":
+        if flash_attn_4_func is None:
+            raise RuntimeError("FlashAttention-4 was selected, but the flash-attn-4 package is not installed")
+        if attn_params.cu_seqlens is not None:
+            raise ValueError("FlashAttention-4 does not support padded batches in this attention path")
+        if attn_params.split_attn:
+            x = []
+            for i in range(len(q)):
+                x_i = flash_attn_4_func(q[i], k[i], v[i])  # B, L, H, D
+                q[i] = None
+                k[i] = None
+                v[i] = None
+                x.append(pad_fn(x_i[0] if isinstance(x_i, tuple) else x_i, attn_params.max_seqlen))
+            x = torch.cat(x, dim=0)
+            q, k, v = None, None, None
+        else:
+            x = flash_attn_4_func(q, k, v)  # B, L, H, D
+            if isinstance(x, tuple):
+                x = x[0]
             q, k, v = None, None, None
 
     else:

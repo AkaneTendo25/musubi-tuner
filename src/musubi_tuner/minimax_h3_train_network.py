@@ -3497,8 +3497,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "MiniMax H3 H2D-only block swap without pinned host memory uses staged copies and can be substantially slower; "
                 "add --use_pinned_memory_for_block_swap for direct asynchronous transfers"
             )
-        if not (args.sdpa or args.flash_attn or args.flash3):
-            raise ValueError("MiniMax H3 training requires --sdpa, --flash_attn, or --flash3")
+        if not (args.sdpa or args.flash_attn or args.flash3 or args.flash4):
+            raise ValueError("MiniMax H3 training requires --sdpa, --flash_attn, --flash3, or --flash4")
         if args.h3_attn_auto_dispatch and not args.sdpa:
             raise ValueError("--h3_attn_auto_dispatch requires --sdpa")
         if getattr(args, "h3_int8_attention", "off") != "off" and args.compile:

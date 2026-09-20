@@ -416,6 +416,7 @@ class TrainingConfig(BaseModel):
     fp8_keep_blocks: str = ""
     flash_attn: bool = False
     flash3: bool = False
+    flash4: bool = False
     sdpa: bool = False
     cudnn_attn: bool = False
     sage_attn: bool = False

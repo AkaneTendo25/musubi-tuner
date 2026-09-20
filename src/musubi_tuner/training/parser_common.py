@@ -76,6 +76,12 @@ def _add_attention_args(parser: argparse.ArgumentParser) -> None:
         " / CrossAttentionにFlashAttention 3を使う、FlashAttention 3が必要。HunyuanVideoは未対応。",
     )
     parser.add_argument(
+        "--flash4",
+        action="store_true",
+        help="use FlashAttention 4 (flash_attn.cute) for CrossAttention, requires flash-attn-4"
+        " / CrossAttentionにFlashAttention 4を使う、flash-attn-4が必要。",
+    )
+    parser.add_argument(
         "--split_attn",
         action="store_true",
         help="use split attention for attention calculation (split batch size=1, affects memory usage and speed)"

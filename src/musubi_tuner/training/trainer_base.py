@@ -1700,9 +1700,11 @@ class NetworkTrainer:
             attn_mode = "xformers"
         elif args.flash3:
             attn_mode = "flash3"
+        elif args.flash4:
+            attn_mode = "flash4"
         else:
             raise ValueError(
-                "either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformersのいずれかを指定してください"
+                "either --sdpa, --flash-attn, --flash3, --flash4, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --flash4, --sage-attn, --xformersのいずれかを指定してください"
             )
         transformer = self.load_transformer(
             accelerator, args, args.dit, attn_mode, args.split_attn, loading_device, dit_weight_dtype

@@ -86,7 +86,7 @@ class H3PairedConditioningUnsupportedError(RuntimeError):
 
 
 _SUPPORTED_DTYPES = {"bfloat16", "float16", "float32"}
-_SUPPORTED_ATTENTION_MODES = {"torch", "flash", "flash3"}
+_SUPPORTED_ATTENTION_MODES = {"torch", "flash", "flash3", "flash4"}
 
 
 def _validate_dtype(dtype: str) -> None:
@@ -348,7 +348,7 @@ def create_training_backend(
     """
     _validate_dtype(dtype)
     if attention_mode not in _SUPPORTED_ATTENTION_MODES:
-        raise ValueError("MiniMax H3 supports only --sdpa, --flash_attn, or --flash3")
+        raise ValueError("MiniMax H3 supports only --sdpa, --flash_attn, --flash3, or --flash4")
     if split_attention:
         raise ValueError("MiniMax H3 does not support split attention")
     validate_reference_image_short_edge(reference_image_short_edge)
