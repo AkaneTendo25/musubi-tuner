@@ -41,6 +41,7 @@ from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig, Se
 from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
 from musubi_tuner.minimax_h3.selective_checkpoint import (
     SavedActivations,
+    adaln_projection_region,
     attention_kernel_is_visible,
     checkpoint_context_fn,
     projection_region,
@@ -255,6 +256,26 @@ class MiniMaxH3AdaLNProjection(nn.Module):
         super().__init__()
         self.linear = nn.Linear(input_dim, output_dim)
         self.apply_silu = apply_silu
+        # Set by ``MiniMaxH3Transformer.set_checkpoint_keep("adaln")``; gates the
+        # region ``install_adaln_region`` wraps around the modulation matmul.
+        self.checkpoint_keep_adaln = False
+
+    def install_adaln_region(self) -> None:
+        """Wrap the modulation Linear's forward in the ``adaln`` checkpoint region, once."""
+        linear = self.linear
+        if getattr(linear, "_h3_adaln_region", False):
+            return
+        base_forward = linear.forward
+        projection = self
+
+        def forward(module: nn.Module, *args: Any, **kwargs: Any) -> torch.Tensor:
+            if not projection.checkpoint_keep_adaln:
+                return base_forward(*args, **kwargs)
+            with adaln_projection_region(module.in_features, module.out_features):
+                return base_forward(*args, **kwargs)
+
+        linear.forward = types.MethodType(forward, linear)
+        linear._h3_adaln_region = True
 
     def forward(self, timestep_embedding: torch.Tensor) -> torch.Tensor:
         # Scaled FP8 stores the frozen weight in E4M3 but dequantizes it to the
@@ -718,7 +739,8 @@ class MiniMaxH3Transformer(nn.Module):
 
         ``none`` is plain checkpointing. ``attention`` keeps each block's fused
         attention output (and logsumexp), so recomputation skips the attention
-        forward; ``qkv`` also keeps the QKV projection's matmul output. Weights
+        forward; ``qkv`` also keeps the QKV projection's matmul output; ``adaln``
+        additionally keeps each block's AdaLN modulation output. Weights
         are never kept, so block swap streams them for the recompute exactly as
         before; only activations change.
         """
@@ -739,9 +761,13 @@ class MiniMaxH3Transformer(nn.Module):
         for block in self.blocks:
             for module in block.modules():
                 if isinstance(module, MiniMaxH3Attention):
-                    module.checkpoint_keep_qkv = keep == "qkv"
-                    if keep == "qkv":
+                    module.checkpoint_keep_qkv = keep in ("qkv", "adaln")
+                    if module.checkpoint_keep_qkv:
                         module.install_projection_region()
+                elif isinstance(module, MiniMaxH3AdaLNProjection):
+                    module.checkpoint_keep_adaln = keep == "adaln"
+                    if module.checkpoint_keep_adaln:
+                        module.install_adaln_region()
 
     def _begin_checkpoint_pass(self) -> None:
         self._checkpoint_saved.reset()
@@ -767,11 +793,16 @@ class MiniMaxH3Transformer(nn.Module):
                 "checkpointed block calls: SDPA resolved to the math backend for this batch (mask, dtype or head width), "
                 "which the policy cannot keep. Drop --h3_checkpoint_keep or make the batch eligible for a fused backend"
             )
-        if self.checkpoint_keep == "qkv" and saved.projection < blocks:
+        if self.checkpoint_keep in ("qkv", "adaln") and saved.projection < blocks:
             raise RuntimeError(
-                f"H3 checkpoint keep='qkv' saved {saved.projection} QKV projection outputs for {blocks} checkpointed block "
-                "calls: the base projection ran outside the dispatcher (a fused adapter kernel or a non-Linear path). "
-                "Use --h3_checkpoint_keep attention"
+                f"H3 checkpoint keep={self.checkpoint_keep!r} saved {saved.projection} QKV projection outputs for {blocks} "
+                "checkpointed block calls: the base projection ran outside the dispatcher (a fused adapter kernel or a "
+                "non-Linear path). Use --h3_checkpoint_keep attention"
+            )
+        if self.checkpoint_keep == "adaln" and saved.adaln < blocks:
+            raise RuntimeError(
+                f"H3 checkpoint keep='adaln' saved {saved.adaln} AdaLN modulation outputs for {blocks} checkpointed block "
+                "calls: the modulation projection ran outside the dispatcher. Use --h3_checkpoint_keep qkv"
             )
 
     def _validate_checkpoint_keep(self, *, keep: str | None = None, activation_cpu_offloading: bool | None = None) -> None:

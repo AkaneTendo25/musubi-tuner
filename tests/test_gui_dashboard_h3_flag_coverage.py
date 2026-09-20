@@ -7,6 +7,7 @@ from musubi_tuner.gui_dashboard.command_builder import (
     build_training_cmd,
 )
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
+from musubi_tuner.gui_dashboard.validation import validate_training_config
 
 
 def _config(tmp_path: Path) -> ProjectConfig:
@@ -80,6 +81,39 @@ def test_every_new_h3_training_control_emits_its_flag(tmp_path: Path) -> None:
         setattr(config.training, name, value)
     command = build_training_cmd(config)
     assert not {f"--{name}" for name in values}.difference(command)
+
+
+def test_h3_attention_and_fused_backward_controls(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.training.flash4 = True
+    config.training.h3_fused_backward_pass = True
+    config.training.h3_adafactor_triton = True
+    config.training.optimizer_type = "Adafactor"
+    config.training.max_grad_norm = 0
+    config.training.h3_checkpoint_keep = "adaln"
+    command = build_training_cmd(config)
+    assert {"--flash4", "--fused_backward_pass", "--adafactor_triton", "--h3_checkpoint_keep"}.issubset(command)
+    assert "--flash3" not in command
+    assert "--sdpa" not in command
+    assert command[command.index("--h3_checkpoint_keep") + 1] == "adaln"
+
+
+def test_h3_fused_backward_validation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.training.model_type = "minimax_h3"
+    config.training.h3_fused_backward_pass = True
+    assert "training.h3_fused_backward_pass" in validate_training_config(config)["field_errors"]
+
+    config.training.optimizer_type = "Adafactor"
+    config.training.max_grad_norm = 0
+    config.training.accelerate_extra_args = "--num_processes 2"
+    assert "training.h3_fused_backward_pass" in validate_training_config(config)["field_errors"]
+
+    config.training.accelerate_extra_args = "--num_processes 1"
+    assert "training.h3_fused_backward_pass" not in validate_training_config(config)["field_errors"]
+    config.training.h3_adafactor_triton = True
+    config.training.h3_fused_backward_pass = False
+    assert "training.h3_adafactor_triton" in validate_training_config(config)["field_errors"]
 
 
 def test_every_new_h3_cache_and_inference_control_emits_its_flag(tmp_path: Path) -> None:

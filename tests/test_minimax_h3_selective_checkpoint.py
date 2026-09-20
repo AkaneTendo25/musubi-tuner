@@ -97,7 +97,7 @@ def _run(
 
 
 @pytest.mark.parametrize("lora", [False, True], ids=["plain", "lora"])
-@pytest.mark.parametrize("keep", ["attention", "qkv"])
+@pytest.mark.parametrize("keep", ["attention", "qkv", "adaln"])
 def test_keeping_activations_is_bit_identical_to_plain_checkpointing(keep, lora):
     num_blocks = _tiny_config().num_layers
     reference_loss, reference_grads, plain, _ = _run("none", lora=lora)
@@ -114,7 +114,7 @@ def test_keeping_activations_is_bit_identical_to_plain_checkpointing(keep, lora)
     # output is replayed from the cache instead. The refiner block is untouched.
     assert plain[_CPU_ATTENTION] - kept[_CPU_ATTENTION] == num_blocks
     assert saved.attention == num_blocks
-    if keep == "qkv":
+    if keep in ("qkv", "adaln"):
         # Exactly the base projection matmul per block is kept; under LoRA the
         # down/up matmuls of the adapter are still recomputed.
         assert saved.projection == num_blocks
@@ -123,6 +123,13 @@ def test_keeping_activations_is_bit_identical_to_plain_checkpointing(keep, lora)
     else:
         assert saved.projection == 0
         assert plain["aten::mm"] == kept["aten::mm"]
+    if keep == "adaln":
+        # The modulation matmul per block is kept on top of the QKV projection.
+        assert saved.adaln == num_blocks
+        _, _, qkv_only, _ = _run("qkv", lora=lora)
+        assert qkv_only["aten::addmm"] - kept["aten::addmm"] == num_blocks
+    else:
+        assert saved.adaln == 0
 
 
 def test_plain_checkpointing_matches_no_checkpointing():

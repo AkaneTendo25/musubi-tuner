@@ -7,7 +7,7 @@ forward OUTPUT and the per-row logsumexp, never the score matrix. Saving those
 outputs lets recomputation skip the attention forward -- the largest single
 cost of a long packed sequence -- for one ``rows x hidden`` tensor per block.
 
-Both levels are expressed as a ``torch.utils.checkpoint`` selective policy:
+The levels are expressed as a ``torch.utils.checkpoint`` selective policy:
 
 - ``attention`` saves the outputs of the fused attention kernels listed in
   :data:`ATTENTION_OUTPUT_OPS`;
@@ -16,7 +16,9 @@ Both levels are expressed as a ``torch.utils.checkpoint`` selective policy:
   LoRA wrapper later captures as ``org_forward`` -- in :func:`projection_region`,
   so adapter terms run outside the region and are recomputed; inside it the
   matmul is recognised by its weight operand's ``(in_features, out_features)``
-  shape, which ConvRot's group rotations do not have.
+  shape, which ConvRot's group rotations do not have;
+- ``adaln`` additionally saves each block's AdaLN modulation matmul, marked by
+  the same shape-keyed region around ``adaln_proj.linear``.
 
 The policy sees dispatcher ops only. A kernel invoked through a plain Python
 binding (an old ``flash_attn`` build without its ``torch.library`` ops, the
@@ -40,7 +42,7 @@ from typing import Any
 import torch
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-CHECKPOINT_KEEP_MODES = ("none", "attention", "qkv")
+CHECKPOINT_KEEP_MODES = ("none", "attention", "qkv", "adaln")
 
 # Fused attention forwards whose backward needs only their own outputs. The
 # ``flash_attn`` names are the ``torch.library`` ops flash-attn >= 2.7.1
@@ -82,6 +84,9 @@ _FLASH_OPS = {
 # left before that call returns, so the policy answers identically in both.
 _projection_shape: ContextVar[tuple[int, int] | None] = ContextVar("h3_projection_shape", default=None)
 
+# Identify the AdaLN modulation matmul by its projection weight shape.
+_adaln_shape: ContextVar[tuple[int, int] | None] = ContextVar("h3_adaln_shape", default=None)
+
 
 @dataclass
 class SavedActivations:
@@ -89,10 +94,12 @@ class SavedActivations:
 
     attention: int = 0
     projection: int = 0
+    adaln: int = 0
 
     def reset(self) -> None:
         self.attention = 0
         self.projection = 0
+        self.adaln = 0
 
 
 @contextmanager
@@ -103,6 +110,16 @@ def projection_region(in_features: int, out_features: int) -> Iterator[None]:
         yield
     finally:
         _projection_shape.reset(token)
+
+
+@contextmanager
+def adaln_projection_region(in_features: int, out_features: int) -> Iterator[None]:
+    """Mark an AdaLN projection's own forward so the ``adaln`` level can find its matmul."""
+    token = _adaln_shape.set((int(in_features), int(out_features)))
+    try:
+        yield
+    finally:
+        _adaln_shape.reset(token)
 
 
 def op_name(func: Any) -> str:
@@ -137,8 +154,7 @@ def attention_kernel_is_visible(attention_mode: str) -> bool:
     return any(_op_is_registered(namespace, name) for namespace, name in _FLASH_OPS.get(attention_mode, ()))
 
 
-def _is_projection_matmul(name: str, args: tuple[Any, ...]) -> bool:
-    shape = _projection_shape.get()
+def _is_projection_matmul(name: str, args: tuple[Any, ...], shape: tuple[int, int] | None) -> bool:
     if shape is None:
         return False
     operand = _PROJECTION_MATMUL_OPS.get(name)
@@ -151,7 +167,8 @@ def _is_projection_matmul(name: str, args: tuple[Any, ...]) -> bool:
 def checkpoint_policy(
     keep: str, saved: SavedActivations | None, ctx: Any, func: Any, *args: Any, **kwargs: Any
 ) -> CheckpointPolicy:
-    """Selective-checkpoint policy: keep the attention output, and at ``qkv`` the base projection matmul."""
+    """Selective-checkpoint policy: keep the attention output, at ``qkv`` the base projection matmul,
+    and at ``adaln`` additionally each block's AdaLN modulation matmul."""
     del kwargs
     name = op_name(func)
     counting = saved is not None and not getattr(ctx, "is_recompute", False)
@@ -159,9 +176,13 @@ def checkpoint_policy(
         if counting:
             saved.attention += 1
         return CheckpointPolicy.MUST_SAVE
-    if keep == "qkv" and _is_projection_matmul(name, args):
+    if keep in ("qkv", "adaln") and _is_projection_matmul(name, args, _projection_shape.get()):
         if counting:
             saved.projection += 1
+        return CheckpointPolicy.MUST_SAVE
+    if keep == "adaln" and _is_projection_matmul(name, args, _adaln_shape.get()):
+        if counting:
+            saved.adaln += 1
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
 
