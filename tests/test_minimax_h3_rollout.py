@@ -3103,21 +3103,29 @@ def test_adapter_ema_tracks_the_parameters_and_saves_on_schedule(tmp_path):
         network.weight.fill_(1.0)
     trainer.on_post_optimizer_step(args, accelerator, network, None, True, 0)
     torch.testing.assert_close(trainer._adapter_ema["weight"], torch.tensor([1.0, 1.0]))
-    # Step 1 (-> step 2): decay 0.5 between 1.0 and the new value 3.0 -> 2.0, and a save.
+    # Step 1 (-> step 2): the decay is still in its warm-up (min(0.5, 2/11)), so
+    # the shadow tracks the parameter far more closely than a flat 0.5 would.
     with torch.no_grad():
         network.weight.fill_(3.0)
     trainer.on_post_optimizer_step(args, accelerator, network, None, True, 1)
-    torch.testing.assert_close(trainer._adapter_ema["weight"], torch.tensor([2.0, 2.0]))
+    torch.testing.assert_close(trainer._adapter_ema["weight"], torch.full((2,), 29.0 / 11.0))
+    # The checkpoint save itself rides the base trainer's on_post_save hook, for
+    # step and epoch checkpoints alike.
+    assert network.saved == []
+    trainer.on_post_save(args, accelerator, network, None, "arm-step00000002.safetensors", torch.float32, {"ss_steps": "2"}, False)
     assert len(network.saved) == 1
     path, _dtype, metadata, weights_at_save = network.saved[0]
-    assert path.endswith("arm-ema-step00000002.safetensors")
+    assert path.endswith("arm-step00000002-ema.safetensors")
     assert metadata["ss_h3_adapter_ema"] == "True" and metadata["ss_steps"] == "2"
     # Saved with the EMA swapped in, and the live weights put back afterwards.
-    torch.testing.assert_close(weights_at_save, torch.tensor([2.0, 2.0]))
+    torch.testing.assert_close(weights_at_save, torch.full((2,), 29.0 / 11.0))
     torch.testing.assert_close(network.weight.detach(), torch.tensor([3.0, 3.0]))
+    # An epoch-named checkpoint gets its EMA companion too, with its own stem.
+    trainer.on_post_save(args, accelerator, network, None, "arm-epoch00000003.safetensors", torch.float32, {"ss_steps": "9"}, False)
+    assert network.saved[1][0].endswith("arm-epoch00000003-ema.safetensors")
     # No update without a synchronised gradient step.
     trainer.on_post_optimizer_step(args, accelerator, network, None, False, 2)
-    torch.testing.assert_close(trainer._adapter_ema["weight"], torch.tensor([2.0, 2.0]))
+    torch.testing.assert_close(trainer._adapter_ema["weight"], torch.full((2,), 29.0 / 11.0))
 
 
 def test_adapter_ema_flags_are_validated():
@@ -3256,7 +3264,13 @@ def test_adapter_ema_saves_on_the_initialising_step_when_scheduled(tmp_path):
     accelerator = _FakeAccelerator()
     accelerator.is_main_process = True
     trainer.on_post_optimizer_step(args, accelerator, network, None, True, 0)
-    assert network.saved and network.saved[0][0].endswith("eager-ema-step00000001.safetensors")
+    # The update alone writes nothing; a checkpoint saved on the same step still
+    # gets its EMA companion, initialised from the very first parameter value.
+    assert network.saved == []
+    trainer.on_post_save(
+        args, accelerator, network, None, "eager-step00000001.safetensors", torch.float32, {"ss_steps": "1"}, False
+    )
+    assert network.saved and network.saved[0][0].endswith("eager-step00000001-ema.safetensors")
 
 
 # ---------------------------------------------------------------------------

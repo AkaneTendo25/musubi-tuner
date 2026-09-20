@@ -1444,6 +1444,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._measured_variance_curve = None
         self._validation_multipliers = []
         self._adapter_ema = None
+        self._adapter_ema_updates = 0
         self._step_recipe: str | None = None
         self._step_qwen_control_dropout = False
         self._crepa: H3CREPA | None = None
@@ -3161,6 +3162,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if getattr(args, "h3_validate_ema", False) and ema_decay <= 0:
             raise ValueError("--h3_validate_ema requires --h3_adapter_ema_decay above 0")
         self._adapter_ema = None
+        self._adapter_ema_updates = 0
         self._measured_variance_curve = None
         curve_path = getattr(args, "h3_measured_variance_weighting", None)
         weight_max = float(getattr(args, "h3_measured_variance_weight_max", 4.0))
@@ -3599,12 +3601,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return [(name, parameter) for name, parameter in named() if parameter.requires_grad]
 
     def _update_adapter_ema(self, args, accelerator, network, global_step: int) -> None:
-        """Track the trainable parameters' EMA and save it beside each scheduled checkpoint.
+        """Track the trainable parameters' EMA; the save itself rides every checkpoint.
 
         Called after every optimizer step (the base loop increments its step
         counter afterwards, so the step this update belongs to is ``global_step
         + 1``). The average is kept in fp32 on the parameters' device; LoRA
         parameters are small enough for that.
+
+        The decay ramps with ``min(decay, (1+n)/(10+n))`` over the update count
+        ``n``: ``lora_up`` is zero-initialised, so the parameter trajectory
+        starts at exactly zero and a flat decay would drag the shadow toward
+        that zero for roughly the first ``1 / (1 - decay)`` steps -- every
+        ``--h3_validate_ema`` swap and every early checkpoint would then
+        evaluate a near-zero adapter.
         """
         decay = float(getattr(args, "h3_adapter_ema_decay", 0.0) or 0.0)
         if decay <= 0 or network is None:
@@ -3613,14 +3622,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         with torch.no_grad():
             if self._adapter_ema is None:
                 self._adapter_ema = {name: parameter.detach().float().clone() for name, parameter in parameters}
+                self._adapter_ema_updates = 0
             else:
+                self._adapter_ema_updates += 1
+                effective_decay = min(decay, (1.0 + self._adapter_ema_updates) / (10.0 + self._adapter_ema_updates))
                 for name, parameter in parameters:
                     shadow = self._adapter_ema[name]
-                    shadow.mul_(decay).add_(parameter.detach().float(), alpha=1.0 - decay)
-        step = int(global_step) + 1
-        every = getattr(args, "save_every_n_steps", None)
-        if every and step % int(every) == 0 and accelerator.is_main_process:
-            self._save_adapter_ema(args, accelerator, network, step)
+                    shadow.mul_(effective_decay).add_(parameter.detach().float(), alpha=1.0 - effective_decay)
 
     @contextmanager
     def _adapter_ema_weights(self, accelerator, network):
@@ -3641,20 +3649,45 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 for name, parameter in parameters:
                     parameter.copy_(backup[name])
 
-    def _save_adapter_ema(self, args, accelerator, network, step: int) -> None:
+    def on_post_save(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        ckpt_name: str,
+        save_dtype,
+        metadata: dict,
+        force_sync_upload: bool,
+    ) -> None:
+        """Write the adapter EMA beside every checkpoint that gets saved.
+
+        Step-scheduled and epoch-scheduled saves alike arrive here, so an
+        epoch-checkpointing run no longer tracks an EMA that is never written
+        to disk. ``metadata`` already carries the checkpoint's own
+        ``ss_steps``/``ss_epoch``.
+        """
+        decay = float(getattr(args, "h3_adapter_ema_decay", 0.0) or 0.0)
+        if decay <= 0 or self._adapter_ema is None or network is None:
+            return
+        if not accelerator.is_main_process:
+            return
+        self._save_adapter_ema(args, accelerator, network, ckpt_name, metadata)
+
+    def _save_adapter_ema(self, args, accelerator, network, ckpt_name: str, metadata: dict) -> None:
         unwrapped = accelerator.unwrap_model(network)
         save_weights = getattr(unwrapped, "save_weights", None)
         if not callable(save_weights):
             logger.warning("--h3_adapter_ema_decay: the network has no save_weights(); the EMA is kept but not saved")
             return
         os.makedirs(args.output_dir, exist_ok=True)
-        path = os.path.join(args.output_dir, f"{args.output_name}-ema-step{step:08d}.safetensors")
+        stem = os.path.splitext(ckpt_name)[0]
+        path = os.path.join(args.output_dir, f"{stem}-ema.safetensors")
         dtype = model_utils.str_to_dtype(getattr(args, "save_precision", None), torch.bfloat16)
-        metadata = dict(self.extra_metadata(args))
-        metadata["ss_h3_adapter_ema"] = "True"
-        metadata["ss_steps"] = str(step)
+        ema_metadata = dict(metadata)
+        ema_metadata["ss_h3_adapter_ema"] = "True"
         with self._adapter_ema_weights(accelerator, network):
-            save_weights(path, dtype, metadata)
+            save_weights(path, dtype, ema_metadata)
         logger.info("saved adapter EMA: %s", path)
 
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
@@ -7827,7 +7860,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=0.0,
         help=(
             "keep an exponential moving average of the adapter's trainable parameters with this decay, updated after "
-            "every optimizer step, and save it beside each scheduled checkpoint as <output_name>-ema-step<N>.safetensors "
+            "every optimizer step, and save it beside every checkpoint that is written as <checkpoint stem>-ema.safetensors "
             "(an ordinary adapter file). Damps the step-to-step swing between competing loss terms without changing "
             "what is optimised. 0 (default) keeps no average"
         ),
