@@ -22,7 +22,6 @@ except ModuleNotFoundError:  # LTX-2 is optional on the minimax-h3 branch.
 
 
 from musubi_tuner.modules.group_lr_scheduler import parse_group_lr_scheduler_args
-from musubi_tuner.tread import default_ltx_tread_route, parse_tread_args
 
 
 def _parse_reward_spec_for_validation(spec: str, reward_plugins: str = "") -> tuple[dict[str, float] | None, str | None]:
@@ -3323,84 +3322,6 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     "training.av_curriculum_mode",
                     "AV Curriculum requires positive Video Loss Weight and Audio Loss Weight.",
                     label="AV Curriculum",
-                    page="techniques",
-                )
-            )
-
-    if t.tread:
-        tread_args_parts = _split_cli_args(t.tread_args)
-        if t.tread_target != "video":
-            tread_args_parts.append(f"target={t.tread_target}")
-        if t.tread_selection_ratio != 0.5:
-            tread_args_parts.append(f"selection_ratio={t.tread_selection_ratio}")
-        if t.tread_start_layer_idx is not None:
-            tread_args_parts.append(f"start_layer_idx={t.tread_start_layer_idx}")
-        if t.tread_end_layer_idx is not None:
-            tread_args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
-        parsed_tread_config = None
-        try:
-            parsed_tread_config = parse_tread_args(
-                tread_args_parts,
-                total_layers=48,
-                default_route=default_ltx_tread_route(t.ltx_version),
-            )
-        except (TypeError, ValueError) as exc:
-            errors.append(
-                _make_issue(
-                    "error",
-                    "training.tread_args",
-                    f"TREAD Args are invalid: {exc}",
-                    label="TREAD Args",
-                    page="techniques",
-                )
-            )
-        tread_targets = {
-            str(route.get("target", "video")).lower()
-            for route in ((parsed_tread_config or {}).get("routes") or [{"target": "video"}])
-        }
-        wants_video_tread = any(target in {"video", "both"} for target in tread_targets)
-        wants_audio_tread = any(target in {"audio", "both"} for target in tread_targets)
-        try:
-            tread_selection_ratio = float(t.tread_selection_ratio)
-        except (TypeError, ValueError):
-            tread_selection_ratio = float("nan")
-        if not math.isfinite(tread_selection_ratio) or not 0.0 <= tread_selection_ratio < 1.0:
-            errors.append(
-                _make_issue(
-                    "error",
-                    "training.tread_selection_ratio",
-                    "TREAD Selection Ratio must be at least 0.0 and less than 1.0.",
-                    label="TREAD Selection Ratio",
-                    page="techniques",
-                )
-            )
-        if wants_video_tread and (t.ltx2_mode == "audio" or t.ltx2_audio_only_model):
-            errors.append(
-                _make_issue(
-                    "error",
-                    "training.tread",
-                    "TREAD target=video requires a video-enabled LTX path. Use target=audio for audio-only training.",
-                    label="TREAD",
-                    page="techniques",
-                )
-            )
-        if wants_audio_tread and t.ltx2_mode == "video":
-            errors.append(
-                _make_issue(
-                    "error",
-                    "training.tread",
-                    "TREAD target=audio requires an audio-enabled LTX mode.",
-                    label="TREAD",
-                    page="techniques",
-                )
-            )
-        if t.ltx2_remote_stage:
-            errors.append(
-                _make_issue(
-                    "error",
-                    "training.tread",
-                    "TREAD cannot be combined with this execution mode because routing changes token lengths across blocks.",
-                    label="TREAD",
                     page="techniques",
                 )
             )

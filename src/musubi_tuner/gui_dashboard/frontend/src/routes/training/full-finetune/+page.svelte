@@ -911,16 +911,6 @@
 			</div>
 		</FormGroup>
 
-		<FormGroup title="TREAD">
-			<div class="space-y-2 pt-2">
-				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
-					<FormToggle fieldPath="full_finetune.tread" checked={t.tread ?? false} onchange={(e) => update('tread', e.target.checked)} />
-					<FormSelect fieldPath="full_finetune.tread_target" value={t.tread_target || 'video'} options={['video', 'audio', 'both']} onchange={(e) => update('tread_target', e.target.value)} />
-					<FormField type="number" fieldPath="full_finetune.tread_selection_ratio" value={t.tread_selection_ratio ?? 0.5} oninput={(e) => update('tread_selection_ratio', Number(e.target.value))} min={0} max={1} step="0.01" />
-					<FormField fieldPath="full_finetune.tread_args" value={t.tread_args || ''} oninput={(e) => update('tread_args', e.target.value)} placeholder="route=..." />
-				</div>
-			</div>
-		</FormGroup>
 
 		<FormGroup title="CLI">
 			<div class="space-y-2 pt-2">

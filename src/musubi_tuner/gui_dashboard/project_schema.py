@@ -905,14 +905,6 @@ class TrainingConfig(BaseModel):
     audio_metrics_av_desync_device: Literal["cpu", "cuda", "auto"] = "cpu"
     audio_metrics_av_desync_max_length_s: float = 8.0
 
-    # Token routing
-    tread: bool = False
-    tread_args: str = ""
-    tread_target: Literal["video", "audio", "both"] = "video"
-    tread_selection_ratio: float = 0.5
-    tread_start_layer_idx: Optional[int] = None
-    tread_end_layer_idx: Optional[int] = None
-
     # Differential Guidance
     differential_guidance: bool = False
     differential_guidance_scale: float = 3.0

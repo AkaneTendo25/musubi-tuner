@@ -2813,21 +2813,9 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     # Audio Metrics
     _append_audio_metrics_args(cmd, t)
 
-    # TREAD token routing
-    if t.tread:
-        cmd.append("--tread")
-        args_parts = []
-        _append_key_value_args(args_parts, t.tread_args)
-        if t.tread_target != "video":
-            args_parts.append(f"target={t.tread_target}")
-        if t.tread_selection_ratio != 0.5:
-            args_parts.append(f"selection_ratio={t.tread_selection_ratio}")
-        if t.tread_start_layer_idx is not None:
-            args_parts.append(f"start_layer_idx={t.tread_start_layer_idx}")
-        if t.tread_end_layer_idx is not None:
-            args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
-        if args_parts:
-            cmd += ["--tread_args"] + args_parts
+    # TREAD token routing: deliberately not emitted -- no trainer in this build
+    # declares --tread, so a command carrying it fails on an unrecognised
+    # argument. Validation rejects enabling it instead of letting the run die.
 
     # Differential guidance
     if t.differential_guidance:
@@ -3470,21 +3458,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--output_drift_batches", str(t.output_drift_batches)]
         cmd += ["--output_drift_timestep", str(t.output_drift_timestep)]
 
-    # TREAD token routing
-    if t.tread:
-        cmd.append("--tread")
-        args_parts = []
-        _append_key_value_args(args_parts, t.tread_args)
-        if t.tread_target != "video":
-            args_parts.append(f"target={t.tread_target}")
-        if t.tread_selection_ratio != 0.5:
-            args_parts.append(f"selection_ratio={t.tread_selection_ratio}")
-        if t.tread_start_layer_idx is not None:
-            args_parts.append(f"start_layer_idx={t.tread_start_layer_idx}")
-        if t.tread_end_layer_idx is not None:
-            args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
-        if args_parts:
-            cmd += ["--tread_args"] + args_parts
+    # TREAD token routing: not emitted here either; see the matching note in
+    # build_training_cmd.
 
     _append_dataloader_args(cmd, t)
 
