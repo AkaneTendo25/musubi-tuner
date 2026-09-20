@@ -16,6 +16,33 @@ logging.basicConfig(level=logging.INFO)
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 
+# One frozen-weight slot; identity, pointer and version detect source replacement.
+_DEQUANT_SLOT: tuple | None = None
+
+
+def _dequant_cache_lookup(sources: tuple[torch.Tensor, ...], dtype: torch.dtype, device: torch.device):
+    global _DEQUANT_SLOT
+    if any(t.requires_grad for t in sources):
+        return None
+    if _DEQUANT_SLOT is None:
+        return None
+    cached_sources, cached_stamp, cached_key, result = _DEQUANT_SLOT
+    if len(cached_sources) != len(sources) or cached_key != (dtype, device):
+        return None
+    for cached, current, (stamp_ptr, stamp_version) in zip(cached_sources, sources, cached_stamp):
+        if cached is not current or stamp_ptr != current.data_ptr() or stamp_version != current._version:
+            return None
+    return result
+
+
+def _dequant_cache_store(sources: tuple[torch.Tensor, ...], dtype: torch.dtype, device: torch.device, result: torch.Tensor):
+    global _DEQUANT_SLOT
+    if any(t.requires_grad for t in sources) or result.requires_grad:
+        return
+    stamp = tuple((t.data_ptr(), t._version) for t in sources)
+    _DEQUANT_SLOT = (tuple(sources), stamp, (dtype, device), result)
+
+
 def calculate_fp8_maxval(exp_bits=4, mantissa_bits=3, sign_bits=1):
     """
     Calculate the maximum representable value in FP8 format.
@@ -424,18 +451,21 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
     else:
         # Dequantize the weight
         original_dtype = self.scale_weight.dtype
-        scale_weight = self.scale_weight.to(device=x.device, dtype=original_dtype)
-        if self.scale_weight.ndim < 3:
-            # per-tensor or per-channel quantization, we can broadcast
-            dequantized_weight = self.weight.to(device=x.device, dtype=original_dtype) * scale_weight
-        else:
-            # block-wise quantization, need to reshape weight to match scale shape for broadcasting
-            out_features, num_blocks, _ = self.scale_weight.shape
-            dequantized_weight = (
-                self.weight.to(device=x.device, dtype=original_dtype).contiguous().view(out_features, num_blocks, -1)
-            )
-            dequantized_weight = dequantized_weight * scale_weight
-            dequantized_weight = dequantized_weight.view(self.weight.shape)
+        dequantized_weight = _dequant_cache_lookup((self.weight, self.scale_weight), original_dtype, x.device)
+        if dequantized_weight is None:
+            scale_weight = self.scale_weight.to(device=x.device, dtype=original_dtype)
+            if self.scale_weight.ndim < 3:
+                # per-tensor or per-channel quantization, we can broadcast
+                dequantized_weight = self.weight.to(device=x.device, dtype=original_dtype) * scale_weight
+            else:
+                # block-wise quantization, need to reshape weight to match scale shape for broadcasting
+                out_features, num_blocks, _ = self.scale_weight.shape
+                dequantized_weight = (
+                    self.weight.to(device=x.device, dtype=original_dtype).contiguous().view(out_features, num_blocks, -1)
+                )
+                dequantized_weight = dequantized_weight * scale_weight
+                dequantized_weight = dequantized_weight.view(self.weight.shape)
+            _dequant_cache_store((self.weight, self.scale_weight), original_dtype, x.device, dequantized_weight)
 
         # Perform linear transformation
         if self.bias is not None:

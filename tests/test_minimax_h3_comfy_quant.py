@@ -231,3 +231,62 @@ def test_non_quantized_checkpoint_is_rejected(tmp_path):
             key_map=lambda prefix: prefix,
             output_dtype=torch.bfloat16,
         )
+
+
+def _tiny_nvfp4_linear() -> ComfyNvfp4Linear:
+    generator = torch.Generator().manual_seed(23)
+    weight = torch.randn((4, 32), generator=generator, dtype=torch.float32).to(torch.bfloat16)
+    packed, blocked_scales, tensor_scale = quantize_nvfp4_weight(weight)
+    return ComfyNvfp4Linear(
+        nn.Linear(32, 4, bias=False),
+        packed,
+        blocked_scales,
+        tensor_scale,
+        None,
+        torch.bfloat16,
+    )
+
+
+def test_nvfp4_dequantize_cache_returns_same_tensor_for_unchanged_sources():
+    import musubi_tuner.modules.fp8_optimization_utils as fp8_utils
+
+    fp8_utils._DEQUANT_SLOT = None
+    linear = _tiny_nvfp4_linear()
+
+    first = linear.dequantize_weight(torch.float32)
+    second = linear.dequantize_weight(torch.float32)
+
+    assert second is first
+
+
+def test_nvfp4_dequantize_cache_invalidates_on_copy_refill_and_rebind():
+    import musubi_tuner.modules.fp8_optimization_utils as fp8_utils
+
+    fp8_utils._DEQUANT_SLOT = None
+    linear = _tiny_nvfp4_linear()
+
+    first = linear.dequantize_weight(torch.float32)
+    linear.packed_weight.copy_(torch.zeros_like(linear.packed_weight))
+    second = linear.dequantize_weight(torch.float32)
+    assert second is not first
+    assert not second.any()
+
+    linear.packed_weight = torch.full((4, 16), 0x12, dtype=torch.uint8)
+    third = linear.dequantize_weight(torch.float32)
+    assert third is not second
+    assert third.any()
+
+
+def test_nvfp4_dequantize_cache_single_slot_bounds_residency():
+    import musubi_tuner.modules.fp8_optimization_utils as fp8_utils
+
+    fp8_utils._DEQUANT_SLOT = None
+    linear_a = _tiny_nvfp4_linear()
+    linear_b = _tiny_nvfp4_linear()
+
+    linear_a.dequantize_weight(torch.float32)
+    linear_b.dequantize_weight(torch.float32)
+    again = linear_a.dequantize_weight(torch.float32)
+
+    assert fp8_utils._DEQUANT_SLOT[0][0] is linear_a.packed_weight
+    assert again is fp8_utils._DEQUANT_SLOT[3]

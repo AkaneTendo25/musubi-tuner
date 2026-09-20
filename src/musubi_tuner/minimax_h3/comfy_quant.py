@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from torch import nn
 
+from musubi_tuner.modules.fp8_optimization_utils import _dequant_cache_lookup, _dequant_cache_store
+
 logger = logging.getLogger(__name__)
 
 COMFY_QUANT_SUFFIX = ".comfy_quant"
@@ -289,6 +291,15 @@ class ComfyNvfp4Linear(nn.Module):
 
     @torch.no_grad()
     def dequantize_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        sources = (self.packed_weight, self.scales_u8, self.per_tensor_scale_u8)
+        cached = _dequant_cache_lookup(sources, dtype, self.packed_weight.device)
+        if cached is not None:
+            return cached
+        result = self._dequantize_weight_uncached(dtype)
+        _dequant_cache_store(sources, dtype, self.packed_weight.device, result)
+        return result
+
+    def _dequantize_weight_uncached(self, dtype: torch.dtype) -> torch.Tensor:
         rows = self.out_features
         columns = self.in_features
         result = torch.empty((rows, columns), device=self.packed_weight.device, dtype=dtype)
