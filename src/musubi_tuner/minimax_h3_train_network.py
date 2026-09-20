@@ -1102,6 +1102,12 @@ def _parse_guidance_scale_range(spec: str | None) -> tuple[float, float] | None:
     return (lower, upper)
 
 
+# Above this many packed video rows, an attention mask costs more than the
+# shared forward saves (any mask drops SDPA from its flash backend), so the
+# batched path groups items by exact text length instead of padding.
+_BATCHED_MASKLESS_ROW_LIMIT = 8192
+
+
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
     @staticmethod
     def _build_audio_only_spatial_tokens(audio_latents: torch.Tensor) -> torch.Tensor:
@@ -5736,7 +5742,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         The returned loss is live: the base loop's ``backward_loss`` runs it.
         """
         del global_step
-        del network
         batch_size = int(latents.shape[0])
         if batch_size < 2 or not getattr(args, "h3_batched_microbatch", False):
             return None
@@ -5847,14 +5852,30 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             tags = tags[0] if isinstance(tags, (list, tuple)) else tags
             token_counts.append(int(tags.numel()))
 
-        try:
+        # Long packed sequences: any attention mask drops SDPA from its flash
+        # backend, which there costs more than the shared forward saves. The
+        # batch is grouped by exact text token count instead: every group pads
+        # nothing, needs no mask and keeps the fast kernels, and singleton
+        # groups are ordinary single-item forwards. Short sequences (images
+        # above all) keep the one padded group, where the mask is cheap and
+        # the batching win is large.
+        patch_h, patch_w = VIDEO_DIT_PATCH_SIZE[-2:]
+        first_video = items[0][1]
+        latent_rows = (
+            int(first_video.shape[2]) * (int(first_video.shape[3]) // patch_h) * (int(first_video.shape[4]) // patch_w)
+            if first_video is not None and first_video.ndim == 5
+            else 0
+        )
+        if latent_rows > _BATCHED_MASKLESS_ROW_LIMIT:
+            groups: dict[int, list[int]] = {}
+            for index, count in enumerate(token_counts):
+                groups.setdefault(count, []).append(index)
+        else:
+            groups = {max(token_counts): list(range(batch_size))}
+
+        def run_group(indices: list[int], padded_to: int):
             with accelerator.autocast(), h3_profile_scope("h3.forward.batched"):
-                predictions = batched(transformer, calls, max(token_counts))
-        except ValueError as error:
-            if not getattr(self, "_batched_layout_fallback_warned", False):
-                logger.warning("H3 batched micro-batch fell back to the per-item loop: %s", error)
-                self._batched_layout_fallback_warned = True
-            return None
+                return batched(transformer, [calls[index] for index in indices], padded_to)
 
         video_weight = args.h3_video_loss_weight
         audio_weight = args.h3_audio_loss_weight
@@ -5862,9 +5883,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         audio_sample_weight = (
             self._sample_weight(args, first_inputs.audio_sigma, modality="audio") if first_inputs.audio is not None else None
         )
-        losses: list[torch.Tensor] = []
-        item_metrics: list[dict[str, float]] = []
-        for prediction, inputs, (item_batch, *_), call in zip(predictions, inputs_items, items, calls, strict=True):
+
+        def item_loss(prediction, index: int):
+            inputs = inputs_items[index]
+            item_batch = items[index][0]
             effective_video_mask = self._mask_to_loss(
                 self._extension_masked(
                     item_batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3
@@ -5893,17 +5915,50 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video_weight=video_weight,
                 audio_weight=audio_weight,
             )
-            losses.append(result.loss / batch_size)
-            item_metrics.append(
-                {
-                    "loss/video": float(result.video_loss.detach()),
-                    "loss/audio": float(result.audio_loss.detach()),
-                    "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
-                    "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()) if inputs.audio_sigma is not None else 0.0,
-                }
-            )
+            return result, inputs
+
+        losses: list[torch.Tensor] = []
+        item_metrics: list[dict[str, float]] = []
+        multi_group = len(groups) > 1
+        for group_position, (padded_to, indices) in enumerate(sorted(groups.items())):
+            try:
+                group_predictions = run_group(indices, padded_to)
+            except ValueError as error:
+                if not getattr(self, "_batched_layout_fallback_warned", False):
+                    logger.warning("H3 batched micro-batch group fell back to single-item forwards: %s", error)
+                    self._batched_layout_fallback_warned = True
+                # The failed group contributed no gradients yet, so replaying
+                # its items one at a time keeps the step's gradient exact.
+                group_predictions = [prediction for index in indices for prediction in run_group([index], token_counts[index])]
+            group_loss = None
+            for index, prediction in zip(indices, group_predictions, strict=True):
+                result, inputs = item_loss(prediction, index)
+                scaled = result.loss / batch_size
+                losses.append(scaled)
+                item_metrics.append(
+                    {
+                        "loss/video": float(result.video_loss.detach()),
+                        "loss/audio": float(result.audio_loss.detach()),
+                        "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
+                        "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()) if inputs.audio_sigma is not None else 0.0,
+                    }
+                )
+                group_loss = scaled if group_loss is None else group_loss + scaled
+            if multi_group:
+                # One backward per group bounds live-graph memory exactly like
+                # the per-item loop; non-final groups skip the DDP reduction.
+                if group_position + 1 < len(groups) and getattr(accelerator, "num_processes", 1) > 1:
+                    with accelerator.no_sync(network if network is not None else transformer):
+                        accelerator.backward(group_loss)
+                else:
+                    accelerator.backward(group_loss)
         metrics = self._average_batch_metrics(item_metrics)
         metrics["h3/batched_microbatch"] = 1.0
+        if multi_group:
+            # The backwards already ran; report the detached batch mean.
+            self._batch_backward_performed = True
+            return torch.stack([term.detach() for term in losses]).mean(), metrics
+        # A single group returns the live loss for backward_loss to run.
         return torch.stack(losses).sum(), metrics
 
     def process_batch(
@@ -5990,7 +6045,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             args, accelerator, transformer, network, batch, latents, noise, noise_scheduler, dit_dtype, global_step
         )
         if batched is not None:
-            self._batch_backward_performed = False
+            # The fast path itself decides whether the backward already ran
+            # (multi-group case) or the live loss still owes one.
             return batched
 
         # The released H3 transformer accepts one shared packed layout, while

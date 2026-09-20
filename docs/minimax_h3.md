@@ -901,9 +901,9 @@ non-blocking device copies, but consumes locked host RAM.
 **`--h3_batched_microbatch`.** Run the plain data objective for a multi-item batch through one shared forward: each
 item's text block is padded to the batch maximum (pad rows are attention-masked and excluded from every loss), the packed
 rows are stacked on the batch axis, and the per-item losses average into one backward. The per-dataset `batch_size` is the
-micro-batch size. Best for image datasets, where it is several times faster per optimizer step; on long video batches the
-text-padding mask leaves SDPA's flash backend and the shared forward is slower than the per-item loop, so keep the flag off
-there. Steps that are not the plain objective (auxiliary branches, caption dropout, per-frame sigma jitter) and batches with
+micro-batch size. Best for image datasets, where it is several times faster per optimizer step. Long video batches are
+grouped by exact text token count: each group runs without padding and keeps the fast attention kernels (about 10% faster
+per step at a batch of four), and items whose lengths all differ simply run one forward each. Steps that are not the plain objective (auxiliary branches, caption dropout, per-frame sigma jitter) and batches with
 incompatible packed layouts automatically use the ordinary per-item loop.
 
 ### Training modes

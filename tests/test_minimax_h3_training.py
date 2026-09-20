@@ -7980,3 +7980,145 @@ def test_batched_microbatch_shares_one_forward_and_falls_back():
     # Per item: the student forward plus the frozen preservation reference.
     assert forward_calls == 2 * 2
     assert torch.isfinite(loss_fallback)
+
+
+class _RecordingBatchedBackend:
+    """Minimal backend double: records predict_training_batched invocations."""
+
+    def __init__(self, fail_multi=False):
+        self.invocations = []
+        self.fail_multi = fail_multi
+
+    def predict_training_batched(self, transformer, calls, text_rows_padded_to):
+        if self.fail_multi and len(calls) > 1:
+            raise ValueError("synthetic heterogeneous layout")
+        self.invocations.append((len(calls), int(text_rows_padded_to)))
+        return [
+            __import__("musubi_tuner.minimax_h3.training", fromlist=["H3ModelPrediction"]).H3ModelPrediction(
+                video=call["video_hidden_states"] * torch.ones((), requires_grad=True), audio=None
+            )
+            for call in calls
+        ]
+
+
+def _grouping_trainer(backend):
+    args = _flag_args("--h3_batched_microbatch")
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    trainer.dit_dtype = torch.float32
+    trainer.backend = backend
+    return args, trainer
+
+
+def _long_video_batch(tokens_a: int, tokens_b: int, *, latent_frames=40, lh=32, lw=32):
+    video = torch.randn(2, 4, latent_frames, lh, lw)
+    task_id = H3_CONDITIONING_TASK_IDS["t2va"]
+    return video, {
+        "latents": video,
+        "timesteps": torch.tensor([500.0, 500.0]),
+        H3_TEXT_HIDDEN_KEY: [torch.randn(tokens_a, 8), torch.randn(tokens_b, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(tokens_a, dtype=torch.long), torch.ones(tokens_b, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(task_id), torch.tensor(task_id)],
+    }
+
+
+def test_batched_microbatch_groups_long_sequences_by_exact_text_length():
+    backend = _RecordingBatchedBackend()
+    args, trainer = _grouping_trainer(backend)
+    video, batch = _long_video_batch(4, 2)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        object(),
+        _ToggleNetwork(object()),
+        batch,
+        video,
+        torch.randn_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    assert metrics.get("h3/batched_microbatch") == 1.0
+    # Distinct token counts -> two singleton groups, each padded to its own
+    # length, so neither forward carries padding or an attention mask.
+    assert backend.invocations == [(1, 2), (1, 4)]
+    assert torch.isfinite(loss)
+
+
+def test_batched_microbatch_keeps_one_maskless_group_for_equal_long_texts():
+    backend = _RecordingBatchedBackend()
+    args, trainer = _grouping_trainer(backend)
+    video, batch = _long_video_batch(4, 4)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        object(),
+        _ToggleNetwork(object()),
+        batch,
+        video,
+        torch.randn_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    assert backend.invocations == [(2, 4)]
+    assert torch.isfinite(loss)
+
+
+def test_batched_microbatch_pads_short_sequences_into_one_group():
+    backend = _RecordingBatchedBackend()
+    args, trainer = _grouping_trainer(backend)
+    video = torch.randn(2, 4, 2, 4, 4)
+    task_id = H3_CONDITIONING_TASK_IDS["t2va"]
+    batch = {
+        "latents": video,
+        "timesteps": torch.tensor([500.0, 500.0]),
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8), torch.randn(2, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long), torch.ones(2, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(task_id), torch.tensor(task_id)],
+    }
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        object(),
+        _ToggleNetwork(object()),
+        batch,
+        video,
+        torch.randn_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    assert backend.invocations == [(2, 4)]
+    assert torch.isfinite(loss)
+
+
+def test_batched_microbatch_replays_a_failed_group_item_by_item():
+    backend = _RecordingBatchedBackend(fail_multi=True)
+    args, trainer = _grouping_trainer(backend)
+    video, batch = _long_video_batch(4, 4)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        object(),
+        _ToggleNetwork(object()),
+        batch,
+        video,
+        torch.randn_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    # The 2-item group raises before recording and is replayed as two
+    # single-item forwards; the gradient contract stays exact because the
+    # group never backwarded.
+    assert backend.invocations == [(1, 4), (1, 4)]
+    assert torch.isfinite(loss)
