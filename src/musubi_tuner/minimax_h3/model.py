@@ -683,6 +683,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.offloader = None
         self.layer_streaming = False
         self.int8_attention_mode = "off"
+        self._refiner_cache: tuple[torch.Tensor, int, torch.dtype | None, torch.Tensor] | None = None
 
     @property
     def device(self) -> torch.device:
@@ -1205,6 +1206,33 @@ class MiniMaxH3Transformer(nn.Module):
                 token_tags_have_padding,
             )
 
+    def _refined_text(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        """Reuse the frozen refiner output for unchanged text and autocast state."""
+        autocast_dtype = (
+            torch.get_autocast_dtype(encoder_hidden_states.device.type)
+            if torch.is_autocast_enabled(encoder_hidden_states.device.type)
+            else None
+        )
+        frozen = all(not p.requires_grad for p in self.condition_proj.parameters()) and all(
+            not p.requires_grad for p in self.token_refiner.parameters()
+        )
+        cached = self._refiner_cache
+        if not frozen or encoder_hidden_states.requires_grad:
+            self._refiner_cache = None
+        elif (
+            cached is not None
+            and cached[0] is encoder_hidden_states
+            and cached[1] == encoder_hidden_states._version
+            and cached[2] == autocast_dtype
+        ):
+            return cached[3]
+        text = self.condition_proj(encoder_hidden_states.to(self.condition_proj.weight.dtype))
+        with h3_profile_scope("h3.refiner"):
+            text = self.token_refiner(text, self.gradient_checkpointing)
+        if frozen and not encoder_hidden_states.requires_grad:
+            self._refiner_cache = (encoder_hidden_states, encoder_hidden_states._version, autocast_dtype, text)
+        return text
+
     def _prepare_packed(
         self,
         video_hidden_states: torch.Tensor,
@@ -1240,9 +1268,7 @@ class MiniMaxH3Transformer(nn.Module):
         rotary_emb = self.rope(position_ids)
         video = self.video_patch_proj(video_hidden_states.to(self.video_patch_proj.weight.dtype))
         audio = self.audio_patch_proj(audio_hidden_states.to(self.audio_patch_proj.weight.dtype))
-        text = self.condition_proj(encoder_hidden_states.to(self.condition_proj.weight.dtype))
-        with h3_profile_scope("h3.refiner"):
-            text = self.token_refiner(text, self.gradient_checkpointing)
+        text = self._refined_text(encoder_hidden_states)
 
         hidden_states = text.new_zeros((text.shape[0], sequence_length, text.shape[-1]))
         hidden_states.index_copy_(1, text_indices, text)

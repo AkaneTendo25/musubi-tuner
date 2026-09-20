@@ -1152,3 +1152,96 @@ def test_native_h3_batched_forward_matches_per_item_with_padded_tags():
     loss.backward()
     gradient = model.blocks[0].attn.qkv_proj.weight.grad
     assert gradient is not None and torch.isfinite(gradient).all()
+
+
+def _count_refiner_calls(model: MiniMaxH3Transformer, monkeypatch) -> list:
+    calls = []
+    original = model.token_refiner.forward
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model.token_refiner, "forward", counted)
+    return calls
+
+
+def test_h3_refiner_cache_reuses_identical_text_object(monkeypatch):
+    torch.manual_seed(3)
+    model = MiniMaxH3Transformer(_tiny_config())
+    for param in model.parameters():
+        param.requires_grad_(False)
+    inputs = _tiny_inputs()
+    calls = _count_refiner_calls(model, monkeypatch)
+
+    first = model(**inputs)
+    second = model(**inputs)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(second.video, first.video)
+    torch.testing.assert_close(second.audio, first.audio)
+
+
+def test_h3_refiner_cache_misses_on_new_text_object(monkeypatch):
+    torch.manual_seed(3)
+    model = MiniMaxH3Transformer(_tiny_config())
+    for param in model.parameters():
+        param.requires_grad_(False)
+    inputs = _tiny_inputs()
+    cloned = {**inputs, "encoder_hidden_states": inputs["encoder_hidden_states"].clone()}
+    calls = _count_refiner_calls(model, monkeypatch)
+
+    first = model(**inputs)
+    second = model(**cloned)
+
+    assert len(calls) == 2
+    torch.testing.assert_close(second.video, first.video)
+
+
+def test_h3_refiner_cache_invalidates_on_input_change_and_trainability(monkeypatch):
+    model = MiniMaxH3Transformer(_tiny_config())
+    for param in model.parameters():
+        param.requires_grad_(False)
+    inputs = _tiny_inputs()
+    calls = _count_refiner_calls(model, monkeypatch)
+
+    model(**inputs)
+    inputs["encoder_hidden_states"].add_(1)
+    model(**inputs)
+    assert len(calls) == 2
+
+    model.condition_proj.weight.requires_grad_(True)
+    model(**inputs)
+    model(**inputs)
+    assert len(calls) == 4
+
+    model.condition_proj.weight.requires_grad_(False)
+    model(**inputs)
+    model(**inputs)
+    assert len(calls) == 5
+
+
+def test_h3_refiner_cache_disabled_when_refiner_trainable(monkeypatch):
+    torch.manual_seed(3)
+    model = MiniMaxH3Transformer(_tiny_config())
+    inputs = _tiny_inputs()
+    calls = _count_refiner_calls(model, monkeypatch)
+
+    model(**inputs)
+    model(**inputs)
+
+    assert len(calls) == 2
+
+
+def test_h3_refiner_cache_preserves_backward_graph():
+    torch.manual_seed(3)
+    model = MiniMaxH3Transformer(_tiny_config())
+    inputs = _tiny_inputs()
+    inputs["video_hidden_states"].requires_grad_(True)
+
+    model(**inputs)
+    second = model(**inputs)
+    (second.video.square().mean() + second.audio.square().mean()).backward()
+
+    assert inputs["video_hidden_states"].grad is not None
+    assert torch.isfinite(inputs["video_hidden_states"].grad).all()

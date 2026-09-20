@@ -1295,6 +1295,8 @@ class _PreparedTrainingForward:
 
     kwargs: dict[str, Any]
     decode: Callable[[Any], H3ModelPrediction]
+    # Identify shared text sources before device transfer.
+    text_source: torch.Tensor | None = None
 
 
 class _NativeTrainingBackend:
@@ -1355,6 +1357,18 @@ class _NativeTrainingBackend:
         for arm in arms:
             with (arm.build or nullcontext)():
                 prepared.append(self._prepare_training_forward(transformer, **arm.call))
+        # Reuse one device copy for arms with the same text source.
+        seen_text: dict[tuple, torch.Tensor] = {}
+        for item in prepared:
+            source = item.text_source
+            if source is None:
+                continue
+            key = (source.data_ptr(), tuple(source.shape), tuple(source.stride()), source.dtype, source.device)
+            existing = seen_text.get(key)
+            if existing is None:
+                seen_text[key] = item.kwargs["encoder_hidden_states"]
+            else:
+                item.kwargs["encoder_hidden_states"] = existing
         outputs = fused([(item.kwargs, arm.run) for item, arm in zip(prepared, arms)])
         predictions = []
         for item, output, arm in zip(prepared, outputs, arms):
@@ -2187,6 +2201,7 @@ class _NativeTrainingBackend:
                 "text_indices": layout.text_indices.to(model_device),
             },
             decode=decode,
+            text_source=padded_text_hidden,
         )
 
     def _one_frame_cache(self, batch, *, latent_frames, latent_height, latent_width, patch_size, device, dtype):
