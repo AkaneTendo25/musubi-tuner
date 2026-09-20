@@ -1386,18 +1386,28 @@ class _NativeTrainingBackend:
         if len(prepared) == 1:
             return [prepared[0].decode(transformer(**prepared[0].kwargs))]
         first = prepared[0].kwargs
+        layout_diffs: list[torch.Tensor] = []
         for item_kwargs in (item.kwargs for item in prepared[1:]):
             if set(item_kwargs) != set(first):
                 raise ValueError("H3 batched micro-batch items disagree on the prepared argument set; refusing to stack")
             for key in self._BATCHED_SHARED_KEYS:
-                if not torch.equal(first[key], item_kwargs[key]):
+                expected, actual = first[key], item_kwargs[key]
+                if expected.shape != actual.shape or expected.dtype != actual.dtype or expected.device != actual.device:
                     raise ValueError(f"H3 batched micro-batch items disagree on the shared packed {key}; refusing to stack")
+                layout_diffs.append((expected != actual).any())
             for key in self._BATCHED_STACKED_KEYS:
                 if first[key] is None or item_kwargs[key] is None:
                     if first[key] is not item_kwargs[key]:
                         raise ValueError(f"H3 batched micro-batch items disagree on {key} presence; refusing to stack")
                 elif first[key].shape != item_kwargs[key].shape and key != "encoder_hidden_states":
                     raise ValueError(f"H3 batched micro-batch items disagree on {key} shape; refusing to stack")
+        if layout_diffs and bool(torch.stack(layout_diffs).any()):
+            # One device read for every shared-key comparison; the named key is
+            # recovered on the failure path only.
+            for item_kwargs in (item.kwargs for item in prepared[1:]):
+                for key in self._BATCHED_SHARED_KEYS:
+                    if not torch.equal(first[key], item_kwargs[key]):
+                        raise ValueError(f"H3 batched micro-batch items disagree on the shared packed {key}; refusing to stack")
         merged = dict(first)
         for key in self._BATCHED_STACKED_KEYS:
             parts = [item.kwargs[key] for item in prepared]

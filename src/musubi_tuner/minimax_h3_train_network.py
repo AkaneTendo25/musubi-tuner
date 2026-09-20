@@ -914,29 +914,29 @@ def _step_video_sigma(inputs) -> float:
     return float(sigma.detach().float().reshape(-1).mean().item())
 
 
-def _null_anchor_sigma_active(args, inputs) -> bool:
+def _null_anchor_sigma_active(args, step_sigma: float) -> bool:
     """--h3_guidance_null_anchor_sigma_min: the anchor holds the empty branch only on
     steps at or above this shifted sigma. The base's field is a high-sigma object
     (nearly all of its length sits above sigma 0.8); below that the prompted and
     empty predictions coincide, so anchoring the empty branch there pins the
     prompted one as well, where the data term is teaching texture."""
     sigma_min = float(getattr(args, "h3_guidance_null_anchor_sigma_min", 0.0) or 0.0)
-    return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
+    return sigma_min <= 0.0 or step_sigma >= sigma_min
 
 
-def _dop_sigma_active(args, inputs) -> bool:
+def _dop_sigma_active(args, step_sigma: float) -> bool:
     """--h3_dop_sigma_min: DOP runs only on steps at or above this shifted video
     sigma. The trigger's update lands at high sigma (the base's field lives there);
     below it the bare and triggered predictions coincide and DOP pins texture."""
     sigma_min = float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0)
-    return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
+    return sigma_min <= 0.0 or step_sigma >= sigma_min
 
 
-def _two_teacher_sigma_active(args, inputs) -> bool:
+def _two_teacher_sigma_active(args, step_sigma: float) -> bool:
     """--h3_two_teacher_sigma_min: distil only on steps at or above this shifted
     video sigma."""
     sigma_min = float(getattr(args, "h3_two_teacher_sigma_min", 0.0) or 0.0)
-    return sigma_min <= 0.0 or _step_video_sigma(inputs) >= sigma_min
+    return sigma_min <= 0.0 or step_sigma >= sigma_min
 
 
 def _two_teacher_curriculum(args) -> bool:
@@ -1140,10 +1140,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # own seeded CPU stream once; rank zero's decision is then authoritative.
         # This keeps the CUDA replay untouched without restoring the Bernoulli
         # generator to the same position after every call.
-        active = (torch.rand((), device="cpu", generator=generator) < probability).to(device=device)
+        active = torch.rand((), device="cpu", generator=generator) < probability
         if distributed:
+            active = active.to(device=device)
             torch.distributed.broadcast(active, src=0)
-        return bool(active.item())
+            return bool(active.item())
+        return bool(active)
 
     @staticmethod
     def _sparse_branch_choice(accelerator: Accelerator, weights, generator: torch.Generator | None = None) -> int:
@@ -1163,10 +1165,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if draw < cumulative:
                 index = position
                 break
-        selected = torch.tensor(index, device=accelerator.device)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
+            selected = torch.tensor(index, device=accelerator.device)
             torch.distributed.broadcast(selected, src=0)
-        return int(selected.item())
+            return int(selected.item())
+        return index
 
     def _base_preservation_active(self, accelerator: Accelerator, probability: float) -> bool:
         """Draw one preservation decision shared by every distributed rank.
@@ -3632,9 +3635,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             else:
                 self._adapter_ema_updates += 1
                 effective_decay = min(decay, (1.0 + self._adapter_ema_updates) / (10.0 + self._adapter_ema_updates))
-                for name, parameter in parameters:
-                    shadow = self._adapter_ema[name]
-                    shadow.mul_(effective_decay).add_(parameter.detach().float(), alpha=1.0 - effective_decay)
+                shadows = [self._adapter_ema[name] for name, _ in parameters]
+                values = [parameter.detach().float() for _, parameter in parameters]
+                if shadows:
+                    torch._foreach_mul_(shadows, effective_decay)
+                    torch._foreach_add_(shadows, values, alpha=1.0 - effective_decay)
 
     @contextmanager
     def _adapter_ema_weights(self, accelerator, network):
@@ -6380,11 +6385,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         dop_reference_prediction = None
         teacher_concept_prediction = None
         two_teacher_bare_loss = None
+        # One device read per batch for every sigma gate together; the gates
+        # share the value, so the three checks below cost no further syncs.
+        step_video_sigma = (
+            _step_video_sigma(inputs)
+            if (
+                float(getattr(args, "h3_two_teacher_sigma_min", 0.0) or 0.0) > 0
+                or float(getattr(args, "h3_guidance_null_anchor_sigma_min", 0.0) or 0.0) > 0
+                or float(getattr(args, "h3_dop_sigma_min", 0.0) or 0.0) > 0
+            )
+            else 0.0
+        )
         two_teacher_active = (
             float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
             and self._teacher_network is not None
             and conditioning == "prompt"
-            and _two_teacher_sigma_active(args, inputs)
+            and _two_teacher_sigma_active(args, step_video_sigma)
         )
         if dop_active or two_teacher_active:
             missing_dop = [
@@ -6417,7 +6433,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         null_anchor_active = (
             float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0
             and conditioning == "prompt"
-            and _null_anchor_sigma_active(args, inputs)
+            and _null_anchor_sigma_active(args, step_video_sigma)
             and self._null_anchor_probability_active(accelerator, null_anchor_probability)
         )
         auxiliary_block_swap = (
@@ -6605,7 +6621,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # student is asked to hold at the same state.
                 teacher_concept_prediction = teacher_forward(conditioning, True)
                 teacher_bare_prediction = teacher_forward("dop", False)
-            if dop_active and not _dop_sigma_active(args, inputs):
+            if dop_active and not _dop_sigma_active(args, step_video_sigma):
                 dop_active = False
             if dop_active:
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_dop_loss_weight")

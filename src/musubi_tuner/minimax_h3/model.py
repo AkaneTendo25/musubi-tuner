@@ -22,6 +22,7 @@ Diffusers model APIs and lets Musubi load the Comfy BF16 repack directly.
 from __future__ import annotations
 
 import inspect
+import logging
 import types
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -53,6 +54,8 @@ from musubi_tuner.minimax_h3.triton_kernels import (
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
+
+logger = logging.getLogger(__name__)
 
 MINIMAX_H3_MODALITY_COUNT = 3
 _CUDNN_AUTO_WORK_THRESHOLD = 1 << 28
@@ -265,6 +268,8 @@ class MiniMaxH3AdaLNProjection(nn.Module):
 
 
 class MiniMaxH3Attention(nn.Module):
+    _masked_fallback_warned = False
+
     def __init__(self, hidden_size: int, heads: int, head_dim: int, qk_norm_eps: float, attention_mode: str = "torch"):
         super().__init__()
         if attention_mode not in {"torch", "flash", "flash3", "flash4"}:
@@ -387,6 +392,21 @@ class MiniMaxH3Attention(nn.Module):
             # Padding uses a pairwise mask which FlashAttention cannot express.
             # Keep the exact SDPA path for that rare case instead of changing
             # the packed-sequence semantics.
+            if (
+                attention_mask is not None
+                and not MiniMaxH3Attention._masked_fallback_warned
+                and (
+                    self.block_sparse_config is not None
+                    or self.int8_attention
+                    or self.attention_mode in {"flash", "flash3", "flash4"}
+                )
+            ):
+                MiniMaxH3Attention._masked_fallback_warned = True
+                logger.warning(
+                    "H3 attention: a padding mask bypassed the configured fast attention "
+                    "(mode=%s); this forward runs masked SDPA on every block",
+                    self.attention_mode,
+                )
             query = query.transpose(1, 2)
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
