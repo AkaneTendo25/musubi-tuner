@@ -2559,6 +2559,8 @@ class NetworkTrainer:
                 if dashboard_metrics is not None and accelerator.sync_gradients:
                     step_time = time.perf_counter() - dashboard_step_started_at
                     current_lr = lr_scheduler.get_last_lr()[0]
+                    if isinstance(current_lr, torch.Tensor):
+                        current_lr = float(current_lr)
                     dashboard_metrics.log(
                         step=global_step,
                         epoch=epoch + 1,
