@@ -101,6 +101,23 @@ SS_METADATA_MINIMUM_KEYS = [
 LOSS_FOR_AVERAGE_KEY = "_loss_for_average"
 
 
+def reduce_trainable_gradients(accelerator, parameters) -> None:
+    """Average dense gradients across ranks, grouping compatible tensors."""
+    grads_by_key: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for parameter in parameters:
+        grad = parameter.grad
+        if grad is None:
+            continue
+        if grad.layout != torch.strided:
+            raise ValueError("distributed gradient bucketing requires dense gradients")
+        grads_by_key.setdefault((grad.device, grad.dtype), []).append(grad)
+    for grads in grads_by_key.values():
+        flat = torch._utils._flatten_dense_tensors(grads)
+        reduced = accelerator.reduce(flat, reduction="mean")
+        for grad, reduced_grad in zip(grads, torch._utils._unflatten_dense_tensors(reduced, grads)):
+            grad.copy_(reduced_grad)
+
+
 def check_base_weights_coverage(weight_path: str, weights_sd: dict[str, torch.Tensor], network) -> None:
     """Fail when a ``--base_weights`` file merges into nothing.
 
@@ -2417,9 +2434,7 @@ class NetworkTrainer:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
                         if state.distributed_type != accelerate.DistributedType.NO:
-                            for param in (*network.parameters(), *self.extra_gradient_params()):
-                                if param.grad is not None:
-                                    param.grad = accelerator.reduce(param.grad, reduction="mean")
+                            reduce_trainable_gradients(accelerator, (*network.parameters(), *self.extra_gradient_params()))
 
                         if args.log_grad_metrics and len(accelerator.trackers) > 0:
                             grad_metrics = self.collect_grad_metrics((*network.parameters(), *self.extra_gradient_params()))
