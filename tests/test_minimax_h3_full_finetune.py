@@ -88,7 +88,7 @@ def test_h3_fused_adafactor_hook_steps_and_releases_gradient():
         warmup_init=False,
     )
     args = SimpleNamespace(fused_backward_pass=True, adafactor_triton=False)
-    accelerator = SimpleNamespace(sync_gradients=True)
+    accelerator = SimpleNamespace(sync_gradients=True, num_processes=1)
     before = parameter.detach().clone()
 
     MiniMaxH3Trainer._install_fused_optimizer(args, accelerator, optimizer)
@@ -96,6 +96,33 @@ def test_h3_fused_adafactor_hook_steps_and_releases_gradient():
 
     assert parameter.grad is None
     assert not torch.equal(parameter, before)
+
+
+def test_h3_fused_adafactor_rejects_distributed_before_installing_hooks():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = Adafactor([parameter], lr=1e-2, relative_step=False, scale_parameter=False)
+    args = SimpleNamespace(fused_backward_pass=True, adafactor_triton=False)
+    accelerator = SimpleNamespace(sync_gradients=True, num_processes=2)
+
+    with pytest.raises(ValueError, match="single process"):
+        MiniMaxH3Trainer._install_fused_optimizer(args, accelerator, optimizer)
+    assert not hasattr(optimizer, "step_param")
+
+
+def test_h3_fused_adafactor_waits_for_accumulation_boundary():
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    optimizer = Adafactor([parameter], lr=1e-2, relative_step=False, scale_parameter=False)
+    args = SimpleNamespace(fused_backward_pass=True, adafactor_triton=False)
+    accelerator = SimpleNamespace(sync_gradients=False, num_processes=1)
+    MiniMaxH3Trainer._install_fused_optimizer(args, accelerator, optimizer)
+
+    parameter.square().backward()
+    assert parameter.grad is not None
+    assert parameter.item() == 2.0
+    accelerator.sync_gradients = True
+    parameter.square().backward()
+    assert parameter.grad is None
+    assert parameter.item() != 2.0
 
 
 def test_h3_full_module_streams_native_transformer_checkpoint(tmp_path):

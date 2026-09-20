@@ -301,6 +301,8 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
     def _install_fused_optimizer(args, accelerator, optimizer) -> None:
         if not args.fused_backward_pass:
             return
+        if accelerator.num_processes != 1:
+            raise ValueError("--fused_backward_pass requires a single process; hooks step before distributed gradient reduction")
         if args.adafactor_triton:
             from musubi_tuner.modules.adafactor_triton import patch_adafactor_triton
 
@@ -351,16 +353,6 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Full-parameter BF16 training for MiniMax H3 FL2VA and Ref2VA"
     parser.add_argument("--full_fp16", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--full_bf16", action="store_true", help="train MiniMax H3 weights directly in BF16")
-    parser.add_argument(
-        "--fused_backward_pass",
-        action="store_true",
-        help="step and clear each Adafactor parameter from its post-accumulate gradient hook",
-    )
-    parser.add_argument(
-        "--adafactor_triton",
-        action="store_true",
-        help="use fused Triton Adafactor kernels for supported contiguous 2D BF16 weights",
-    )
     parser.add_argument(
         "--block_swap_trainable_ring",
         action="store_true",

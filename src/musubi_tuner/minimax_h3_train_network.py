@@ -2964,6 +2964,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_swiglu_chunk_rows must be non-negative")
         if args.h3_swiglu_chunk_rows and args.compile:
             raise ValueError("--h3_swiglu_chunk_rows is not supported with --compile")
+        if getattr(args, "fused_backward_pass", False):
+            if args.optimizer_type.lower() != "adafactor":
+                raise ValueError("--fused_backward_pass currently requires --optimizer_type Adafactor")
+            if args.max_grad_norm != 0.0:
+                raise ValueError(
+                    "--fused_backward_pass requires --max_grad_norm 0 so each gradient can be stepped and freed immediately"
+                )
+        if getattr(args, "adafactor_triton", False):
+            if not getattr(args, "fused_backward_pass", False):
+                raise ValueError("--adafactor_triton requires --fused_backward_pass")
+            optimizer_args = {}
+            for item in args.optimizer_args or []:
+                key, separator, value = item.partition("=")
+                if not separator:
+                    raise ValueError(f"invalid --optimizer_args entry {item!r}; expected key=value")
+                optimizer_args[key] = value.lower()
+            if optimizer_args.get("scale_parameter") != "false" or optimizer_args.get("relative_step") != "false":
+                raise ValueError(
+                    "--adafactor_triton requires manual-LR Adafactor arguments: "
+                    "--optimizer_args scale_parameter=False relative_step=False warmup_init=False"
+                )
         if args.h3_lora_token_refiner:
             if not args.network_module.endswith("lora_minimax_h3"):
                 raise ValueError("--h3_lora_token_refiner requires --network_module networks.lora_minimax_h3")
@@ -3570,6 +3591,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def on_train_start(self, args, accelerator, network, transformer, optimizer) -> None:
         super().on_train_start(args, accelerator, network, transformer, optimizer)
+        self._install_fused_optimizer(args, accelerator, optimizer)
         if getattr(args, "h3_fused_elementwise", False) and isinstance(network, torch.nn.Module):
             # The adapters' delta add joins the single-rounding regime for factors that are not
             # powers of two (power-of-two factors already take the fused, bit-identical path).
@@ -3588,6 +3610,37 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         output_path = Path(args.output_dir) / f"{output_name}_profile.txt"
         self._h3_profiler = H3StepProfiler(steps, accelerator.device, output_path)
         self._h3_profiler.start()
+
+    @staticmethod
+    def _install_fused_optimizer(args, accelerator, optimizer) -> None:
+        if not getattr(args, "fused_backward_pass", False):
+            return
+        if accelerator.num_processes != 1:
+            raise ValueError("--fused_backward_pass requires a single process; hooks step before distributed gradient reduction")
+        if getattr(args, "adafactor_triton", False):
+            from musubi_tuner.modules.adafactor_triton import patch_adafactor_triton
+
+            patch_adafactor_triton(optimizer)
+            logger.info("MiniMax H3 LoRA Adafactor uses the Triton 2D BF16 fast path")
+        else:
+            from musubi_tuner.modules.adafactor_fused import patch_adafactor_fused
+
+            patch_adafactor_fused(optimizer)
+            logger.info("MiniMax H3 LoRA Adafactor uses fused per-parameter backward updates")
+
+        def make_hook(parameter: torch.nn.Parameter, param_group: dict):
+            def grad_hook(_tensor: torch.Tensor) -> None:
+                if not accelerator.sync_gradients:
+                    return
+                optimizer.step_param(parameter, param_group)
+                parameter.grad = None
+
+            return grad_hook
+
+        for param_group in optimizer.param_groups:
+            for parameter in param_group["params"]:
+                if parameter.requires_grad:
+                    parameter.register_post_accumulate_grad_hook(make_hook(parameter, param_group))
 
     def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step) -> None:
         super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
@@ -8578,6 +8631,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fused_backward_pass",
+        action="store_true",
+        help="step and free each parameter's gradient inside the backward pass; requires --optimizer_type Adafactor and --max_grad_norm 0",
+    )
+    parser.add_argument(
+        "--adafactor_triton",
+        action="store_true",
+        help="use the Triton 2D BF16 Adafactor fast path; requires --fused_backward_pass and manual-LR optimizer args",
+    )
+    parser.add_argument(
         "--h3_fused_swiglu",
         action="store_true",
         help=(
@@ -8637,7 +8700,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "kernel (SDPA flash/cuDNN/efficient or registered flash-attn ops); a batch that falls back to SDPA's math "
             "backend stops with an error. Requires --gradient_checkpointing; incompatible with "
             "--gradient_checkpointing_cpu_offload, --compile, --h3_int8_attention train, block-sparse attention, "
-            "--block_swap_granularity layer and, for 'qkv', --h3_convrot_int8_lora_fused"
+            "--block_swap_granularity layer and, for 'qkv' or 'adaln', --h3_convrot_int8_lora_fused"
         ),
     )
     parser.add_argument(

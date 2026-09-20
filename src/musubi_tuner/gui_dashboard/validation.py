@@ -917,6 +917,29 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_fused_backward_pass and (t.optimizer_type or "").lower() != "adafactor":
+            errors.append(
+                _make_issue("error", "training.h3_fused_backward_pass", "H3 fused backward requires Adafactor.", page="training")
+            )
+        if t.h3_fused_backward_pass and t.max_grad_norm != 0:
+            errors.append(
+                _make_issue("error", "training.max_grad_norm", "H3 fused backward requires max grad norm 0.", page="training")
+            )
+        if t.h3_fused_backward_pass and (_accelerate_num_processes(t.accelerate_extra_args) or 1) != 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_fused_backward_pass",
+                    "H3 fused backward currently supports one process only.",
+                    page="training",
+                )
+            )
+        if t.h3_adafactor_triton and not t.h3_fused_backward_pass:
+            errors.append(
+                _make_issue(
+                    "error", "training.h3_adafactor_triton", "Triton Adafactor requires H3 fused backward.", page="training"
+                )
+            )
         if t.int8_convrot_base and (t.fp8_base or t.fp8_scaled):
             message = "MiniMax H3 INT8 ConvRot and FP8 base loading are mutually exclusive."
             errors.append(

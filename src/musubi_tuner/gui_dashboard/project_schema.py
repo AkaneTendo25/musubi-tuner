@@ -421,6 +421,8 @@ class TrainingConfig(BaseModel):
     cudnn_attn: bool = False
     sage_attn: bool = False
     xformers: bool = False
+    h3_fused_backward_pass: bool = False
+    h3_adafactor_triton: bool = False
     gemma_load_in_8bit: bool = False
     gemma_load_in_4bit: bool = False
     gemma_bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"

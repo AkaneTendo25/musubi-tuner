@@ -838,6 +838,10 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--learning_rate", str(learning_rate)]
     if t.optimizer_type:
         cmd += ["--optimizer_type", t.optimizer_type]
+    if t.h3_fused_backward_pass:
+        cmd.append("--fused_backward_pass")
+    if t.h3_adafactor_triton:
+        cmd.append("--adafactor_triton")
     if t.optimizer_args:
         cmd += ["--optimizer_args", *_split_cli_args(t.optimizer_args)]
     cmd += ["--lr_scheduler", t.lr_scheduler]
