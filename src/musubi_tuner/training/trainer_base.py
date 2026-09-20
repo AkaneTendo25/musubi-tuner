@@ -298,6 +298,18 @@ class NetworkTrainer:
             optimizer_class = torch.optim.AdamW
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type in {"adamw_optimi", "stableadamw_optimi"}:
+            # optimi's fused/foreach AdamW is typically faster than both the
+            # torch default and bitsandbytes at LoRA scale; the stable variant
+            # also updates in fp32 regardless of the parameter dtype.
+            try:
+                import optimi
+            except ImportError:
+                raise ImportError(f"--optimizer_type {optimizer_type} requires the torch-optimi package (pip install torch-optimi)")
+            optimizer_class = optimi.StableAdamW if optimizer_type == "stableadamw_optimi" else optimi.AdamW
+            logger.info(f"use optimi {optimizer_class.__name__} optimizer | {optimizer_kwargs}")
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         elif optimizer_type in {"automagic3", "automagicv3"}:
             from musubi_tuner.optimizers import Automagic3
 
