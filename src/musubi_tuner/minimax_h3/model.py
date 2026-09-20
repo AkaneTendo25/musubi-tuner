@@ -391,7 +391,10 @@ class MiniMaxH3Attention(nn.Module):
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
             if attention_mask is not None:
-                attention_mask = attention_mask[None, None, :, :]
+                # [S, S] broadcasts over the batch; a [B, S, S] per-item mask
+                # becomes [B, 1, S, S] so each item's isolation applies to its
+                # own queries only.
+                attention_mask = attention_mask[:, None, :, :] if attention_mask.ndim == 3 else attention_mask[None, None, :, :]
             if self.auto_dispatch and _use_cudnn_auto_dispatch(query, key, value, attention_mask):
                 with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
                     hidden_states = F.scaled_dot_product_attention(
@@ -524,12 +527,15 @@ class MiniMaxH3TransformerBlock(nn.Module):
             if fused is not None:
                 return fused
         normalized = norm(hidden_states)
+        # Advanced indexing, not index_select: it gathers with the same values
+        # for the shared [sequence] indices and additionally accepts the
+        # per-item [batch, sequence] indices a layout-homogeneous batch builds.
         if self.fused_elementwise:
             # shift + normalized * (1 + scale) with the product kept in the fp32 accumulator and
             # rounded once: 2 kernels and 6 tensor passes instead of 3 and 8.
-            return torch.addcmul(shift.index_select(0, adaln_indices), normalized, 1.0 + scale.index_select(0, adaln_indices))
-        normalized = normalized * (1.0 + scale.index_select(0, adaln_indices))
-        return normalized + shift.index_select(0, adaln_indices)
+            return torch.addcmul(shift[adaln_indices], normalized, 1.0 + scale[adaln_indices])
+        normalized = normalized * (1.0 + scale[adaln_indices])
+        return normalized + shift[adaln_indices]
 
     def _gated_residual(self, hidden_states: torch.Tensor, gate: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
         if self.fused_elementwise:
@@ -566,14 +572,14 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 else:
                     attention = attn(norm_hidden_states, rotary_emb, attention_mask)
             with h3_profile_scope("h3.gate"):
-                hidden_states = self._gated_residual(hidden_states, gate_attn.index_select(0, adaln_indices), attention)
+                hidden_states = self._gated_residual(hidden_states, gate_attn[adaln_indices], attention)
 
             with h3_profile_scope("h3.norm"):
                 norm_hidden_states = self._norm_and_modulate(self.norm2, hidden_states, shift_mlp, scale_mlp, adaln_indices)
             with h3_profile_scope("h3.mlp"):
                 feed_forward = self.mlp(norm_hidden_states)
             with h3_profile_scope("h3.gate"):
-                return self._gated_residual(hidden_states, gate_mlp.index_select(0, adaln_indices), feed_forward)
+                return self._gated_residual(hidden_states, gate_mlp[adaln_indices], feed_forward)
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -1197,8 +1203,14 @@ class MiniMaxH3Transformer(nn.Module):
         sequence_length = position_ids.shape[0]
         if position_ids.shape != (sequence_length, 3):
             raise ValueError(f"position_ids must have shape (sequence_length, 3), got {tuple(position_ids.shape)}")
-        if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
-            raise ValueError("token_tags and timestep_indices must match the packed sequence length")
+        # timestep_indices stay shared across the batch: layout-homogeneous
+        # items share the step's sigma schedule, so every item's row ``s`` reads
+        # the same modulation entry. token_tags may carry a batch axis -- the
+        # per-item padding that text padded to a common length produces.
+        if timestep_indices.shape != (sequence_length,):
+            raise ValueError(f"H3 timestep_indices must have shape (sequence,), got {tuple(timestep_indices.shape)}")
+        if token_tags.ndim not in (1, 2) or token_tags.shape[-1] != sequence_length:
+            raise ValueError(f"H3 token_tags must have shape (sequence,) or (batch, sequence), got {tuple(token_tags.shape)}")
 
         # A pairwise attention mask forces every block onto the dense path, so
         # the plan the refresh builds could never be consulted; skip its host
@@ -1226,13 +1238,26 @@ class MiniMaxH3Transformer(nn.Module):
         # A caller-supplied topology narrows attention further; the padding mask
         # is always applied on top so a custom mask cannot re-expose padding.
         # ``True`` means the pair may attend, matching SDPA's boolean contract.
+        # A batched key-validity mask [batch, 1, S] is also accepted: padded rows
+        # are hidden as keys, their query outputs are garbage but every consumer
+        # reads only the media indices, so key-side validity is the whole
+        # requirement -- and it costs O(S) memory against the pairwise form's
+        # O(S^2), which on long packed sequences dominates the attention call.
         if attention_mask is not None:
             if attention_mask.dtype is not torch.bool:
                 raise ValueError(f"H3 attention mask must be boolean, got {attention_mask.dtype}")
-            if attention_mask.shape != (sequence_length, sequence_length):
-                raise ValueError(
-                    f"H3 attention mask must be [{sequence_length}, {sequence_length}], got {tuple(attention_mask.shape)}"
+            mask_batch = token_tags.shape[0] if token_tags.ndim == 2 else 1
+            allowed_shapes = (
+                (
+                    (sequence_length, sequence_length),
+                    (mask_batch, sequence_length, sequence_length),
+                    (mask_batch, 1, sequence_length),
                 )
+                if mask_batch > 1
+                else ((sequence_length, sequence_length),)
+            )
+            if attention_mask.shape not in allowed_shapes:
+                raise ValueError(f"H3 attention mask must be one of {allowed_shapes}, got {tuple(attention_mask.shape)}")
             attention_mask = attention_mask.to(device=hidden_states.device)
         if token_tags_have_padding is None:
             # No host-side knowledge of the tags: read the predicate from the
@@ -1243,7 +1268,12 @@ class MiniMaxH3Transformer(nn.Module):
         else:
             has_padding = token_tags_have_padding
         if has_padding:
-            padding_mask = is_padding[None, :] == is_padding[:, None]
+            if is_padding.ndim == 2:
+                # Key-side validity per item: padded rows cannot be attended to;
+                # their own outputs are discarded by every decoder downstream.
+                padding_mask = ~is_padding[:, None, :]
+            else:
+                padding_mask = is_padding[None, :] == is_padding[:, None]
             attention_mask = padding_mask if attention_mask is None else attention_mask & padding_mask
 
         return MiniMaxH3PackedState(

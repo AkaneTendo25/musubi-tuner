@@ -5712,6 +5712,200 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return batch[H3_AUDIO_LATENTS_KEY]
         raise KeyError("MiniMax H3 cache contains neither video nor audio target latents")
 
+    def _try_batched_plain_step(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+        batch: dict[str, torch.Tensor],
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        noise_scheduler,
+        dit_dtype: torch.dtype,
+        global_step: int,
+    ) -> tuple[torch.Tensor, dict[str, float]] | None:
+        """Run one plain data step for the whole batch through a single forward.
+
+        Returns ``None`` whenever anything about the step deviates from the
+        plain objective -- an auxiliary branch active, caption dropout, a drawn
+        per-frame sigma jitter, a teacher or CREPA install -- and the caller
+        falls back to the per-item loop, which keeps every one of those paths
+        exactly as it is. Structural incompatibilities (heterogeneous packed
+        layouts) surface as ``ValueError`` from the backend and fall back too.
+        The returned loss is live: the base loop's ``backward_loss`` runs it.
+        """
+        del global_step
+        del network
+        batch_size = int(latents.shape[0])
+        if batch_size < 2 or not getattr(args, "h3_batched_microbatch", False):
+            return None
+        batched = getattr(self.backend, "predict_training_batched", None)
+        if not callable(batched):
+            return None
+        if (
+            args.h3_guidance_distillation_scale is not None
+            or float(args.h3_base_preservation_loss_weight) > 0
+            or float(args.h3_dop_loss_weight) > 0
+            or float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
+            or bool(getattr(args, "h3_rollout_supervision", False))
+            or float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0
+            or self._crepa is not None
+            or self._teacher_network is not None
+            or float(getattr(args, "h3_qwen_control_dropout_rate", 0.0)) > 0
+            or args.h3_observed_modality is not None
+            or args.h3_caption_dropout_rate > 0
+            or self._frame_sigma_jitter > 0
+            or bool(getattr(self, "_adapter_prompt_only", False))
+        ):
+            return None
+        has_video = "latents" in batch or latents.ndim == 5
+        has_audio = H3_AUDIO_LATENTS_KEY in batch
+        if not has_video:
+            return None
+        del has_audio
+
+        items = []
+        for index in range(batch_size):
+            item_batch = self._slice_batch_item(batch, index, batch_size)
+            video_latents = item_batch.get("latents", latents[index : index + 1] if latents.ndim == 5 else None)
+            if video_latents is None:
+                return None
+            video_latents = video_latents.to(device=accelerator.device, dtype=dit_dtype)
+            audio_latents = (
+                item_batch[H3_AUDIO_LATENTS_KEY].to(device=accelerator.device, dtype=dit_dtype)
+                if H3_AUDIO_LATENTS_KEY in item_batch
+                else None
+            )
+            if index and (
+                video_latents.shape != items[0][1].shape
+                or (audio_latents is None) != (items[0][2] is None)
+                or (audio_latents is not None and audio_latents.shape != items[0][2].shape)
+            ):
+                return None
+            video_noise = noise[index : index + 1].to(device=accelerator.device, dtype=dit_dtype)
+            audio_noise = torch.randn_like(audio_latents) if audio_latents is not None else None
+            items.append((item_batch, video_latents, audio_latents, video_noise, audio_noise))
+
+        first_batch, first_video, first_audio, first_video_noise, first_audio_noise = items[0]
+        _require_one_frame_opt_in(args, first_batch, first_video)
+        is_image = first_video.shape[2] == 1
+        scheduler_args = args
+        if is_image:
+            scheduler_args = copy.copy(args)
+            if args.h3_image_flow_shift is None:
+                scheduler_args.timestep_sampling = "krea2_shift"
+            else:
+                scheduler_args.timestep_sampling = "shift"
+                scheduler_args.discrete_flow_shift = args.h3_image_flow_shift
+        _, scheduler_timesteps = super().get_noisy_model_input_and_timesteps(
+            scheduler_args,
+            first_video_noise,
+            first_video,
+            first_batch["timesteps"],
+            noise_scheduler,
+            accelerator.device,
+            dit_dtype,
+            return_noisy=False,
+        )
+        # One sigma for the whole micro-batch, exactly the diffusion-pipe
+        # practice: the marginal distribution is unchanged, only correlated
+        # within the batch -- which a shared modulation table requires anyway.
+        base_sigma = self._base_sigma(scheduler_args, noise_scheduler, scheduler_timesteps, accelerator.device)
+
+        inputs_items = []
+        for item_batch, video_latents, audio_latents, video_noise, audio_noise in items:
+            inputs_items.append(
+                prepare_joint_noisy_inputs(
+                    video_latents,
+                    audio_latents,
+                    video_noise,
+                    audio_noise,
+                    base_sigma,
+                    video_shift=1.0 if is_image else args.h3_shift_video,
+                    audio_shift=1.0 if is_image else args.h3_shift_audio,
+                )
+            )
+        # The step-shared conditioning state is drawn once, from the first
+        # item's inputs, so every item in the batch sees the same anchors,
+        # mask and presentation the per-item path would have drawn once anyway.
+        self._step_reference_modality = "av"
+        self._step_spatial_density_scale = self._draw_spatial_density_scale()
+        self._step_recipe = self._draw_step_recipe(accelerator, args)
+        self._step_row_video_timestep = None
+        self._step_qwen_control_dropout = False
+        first_inputs = inputs_items[0]
+        self._step_mask = self._draw_step_mask(first_inputs, tuple(VIDEO_DIT_PATCH_SIZE), batch)
+        self._step_keyframes = self._resolve_keyframe_anchors(first_inputs.video)
+        self._step_guides = self._resolve_guide_specs(first_inputs.video, first_inputs.audio)
+
+        calls = []
+        token_counts = []
+        for (item_batch, *_), inputs in zip(items, inputs_items, strict=True):
+            calls.append(self._predict_call(accelerator, item_batch, inputs, conditioning="prompt"))
+            tags = item_batch[H3_TEXT_TOKEN_TAGS_KEY]
+            tags = tags[0] if isinstance(tags, (list, tuple)) else tags
+            token_counts.append(int(tags.numel()))
+
+        try:
+            with accelerator.autocast(), h3_profile_scope("h3.forward.batched"):
+                predictions = batched(transformer, calls, max(token_counts))
+        except ValueError as error:
+            if not getattr(self, "_batched_layout_fallback_warned", False):
+                logger.warning("H3 batched micro-batch fell back to the per-item loop: %s", error)
+                self._batched_layout_fallback_warned = True
+            return None
+
+        video_weight = args.h3_video_loss_weight
+        audio_weight = args.h3_audio_loss_weight
+        video_sample_weight = self._sample_weight(args, first_inputs.video_sigma) if has_video else None
+        audio_sample_weight = (
+            self._sample_weight(args, first_inputs.audio_sigma, modality="audio") if first_inputs.audio is not None else None
+        )
+        losses: list[torch.Tensor] = []
+        item_metrics: list[dict[str, float]] = []
+        for prediction, inputs, (item_batch, *_), call in zip(predictions, inputs_items, items, calls, strict=True):
+            effective_video_mask = self._mask_to_loss(
+                self._extension_masked(
+                    item_batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3
+                ),
+                inputs.video_target,
+                None if self._step_mask is None else self._step_mask.video_latent,
+                axis=-3,
+            )
+            effective_audio_mask = self._mask_to_loss(
+                self._extension_masked(
+                    item_batch.get("audio_loss_mask"), inputs.audio_target, self._active_extension_audio_latents, axis=-1
+                ),
+                inputs.audio_target,
+                None if self._step_mask is None else self._step_mask.audio_latent,
+                axis=-1,
+            )
+            result = joint_velocity_loss(
+                prediction,
+                inputs,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+            losses.append(result.loss / batch_size)
+            item_metrics.append(
+                {
+                    "loss/video": float(result.video_loss.detach()),
+                    "loss/audio": float(result.audio_loss.detach()),
+                    "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
+                    "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()) if inputs.audio_sigma is not None else 0.0,
+                }
+            )
+        metrics = self._average_batch_metrics(item_metrics)
+        metrics["h3/batched_microbatch"] = 1.0
+        return torch.stack(losses).sum(), metrics
+
     def process_batch(
         self,
         args: argparse.Namespace,
@@ -5787,6 +5981,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 qwen_control_dropout_override=qwen_control_dropout,
                 rollout_active_override=rollout_active,
             )
+
+        # One shared forward for the whole batch when the step is the plain
+        # data objective and the items pack onto one layout; anything else
+        # falls through to the per-item loop below. The returned loss is live,
+        # so backward_loss drives it in one call.
+        batched = self._try_batched_plain_step(
+            args, accelerator, transformer, network, batch, latents, noise, noise_scheduler, dit_dtype, global_step
+        )
+        if batched is not None:
+            self._batch_backward_performed = False
+            return batched
 
         # The released H3 transformer accepts one shared packed layout, while
         # prompts, references and task presentations are variable-length. Run
@@ -7449,6 +7654,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "perturb the area normalization of the spatial RoPE grids by up to this fraction each step, drawn "
             "log-uniformly from [1/(1+j), 1+j], so fixed-resolution data still trains a range of token spacings. "
             "0 disables it"
+        ),
+    )
+    parser.add_argument(
+        "--h3_batched_microbatch",
+        action="store_true",
+        help=(
+            "run the plain data objective for a multi-item batch through one shared forward, with each item's text padded "
+            "to the batch maximum and the pad rows attention-masked. Best for image datasets with a per-dataset batch size "
+            "above 1 (about five times faster per step); any non-plain step or layout-heterogeneous batch uses the "
+            "ordinary per-item loop"
         ),
     )
     parser.add_argument(

@@ -898,6 +898,14 @@ CPU loading leaves the GPU idle; `--persistent_data_loader_workers` avoids resta
 `--dataloader_prefetch_factor N` controls queued batches per worker. `--dataloader_pin_memory` enables pinned batch buffers and
 non-blocking device copies, but consumes locked host RAM.
 
+**`--h3_batched_microbatch`.** Run the plain data objective for a multi-item batch through one shared forward: each
+item's text block is padded to the batch maximum (pad rows are attention-masked and excluded from every loss), the packed
+rows are stacked on the batch axis, and the per-item losses average into one backward. The per-dataset `batch_size` is the
+micro-batch size. Best for image datasets, where it is several times faster per optimizer step; on long video batches the
+text-padding mask leaves SDPA's flash backend and the shared forward is slower than the per-item loop, so keep the flag off
+there. Steps that are not the plain objective (auxiliary branches, caption dropout, per-frame sigma jitter) and batches with
+incompatible packed layouts automatically use the ordinary per-item loop.
+
 ### Training modes
 
 Extension, keyframes, and masking add or pin conditioning rows. Keyframes, masking, and `per_row_sigma` extension also combine

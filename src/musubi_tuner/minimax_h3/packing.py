@@ -240,6 +240,7 @@ def build_t2va_packed_sequence(
     spatial_density_scale: float = 1.0,
     one_frame_target_index: int | None = None,
     one_frame_control_indices: tuple[int, ...] | None = None,
+    pad_text_rows_to: int | None = None,
 ) -> MiniMaxH3PackedSequence:
     """Build FL2VA's ``[text | keyframes | condition audio | target audio | target video]`` layout.
 
@@ -262,6 +263,10 @@ def build_t2va_packed_sequence(
         raise ValueError("H3 text token tags must be a non-empty one-dimensional tensor")
     if bool(((text_token_tags < 0) | (text_token_tags > int(MiniMaxH3TokenTag.AUDIO))).any()):
         raise ValueError("H3 text token tags must be valid video, text, or audio modality tags")
+    if pad_text_rows_to is not None and (
+        isinstance(pad_text_rows_to, bool) or not isinstance(pad_text_rows_to, int) or pad_text_rows_to < 0
+    ):
+        raise ValueError("H3 text row padding target must be a non-negative integer")
     patch_t, patch_h, patch_w = patch_size
     if patch_t != 1:
         raise ValueError(f"the released H3 transformer requires temporal patch size 1, got {patch_t}")
@@ -280,7 +285,12 @@ def build_t2va_packed_sequence(
     density_scale = _validated_density_scale(spatial_density_scale)
 
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
-    num_text_rows = int(text_token_tags.shape[0])
+    # A batched micro-batch pads every item's text block to one common length so
+    # the packed indices and the media temporal anchor (which follows
+    # num_text_rows) are shared across items; the pad rows carry tag -1, are
+    # hidden by the transformer's padding mask, and never reach a loss.
+    true_text_rows = int(text_token_tags.shape[0])
+    num_text_rows = true_text_rows if pad_text_rows_to is None else max(true_text_rows, int(pad_text_rows_to))
     # "first" and an explicit index 0 name the same coordinate, so they collide;
     # "last" names the final pixel frame and never collides with an index.
     if one_frame_target_index is not None:
@@ -334,7 +344,8 @@ def build_t2va_packed_sequence(
     audio_indices = torch.arange(audio_start, video_start)
     video_indices = torch.cat((torch.arange(condition_start, audio_start), torch.arange(video_start, sequence_length)))
     token_tags = torch.empty(sequence_length, dtype=torch.long)
-    token_tags[text_indices] = text_token_tags.to(device="cpu", dtype=torch.long)
+    token_tags[:true_text_rows] = text_token_tags.to(device="cpu", dtype=torch.long)
+    token_tags[true_text_rows:num_text_rows] = -1
     token_tags[audio_indices] = int(MiniMaxH3TokenTag.AUDIO)
     token_tags[video_indices] = int(MiniMaxH3TokenTag.VIDEO)
 
@@ -406,6 +417,7 @@ def build_ref2va_packed_sequence(
     guides: tuple[MiniMaxH3GuideGeometry, ...] = (),
     spatial_density_scale: float = 1.0,
     one_frame_target_index: int | None = None,
+    pad_text_rows_to: int | None = None,
 ) -> MiniMaxH3PackedSequence:
     """Build ``[text | references | guides | target audio | target video]``.
 
@@ -415,6 +427,10 @@ def build_ref2va_packed_sequence(
     """
     if text_token_tags.ndim != 1 or text_token_tags.numel() == 0:
         raise ValueError("H3 Ref2VA text token tags must be a non-empty vector")
+    if pad_text_rows_to is not None and (
+        isinstance(pad_text_rows_to, bool) or not isinstance(pad_text_rows_to, int) or pad_text_rows_to < 0
+    ):
+        raise ValueError("H3 text row padding target must be a non-negative integer")
     patch_t, patch_h, patch_w = patch_size
     if patch_t != 1:
         raise ValueError(f"the released H3 transformer requires temporal patch size 1, got {patch_t}")
@@ -501,7 +517,10 @@ def build_ref2va_packed_sequence(
             raise ValueError("H3 guide frame indices must be unique")
         guide_starts.add(guide.frame_index)
 
-    num_text_rows = int(text_token_tags.numel())
+    # See build_t2va_packed_sequence: pad rows carry tag -1, are masked from
+    # attention, and shift the media anchor to the common padded length.
+    true_text_rows = int(text_token_tags.numel())
+    num_text_rows = true_text_rows if pad_text_rows_to is None else max(true_text_rows, int(pad_text_rows_to))
     num_reference_video_rows = sum(reference.num_video_rows(patch_size) for reference in references)
     num_reference_audio_rows = sum(reference.num_audio_rows for reference in references)
     rows_per_target_frame = (latent_height // patch_h) * (latent_width // patch_w)
@@ -621,7 +640,8 @@ def build_ref2va_packed_sequence(
     packed_audio_indices = torch.cat(audio_indices)
     text_indices = torch.arange(num_text_rows)
     token_tags = torch.empty(sequence_length, dtype=torch.long)
-    token_tags[text_indices] = text_token_tags.to(device="cpu", dtype=torch.long)
+    token_tags[:true_text_rows] = text_token_tags.to(device="cpu", dtype=torch.long)
+    token_tags[true_text_rows:num_text_rows] = -1
     token_tags[packed_audio_indices] = int(MiniMaxH3TokenTag.AUDIO)
     token_tags[packed_video_indices] = int(MiniMaxH3TokenTag.VIDEO)
     return MiniMaxH3PackedSequence(

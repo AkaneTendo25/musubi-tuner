@@ -1362,6 +1362,64 @@ class _NativeTrainingBackend:
                 predictions.append(item.decode(output))
         return predictions
 
+    _BATCHED_STACKED_KEYS = ("video_hidden_states", "audio_hidden_states", "encoder_hidden_states", "token_tags")
+    _BATCHED_SHARED_KEYS = ("timestep", "timestep_indices", "position_ids", "video_indices", "audio_indices", "text_indices")
+
+    def predict_training_batched(
+        self, transformer: torch.nn.Module, calls: Sequence[dict], text_rows_padded_to: int
+    ) -> list[H3ModelPrediction]:
+        """One transformer pass over several layout-homogeneous training forwards.
+
+        ``calls`` are exactly the keyword dictionaries :meth:`predict_training`
+        accepts, one per item. Every item's text block is padded to
+        ``text_rows_padded_to`` (the batch maximum), which makes the packed
+        indices, the position grid, and the timestep rows identical across
+        items; anything that still disagrees raises instead of silently
+        stacking incompatible layouts. Each returned prediction carries the
+        graph of the one shared forward, sliced per item.
+        """
+        if not calls:
+            return []
+        prepared = [
+            self._prepare_training_forward(transformer, **call, text_rows_padded_to=int(text_rows_padded_to)) for call in calls
+        ]
+        if len(prepared) == 1:
+            return [prepared[0].decode(transformer(**prepared[0].kwargs))]
+        first = prepared[0].kwargs
+        for item_kwargs in (item.kwargs for item in prepared[1:]):
+            if set(item_kwargs) != set(first):
+                raise ValueError("H3 batched micro-batch items disagree on the prepared argument set; refusing to stack")
+            for key in self._BATCHED_SHARED_KEYS:
+                if not torch.equal(first[key], item_kwargs[key]):
+                    raise ValueError(f"H3 batched micro-batch items disagree on the shared packed {key}; refusing to stack")
+            for key in self._BATCHED_STACKED_KEYS:
+                if first[key] is None or item_kwargs[key] is None:
+                    if first[key] is not item_kwargs[key]:
+                        raise ValueError(f"H3 batched micro-batch items disagree on {key} presence; refusing to stack")
+                elif first[key].shape != item_kwargs[key].shape and key != "encoder_hidden_states":
+                    raise ValueError(f"H3 batched micro-batch items disagree on {key} shape; refusing to stack")
+        merged = dict(first)
+        for key in self._BATCHED_STACKED_KEYS:
+            parts = [item.kwargs[key] for item in prepared]
+            if any(part is None for part in parts):
+                merged[key] = None
+                continue
+            if key == "token_tags":
+                merged[key] = torch.stack(parts)
+            else:
+                merged[key] = torch.cat(parts)
+        merged["token_tags_have_padding"] = any(item.kwargs["token_tags_have_padding"] for item in prepared)
+        output = transformer(**merged)
+        prediction = prepared[0].decode(output)
+        predictions = []
+        for index in range(len(prepared)):
+            # Keep each item's leading batch dimension of 1: consumers downstream
+            # (per-item losses, targets) are shaped like a solo prediction.
+            video = prediction.video[index : index + 1] if prediction.video is not None else None
+            audio = prediction.audio[index : index + 1] if prediction.audio is not None else None
+            predictions.append(H3ModelPrediction(video=video, audio=audio))
+        return predictions
+
     def _prepare_training_forward(
         self,
         transformer: torch.nn.Module,
@@ -1389,6 +1447,7 @@ class _NativeTrainingBackend:
         observed_audio_rows: torch.Tensor | None = None,
         clean_video_latents: torch.Tensor | None = None,
         clean_audio_latents: torch.Tensor | None = None,
+        text_rows_padded_to: int | None = None,
     ) -> _PreparedTrainingForward:
         present = video_hidden_states if video_hidden_states is not None else audio_hidden_states
         if present is None:
@@ -1698,6 +1757,7 @@ class _NativeTrainingBackend:
                 latent_height=latent_height,
                 latent_width=latent_width,
                 num_audio_latents=num_audio_latents,
+                pad_text_rows_to=text_rows_padded_to,
                 patch_size=patch_size,
                 keyframe_anchors=condition_video_anchors,
                 guides=guide_geometries,
@@ -1860,6 +1920,7 @@ class _NativeTrainingBackend:
                 latent_height=latent_height,
                 latent_width=latent_width,
                 num_audio_latents=num_audio_latents,
+                pad_text_rows_to=text_rows_padded_to,
                 patch_size=patch_size,
                 keyframe_anchors=anchors,
                 spatial_density_scale=spatial_density_scale,
@@ -1949,6 +2010,7 @@ class _NativeTrainingBackend:
                 latent_height=latent_height,
                 latent_width=latent_width,
                 num_audio_latents=num_audio_latents,
+                pad_text_rows_to=text_rows_padded_to,
                 patch_size=patch_size,
                 keyframe_anchors=anchors if duplicate_context else (),
                 num_condition_audio_latents=extension_audio_latents if duplicate_context else 0,
@@ -2082,17 +2144,32 @@ class _NativeTrainingBackend:
             )
             return H3ModelPrediction(video=video, audio=audio)
 
+        padded_text_hidden = text_hidden
+        if text_rows_padded_to is not None:
+            pad_target = int(text_rows_padded_to)
+            token_count = padded_text_hidden.shape[1]
+            if pad_target < token_count:
+                raise ValueError(
+                    f"H3 text padding target {pad_target} is below the item's {token_count} text tokens; "
+                    "a micro-batch must pad to the batch maximum"
+                )
+            if pad_target > token_count:
+                filler = padded_text_hidden.new_zeros(
+                    (padded_text_hidden.shape[0], pad_target - token_count, padded_text_hidden.shape[-1])
+                )
+                padded_text_hidden = torch.cat((padded_text_hidden, filler), dim=1)
         return _PreparedTrainingForward(
             kwargs={
                 "video_hidden_states": video_rows,
                 "audio_hidden_states": audio_rows,
-                "encoder_hidden_states": text_hidden.to(model_device),
+                "encoder_hidden_states": padded_text_hidden.to(model_device),
                 "timestep": timestep.to(model_device),
                 "timestep_indices": timestep_indices.to(model_device),
                 "token_tags": layout.token_tags.to(model_device),
                 # Resolved from the packer's CPU-side tags so ``_prepare`` does
                 # not pay a device round-trip for a predicate the host already
-                # knows (the packer itself never emits negative tags).
+                # knows; with text padding active it is True exactly for the
+                # items whose prompt fell short of the batch maximum.
                 "token_tags_have_padding": bool((layout.token_tags < 0).any()),
                 "position_ids": layout.position_ids.to(model_device),
                 "video_indices": layout.video_indices.to(model_device),

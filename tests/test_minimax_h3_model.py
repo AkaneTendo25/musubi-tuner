@@ -1084,7 +1084,7 @@ def test_h3_attention_mask_cannot_re_expose_padding():
     ("mask", "message"),
     [
         (torch.ones(9, 9, dtype=torch.float32), "boolean"),
-        (torch.ones(4, 4, dtype=torch.bool), r"\[9, 9\]"),
+        (torch.ones(4, 4, dtype=torch.bool), r"one of \(\(9, 9\),\)"),
     ],
 )
 def test_h3_attention_mask_is_validated(mask, message):
@@ -1092,3 +1092,63 @@ def test_h3_attention_mask_is_validated(mask, message):
 
     with pytest.raises(ValueError, match=message):
         model(**_tiny_inputs(), attention_mask=mask)
+
+
+def test_native_h3_batched_forward_matches_per_item_with_padded_tags():
+    torch.manual_seed(2)
+    model = MiniMaxH3Transformer(_tiny_config())
+    template = _tiny_inputs()
+
+    def item_inputs(seed: int, tags: torch.Tensor) -> dict:
+        generator = torch.Generator().manual_seed(seed)
+        return {
+            "video_hidden_states": torch.randn(1, 2, 16, generator=generator),
+            "audio_hidden_states": torch.randn(1, 4, 8, generator=generator),
+            "encoder_hidden_states": torch.randn(1, 3, 12, generator=generator),
+            "timestep": template["timestep"],
+            "timestep_indices": template["timestep_indices"],
+            "token_tags": tags,
+            "token_tags_have_padding": bool((tags < 0).any()),
+            "position_ids": template["position_ids"],
+            "video_indices": template["video_indices"],
+            "audio_indices": template["audio_indices"],
+            "text_indices": template["text_indices"],
+        }
+
+    tags_a = template["token_tags"]
+    tags_b = template["token_tags"].clone()
+    tags_b[2] = -1
+    solo_a = model(**item_inputs(11, tags_a))
+    solo_b = model(**item_inputs(22, tags_b))
+
+    a, b = item_inputs(11, tags_a), item_inputs(22, tags_b)
+    batched = {
+        "video_hidden_states": torch.cat([a["video_hidden_states"], b["video_hidden_states"]]),
+        "audio_hidden_states": torch.cat([a["audio_hidden_states"], b["audio_hidden_states"]]),
+        "encoder_hidden_states": torch.cat([a["encoder_hidden_states"], b["encoder_hidden_states"]]),
+        "timestep": template["timestep"],
+        "timestep_indices": template["timestep_indices"],
+        "token_tags": torch.stack([tags_a, tags_b]),
+        "token_tags_have_padding": True,
+        "position_ids": template["position_ids"],
+        "video_indices": template["video_indices"],
+        "audio_indices": template["audio_indices"],
+        "text_indices": template["text_indices"],
+    }
+    batched_out = model(**batched)
+
+    assert batched_out.video.shape == (2, 2, 16)
+    assert batched_out.audio.shape == (2, 4, 8)
+    # The unpadded item sees exactly its solo attention (all its own rows); the
+    # padded item's real rows see only real rows, matching its solo padding mask.
+    torch.testing.assert_close(batched_out.video[0], solo_a.video[0])
+    torch.testing.assert_close(batched_out.audio[0], solo_a.audio[0])
+    torch.testing.assert_close(batched_out.video[1], solo_b.video[0])
+    torch.testing.assert_close(batched_out.audio[1], solo_b.audio[0])
+
+    # The batched path backpropagates into every item's media tokens.
+    model.zero_grad(set_to_none=True)
+    loss = batched_out.video.square().mean() + batched_out.audio.square().mean()
+    loss.backward()
+    gradient = model.blocks[0].attn.qkv_proj.weight.grad
+    assert gradient is not None and torch.isfinite(gradient).all()

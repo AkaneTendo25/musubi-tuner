@@ -7816,3 +7816,167 @@ def test_h3_two_teacher_weights_alone_are_rejected():
     args.h3_two_teacher_weights = "teacher.safetensors"
     with pytest.raises(ValueError, match="requires --h3_two_teacher_loss_weight"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_native_h3_backend_batches_layout_homogeneous_items():
+    torch.manual_seed(3)
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer)
+
+    def item(seed: int, tokens: int):
+        generator = torch.Generator().manual_seed(seed)
+        video = torch.randn(1, 4, 2, 4, 4, generator=generator)
+        audio = torch.randn(1, 2, 6, 3, generator=generator)
+        inputs = prepare_joint_noisy_inputs(video, audio, torch.randn_like(video), torch.randn_like(audio), torch.tensor([0.6]))
+        batch = {
+            H3_TEXT_HIDDEN_KEY: [torch.randn(tokens, 8, generator=generator)],
+            H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(tokens, dtype=torch.long)],
+            H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+        }
+        return {
+            "batch": batch,
+            "video_hidden_states": inputs.video,
+            "audio_hidden_states": inputs.audio,
+            "video_timestep": inputs.video_timestep,
+            "audio_timestep": inputs.audio_timestep,
+        }, inputs
+
+    call_a, _ = item(101, tokens=4)
+    call_b, _ = item(202, tokens=2)
+    solo_a = backend.predict_training(transformer, **call_a)
+
+    batched = backend.predict_training_batched(transformer, [call_a, call_b], text_rows_padded_to=4)
+    assert len(batched) == 2
+    assert batched[0].video.shape == (1, 4, 2, 4, 4)
+    assert batched[1].audio.shape == (1, 2, 6, 3)
+
+    # The unpadded item keeps its exact solo layout, so the shared forward
+    # matches its solo prediction to float32 ulps (a different batch shape
+    # re-blocks the CPU matmuls, so bitwise equality across shapes does not
+    # exist even deterministically).
+    torch.testing.assert_close(batched[0].video, solo_a.video, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(batched[0].audio, solo_a.audio, rtol=1e-5, atol=1e-6)
+
+    # No cross-item leakage: changing item A's values cannot move item B's rows.
+    call_a_noise, _ = item(303, tokens=4)
+    batched_again = backend.predict_training_batched(transformer, [call_a_noise, call_b], text_rows_padded_to=4)
+    torch.testing.assert_close(batched_again[1].video, batched[1].video, rtol=0, atol=0)
+    torch.testing.assert_close(batched_again[1].audio, batched[1].audio, rtol=0, atol=0)
+
+    # Incompatible layouts are rejected instead of silently stacked.
+    call_c, _ = item(404, tokens=3)
+    with pytest.raises(ValueError, match="refusing to stack"):
+        # Different latent geometry -> different video row count vs call_a.
+        call_c["video_hidden_states"] = torch.randn(1, 4, 2, 4, 6)
+        backend.predict_training_batched(transformer, [call_a, call_c], text_rows_padded_to=4)
+
+    # Both items' predictions carry the shared forward's graph.
+    transformer.zero_grad(set_to_none=True)
+    (batched[0].video.square().mean() + batched[1].audio.square().mean()).backward()
+    assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
+    assert torch.isfinite(transformer.blocks[0].attn.qkv_proj.weight.grad).all()
+
+
+def _flag_args(*extra):
+    argv = ["--sdpa"]
+    for value in extra:
+        argv.append(str(value))
+    return create_parser().parse_args(argv)
+
+
+def test_batched_microbatch_shares_one_forward_and_falls_back():
+    torch.manual_seed(4)
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer)
+    video = torch.randn(2, 4, 2, 4, 4)
+    audio = torch.randn(2, 2, 6, 3)
+    task_id = H3_CONDITIONING_TASK_IDS["t2va"]
+    batch = {
+        "latents": video,
+        H3_AUDIO_LATENTS_KEY: audio,
+        "timesteps": torch.tensor([500.0, 500.0]),
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8), torch.randn(2, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long), torch.ones(2, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(task_id), torch.tensor(task_id)],
+    }
+    forward_calls = 0
+    original_forward = transformer.forward
+
+    def counting_forward(*args, **kwargs):
+        nonlocal forward_calls
+        forward_calls += 1
+        return original_forward(*args, **kwargs)
+
+    transformer.forward = counting_forward
+
+    def run(*flags):
+        args = _flag_args("--h3_batched_microbatch", *flags)
+        trainer = MiniMaxH3NetworkTrainer()
+        trainer.handle_model_specific_args(args)
+        trainer.dit_dtype = torch.float32
+        trainer.backend = backend
+        torch.manual_seed(4)
+        return trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            _ToggleNetwork(transformer),
+            batch,
+            video,
+            torch.randn_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+
+    loss, metrics = run()
+    assert metrics.get("h3/batched_microbatch") == 1.0
+    assert forward_calls == 1
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
+    assert torch.isfinite(transformer.blocks[0].attn.qkv_proj.weight.grad).all()
+
+    # An active auxiliary objective stands the batched path down: the per-item
+    # loop runs, one forward per item, and the marker metric disappears.
+    forward_calls = 0
+    transformer.zero_grad(set_to_none=True)
+    loss_fallback, metrics_fallback = run("--h3_base_preservation_loss_weight", "0.02")
+    assert "h3/batched_microbatch" not in metrics_fallback
+    # Per item: the student forward plus the frozen preservation reference.
+    assert forward_calls == 2 * 2
+    assert torch.isfinite(loss_fallback)
