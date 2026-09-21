@@ -50,6 +50,10 @@ class AttentionParams:
     cu_seqlens: torch.Tensor | None = None
     max_seqlen: int | None = None
 
+    def __post_init__(self):
+        if self.attn_mode == "sdpa":
+            self.attn_mode = "torch"
+
     @staticmethod
     def create_attention_params(attn_mode: str | None, split_attn: bool) -> AttentionParams:
         return AttentionParams(attn_mode, split_attn)
@@ -58,6 +62,8 @@ class AttentionParams:
     def create_attention_params_from_mask(
         attn_mode: str | None, split_attn: bool, img_len: int | None, attention_mask: torch.Tensor | None
     ) -> AttentionParams:
+        if attn_mode == "sdpa":
+            attn_mode = "torch"
         if attention_mask is None:
             # No attention mask provided: assume all tokens are valid
             return AttentionParams(attn_mode, split_attn, None, None, None, None, None)

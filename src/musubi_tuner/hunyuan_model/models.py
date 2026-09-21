@@ -532,6 +532,8 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
+        if attn_mode == "sdpa":
+            attn_mode = "torch"
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.out_channels = in_channels if out_channels is None else out_channels
