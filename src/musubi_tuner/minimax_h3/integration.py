@@ -1130,6 +1130,25 @@ class _NativeGenerator:
         )
 
 
+def _probe_fused_attention_backward(attention_mode: str) -> None:
+    """Fail fast when the selected fused attention build cannot run backward.
+
+    A small BLHD backward call checks backend support before model loading.
+    """
+    from musubi_tuner.modules.attention import AttentionParams
+    from musubi_tuner.modules.attention import attention as musubi_attention
+
+    try:
+        tensors = [torch.randn(1, 32, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+        out = musubi_attention(tensors, attn_params=AttentionParams.create_attention_params(attention_mode, False))
+        out.float().sum().backward()
+    except Exception as exc:
+        raise ValueError(
+            f"MiniMax H3 attention mode {attention_mode!r} cannot run backward on this install ({exc}); "
+            "pick --sdpa or a backend whose build supports training"
+        ) from exc
+
+
 def create_training_backend(
     *,
     model: Path,
@@ -1165,7 +1184,9 @@ def create_training_backend(
     if dtype != "bfloat16":
         raise ValueError("MiniMax H3 full-checkpoint training requires bfloat16 compute")
     if attention_mode not in {"torch", "flash", "flash3", "flash4"} or split_attention:
-        raise ValueError("the native MiniMax H3 backend supports only unsplit SDPA, FlashAttention 2, or FlashAttention 3")
+        raise ValueError("the native MiniMax H3 backend supports only unsplit SDPA or FlashAttention 2, 3, or 4")
+    if attention_mode != "torch" and torch.cuda.is_available():
+        _probe_fused_attention_backward(attention_mode)
     from musubi_tuner.minimax_h3.model_loader import load_transformer
 
     transformer = load_transformer(
