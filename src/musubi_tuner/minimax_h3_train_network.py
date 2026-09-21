@@ -3971,7 +3971,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             offload_dtype = getattr(args, "gradient_checkpointing_cpu_offload_dtype", "none")
             if offload_dtype != "none":
                 transformer.reusable_activation_offloader.set_offload_dtype(offload_dtype)
-        if args.h3_fused_qk_norm_rope:
+        fused_qk_rope = args.h3_fused_qk_norm_rope
+        if fused_qk_rope is None:
+            from musubi_tuner.minimax_h3.triton_kernels import HAS_TRITON
+
+            fused_qk_rope = HAS_TRITON
+        if fused_qk_rope:
             transformer.enable_fused_qk_norm_rope()
             if args.compile:
                 logger.info(
@@ -8903,11 +8908,20 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--h3_fused_qk_norm_rope",
+        dest="h3_fused_qk_norm_rope",
         action="store_true",
+        default=None,
         help=(
-            "use the opt-in Triton kernel that fuses H3 per-head Q/K RMSNorm with split RoPE; "
-            "unsupported shapes and torch.compile automatically use the eager/Inductor path"
+            "use the Triton kernel that fuses H3 per-head Q/K RMSNorm with split RoPE; "
+            "on by default when Triton is available, and unsupported shapes and torch.compile "
+            "automatically use the eager/Inductor path"
         ),
+    )
+    parser.add_argument(
+        "--no_h3_fused_qk_norm_rope",
+        dest="h3_fused_qk_norm_rope",
+        action="store_false",
+        help="disable the fused Triton Q/K RMSNorm+RoPE kernel and always use the eager path",
     )
     parser.add_argument(
         "--h3_fused_indexed_adaln",
