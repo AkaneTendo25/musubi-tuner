@@ -185,8 +185,10 @@ if HAS_TRITON:
         block_size: tl.constexpr,
         input_dtype_code: tl.constexpr,
     ):
-        # Row index we are processing
-        row_idx = tl.program_id(0)
+        # Row index we are processing. Promote to int64 before the stride multiply:
+        # H3 packs video+audio+text into one ~90k-row sequence, so row*cols can
+        # exceed int32 (Triton wraps silently, corrupting the tail of the tensor).
+        row_idx = tl.program_id(0).to(tl.int64)
 
         # Pointers to the start of the row
         x_row_ptr = x_ptr + row_idx * n_elements
@@ -308,7 +310,10 @@ if HAS_TRITON:
         offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
         offs_k = tl.arange(0, block_k)
 
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        # row * stride must be int64: at H3 scale m*stride_am and m*stride_cm exceed
+        # int32 (e.g. fc1 output m~90k x n=28672), and Triton wraps i32 silently
+        offs_am_i64 = offs_am.to(tl.int64)
+        a_ptrs = a_ptr + (offs_am_i64[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
         # 2. Main Loop (Accumulate in Int32)
@@ -339,7 +344,7 @@ if HAS_TRITON:
             c = c + bias[None, :]
 
         # 4. Store Result
-        c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+        c_ptrs = c_ptr + stride_cm * offs_am_i64[:, None] + stride_cn * offs_bn[None, :]
         c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -401,7 +406,10 @@ if HAS_TRITON:
         offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
         offs_k = tl.arange(0, block_k)
 
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        # row * stride must be int64: at H3 scale m*stride_am and m*stride_cm exceed
+        # int32 (e.g. fc1 output m~90k x n=28672), and Triton wraps i32 silently
+        offs_am_i64 = offs_am.to(tl.int64)
+        a_ptrs = a_ptr + (offs_am_i64[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
         # 2. Main Loop (Accumulate in Int32)
@@ -427,7 +435,7 @@ if HAS_TRITON:
             c = c + bias[None, :]
 
         # 4. Store Result
-        c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+        c_ptrs = c_ptr + stride_cm * offs_am_i64[:, None] + stride_cn * offs_bn[None, :]
         c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -577,7 +585,7 @@ if HAS_TRITON:
         actual_group_m = min(num_m - first_m, group_size_m)
         pid_m = first_m + (pid % programs_per_group) % actual_group_m
         pid_n = (pid % programs_per_group) // actual_group_m
-        om = pid_m * block_m + tl.arange(0, block_m)
+        om = (pid_m * block_m + tl.arange(0, block_m)).to(tl.int64)
         on = pid_n * block_n + tl.arange(0, block_n)
         ok = tl.arange(0, block_k)
         acc = tl.zeros((block_m, block_n), tl.int32)
