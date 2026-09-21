@@ -3972,10 +3972,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             offload_dtype = getattr(args, "gradient_checkpointing_cpu_offload_dtype", "none")
             if offload_dtype != "none":
                 transformer.reusable_activation_offloader.set_offload_dtype(offload_dtype)
+        from musubi_tuner.minimax_h3.triton_kernels import HAS_TRITON
+
         fused_qk_rope = args.h3_fused_qk_norm_rope
         if fused_qk_rope is None:
-            from musubi_tuner.minimax_h3.triton_kernels import HAS_TRITON
-
             fused_qk_rope = HAS_TRITON
         if fused_qk_rope:
             transformer.enable_fused_qk_norm_rope()
@@ -3984,12 +3984,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "--h3_fused_qk_norm_rope requested with --compile: compiled blocks use Inductor fusion; "
                     "the explicit Triton kernel remains active for eager calls"
                 )
-        if getattr(args, "h3_fused_indexed_adaln", False):
-            transformer.enable_fused_indexed_adaln()
+        fused_indexed_adaln = getattr(args, "h3_fused_indexed_adaln", None)
+        if fused_indexed_adaln is None:
+            fused_indexed_adaln = HAS_TRITON
+        enable_fused_indexed_adaln = getattr(transformer, "enable_fused_indexed_adaln", None)
+        if fused_indexed_adaln and callable(enable_fused_indexed_adaln):
+            enable_fused_indexed_adaln()
             if args.compile:
                 logger.warning("--h3_fused_indexed_adaln falls back to the Inductor path inside compiled blocks")
-        if getattr(args, "h3_fused_swiglu", False):
-            transformer.enable_fused_swiglu()
+        fused_swiglu = getattr(args, "h3_fused_swiglu", None)
+        if fused_swiglu is None:
+            fused_swiglu = HAS_TRITON
+        enable_fused_swiglu = getattr(transformer, "enable_fused_swiglu", None)
+        if fused_swiglu and callable(enable_fused_swiglu):
+            enable_fused_swiglu()
             if args.compile:
                 logger.warning("--h3_fused_swiglu falls back to the Inductor path inside compiled blocks")
         if getattr(args, "h3_fused_elementwise", False):
@@ -8943,11 +8951,20 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--h3_fused_indexed_adaln",
+        dest="h3_fused_indexed_adaln",
         action="store_true",
+        default=None,
         help=(
-            "use an opt-in Triton kernel that fuses each main-block RMSNorm with token-indexed AdaLN shift/scale; "
-            "frozen LoRA bases use the fused forward/backward path and unsupported cases fall back safely"
+            "use the Triton kernel that fuses each main-block RMSNorm with token-indexed AdaLN shift/scale; "
+            "on by default when Triton is available, frozen LoRA bases use the fused forward/backward path and "
+            "unsupported cases fall back safely"
         ),
+    )
+    parser.add_argument(
+        "--no_h3_fused_indexed_adaln",
+        dest="h3_fused_indexed_adaln",
+        action="store_false",
+        help="disable the fused Triton RMSNorm+AdaLN kernel and always use the eager path",
     )
     parser.add_argument(
         "--fused_backward_pass",
@@ -8961,11 +8978,20 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--h3_fused_swiglu",
+        dest="h3_fused_swiglu",
         action="store_true",
+        default=None,
         help=(
-            "use an opt-in Triton kernel for the SwiGLU activation in H3 main and token-refiner feed-forward layers; "
-            "unsupported cases fall back safely and compiled blocks use their Inductor path"
+            "use the Triton kernel for the SwiGLU activation in H3 main and token-refiner feed-forward layers; "
+            "on by default when Triton is available, unsupported cases fall back safely and compiled blocks use "
+            "their Inductor path"
         ),
+    )
+    parser.add_argument(
+        "--no_h3_fused_swiglu",
+        dest="h3_fused_swiglu",
+        action="store_false",
+        help="disable the fused Triton SwiGLU kernel and always use the eager silu*gate pair",
     )
     parser.add_argument(
         "--h3_fused_elementwise",
