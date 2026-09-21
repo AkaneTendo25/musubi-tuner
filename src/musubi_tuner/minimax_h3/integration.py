@@ -217,8 +217,8 @@ def create_latent_encoder(
 ):
     """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
-    # The VAE always computes in `dtype`; latents may additionally be stored at a
-    # narrower `cache_dtype` -- the dtype suffix in each cache key records it.
+    # The VAE retains its checkpoint dtype; cache_dtype overrides the stored
+    # latent dtype, which is recorded in each cache key.
     output_dtype = str_to_dtype(cache_dtype) if cache_dtype is not None else str_to_dtype(dtype)
     video_encoder = load_video_vae_encoder(video_vae, target_device) if video_vae is not None else None
     audio_encoder = load_audio_vae_encoder(audio_vae, target_device) if audio_vae is not None else None
@@ -2760,12 +2760,30 @@ class _NativeLatentEncoder:
         for (is_image, _), indices in groups.items():
             if self.video_encoder is None:
                 raise ValueError("MiniMax H3 visual latent caching requires --vae")
-            pixels = torch.cat([self._video_pixels(batch[index].content) for index in indices], dim=0)
-            with torch.no_grad():
-                encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
-                latents = encode(pixels)
-            for index, latent in zip(indices, latents):
-                grouped_latents[index] = latent.to(self.output_dtype)
+
+            def encode_indices(chunk: list[int]) -> None:
+                pixels = None
+                latents = None
+                try:
+                    pixels = torch.cat([self._video_pixels(batch[index].content) for index in chunk], dim=0)
+                    with torch.no_grad():
+                        encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
+                        latents = encode(pixels)
+                    for index, latent in zip(chunk, latents):
+                        grouped_latents[index] = latent.to(self.output_dtype)
+                except torch.OutOfMemoryError:
+                    if len(chunk) == 1:
+                        raise
+                    pixels = None
+                    latents = None
+                    midpoint = len(chunk) // 2
+                    encode_indices(chunk[:midpoint])
+                    encode_indices(chunk[midpoint:])
+
+            # Bound the peak input and VAE activation size independently of the
+            # dataset bucket size. A split also rescues batches that exceed VRAM.
+            for start in range(0, len(indices), 4):
+                encode_indices(indices[start : start + 4])
         results = []
         for index, item in enumerate(batch):
             target = self._target_asset(item)

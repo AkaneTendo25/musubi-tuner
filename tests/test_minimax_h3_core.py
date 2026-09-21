@@ -2270,6 +2270,16 @@ def _latent_cache_predicate(monkeypatch, argv):
     return captured["predicate"]
 
 
+def test_skip_existing_rejects_other_latent_cache_dtype(monkeypatch, tmp_path):
+    path = tmp_path / "sample.safetensors"
+    save_file({"latents_1x2x2_float32": torch.zeros(24, 1, 2, 2)}, str(path))
+    item = SimpleNamespace(h3_cache_metadata={})
+    assert _latent_cache_predicate(monkeypatch, [])(item, str(path)) is True
+    assert _latent_cache_predicate(monkeypatch, ["--latent_cache_dtype", "bfloat16"])(item, str(path)) is False
+    save_file({"latents_1x2x2_bfloat16": torch.zeros(24, 1, 2, 2, dtype=torch.bfloat16)}, str(path))
+    assert _latent_cache_predicate(monkeypatch, ["--latent_cache_dtype", "bfloat16"])(item, str(path)) is True
+
+
 def test_skip_existing_rejects_reference_caches_written_with_other_sizing(monkeypatch, tmp_path):
     monkeypatch.setattr(h3_cache_latents, "reference_assets", lambda item: item.has_references)
     item = SimpleNamespace(has_references=True, h3_cache_metadata={h3_references.REFERENCE_FINGERPRINT_KEY: "fingerprint"})
@@ -3031,6 +3041,38 @@ def test_native_latent_encoder_uses_direct_image_vae_path_and_omits_audio():
 
     assert video_encoder.image_calls == 1
     assert set(tensors) == {"latents_1x2x2_float32"}
+
+
+def test_native_latent_encoder_bounds_image_batches_and_splits_on_oom():
+    class VideoEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+            self.calls = []
+
+        def encode_image(self, pixels):
+            self.calls.append(pixels.shape[0])
+            if pixels.shape[0] > 2:
+                raise torch.OutOfMemoryError("simulated VAE OOM")
+            return torch.zeros(pixels.shape[0], 24, 1, 2, 2)
+
+    video_encoder = VideoEncoder()
+    encoder = h3_integration._NativeLatentEncoder(video_encoder, None, torch.float32)
+    encoder._encode_references = lambda item: {}
+    items = [
+        SimpleNamespace(
+            content=np.zeros((32, 32, 3), dtype=np.uint8),
+            item_key=f"image-{index}.png",
+            h3_media_assets=(MediaAsset(Path(f"image-{index}.png"), MediaModality.IMAGE, "target"),),
+        )
+        for index in range(9)
+    ]
+
+    results = encoder.encode_latents(items)
+
+    assert len(results) == 9
+    assert video_encoder.calls == [4, 2, 2, 4, 2, 2, 1]
+    assert all(result["latents_1x2x2_float32"].shape == (24, 1, 2, 2) for result in results)
 
 
 def test_native_latent_encoder_caches_image_and_separate_audio_targets():

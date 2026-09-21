@@ -731,8 +731,15 @@ def build_row_timesteps(
     if video_timestep.numel() == 1 and audio_timestep.numel() == 1:
         # Scalar fills: the unique set is just the handful of fill values, so
         # build it directly instead of sorting the full-length row vector.
-        fills = [base.reshape(1), video_timestep[:1], audio_timestep[:1]]
-        condition_video_idx = condition_audio_idx = 0
+        fills = [base.reshape(1)]
+        video_fill_idx = audio_fill_idx = None
+        if target_video.numel():
+            video_fill_idx = len(fills)
+            fills.append(video_timestep[:1])
+        if target_audio.numel():
+            audio_fill_idx = len(fills)
+            fills.append(audio_timestep[:1])
+        condition_video_idx = condition_audio_idx = None
         if layout.num_condition_video_rows:
             condition_video_idx = len(fills)
             fills.append(condition_video_timestep)
@@ -743,8 +750,10 @@ def build_row_timesteps(
         unique = torch.unique(fills, sorted=True)
         inverse = torch.empty(layout.sequence_length, dtype=torch.long, device=device)
         inverse.fill_(torch.searchsorted(unique, fills[0]))
-        inverse[target_video] = torch.searchsorted(unique, fills[1])
-        inverse[target_audio] = torch.searchsorted(unique, fills[2])
+        if video_fill_idx is not None:
+            inverse[target_video] = torch.searchsorted(unique, fills[video_fill_idx])
+        if audio_fill_idx is not None:
+            inverse[target_audio] = torch.searchsorted(unique, fills[audio_fill_idx])
         if layout.num_condition_video_rows:
             inverse[video_indices[: layout.num_condition_video_rows]] = torch.searchsorted(unique, fills[condition_video_idx])
         if layout.num_condition_audio_rows:

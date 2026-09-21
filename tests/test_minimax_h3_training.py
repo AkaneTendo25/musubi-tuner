@@ -862,6 +862,26 @@ def _row_timestep_layout():
     )
 
 
+@pytest.mark.parametrize("present", ["video", "audio"])
+def test_h3_row_timesteps_exclude_absent_target_modality(present):
+    from types import SimpleNamespace
+
+    video_indices = torch.tensor([2], dtype=torch.long) if present == "video" else torch.empty(0, dtype=torch.long)
+    audio_indices = torch.tensor([2], dtype=torch.long) if present == "audio" else torch.empty(0, dtype=torch.long)
+    layout = SimpleNamespace(
+        sequence_length=3,
+        text_indices=torch.tensor([0, 1]),
+        video_indices=video_indices,
+        audio_indices=audio_indices,
+        num_condition_video_rows=0,
+        num_condition_audio_rows=0,
+    )
+    timesteps, indices = build_row_timesteps(layout, torch.tensor([0.25]), torch.tensor([0.75]))
+    expected = torch.tensor([0.25]) if present == "video" else torch.tensor([0.25, 0.75])
+    torch.testing.assert_close(timesteps, expected)
+    torch.testing.assert_close(timesteps[indices], torch.tensor([0.25, 0.25, 0.25 if present == "video" else 0.75]))
+
+
 def test_h3_row_timesteps_accept_one_value_per_target_video_row():
     # A packed sequence may carry a different noise level on every video row.
     # The transformer selects modulation through timestep_indices, so the only

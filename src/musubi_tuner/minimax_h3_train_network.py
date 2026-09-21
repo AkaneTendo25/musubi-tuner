@@ -1576,7 +1576,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._overlay_network = None
         self._overlay_training_only = False
         self._h3_profiler: H3StepProfiler | None = None
-        self._clean_latent_cache: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._clean_latent_cache: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         # The frozen base's field is a property of the checkpoint and the validation
         # item, not of the training run, so it is measured once and kept.
         self._field_base_gaps: dict[tuple, float] = {}

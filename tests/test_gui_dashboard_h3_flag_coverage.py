@@ -98,6 +98,43 @@ def test_h3_attention_and_fused_backward_controls(tmp_path: Path) -> None:
     assert command[command.index("--h3_checkpoint_keep") + 1] == "adaln"
 
 
+def test_h3_fused_kernel_auto_and_explicit_opt_out(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    fields = ("h3_fused_qk_norm_rope", "h3_fused_indexed_adaln", "h3_fused_swiglu")
+    command = build_training_cmd(config)
+    for field in fields:
+        assert getattr(config.training, field) is None
+        assert f"--{field}" not in command
+        assert f"--no_{field}" not in command
+
+    for field in fields:
+        setattr(config.training, field, False)
+    command = build_training_cmd(config)
+    for field in fields:
+        assert f"--no_{field}" in command
+        assert f"--{field}" not in command
+
+    for field in fields:
+        setattr(config.training, field, True)
+    command = build_training_cmd(config)
+    for field in fields:
+        assert f"--{field}" in command
+        assert f"--no_{field}" not in command
+
+
+def test_h3_latent_cache_dtype_is_independent_of_vae_dtype(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.caching.model_type = "minimax_h3"
+    config.caching.vae_dtype = "float32"
+    config.caching.latent_cache_dtype = "bfloat16"
+    command = build_cache_latents_cmd(config)
+    assert command[command.index("--vae_dtype") + 1] == "float32"
+    assert command[command.index("--latent_cache_dtype") + 1] == "bfloat16"
+
+    config.caching.latent_cache_dtype = None
+    assert "--latent_cache_dtype" not in build_cache_latents_cmd(config)
+
+
 def test_h3_fused_backward_validation(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config.training.model_type = "minimax_h3"

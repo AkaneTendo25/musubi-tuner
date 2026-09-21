@@ -181,6 +181,7 @@ class CachingConfig(BaseModel):
     ltx2_text_encoder_checkpoint: str = ""
     ltx2_mode: Literal["video", "av", "audio"] = "video"
     vae_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
+    latent_cache_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
     device: Optional[str] = None
     skip_existing: bool = False
     faster_check: bool = False
@@ -337,9 +338,9 @@ class TrainingConfig(BaseModel):
     h3_attn_auto_dispatch: bool = False
     h3_int8_attention: Literal["off", "aux", "train"] = "off"
     h3_lora_token_refiner: bool = False
-    h3_fused_qk_norm_rope: bool = False
-    h3_fused_indexed_adaln: bool = False
-    h3_fused_swiglu: bool = False
+    h3_fused_qk_norm_rope: Optional[bool] = None
+    h3_fused_indexed_adaln: Optional[bool] = None
+    h3_fused_swiglu: Optional[bool] = None
     h3_adaln_rank: Optional[int] = None
     h3_fp8_quantization_mode: Literal["block", "channel", "tensor"] = "block"
     h3_convrot_int8: bool = False

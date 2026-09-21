@@ -237,7 +237,7 @@ python minimax_h3_cache_latents.py \
 - Keep `--audio_vae` when any target or reference includes audio; omit it for image-only and video-only data.
 - Omit `--vae` only for audio-only targets with no visual references.
 - `--skip_existing` validates and reuses compatible caches. On a large, unchanged dataset add `--faster_check`; it fully validates `--faster_check_samples` items (default 8) first, but cannot detect a source file replaced in place.
-- `--vae_dtype` defaults to `float32` for H3. `--latent_cache_dtype {float32,float16,bfloat16}` controls the stored latent precision independently (default: VAE dtype); changing it makes existing mismatched caches recache into the same filenames.
+- `--vae_dtype` defaults to `float32` for H3 and sets the default stored latent dtype; the VAE retains its checkpoint precision. `--latent_cache_dtype {float32,float16,bfloat16}` overrides the stored dtype. A mismatch makes `--skip_existing` recache into the same filename.
 
 ### Cache FL2VA text embeddings
 

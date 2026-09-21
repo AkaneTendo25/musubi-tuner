@@ -373,6 +373,8 @@ def _build_h3_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--one_frame")
     if c.vae_dtype:
         cmd += ["--vae_dtype", c.vae_dtype]
+    if c.latent_cache_dtype:
+        cmd += ["--latent_cache_dtype", c.latent_cache_dtype]
     if c.h3_image_mode != "none":
         cmd += ["--h3_image_mode", c.h3_image_mode]
     if c.h3_image_frame_count is not None:
@@ -659,12 +661,10 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd.append("--h3_convrot_int8_lora_fused")
     if t.h3_adaln_rank is not None and not t.int8_convrot_base:
         cmd += ["--h3_adaln_rank", str(t.h3_adaln_rank)]
-    if t.h3_fused_qk_norm_rope:
-        cmd.append("--h3_fused_qk_norm_rope")
-    if t.h3_fused_indexed_adaln:
-        cmd.append("--h3_fused_indexed_adaln")
-    if t.h3_fused_swiglu:
-        cmd.append("--h3_fused_swiglu")
+    for field in ("h3_fused_qk_norm_rope", "h3_fused_indexed_adaln", "h3_fused_swiglu"):
+        value = getattr(t, field)
+        if value is not None:
+            cmd.append(f"--{field}" if value else f"--no_{field}")
     if t.h3_attn_auto_dispatch:
         cmd.append("--h3_attn_auto_dispatch")
     if t.h3_int8_attention != "off":

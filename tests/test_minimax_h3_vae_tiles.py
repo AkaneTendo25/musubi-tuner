@@ -3,7 +3,32 @@ from torch import nn
 from torch.nn import functional as F
 
 from musubi_tuner.minimax_h3 import video_vae
-from musubi_tuner.minimax_h3.video_vae import MiniMaxH3VideoDecoderModel, MiniMaxH3VideoEncoderModel
+from musubi_tuner.minimax_h3.video_vae import (
+    MiniMaxH3VideoDecoderModel,
+    MiniMaxH3VideoDecoderTransformerBlock,
+    MiniMaxH3VideoEncoderModel,
+)
+
+
+def test_decoder_norm_fp32_weight_tracks_same_device_updates():
+    norm = nn.RMSNorm(4).to(dtype=torch.bfloat16).requires_grad_(False)
+    first = MiniMaxH3VideoDecoderTransformerBlock._f32_weight(norm)
+    assert MiniMaxH3VideoDecoderTransformerBlock._f32_weight(norm) is first
+    with torch.no_grad():
+        norm.weight.fill_(2)
+    second = MiniMaxH3VideoDecoderTransformerBlock._f32_weight(norm)
+    torch.testing.assert_close(first, torch.ones(4))
+    torch.testing.assert_close(second, torch.full((4,), 2.0))
+
+    norm.load_state_dict({"weight": torch.full((4,), 3.0, dtype=torch.bfloat16)})
+    third = MiniMaxH3VideoDecoderTransformerBlock._f32_weight(norm)
+    torch.testing.assert_close(third, torch.full((4,), 3.0))
+
+
+def test_decoder_norm_fp32_weight_keeps_trainable_gradient():
+    norm = nn.RMSNorm(4).to(dtype=torch.bfloat16)
+    MiniMaxH3VideoDecoderTransformerBlock._f32_weight(norm).sum().backward()
+    torch.testing.assert_close(norm.weight.grad, torch.ones(4, dtype=torch.bfloat16))
 
 
 class _Capture(nn.Module):

@@ -108,9 +108,9 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=("float32", "float16", "bfloat16"),
         default=None,
         help=(
-            "dtype the latent caches are written at; defaults to the VAE dtype. bf16 halves cache disk, "
-            "read and host-to-device cost -- the dtype is part of every cache key, so caches of different "
-            "precisions coexist and the loader resolves either"
+            "dtype the latent caches are written at; defaults to --vae_dtype. bf16 reduces cache disk, "
+            "read and host-to-device cost. The cache filename is unchanged, so recaching at another dtype "
+            "replaces the previous cache"
         ),
     )
     parser.set_defaults(vae_dtype="float32")
@@ -204,6 +204,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         try:
             with safe_open(path, framework="pt", device="cpu") as handle:
                 keys = set(handle.keys())
+                requested_dtype = args.latent_cache_dtype or args.vae_dtype or "float32"
+                latent_keys = [
+                    key
+                    for key in keys
+                    if key.startswith(
+                        (
+                            "latents_",
+                            "varlen_mmh3_reference_video_rows",
+                            "varlen_mmh3_reference_audio_rows",
+                            "varlen_mmh3_keyframe_video_rows",
+                        )
+                    )
+                ]
+                if any(not key.endswith(f"_{requested_dtype}") for key in latent_keys):
+                    return False
                 if "video_loss_mask" in keys:
                     key = f"{H3_LOSS_MASK_POOLING_KEY}_int64"
                     if key not in keys or int(handle.get_tensor(key)) != H3_LOSS_MASK_POOLING_CODES[args.h3_loss_mask_pooling]:

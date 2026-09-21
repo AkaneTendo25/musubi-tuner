@@ -510,11 +510,15 @@ class MiniMaxH3VideoDecoderTransformerBlock(nn.Module):
 
     @staticmethod
     def _f32_weight(norm: nn.RMSNorm) -> torch.Tensor:
+        weight = norm.weight
+        if weight.requires_grad:
+            return weight.float()
+        key = (weight, weight._version, weight.device, weight.dtype)
         cached = getattr(norm, "_weight_f32", None)
-        if cached is None or cached.device != norm.weight.device:
-            cached = norm.weight.float()
+        if cached is None or cached[0][0] is not weight or cached[0][1:] != key[1:]:
+            cached = (key, weight.float())
             norm._weight_f32 = cached
-        return cached
+        return cached[1]
 
     def forward(self, hidden_states: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         norm = F.rms_norm(
