@@ -63,16 +63,19 @@ _CUDNN_AUTO_WORK_THRESHOLD = 1 << 28
 _CUDNN_AUTO_MIN_SEQUENCE = 1024
 
 
+_H3_NULL_PROFILE_SCOPE = nullcontext()
+
+
 def h3_profile_scope(name: str) -> AbstractContextManager:
     """A ``torch.profiler.record_function`` label while a profiler is collecting, else a no-op.
 
-    Outside profiling this returns ``nullcontext``, so a block pays a flag read and a null
+    Outside profiling this returns a shared ``nullcontext``, so a block pays a flag read and a null
     context enter per label -- negligible next to its compute. Inside a ``torch.compile``
     region Dynamo treats both as null contexts, and a checkpointed block simply re-enters the
     label on recompute."""
     if getattr(torch.autograd.profiler, "_is_profiler_enabled", False):
         return torch.profiler.record_function(name)
-    return nullcontext()
+    return _H3_NULL_PROFILE_SCOPE
 
 
 try:
