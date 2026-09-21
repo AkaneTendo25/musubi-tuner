@@ -1057,7 +1057,7 @@ def _step_video_sigma(inputs) -> float:
     """The step's shifted video sigma as one number: the mean over frames and samples
     of the per-frame sigma when jitter is on, else of the per-sample one."""
     sigma = inputs.video_frame_sigma if getattr(inputs, "video_frame_sigma", None) is not None else inputs.video_sigma
-    return float(sigma.detach().float().reshape(-1).mean().item())
+    return sigma.detach().float().reshape(-1).mean().item()
 
 
 def _null_anchor_sigma_active(args, step_sigma: float) -> bool:
@@ -6220,10 +6220,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 losses.append(scaled)
                 item_metrics.append(
                     {
-                        "loss/video": float(result.video_loss.detach()),
-                        "loss/audio": float(result.audio_loss.detach()),
-                        "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
-                        "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()) if inputs.audio_sigma is not None else 0.0,
+                        "loss/video": result.video_loss.detach(),
+                        "loss/audio": result.audio_loss.detach(),
+                        "h3/sigma_video": inputs.video_sigma.mean().detach(),
+                        "h3/sigma_audio": inputs.audio_sigma.mean().detach() if inputs.audio_sigma is not None else 0.0,
                     }
                 )
                 group_loss = scaled if group_loss is None else group_loss + scaled
@@ -6299,7 +6299,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             accelerator, args.h3_rollout_probability
         )
         if batch_size == 1:
-            return self._process_single_batch(
+            loss, metrics = self._process_single_batch(
                 args,
                 accelerator,
                 transformer,
@@ -6320,6 +6320,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 qwen_control_dropout_override=qwen_control_dropout,
                 rollout_active_override=rollout_active,
             )
+            return loss, self._materialize_metrics(metrics)
 
         # One shared forward for the whole batch when the step is the plain
         # data objective and the items pack onto one layout; anything else
@@ -6401,7 +6402,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 self._crepa.clear_step()
 
     @staticmethod
-    def _average_batch_metrics(item_metrics: list[dict[str, float]]) -> dict[str, float]:
+    def _materialize_metrics(metrics: dict) -> dict[str, float]:
+        """Resolve every deferred tensor metric to a host float in one sync."""
+        tensor_keys = [key for key, value in metrics.items() if torch.is_tensor(value)]
+        if not tensor_keys:
+            return metrics
+        resolved = torch.stack([metrics[key].detach().reshape(()).float() for key in tensor_keys]).tolist()
+        materialized = dict(metrics)
+        materialized.update(zip(tensor_keys, resolved))
+        return materialized
+
+    @classmethod
+    def _average_batch_metrics(cls, item_metrics: list[dict[str, float]]) -> dict[str, float]:
+        item_metrics = [cls._materialize_metrics(metrics) for metrics in item_metrics]
         metric_keys = set().union(*(metrics.keys() for metrics in item_metrics))
         return {
             key: sum(metrics[key] for metrics in item_metrics if key in metrics) / sum(key in metrics for metrics in item_metrics)
@@ -7094,19 +7107,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # set so existing dashboards and the per-item averaging below keep a
         # constant schema.
         metrics = {
-            "loss/video": float(result.video_loss.detach()),
-            "loss/audio": float(result.audio_loss.detach()),
-            "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
-            "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
+            "loss/video": result.video_loss.detach(),
+            "loss/audio": result.audio_loss.detach(),
+            "h3/sigma_video": inputs.video_sigma.mean().detach(),
+            "h3/sigma_audio": inputs.audio_sigma.mean().detach(),
         }
         if getattr(args, "h3_train_sigma_bins", False) and has_video:
             # Only the bin this step fell in is reported; the batch average keeps
             # a key wherever at least one item carried it.
             sigma_bin = bisect.bisect_right([0.5, 0.8, 0.9], float(inputs.video_sigma.mean()))
-            metrics[f"loss/video/bin{sigma_bin}"] = float(result.video_loss.detach())
+            metrics[f"loss/video/bin{sigma_bin}"] = result.video_loss.detach()
         if args.h3_dop_loss_weight > 0:
             metrics["h3/dop_active"] = float(dop_active)
-            metrics["loss/dop"] = 0.0 if dop_term is None else float(dop_term.detach())
+            metrics["loss/dop"] = 0.0 if dop_term is None else dop_term.detach()
         if result.video_elements == 0 and result.audio_elements == 0:
             metrics["h3/no_active_target"] = 1.0
         if args.h3_caption_dropout_rate > 0:
@@ -7150,9 +7163,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
             if not teacher_conditioned:
                 loss = loss * args.h3_teacher_preservation_weight * _teacher_anchor_compensation(args)
-            metrics["loss/video"] = float(video_teacher_loss.detach())
-            metrics["loss/audio"] = float(audio_teacher_loss.detach())
-            metrics["loss/teaching" if teacher_conditioned else "loss/anchor"] = float(loss.detach())
+            metrics["loss/video"] = video_teacher_loss.detach()
+            metrics["loss/audio"] = audio_teacher_loss.detach()
+            metrics["loss/teaching" if teacher_conditioned else "loss/anchor"] = loss.detach()
             metrics["h3/teacher_conditioned"] = float(teacher_conditioned)
             dense_loss = loss
         two_teacher_trigger_loss = None
@@ -7174,10 +7187,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             loss = float(args.h3_two_teacher_data_weight) * loss + float(args.h3_two_teacher_loss_weight) * two_teacher_trigger_loss
         if float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0:
             metrics["h3/two_teacher_active"] = float(two_teacher_active)
-            metrics["loss/two_teacher_trigger"] = (
-                0.0 if two_teacher_trigger_loss is None else float(two_teacher_trigger_loss.detach())
-            )
-            metrics["loss/two_teacher_bare"] = 0.0 if two_teacher_bare_loss is None else float(two_teacher_bare_loss.detach())
+            metrics["loss/two_teacher_trigger"] = 0.0 if two_teacher_trigger_loss is None else two_teacher_trigger_loss.detach()
+            metrics["loss/two_teacher_bare"] = 0.0 if two_teacher_bare_loss is None else two_teacher_bare_loss.detach()
         rollout_replaced = False
         rollout_main_objective = None
         rollout_field_floor = None
@@ -7336,14 +7347,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # gives its video term.
                 rollout_teacher_magnitude = magnitude_weight * sum(rollout_magnitude_terms) / float(len(rollout_magnitude_terms))
                 loss = loss + rollout_teacher_magnitude
-                metrics["loss/rollout_teacher_magnitude"] = float(rollout_teacher_magnitude.detach())
+                metrics["loss/rollout_teacher_magnitude"] = rollout_teacher_magnitude.detach()
                 metrics["h3/rollout_teacher_length_ratio"] = sum(rollout_length_ratios) / float(len(rollout_length_ratios))
             rescaled_rollout_loss = loss
             rollout_main_objective = loss
             rollout_replaced = True
             # With the split on, this is the direction half; the magnitude half is
             # loss/rollout_teacher_magnitude.
-            metrics["loss/rollout_video"] = float(sum(term.video_loss.detach() for term in rollout_terms) / window)
+            metrics["loss/rollout_video"] = sum(term.video_loss.detach() for term in rollout_terms) / window
             metrics["h3/rollout_stop_sigma"] = rollout_stop_sigma
             if rollout_student_empties is not None:
                 # The null anchor at the supervised states: the student's own empty
@@ -7367,7 +7378,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 ]
                 rollout_null_anchor = float(args.h3_rollout_null_anchor_weight) * sum(anchor_terms) / float(len(anchor_terms))
                 loss = loss + rollout_null_anchor
-                metrics["loss/rollout_null_anchor"] = float(rollout_null_anchor.detach())
+                metrics["loss/rollout_null_anchor"] = rollout_null_anchor.detach()
             if rollout_bases is not None and float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0:
                 # A LENGTH floor on the guidance field at the supervised states.
                 # The teacher term above sets the field's direction; this holds
@@ -7438,8 +7449,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     band = band + torch.relu(ratios - field_cap).pow(2)
                 rollout_field_floor = float(args.h3_rollout_field_floor) * (band * valid).sum() / scored
                 loss = loss + rollout_field_floor
-                metrics["loss/rollout_field_floor"] = float(rollout_field_floor.detach())
-                metrics["h3/rollout_field_ratio"] = float((ratios.detach() * valid).sum() / scored)
+                metrics["loss/rollout_field_floor"] = rollout_field_floor.detach()
+                metrics["h3/rollout_field_ratio"] = (ratios.detach() * valid).sum() / scored
         if getattr(args, "h3_rollout_supervision", False):
             # Only reported when the feature is on, so an existing run's metric
             # set is unchanged.
@@ -7492,7 +7503,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 args.h3_base_preservation_loss_weight / args.h3_base_preservation_probability
             ) * preservation.loss
             loss = loss + base_preservation_term
-            metrics["loss/base_preservation"] = float(base_preservation_term.detach())
+            metrics["loss/base_preservation"] = base_preservation_term.detach()
         if args.h3_base_preservation_loss_weight > 0:
             metrics["h3/base_preservation_active"] = float(preservation_active)
             metrics.setdefault("loss/base_preservation", 0.0)
@@ -7517,7 +7528,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 ).loss
             )
             loss = loss + null_anchor
-            metrics["loss/guidance_null_anchor"] = float(null_anchor.detach())
+            metrics["loss/guidance_null_anchor"] = null_anchor.detach()
             if getattr(args, "h3_guidance_null_anchor_weight_end", None) is not None:
                 metrics["h3/null_anchor_weight"] = scheduled_anchor_weight
         elif float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0:
@@ -7583,7 +7594,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # same forward already produced, which is what a run without the
                 # flag would have logged.
                 average_loss = average_loss - rescaled_rollout_loss + dense_loss
-            metrics[LOSS_FOR_AVERAGE_KEY] = float(average_loss.detach())
+            metrics[LOSS_FOR_AVERAGE_KEY] = average_loss.detach()
         # Keep capture active until backward has completed. Non-reentrant
         # gradient checkpointing recomputes hooked blocks during backward and
         # requires the hook to perform the same tensor operations as forward.
