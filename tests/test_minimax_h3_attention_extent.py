@@ -7,7 +7,7 @@ from musubi_tuner.minimax_h3.model import SDPA_INT32_EXTENT, materialize_wide_vi
 
 def _fused_value_view(rows: int, inner: int) -> torch.Tensor:
     # The real path: value is the last third of a [B, S, 3 * inner] projection.
-    fused = torch.empty(1, rows, 3 * inner)
+    fused = torch.arange(rows * 3 * inner, dtype=torch.float32).reshape(1, rows, 3 * inner)
     return fused.chunk(3, dim=-1)[2]
 
 
