@@ -1313,7 +1313,6 @@ class MiniMaxH3Transformer(nn.Module):
 
         timestep_embedding = self._time_embedding(timestep)
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_COUNT + token_tags.clamp(min=0)
-        is_padding = token_tags < 0
         # A caller-supplied topology narrows attention further; the padding mask
         # is always applied on top so a custom mask cannot re-expose padding.
         # ``True`` means the pair may attend, matching SDPA's boolean contract.
@@ -1343,10 +1342,11 @@ class MiniMaxH3Transformer(nn.Module):
             # device (one round-trip per forward). The in-repo packer never
             # emits negative tags and passes the flag computed from its CPU-side
             # tensor, so training skips this entirely.
-            has_padding = bool(is_padding.any())
+            has_padding = bool((token_tags < 0).any())
         else:
             has_padding = token_tags_have_padding
         if has_padding:
+            is_padding = token_tags < 0
             if is_padding.ndim == 2:
                 # Key-side validity per item: padded rows cannot be attended to;
                 # their own outputs are discarded by every decoder downstream.
