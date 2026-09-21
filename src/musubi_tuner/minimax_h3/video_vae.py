@@ -508,18 +508,26 @@ class MiniMaxH3VideoDecoderTransformerBlock(nn.Module):
         self.ff = MiniMaxH3VideoDecoderFeedForward(dim, ffn_mult)
         self.scale2 = nn.Parameter(torch.zeros(dim))
 
+    @staticmethod
+    def _f32_weight(norm: nn.RMSNorm) -> torch.Tensor:
+        cached = getattr(norm, "_weight_f32", None)
+        if cached is None or cached.device != norm.weight.device:
+            cached = norm.weight.float()
+            norm._weight_f32 = cached
+        return cached
+
     def forward(self, hidden_states: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         norm = F.rms_norm(
             hidden_states.float(),
             self.norm1.normalized_shape,
-            self.norm1.weight.float(),
+            self._f32_weight(self.norm1),
             self.norm1.eps,
         ).to(hidden_states.dtype)
         hidden_states = hidden_states + self.attn(norm, rotary_emb) * self.scale1
         norm = F.rms_norm(
             hidden_states.float(),
             self.norm2.normalized_shape,
-            self.norm2.weight.float(),
+            self._f32_weight(self.norm2),
             self.norm2.eps,
         ).to(hidden_states.dtype)
         return hidden_states + self.ff(norm) * self.scale2
