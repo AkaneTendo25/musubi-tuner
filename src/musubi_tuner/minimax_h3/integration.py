@@ -213,10 +213,13 @@ def create_latent_encoder(
     reference_video_max_pixels: int = REFERENCE_VIDEO_MAX_PIXELS,
     reference_video_fps: float = REFERENCE_VIDEO_FPS,
     loss_mask_pooling: str = "max",
+    cache_dtype: str | None = None,
 ):
     """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
-    output_dtype = str_to_dtype(dtype)
+    # The VAE always computes in `dtype`; latents may additionally be stored at a
+    # narrower `cache_dtype` -- the dtype suffix in each cache key records it.
+    output_dtype = str_to_dtype(cache_dtype) if cache_dtype is not None else str_to_dtype(dtype)
     video_encoder = load_video_vae_encoder(video_vae, target_device) if video_vae is not None else None
     audio_encoder = load_audio_vae_encoder(audio_vae, target_device) if audio_vae is not None else None
     return _NativeLatentEncoder(

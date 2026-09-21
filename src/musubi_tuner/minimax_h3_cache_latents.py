@@ -103,6 +103,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "conditions the model; 0 (default) keeps the released behaviour of truncating to the target length"
         ),
     )
+    parser.add_argument(
+        "--latent_cache_dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default=None,
+        help=(
+            "dtype the latent caches are written at; defaults to the VAE dtype. bf16 halves cache disk, "
+            "read and host-to-device cost -- the dtype is part of every cache key, so caches of different "
+            "precisions coexist and the loader resolves either"
+        ),
+    )
     parser.set_defaults(vae_dtype="float32")
     add_image_training_arguments(parser)
     return parser
@@ -149,6 +159,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         reference_video_max_pixels=args.reference_video_max_pixels,
         reference_video_fps=args.reference_video_fps,
         loss_mask_pooling=args.h3_loss_mask_pooling,
+        cache_dtype=args.latent_cache_dtype,
     )
 
     def encode(batch: list[ItemInfo]) -> None:
