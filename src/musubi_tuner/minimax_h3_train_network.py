@@ -1576,6 +1576,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._overlay_network = None
         self._overlay_training_only = False
         self._h3_profiler: H3StepProfiler | None = None
+        self._clean_latent_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         # The frozen base's field is a property of the checkpoint and the validation
         # item, not of the training run, so it is measured once and kept.
         self._field_base_gaps: dict[tuple, float] = {}
@@ -4822,12 +4823,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             resolved.append((MiniMaxH3GuideGeometry(start, video_length, audio_length), video_start, audio_start))
         return tuple(resolved)
 
-    @staticmethod
-    def _clean_latents(noisy, target, sigma):
+    def _clean_latents(self, noisy, target, sigma):
         """Recover x0 from the noised latents and their flow target."""
+        key = (id(noisy), id(target), id(sigma))
+        cached = self._clean_latent_cache.get(key)
+        if cached is not None:
+            return cached[3]
         shape = [1] * noisy.ndim
         shape[0] = sigma.shape[0]
-        return noisy + sigma.to(device=noisy.device, dtype=noisy.dtype).view(shape) * target
+        clean = noisy + sigma.to(device=noisy.device, dtype=noisy.dtype).view(shape) * target
+        # Keeping the inputs in the entry means its id key cannot be recycled while
+        # the entry exists; the cache is reset once per optimizer step in process_batch.
+        if len(self._clean_latent_cache) < 8:
+            self._clean_latent_cache[key] = (noisy, target, sigma, clean)
+        return clean
 
     @staticmethod
     def _dataset_observed_mask(batch, inputs):
@@ -4929,8 +4938,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         mask = mask.to(device=target.device)
         return torch.where(keep, mask, torch.zeros((), device=mask.device, dtype=mask.dtype))
 
-    @staticmethod
-    def _clean_context(noisy, target, sigma, context_length: int, *, axis: int):
+    def _clean_context(self, noisy, target, sigma, context_length: int, *, axis: int):
         """Recover the clean leading latents the observed context must present.
 
         The packed rows are already noised, so the context has to be rebuilt.
@@ -4940,9 +4948,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         """
         if noisy is None or target is None:
             raise ValueError("H3 extension needs both the noisy latents and their flow target")
-        shape = [1] * noisy.ndim
-        shape[0] = sigma.shape[0]
-        clean = noisy + sigma.to(device=noisy.device, dtype=noisy.dtype).view(shape) * target
+        clean = self._clean_latents(noisy, target, sigma)
         index = [slice(None)] * noisy.ndim
         index[axis] = slice(0, context_length)
         return clean[tuple(index)].contiguous()
@@ -6256,6 +6262,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._batch_backward_performed = False
         self._adapter_network = network
         self._adapter_prompt_only = bool(getattr(args, "h3_adapter_prompt_only", False))
+        self._clean_latent_cache = {}
         # The block-swap arm gate is balanced by construction -- one hook firing
         # per announced invocation -- but a step that raises between forward and
         # backward leaves announcements nothing will consume. An H2D-only ring
