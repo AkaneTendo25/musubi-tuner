@@ -2530,7 +2530,7 @@ class _NativeLatentEncoder:
             raise ValueError(f"H3 item {item.item_key!r} must have one attached target image, video, or audio clip")
         return targets[0]
 
-    def _encode_video(self, content: np.ndarray, *, is_image: bool) -> torch.Tensor:
+    def _video_pixels(self, content: np.ndarray) -> torch.Tensor:
         if self.video_encoder is None:
             raise ValueError("MiniMax H3 visual latent caching requires --vae")
         if not isinstance(content, np.ndarray):
@@ -2545,7 +2545,10 @@ class _NativeLatentEncoder:
         pixels = pixels.to(device=device, dtype=torch.float32).div_(255.0)
         pixel_mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
         pixel_std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-        pixels = ((pixels - pixel_mean) / pixel_std).to(weight_dtype)
+        return ((pixels - pixel_mean) / pixel_std).to(weight_dtype)
+
+    def _encode_video(self, content: np.ndarray, *, is_image: bool) -> torch.Tensor:
+        pixels = self._video_pixels(content)
         with torch.no_grad():
             encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
             return encode(pixels)[0].to(self.output_dtype)
@@ -2733,8 +2736,35 @@ class _NativeLatentEncoder:
 
     def encode_latents(self, batch: list[Any]) -> tuple[dict[str, torch.Tensor], ...]:
         dtype_name = dtype_to_str(self.output_dtype)
+        # Items in a bucket share resolution and frame count, so their visual
+        # targets can run through the VAE as one batch per identical shape.
+        # encode/encode_image read only the posterior mean, which makes the
+        # stacked call reproduce the per-item latents exactly; references stay
+        # per-item because encode_reference draws seeded posterior noise.
+        grouped_latents: dict[int, torch.Tensor] = {}
+        groups: dict[tuple[bool, tuple[int, ...]], list[int]] = {}
+        for index, item in enumerate(batch):
+            if getattr(item, "h3_target_mode", "av") == "audio":
+                continue
+            content = item.content
+            if not isinstance(content, np.ndarray):
+                continue
+            normalized = content[None] if content.ndim == 3 else content
+            conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
+            target = self._target_asset(item)
+            is_image = target.modality is MediaModality.IMAGE and not conditioned_image
+            groups.setdefault((is_image, tuple(normalized.shape)), []).append(index)
+        for (is_image, _), indices in groups.items():
+            if self.video_encoder is None:
+                raise ValueError("MiniMax H3 visual latent caching requires --vae")
+            pixels = torch.cat([self._video_pixels(batch[index].content) for index in indices], dim=0)
+            with torch.no_grad():
+                encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
+                latents = encode(pixels)
+            for index, latent in zip(indices, latents):
+                grouped_latents[index] = latent.to(self.output_dtype)
         results = []
-        for item in batch:
+        for index, item in enumerate(batch):
             target = self._target_asset(item)
             target_mode = getattr(item, "h3_target_mode", "av")
             if target_mode == "audio":
@@ -2758,7 +2788,9 @@ class _NativeLatentEncoder:
             conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
             one_frame = bool(getattr(item, "h3_one_frame", False))
             is_image = target.modality is MediaModality.IMAGE and not conditioned_image
-            video = self._encode_video(item.content, is_image=is_image)
+            video = grouped_latents.get(index)
+            if video is None:
+                video = self._encode_video(item.content, is_image=is_image)
             video_frame_count = IMAGE_FRAME_COUNT if is_image else int(item.content.shape[0])
             expected_video_frames = IMAGE_FRAME_COUNT if is_image else temporal_shape(video_frame_count).video_latent_frames
             if video.shape[1] != expected_video_frames:
