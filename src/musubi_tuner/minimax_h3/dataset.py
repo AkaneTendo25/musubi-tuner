@@ -782,6 +782,7 @@ class H3DatasetAdapter:
         self._target_audio_paths: dict[str, Path] = {}
         self._target_audio_frame_counts: dict[str, int] = {}
         self._target_reference_probabilities: dict[str, tuple[float, float, float]] = {}
+        self._teacher_captions: dict[str, str] = {}
         self._image_frame_counts: dict[str, int] = {}
         self._one_frame_settings: dict[tuple[str, str], tuple[int, tuple[int, ...]]] = {}
         # Authored conditioning masks: the observed region for --h3_mask_mode
@@ -792,6 +793,7 @@ class H3DatasetAdapter:
         self.image_frame_count = getattr(args, "h3_image_frame_count", None)
         self.one_frame = bool(getattr(args, "one_frame", False))
         self.task = str(getattr(args, "task", getattr(args, "h3_training_mode", "t2va")))
+        self.teacher_conditions = getattr(args, "teacher_conditions", None)
         if self.image_mode not in {"none", "first", "first_last"}:
             raise ValueError("MiniMax H3 image mode must be none, first, or first_last")
         self.audio_datasets: list[H3AudioDataset] = []
@@ -1106,6 +1108,17 @@ class H3DatasetAdapter:
                 reference_paths = {}
 
             qwen_control_paths = _resolve_qwen_controls(qwen_control_directory, records, target_paths)
+            if records is not None:
+                for record, target in zip(records, target_paths):
+                    teacher_caption = record.get("teacher_caption")
+                    if teacher_caption is not None:
+                        if not isinstance(teacher_caption, str) or not teacher_caption.strip():
+                            raise ValueError(f"teacher_caption for {target!r} must be a nonempty string")
+                        normal_target = _normal_path(target)
+                        existing_caption = self._teacher_captions.get(normal_target)
+                        if existing_caption is not None and existing_caption != teacher_caption:
+                            raise ValueError(f"conflicting teacher_caption for target path: {target}")
+                        self._teacher_captions[normal_target] = teacher_caption
             target_audio_paths: dict[str, Path] = {}
             if target_audio_directory:
                 matched_audio = _references_from_directory(target_audio_directory, target_paths)
@@ -1145,7 +1158,7 @@ class H3DatasetAdapter:
                             raise ValueError("MiniMax H3 timed one-frame controls must all be images")
                     elif self.task == "fl2va" and references:
                         raise ValueError("FL2VA one-frame controls require fp_1f_clean_indices")
-                    elif self.task not in {"ref2va", "ref2va_omni"} and references:
+                    elif self.task not in {"ref2va", "ref2va_omni"} and self.teacher_conditions != "subject_ref" and references:
                         raise ValueError("untimed one-frame controls are Ref2VA references and require --task ref2va")
                 resolved = _ResolvedTarget(Path(target), references, qwen_control_paths.get(target, ()))
                 normal = _normal_path(target)
@@ -1337,8 +1350,11 @@ class H3DatasetAdapter:
             return item.h3_media_assets
         resolved, start_frame, frame_count = self._resolve_target(item.item_key)
         normal = _normal_path(resolved.path)
+        item.h3_teacher_caption = self._teacher_captions.get(normal)
         modality = self._target_modalities[normal]
         target_fps = self._target_fps.get(normal)
+        item.h3_target_fps = target_fps
+        item.h3_target_mode = self._target_modes[normal]
         target_frame_count = frame_count if frame_count is not None else item.frame_count
         image_frame_count = self._image_frame_counts.get(normal)
         target = MediaAsset(

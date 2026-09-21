@@ -8,8 +8,8 @@ import gc
 import hashlib
 import json
 import logging
-import os
 import math
+import os
 import re
 import time
 from collections.abc import Sequence
@@ -49,19 +49,25 @@ from musubi_tuner.minimax_h3.backend import (
 from musubi_tuner.minimax_h3.block_sparse_attention import DEFAULT_BLOCK
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
-    H3_EMPTY_TEXT_HIDDEN_KEY,
-    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_CONDITIONING_TASK_IDS,
+    H3_CONDITIONING_TASK_KEY,
     H3_DOP_CONFIG_KEY,
     H3_DOP_TEXT_HIDDEN_KEY,
     H3_DOP_TEXT_TOKEN_TAGS_KEY,
+    H3_EMPTY_TEXT_HIDDEN_KEY,
+    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
+    H3_TEACHER_CONDITION_IDS as _TEACHER_CONDITION_IDS,
+    H3_TEACHER_CONDITIONS_KEY as _TEACHER_ID_KEY,
+    H3_TEACHER_HIDDEN_KEY as _TEACHER_HIDDEN_KEY,
+    H3_TEACHER_TOKEN_TAGS_KEY as _TEACHER_TAGS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
 )
-from musubi_tuner.minimax_h3.dop import dop_config_identity
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_decoder, load_video_vae_decoder
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
+from musubi_tuner.minimax_h3.dop import dop_config_identity
 from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
     denoise_fl2va,
@@ -71,7 +77,6 @@ from musubi_tuner.minimax_h3.inference import (
     prepare_keyframe_image,
     save_av_mp4,
 )
-from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.masking import (
     CONDITIONING_MASK_BATCH_KEY as H3_CONDITIONING_MASK_KEY,
 )
@@ -82,11 +87,21 @@ from musubi_tuner.minimax_h3.masking import (
     sample_video_mask,
     video_mask_to_rows,
 )
+from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.model import h3_profile_scope
 from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS, MiniMaxH3GuideGeometry
+from musubi_tuner.minimax_h3.references import (
+    REFERENCE_IMAGE_SHORT_EDGE,
+    REFERENCE_IMAGE_SIZE_MODES,
+    REFERENCE_VIDEO_FPS,
+    REFERENCE_VIDEO_MAX_PIXELS,
+    REFERENCE_VIDEO_SHORT_EDGE,
+    prepare_references,
+    validate_reference_video_fps,
+    validate_reference_video_sizing,
+)
 from musubi_tuner.minimax_h3.rollout import (
     MAX_ROLLOUT_WINDOW,
-    SIGMA_FLOOR as ROLLOUT_SIGMA_FLOOR,
     TEACHER_PRIVILEGE_CHANNELS,
     H3RolloutTeacherCache,
     batch_item_key,
@@ -97,20 +112,14 @@ from musubi_tuner.minimax_h3.rollout import (
     rollout_base_sigmas,
     teacher_batch,
 )
-from musubi_tuner.minimax_h3.references import (
-    REFERENCE_IMAGE_SHORT_EDGE,
-    REFERENCE_IMAGE_SIZE_MODES,
-    REFERENCE_VIDEO_FPS,
-    REFERENCE_VIDEO_MAX_PIXELS,
-    REFERENCE_VIDEO_SHORT_EDGE,
-    validate_reference_video_fps,
-    validate_reference_video_sizing,
-    prepare_references,
+from musubi_tuner.minimax_h3.rollout import (
+    SIGMA_FLOOR as ROLLOUT_SIGMA_FLOOR,
 )
 from musubi_tuner.minimax_h3.training import (
     H3FusedArm,
     H3JointNoisyInputs,
     H3ModelPrediction,
+    _broadcast_mask,
     cfg_zero_rescaled_empty,
     contrastive_guidance_target,
     guidance_consistent_prediction,
@@ -137,6 +146,143 @@ from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
+
+
+def _teacher_conditioned(args, base_sigma: float) -> bool:
+    return float(args.h3_teacher_condition_sigma_min) <= base_sigma <= float(args.h3_teacher_condition_sigma_max)
+
+
+def _teacher_anchor_compensation(args) -> float:
+    """Keep the anchor's expected share when the base-sigma sampler favors a focus band."""
+    probability = float(args.h3_timestep_focus_probability)
+    if probability <= 0:
+        return 1.0
+    minimum = float(args.h3_teacher_condition_sigma_min)
+    maximum = float(args.h3_teacher_condition_sigma_max)
+    anchor_width = minimum + 1.0 - maximum
+    if anchor_width <= 0:
+        return 1.0
+    low = float(args.h3_timestep_focus_min)
+    high = float(args.h3_timestep_focus_max)
+    focused_width = max(0.0, min(minimum, high) - low) + max(0.0, high - max(maximum, low))
+    focused_share = (1.0 - probability) * anchor_width + probability * focused_width / (high - low)
+    return anchor_width / focused_share if focused_share > 0 else 1.0
+
+
+def _teacher_flow_parts(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mag_weight: float,
+    dc_weight: float = 1.0,
+    mask=None,
+    sample_weight=None,
+    mask_normalization: str = "weighted",
+):
+    """Return decomposed modality mean, numerator, active count, and mean denominator."""
+    if pred.shape != target.shape:
+        raise ValueError("H3 teacher prediction and target shapes differ")
+    if mask_normalization not in ("weighted", "full"):
+        raise ValueError("unsupported H3 loss mask normalization")
+    pred = pred.float()
+    target = target.float()
+    if mask is not None:
+        mask = _broadcast_mask(mask, target).to(dtype=pred.dtype)
+    elements = pred.numel() if mask is None else int((mask > 0).sum())
+    denominator = float(pred.numel()) if mask is None or mask_normalization == "full" else mask.sum()
+    if sample_weight is not None:
+        if sample_weight.shape != (pred.shape[0],):
+            raise ValueError("H3 teacher sample weighting must contain one value per batch item")
+        sample = sample_weight.to(device=pred.device, dtype=pred.dtype).view(-1, *([1] * (pred.ndim - 1)))
+        denominator = denominator * sample_weight.to(device=pred.device, dtype=pred.dtype).reshape(-1)[0]
+    else:
+        sample = None
+    if dc_weight != 1.0:
+        residual = pred - target
+        axes = tuple(range(2, pred.ndim))
+        residual_dc = (
+            residual.mean(dim=axes, keepdim=True)
+            if mask is None
+            else (residual * mask).sum(dim=axes, keepdim=True) / mask.sum(dim=axes, keepdim=True).clamp_min(1)
+        )
+        pred = pred - (1.0 - math.sqrt(dc_weight)) * residual_dc
+    if mask is not None:
+        root_mask = mask.sqrt()
+        pred = pred * root_mask
+        target = target * root_mask
+    if sample is not None:
+        pred = pred * sample.sqrt()
+        target = target * sample.sqrt()
+    pred_norm = pred.flatten().norm()
+    target_norm = target.flatten().norm()
+    cosine = (torch.dot(pred.flatten(), target.flatten()) / (pred_norm * target_norm + 1e-12)).clamp(-1.0, 1.0)
+    total = mag_weight * (pred_norm - target_norm).square() + 2 * pred_norm.detach() * target_norm * (1 - cosine)
+    mean = (
+        total / denominator.clamp_min(torch.finfo(torch.float32).tiny)
+        if isinstance(denominator, torch.Tensor)
+        else total / max(denominator, torch.finfo(torch.float32).tiny)
+    )
+    return mean, total, elements, denominator
+
+
+def _teacher_flow_loss(
+    pred: torch.Tensor, target: torch.Tensor, *, mag_weight: float, dc_weight: float = 1.0, mask=None
+) -> torch.Tensor:
+    return _teacher_flow_parts(pred, target, mag_weight=mag_weight, dc_weight=dc_weight, mask=mask)[0]
+
+
+def _teacher_joint_loss(
+    prediction,
+    teacher,
+    *,
+    video_mask=None,
+    audio_mask=None,
+    video_sample_weight=None,
+    audio_sample_weight=None,
+    balance="modality",
+    mask_normalization="weighted",
+    video_weight=1.0,
+    audio_weight=1.0,
+    mag_weight=1.0,
+    dc_weight=1.0,
+):
+    """Mirror H3 joint reduction while using the decoupled per-modality numerator."""
+    zero = (prediction.video if prediction.video is not None else prediction.audio).sum() * 0.0
+
+    def part(pred, target, mask, sample_weight, weight, *, dc):
+        if pred is None or target is None or weight == 0:
+            return zero, zero, 0, 0.0
+        return _teacher_flow_parts(
+            pred,
+            target,
+            mag_weight=mag_weight,
+            dc_weight=dc,
+            mask=mask,
+            sample_weight=sample_weight,
+            mask_normalization=mask_normalization,
+        )
+
+    vmean, vtotal, vcount, vdenom = part(
+        prediction.video, teacher.video, video_mask, video_sample_weight, video_weight, dc=dc_weight
+    )
+    amean, atotal, acount, adenom = part(prediction.audio, teacher.audio, audio_mask, audio_sample_weight, audio_weight, dc=1.0)
+    vw = video_weight if vcount else 0.0
+    aw = audio_weight if acount else 0.0
+    if vw + aw == 0:
+        return zero, vmean, amean
+    if balance == "modality":
+        return (vw * vmean + aw * amean) / (vw + aw), vmean, amean
+    if balance != "token":
+        raise ValueError("unsupported H3 loss balance")
+    denominator = vw * vdenom + aw * adenom
+    return (
+        (vw * vtotal + aw * atotal) / denominator.clamp_min(torch.finfo(torch.float32).tiny)
+        if isinstance(denominator, torch.Tensor)
+        else (vw * vtotal + aw * atotal) / max(denominator, torch.finfo(torch.float32).tiny),
+        vmean,
+        amean,
+    )
+
 
 _SAMPLE_KEYFRAME_ROWS = "_h3_keyframe_rows"
 _SAMPLE_KEYFRAME_ANCHORS = "_h3_keyframe_anchors"
@@ -3114,6 +3260,35 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
+        if getattr(args, "h3_teacher_matching", False):
+            if args.h3_training_mode != "fl2va":
+                raise ValueError("--h3_teacher_matching requires --h3_training_mode fl2va for a text-only T2VA student")
+            if getattr(args, "one_frame", False) and args.h3_teacher_conditions != "subject_ref":
+                raise ValueError("--one_frame teacher matching supports --h3_teacher_conditions subject_ref only")
+            if args.h3_guidance_distillation_scale is not None:
+                raise ValueError("--h3_teacher_matching cannot combine with guidance distillation")
+            if (
+                getattr(args, "h3_rollout_supervision", False)
+                or float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
+                or float(getattr(args, "h3_dop_loss_weight", 0.0) or 0.0) > 0
+                or float(getattr(args, "h3_base_preservation_loss_weight", 0.0) or 0.0) > 0
+                or float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0
+                or float(getattr(args, "h3_caption_dropout_rate", 0.0) or 0.0) > 0
+            ):
+                raise ValueError(
+                    "--h3_teacher_matching is exclusive with rollout, two-teacher, DOP, base-preservation, null-anchor and caption dropout objectives"
+                )
+            if args.h3_teacher_conditions not in _TEACHER_CONDITION_IDS:
+                raise ValueError("unsupported H3 teacher conditions")
+            if not 0 <= args.h3_teacher_condition_sigma_min <= args.h3_teacher_condition_sigma_max <= 1:
+                raise ValueError("H3 teacher condition sigma gates must satisfy 0 <= min <= max <= 1")
+            teacher_weights = (
+                args.h3_teacher_loss_mag_weight,
+                args.h3_teacher_loss_dc_weight,
+                args.h3_teacher_preservation_weight,
+            )
+            if any(not math.isfinite(value) or value < 0 for value in teacher_weights):
+                raise ValueError("H3 teacher loss weights must be finite and non-negative")
         overlay_weights = getattr(args, "h3_overlay_weights", None)
         overlay_multiplier = float(getattr(args, "h3_overlay_weights_multiplier", 1.0))
         self._overlay_training_only = bool(getattr(args, "h3_overlay_training_only", False))
@@ -3359,6 +3534,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if self._keyframe_anchors and args.h3_keyframe_random_count:
             raise ValueError("H3 keyframe anchors are either listed or drawn at random, not both")
         keyframes = bool(self._keyframe_anchors) or bool(args.h3_keyframe_random_count) or bool(self._guide_specs)
+        if getattr(args, "h3_teacher_matching", False) and (
+            keyframes
+            or args.h3_mask_mode != "off"
+            or args.h3_mask_audio
+            or args.h3_extension_video_frames
+            or args.h3_extension_audio_latents
+            or args.h3_observed_modality is not None
+            or args.h3_qwen_control_dropout_rate > 0
+        ):
+            raise ValueError(
+                "--h3_teacher_matching requires an unconditioned T2VA student; remove keyframes, guides, masks, extension, observed modality and control dropout"
+            )
         if keyframes and (args.h3_extension_video_frames or args.h3_extension_audio_latents):
             raise ValueError("H3 keyframe conditioning and extension both claim the observed rows; enable only one")
         if keyframes and (args.h3_mask_mode != "off" or args.h3_mask_audio):
@@ -5594,6 +5781,30 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             inputs,
         )
 
+    def _teacher_matching_batch(self, args, batch, inputs, conditioned: bool):
+        expected = _TEACHER_CONDITION_IDS[args.h3_teacher_conditions]
+        missing = [key for key in (_TEACHER_HIDDEN_KEY, _TEACHER_TAGS_KEY, _TEACHER_ID_KEY) if key not in batch]
+        if missing:
+            raise KeyError("H3 teacher matching requires teacher text caches; missing " + ", ".join(missing))
+        identity = self.backend._one_conditioning_item(batch, _TEACHER_ID_KEY, expected_ndim=0)
+        if identity.dtype != torch.int64 or int(identity) != expected:
+            raise ValueError("H3 teacher cache conditions do not match --h3_teacher_conditions; re-cache text")
+        student_task = self.backend._one_conditioning_item(batch, H3_CONDITIONING_TASK_KEY, expected_ndim=0)
+        if student_task.dtype != torch.int64 or int(student_task) != H3_CONDITIONING_TASK_IDS["t2va"]:
+            raise ValueError("H3 teacher matching requires T2VA student text conditioning; re-cache text")
+        if not conditioned:
+            return batch, self.backend.mode
+        teacher = dict(batch)
+        teacher[H3_TEXT_HIDDEN_KEY] = batch[_TEACHER_HIDDEN_KEY]
+        teacher[H3_TEXT_TOKEN_TAGS_KEY] = batch[_TEACHER_TAGS_KEY]
+        mode = "fl2va" if expected == 1 else "ref2va"
+        teacher[H3_CONDITIONING_TASK_KEY] = torch.tensor([H3_CONDITIONING_TASK_IDS[mode]], dtype=torch.long)
+        if expected == 2:
+            teacher["mmh3_teacher_reference_video"] = self._clean_latents(inputs.video, inputs.video_target, inputs.video_sigma)
+            if inputs.audio is not None:
+                teacher["mmh3_teacher_reference_audio"] = self._clean_latents(inputs.audio, inputs.audio_target, inputs.audio_sigma)
+        return teacher, mode
+
     def _predict_call(
         self,
         accelerator: Accelerator,
@@ -5814,6 +6025,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             or float(args.h3_dop_loss_weight) > 0
             or float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
             or bool(getattr(args, "h3_rollout_supervision", False))
+            or bool(getattr(args, "h3_teacher_matching", False))
             or float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0
             or self._crepa is not None
             or self._teacher_network is not None
@@ -6439,6 +6651,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         dop_reference_prediction = None
         teacher_concept_prediction = None
+        matching_teacher_prediction = None
+        teacher_conditioned = False
+        if getattr(args, "h3_teacher_matching", False):
+            teacher_conditioned = _teacher_conditioned(args, float(base_sigma.reshape(-1)[0]))
         two_teacher_bare_loss = None
         # One device read per batch for every sigma gate together; the gates
         # share the value, so the three checks below cost no further syncs.
@@ -6494,7 +6710,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         auxiliary_block_swap = (
             bool(self.blocks_to_swap)
             and not getattr(self, "_block_swap_h2d_only", False)
-            and (use_guidance or preservation_active or dop_active or null_anchor_active or two_teacher_active)
+            and (
+                use_guidance
+                or preservation_active
+                or dop_active
+                or null_anchor_active
+                or two_teacher_active
+                or getattr(args, "h3_teacher_matching", False)
+            )
         )
         if auxiliary_block_swap:
             # Teacher branches have no backward pass. Classic block swap in
@@ -6504,6 +6727,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # the graph-carrying student forward.
             transformer.switch_block_swap_for_inference()
         try:
+            if getattr(args, "h3_teacher_matching", False):
+                teacher_batch, teacher_mode = self._teacher_matching_batch(args, batch, inputs, teacher_conditioned)
+                set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_teacher_matching")
+                original_mode = self.backend.mode
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                int8_context = getattr(transformer, "int8_attention_context", None)
+                with torch.random.fork_rng(devices=fork_devices):
+                    set_enabled(False)
+                    self.backend.mode = teacher_mode
+                    try:
+                        with torch.no_grad(), int8_context(auxiliary=True) if callable(int8_context) else nullcontext():
+                            matching_teacher_prediction = self._predict(
+                                accelerator, transformer, teacher_batch, inputs, conditioning="prompt"
+                            )
+                    finally:
+                        self.backend.mode = original_mode
+                        set_enabled(True)
             fused_teachers = bool(
                 args.h3_fuse_frozen_teachers
                 and use_guidance
@@ -6880,6 +7120,29 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # auxiliary terms. Reported as the averaged loss whenever the optimized
         # loss differs from it.
         dense_loss = result.loss
+        if matching_teacher_prediction is not None:
+            magnitude = args.h3_teacher_loss_mag_weight if teacher_conditioned else 1.0
+            loss, video_teacher_loss, audio_teacher_loss = _teacher_joint_loss(
+                raw_prediction,
+                matching_teacher_prediction,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+                mag_weight=magnitude,
+                dc_weight=args.h3_teacher_loss_dc_weight if teacher_conditioned else 1.0,
+            )
+            if not teacher_conditioned:
+                loss = loss * args.h3_teacher_preservation_weight * _teacher_anchor_compensation(args)
+            metrics["loss/video"] = float(video_teacher_loss.detach())
+            metrics["loss/audio"] = float(audio_teacher_loss.detach())
+            metrics["loss/teaching" if teacher_conditioned else "loss/anchor"] = float(loss.detach())
+            metrics["h3/teacher_conditioned"] = float(teacher_conditioned)
+            dense_loss = loss
         two_teacher_trigger_loss = None
         if two_teacher_active:
             # The triggered arm reuses the primary forward: the student's own
@@ -7449,6 +7712,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_int8_attention": args.h3_int8_attention,
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
+            **(
+                {
+                    "ss_h3_teacher_matching": "True",
+                    "ss_h3_teacher_conditions": args.h3_teacher_conditions,
+                    "ss_h3_teacher_condition_sigma_min": str(args.h3_teacher_condition_sigma_min),
+                    "ss_h3_teacher_condition_sigma_max": str(args.h3_teacher_condition_sigma_max),
+                    "ss_h3_teacher_loss_mag_weight": str(args.h3_teacher_loss_mag_weight),
+                    "ss_h3_teacher_loss_dc_weight": str(args.h3_teacher_loss_dc_weight),
+                    "ss_h3_teacher_preservation_weight": str(args.h3_teacher_preservation_weight),
+                }
+                if getattr(args, "h3_teacher_matching", False)
+                else {}
+            ),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_guidance_audio_scale": str(getattr(args, "h3_guidance_audio_scale", None) or "same"),
             "ss_h3_guidance_scale_range": (
@@ -7564,6 +7840,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="accept MiniMax H3 one-frame caches with explicit target/control frame indices",
     )
+    parser.add_argument(
+        "--h3_teacher_matching", action="store_true", help="match a frozen same-base teacher given privileged conditions"
+    )
+    parser.add_argument("--h3_teacher_conditions", choices=tuple(_TEACHER_CONDITION_IDS), default="first,last")
+    parser.add_argument("--h3_teacher_condition_sigma_min", type=float, default=0.0)
+    parser.add_argument("--h3_teacher_condition_sigma_max", type=float, default=0.75)
+    parser.add_argument("--h3_teacher_loss_mag_weight", type=float, default=1.0)
+    parser.add_argument("--h3_teacher_loss_dc_weight", type=float, default=1.0)
+    parser.add_argument("--h3_teacher_preservation_weight", type=float, default=1.0)
     parser.add_argument(
         "--h3_lora_token_refiner",
         action="store_true",

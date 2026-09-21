@@ -36,19 +36,19 @@ from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LOSS_MASK_KEY,
     H3_CONDITIONING_TASK_IDS,
     H3_CONDITIONING_TASK_KEY,
-    H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_DOP_TEXT_HIDDEN_KEY,
     H3_DOP_TEXT_TOKEN_TAGS_KEY,
+    H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
     H3_KEYFRAME_VISUAL_LAST,
     H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
-    H3_ONE_FRAME_TARGET_INDEX_KEY,
     H3_ONE_FRAME_CONTROL_INDICES_KEY,
+    H3_ONE_FRAME_TARGET_INDEX_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
-    H3_REFERENCE_AUDIO_LENGTHS_KEY,
     H3_REFERENCE_ALIGNED_KEY,
+    H3_REFERENCE_AUDIO_LENGTHS_KEY,
     H3_REFERENCE_AUDIO_ROWS_KEY,
     H3_REFERENCE_IMAGE_MAX_PIXELS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
@@ -77,10 +77,10 @@ from musubi_tuner.minimax_h3.component_loader import (
     load_video_vae_encoder,
 )
 from musubi_tuner.minimax_h3.inference import (
-    H3NullGuidance,
     CANVAS_MULTIPLE,
     VIDEO_SPATIAL_COMPRESSION,
     H3EncodedReferences,
+    H3NullGuidance,
     decode_latents_sequentially,
     denoise_fl2va,
     denoise_ref2va,
@@ -123,6 +123,11 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils.model_utils import dtype_to_str, str_to_dtype
 
 logger = logging.getLogger(__name__)
+
+# Transient trainer inputs for the opt-in self-reference teacher. They are never
+# written to the latent cache: the reference is the current clean target crop.
+H3_TEACHER_REFERENCE_VIDEO_KEY = "mmh3_teacher_reference_video"
+H3_TEACHER_REFERENCE_AUDIO_KEY = "mmh3_teacher_reference_audio"
 
 
 def _round_to(value: float, multiple: int) -> int:
@@ -2280,6 +2285,8 @@ class _NativeTrainingBackend:
 
     def _cached_reference_kinds(self, batch: dict) -> torch.Tensor | None:
         """Peek at the cached reference kinds without unpacking the whole bundle."""
+        if H3_TEACHER_REFERENCE_VIDEO_KEY in batch:
+            return torch.tensor([int(H3ReferenceKind.VIDEO)], dtype=torch.long)
         suffix = reference_key_suffix(
             self.reference_image_short_edge,
             self.reference_image_size_mode,
@@ -2305,6 +2312,50 @@ class _NativeTrainingBackend:
         dtype: torch.dtype,
         reference_modality: Literal["av", "video", "audio"] = "av",
     ) -> tuple[tuple[MiniMaxH3ReferenceGeometry, ...], torch.Tensor, torch.Tensor]:
+        if H3_TEACHER_REFERENCE_VIDEO_KEY in batch:
+            if reference_modality != "av":
+                raise ValueError("H3 self-reference teacher requires the complete video/audio reference")
+
+            def clean_target(key: str, ndim: int) -> torch.Tensor | None:
+                value = batch.get(key)
+                if value is None:
+                    return None
+                if isinstance(value, (list, tuple)):
+                    if len(value) != 1:
+                        raise ValueError(f"H3 {key} requires one batch item")
+                    value = value[0]
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(f"H3 {key} must be a tensor")
+                if value.ndim == ndim + 1 and value.shape[0] == 1:
+                    value = value[0]
+                if value.ndim != ndim:
+                    raise ValueError(f"H3 {key} must have {ndim} dimensions per item")
+                return value.detach().to(device=device, dtype=dtype)
+
+            video = clean_target(H3_TEACHER_REFERENCE_VIDEO_KEY, 4)
+            audio = clean_target(H3_TEACHER_REFERENCE_AUDIO_KEY, 3)
+            if video is None or video.shape[-3] < 1:
+                raise ValueError("H3 self-reference teacher requires clean video target latents")
+            if video.shape[0] * int(np.prod(patch_size)) != video_width:
+                raise ValueError("H3 self-reference video channels do not match the target")
+            video_rows = patchify_video_latents(video[None], patch_size)[0]
+            if audio is None:
+                audio_rows = torch.empty((0, audio_width), device=device, dtype=dtype)
+                audio_length = 0
+            else:
+                if audio.shape[0] != AUDIO_CHANNELS or audio.shape[1] != audio_width:
+                    raise ValueError("H3 self-reference audio channels do not match the target")
+                audio_rows = pack_audio_latents(audio[None])[0]
+                audio_length = int(audio.shape[-1])
+            reference = MiniMaxH3ReferenceGeometry(
+                kind=int(H3ReferenceKind.VIDEO),
+                num_latent_frames=int(video.shape[-3]),
+                latent_height=int(video.shape[-2]),
+                latent_width=int(video.shape[-1]),
+                num_audio_latents=audio_length,
+            )
+            return (reference,), video_rows, audio_rows
+
         suffix = reference_key_suffix(
             self.reference_image_short_edge,
             self.reference_image_size_mode,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 from collections.abc import Sequence
 from pathlib import Path
@@ -32,6 +33,11 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
+    H3_TEACHER_CONDITION_IDS,
+    H3_TEACHER_CONDITIONS_KEY,
+    H3_TEACHER_FINGERPRINT_CACHE_KEY,
+    H3_TEACHER_HIDDEN_KEY,
+    H3_TEACHER_TOKEN_TAGS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -65,6 +71,27 @@ from musubi_tuner.minimax_h3.references import (
 logger = logging.getLogger(__name__)
 
 
+def _teacher_identity(item: ItemInfo, mode: str) -> torch.Tensor:
+    """Bind extra teacher rows to their prompt and privileged visual source."""
+    digest = hashlib.sha256()
+    digest.update(mode.encode())
+    digest.update(item.caption.encode())
+    digest.update((getattr(item, "h3_teacher_caption", None) or "").encode())
+    digest.update(str(getattr(item, "h3_target_mode", "")).encode())
+    if mode == "subject_ref":
+        digest.update(str(getattr(item, "h3_cache_metadata", {}).get(REFERENCE_FINGERPRINT_KEY, "")).encode())
+    else:
+        content = item.content
+        if content is None:
+            raise ValueError(f"{mode} teacher needs decoded target content for {item.item_key}")
+        if mode == "first,last":
+            digest.update(memoryview(content[0]).tobytes())
+            digest.update(memoryview(content[-1]).tobytes())
+        else:
+            digest.update(memoryview(content).tobytes())
+    return torch.tensor(list(digest.digest()), dtype=torch.uint8)
+
+
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Cache MiniMax H3 conditioning with Musubi's dataset and cache pipeline"
     parser.add_argument("--text_encoder", type=Path, required=True, help="H3 Qwen3-VL checkpoint or Comfy model directory")
@@ -96,6 +123,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--text_encoder_dtype", default="bfloat16")
+    parser.add_argument(
+        "--teacher_conditions",
+        choices=tuple(H3_TEACHER_CONDITION_IDS),
+        default=None,
+        help="also cache a privileged teacher presentation for T2VA: first,last, ref, or subject_ref",
+    )
     parser.add_argument(
         "--text_encoder_quantization",
         choices=("none", "int8", "nf4", "nvfp4", "nvfp4_awq"),
@@ -196,6 +229,12 @@ def create_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = create_parser()
     args = parser.parse_args(argv)
+    if args.teacher_conditions and args.task != "t2va":
+        parser.error("--teacher_conditions requires --task t2va")
+    if args.teacher_conditions in {"first,last", "ref"} and args.one_frame:
+        parser.error("first,last and ref teacher conditions require video targets")
+    if args.teacher_conditions and args.h3_keyframe_visuals:
+        parser.error("--teacher_conditions cannot be combined with --h3_keyframe_visuals")
     if args.h3_image_mode != "none" and args.task != "fl2va":
         parser.error("--h3_image_mode requires --task fl2va")
     if args.h3_text_visual_max_pixels < 0:
@@ -272,6 +311,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "conditioning encoder",
         )
         for item, tensors in zip(batch, results):
+            if args.teacher_conditions:
+                tensors.update(encoder.encode_teacher(item, args.teacher_conditions))
+                tensors[H3_TEACHER_FINGERPRINT_CACHE_KEY] = _teacher_identity(item, args.teacher_conditions)
             save_text_encoder_output_cache_minimax_h3(item, tensors)
 
     def existing_cache_valid(item: ItemInfo, path: str) -> bool:
@@ -306,7 +348,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                     return False
                 if int(handle.get_tensor(H3_CONDITIONING_TASK_KEY)) != H3_CONDITIONING_TASK_IDS[args.task]:
                     return False
-                if args.task in {"ref2va", "ref2va_omni"}:
+                if args.teacher_conditions:
+                    required_teacher = {H3_TEACHER_HIDDEN_KEY, H3_TEACHER_TOKEN_TAGS_KEY}
+                    if (
+                        not required_teacher <= logical_keys
+                        or not {H3_TEACHER_CONDITIONS_KEY, H3_TEACHER_FINGERPRINT_CACHE_KEY} <= keys
+                    ):
+                        return False
+                    if int(handle.get_tensor(H3_TEACHER_CONDITIONS_KEY)) != H3_TEACHER_CONDITION_IDS[args.teacher_conditions]:
+                        return False
+                    if not torch.equal(
+                        handle.get_tensor(H3_TEACHER_FINGERPRINT_CACHE_KEY), _teacher_identity(item, args.teacher_conditions)
+                    ):
+                        return False
+                elif H3_TEACHER_CONDITIONS_KEY in keys:
+                    return False
+                if args.task in {"ref2va", "ref2va_omni"} or args.teacher_conditions in {"ref", "subject_ref"}:
                     if H3_REFERENCE_VIDEO_SHORT_EDGE_KEY not in keys or H3_REFERENCE_VIDEO_MAX_PIXELS_KEY not in keys:
                         return False
                     if int(handle.get_tensor(H3_REFERENCE_VIDEO_SHORT_EDGE_KEY)) != args.reference_video_short_edge:
@@ -422,7 +479,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         all_cache_files,
         all_cache_paths,
         encode,
-        requires_content=encoder.conditioning_requires_content,
+        requires_content=encoder.conditioning_requires_content or bool(args.teacher_conditions),
         existing_cache_valid=existing_cache_valid,
         faster_check=args.faster_check,
         faster_check_samples=args.faster_check_samples,

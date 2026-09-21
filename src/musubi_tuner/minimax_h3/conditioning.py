@@ -14,14 +14,14 @@ from torch import nn
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLConfig, Qwen3VLModel
 
 from musubi_tuner.minimax_h3.cache import (
+    H3_ALIGNED_GUIDE_COUNT_KEY,
     H3_CONDITIONING_TASK_IDS,
     H3_CONDITIONING_TASK_KEY,
-    H3_ALIGNED_GUIDE_COUNT_KEY,
-    H3_EMPTY_TEXT_HIDDEN_KEY,
-    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_DOP_CONFIG_CACHE_KEY,
     H3_DOP_TEXT_HIDDEN_KEY,
     H3_DOP_TEXT_TOKEN_TAGS_KEY,
+    H3_EMPTY_TEXT_HIDDEN_KEY,
+    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
@@ -34,6 +34,10 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
+    H3_TEACHER_CONDITION_IDS,
+    H3_TEACHER_CONDITIONS_KEY,
+    H3_TEACHER_HIDDEN_KEY,
+    H3_TEACHER_TOKEN_TAGS_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_VISUAL_MAX_PIXELS_KEY,
@@ -42,7 +46,6 @@ from musubi_tuner.minimax_h3.cache import (
     reference_variant_key,
     resolve_keyframe_visuals,
 )
-from musubi_tuner.minimax_h3.dop import dop_config_identity, rewrite_dop_caption
 from musubi_tuner.minimax_h3.comfy_quant import (
     has_comfy_quantized_layers,
     load_comfy_quantized_state_dict,
@@ -50,6 +53,7 @@ from musubi_tuner.minimax_h3.comfy_quant import (
     quantize_linear_nvfp4_weight_only,
 )
 from musubi_tuner.minimax_h3.component_loader import resolve_nvfp4_awq_text_encoder_checkpoint, text_encoder_metadata
+from musubi_tuner.minimax_h3.dop import dop_config_identity, rewrite_dop_caption
 from musubi_tuner.minimax_h3.media import MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.references import (
@@ -714,6 +718,75 @@ class MiniMaxH3ConditioningEncoder:
             raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
         hidden, tags = self._encode_prompt(prompt, references=references)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
+
+    def encode_teacher(self, item: Any, mode: str) -> dict[str, torch.Tensor]:
+        """Encode an optional privileged presentation without changing student rows."""
+        if self.task != "t2va" or mode not in H3_TEACHER_CONDITION_IDS:
+            raise ValueError("H3 teacher conditions require T2VA and first,last, ref, or subject_ref")
+        caption = getattr(item, "h3_teacher_caption", None) or item.caption
+        images = None
+        references = None
+        if mode == "first,last":
+            content = np.asarray(item.content)
+            if content.ndim != 4 or len(content) < 2:
+                raise ValueError("first,last teacher requires a target video with at least two frames")
+            images = [Image.fromarray(content[0].astype(np.uint8)), Image.fromarray(content[-1].astype(np.uint8))]
+        elif mode == "subject_ref":
+            from musubi_tuner.minimax_h3.teacher_presentations import subject_reference_caption
+
+            references = prepare_references(
+                item,
+                self.reference_image_short_edge,
+                self.reference_image_size_mode,
+                self.reference_image_max_pixels,
+                self.reference_video_short_edge,
+                self.reference_video_max_pixels,
+                self.reference_video_fps,
+            )
+            if not references or any(ref.kind is not H3ReferenceKind.IMAGE for ref in references):
+                raise ValueError("subject_ref teacher requires one or more image references only")
+            if not getattr(item, "h3_teacher_caption", None):
+                caption = subject_reference_caption(
+                    caption, len(references), still_image=bool(getattr(item, "h3_one_frame", False))
+                )
+        else:
+            from musubi_tuner.minimax_h3.teacher_presentations import ref_teacher_caption
+
+            content = np.asarray(item.content)
+            if content.ndim != 4 or len(content) < 1:
+                raise ValueError("ref teacher requires a decoded target video")
+            has_target_audio = getattr(item, "h3_target_mode", "av") != "video"
+            references = (
+                H3PreparedReference(
+                    kind=H3ReferenceKind.VIDEO,
+                    frames=content.astype(np.uint8),
+                    sample_fps=float(getattr(item, "h3_target_fps", None) or 24.0),
+                    waveform=torch.empty(0) if has_target_audio else None,
+                ),
+            )
+            if not getattr(item, "h3_teacher_caption", None):
+                caption = ref_teacher_caption(caption, has_audio=has_target_audio)
+        hidden, tags = self._encode_prompt(caption, images, references)
+        dtype_name = dtype_to_str(self.output_dtype)
+        return {
+            f"varlen_{H3_TEACHER_HIDDEN_KEY}_{dtype_name}": hidden,
+            f"varlen_{H3_TEACHER_TOKEN_TAGS_KEY}_int64": tags,
+            H3_TEACHER_CONDITIONS_KEY: torch.tensor(H3_TEACHER_CONDITION_IDS[mode], dtype=torch.long),
+            **(
+                {
+                    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY: torch.tensor(self.reference_image_short_edge, dtype=torch.long),
+                    H3_REFERENCE_IMAGE_SIZE_MODE_KEY: torch.tensor(
+                        0 if self.reference_image_size_mode == "short_edge" else 1, dtype=torch.long
+                    ),
+                    H3_REFERENCE_IMAGE_MAX_PIXELS_KEY: torch.tensor(self.reference_image_max_pixels, dtype=torch.long),
+                    H3_REFERENCE_VIDEO_SHORT_EDGE_KEY: torch.tensor(self.reference_video_short_edge, dtype=torch.long),
+                    H3_REFERENCE_VIDEO_MAX_PIXELS_KEY: torch.tensor(self.reference_video_max_pixels, dtype=torch.long),
+                    H3_REFERENCE_VIDEO_FPS_KEY: torch.tensor(float(self.reference_video_fps), dtype=torch.float64),
+                }
+                if mode in {"ref", "subject_ref"}
+                else {}
+            ),
+        }
 
     def encode_conditioning(
         self,

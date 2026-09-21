@@ -59,6 +59,7 @@ Two released transformers, with different conditioning contracts:
   - [Methods](#methods)
     - [Plain LoRA](#plain-lora)
     - [De-distilling adapter](#de-distilling-adapter)
+    - [Teacher matching](#teacher-matching)
     - [Contrastive guidance loss](#contrastive-guidance-loss)
     - [Frozen-null target with the null anchor](#frozen-null-target-with-the-null-anchor)
     - [Rollout supervision](#rollout-supervision)
@@ -99,6 +100,7 @@ FL2VA conditioning also accepts an explicitly selected Ref2VA checkpoint. `--tas
 | First+last-conditioned image editing | [`image_fl2va_first_last.toml`](../examples/minimax_h3/image_fl2va_first_last.toml): two ordered controls per target | FL2VA | `fl2va` | Both cache commands: `--h3_image_mode first_last` |
 | Text-to-video+audio | [`t2va.toml`](../examples/minimax_h3/t2va.toml): `target_video_directory` or `video_jsonl_file`, with `target_modalities = ["video", "audio"]` | FL2VA | `t2va` | None |
 | Text-to-video only | [`video_only.toml`](../examples/minimax_h3/video_only.toml): `target_modalities = ["video"]` | FL2VA | `t2va` | None |
+| Text-only identity from privileged video or subject references | Video targets for `first,last`/`ref`; image JSONL or reference directories for `subject_ref` | FL2VA | `t2va` | Text cache: `--teacher_conditions KIND`; trainer: `--h3_teacher_matching --h3_teacher_conditions KIND` (see [Teacher matching](#teacher-matching)) |
 | Text-to-audio only | [`audio_only.toml`](../examples/minimax_h3/audio_only.toml): `target_audio_directory` or `audio_jsonl_file`, with `target_modalities = ["audio"]` | FL2VA | `t2va` | None |
 | Video-to-audio | [`av.toml`](../examples/minimax_h3/av.toml): `target_modalities = ["video", "audio"]` | FL2VA | `t2va` | `--h3_observed_modality video` |
 | Audio-to-video | [`av.toml`](../examples/minimax_h3/av.toml): `target_modalities = ["video", "audio"]` | FL2VA | `t2va` | `--h3_observed_modality audio` |
@@ -1533,6 +1535,39 @@ It adds LoRA computation but no extra transformer forward. Available adapters in
 Alternatively, `--base_weights adapter.safetensors` merges the adapter into the frozen training base at load time,
 with strength set by `--base_weights_multiplier`. This avoids live-overlay computation, but cannot disable the
 adapter for previews. The field and rollout validation probes reject merged base weights.
+
+#### Teacher matching
+
+This opt-in LoRA objective fits a text-only student to the frozen checkpoint at the **same noisy state**. The teacher
+receives privileged conditions; the student never receives them and remains text-only at inference. This is distinct
+from the fork's on-policy rollout supervision and its two-teacher adapter distillation. It adds one no-grad transformer
+forward per training step and needs a text cache containing both student and teacher presentations.
+
+Choose one teacher kind:
+
+| `KIND` | Teacher sees | Dataset and use |
+| --- | --- | --- |
+| `first,last` | The target video's first and last frames | Video identity; the audio branch anchors to the frozen base. |
+| `ref` | The target clip as a self-reference, including its audio when present | Video identity and voice; use only when the recorded audio is worth teaching. |
+| `subject_ref` | Other images of the subject from the item's references | Image or video identity; supports one-frame image targets while the student stays text-only. |
+
+Cache video latents with `--task t2va` for `first,last` or `ref`; cache `subject_ref` latents with
+`--task ref2va` so the teacher's separate images are included. Then cache text with
+`--task t2va --teacher_conditions KIND`. Train on that same dataset with
+`--h3_training_mode fl2va --h3_teacher_matching --h3_teacher_conditions KIND`.
+For a one-frame image dataset, add `--one_frame` to both cache commands and training and choose only `subject_ref`.
+Changing `KIND` requires re-caching text. The trainer rejects a missing or mismatched teacher presentation.
+For JSONL datasets, an optional per-record `teacher_caption` overrides the generated teacher instruction while leaving
+the student's `caption` unchanged. Re-caching detects changes to that instruction and to the teacher's visual sources.
+
+The optional `--h3_teacher_condition_sigma_min` and `--h3_teacher_condition_sigma_max` bound the teaching band in
+base-sigma units. Outside it, the frozen checkpoint runs with the student's text-only presentation as a
+base-preservation anchor. `--h3_teacher_loss_mag_weight` weights field magnitude relative to direction on teaching
+steps; `--h3_teacher_loss_dc_weight` downweights the video residual's spatially constant component; and
+`--h3_teacher_preservation_weight` sets the anchor strength. These controls have no effect unless
+`--h3_teacher_matching` is enabled. Start with an upper gate around `0.75` for `first,last`/`ref`; for
+`subject_ref`, which teaches identity at high noise, explicitly set `--h3_teacher_condition_sigma_max 1.0`.
+Teacher matching cannot be combined with the fork's guidance-distillation objective.
 
 #### Contrastive guidance loss
 

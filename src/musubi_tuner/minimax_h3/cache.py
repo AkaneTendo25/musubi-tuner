@@ -12,7 +12,12 @@ from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.dataset.cache_io import save_latent_cache_common, save_text_encoder_output_cache_common
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.architecture import AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS, TEXT_DIM, VIDEO_LATENT_CHANNELS
-from musubi_tuner.minimax_h3.image_training import file_identity
+from musubi_tuner.minimax_h3.image_training import (
+    H3_ONE_FRAME_CACHE_FORMAT,
+    H3_ONE_FRAME_CONTROL_INDICES_KEY,
+    H3_ONE_FRAME_TARGET_INDEX_KEY,
+    file_identity,
+)
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
@@ -26,17 +31,18 @@ from musubi_tuner.minimax_h3.references import (
     validate_reference_video_sizing,
 )
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
-from musubi_tuner.minimax_h3.image_training import (
-    H3_ONE_FRAME_CACHE_FORMAT,
-    H3_ONE_FRAME_CONTROL_INDICES_KEY,
-    H3_ONE_FRAME_TARGET_INDEX_KEY,
-)
 
 H3_AUDIO_LATENTS_KEY = "latents_audio"
 H3_AUDIO_LOSS_MASK_KEY = "audio_loss_mask"
 H3_VIDEO_GEOMETRY_KEY = "mmh3_video_geometry"
 H3_TEXT_HIDDEN_KEY = "mmh3_hidden_states"
 H3_TEXT_TOKEN_TAGS_KEY = "mmh3_token_tags"
+H3_TEACHER_HIDDEN_KEY = "mmh3_teacher_hidden_states"
+H3_TEACHER_TOKEN_TAGS_KEY = "mmh3_teacher_token_tags"
+H3_TEACHER_CONDITIONS_KEY = "mmh3_teacher_conditions"
+H3_TEACHER_FINGERPRINT_KEY = "mmh3_teacher_fingerprint"
+H3_TEACHER_FINGERPRINT_CACHE_KEY = f"{H3_TEACHER_FINGERPRINT_KEY}_uint8"
+H3_TEACHER_CONDITION_IDS = {"first,last": 1, "ref": 2, "subject_ref": 3}
 H3_MAX_CAPTION_TOKENS_KEY = "mmh3_max_caption_tokens"
 H3_TEXT_VISUAL_MAX_PIXELS_KEY = "mmh3_text_visual_max_pixels"
 H3_EMPTY_TEXT_HIDDEN_KEY = "mmh3_empty_hidden_states"
@@ -350,6 +356,9 @@ def save_text_encoder_output_cache_minimax_h3(
     dop_keys = {H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY, H3_DOP_CONFIG_KEY}
     if logical_keys & dop_keys and not dop_keys <= logical_keys:
         raise ValueError("H3 DOP conditioning cache must contain hidden states, token tags, and config identity")
+    teacher_keys = {H3_TEACHER_HIDDEN_KEY, H3_TEACHER_TOKEN_TAGS_KEY, H3_TEACHER_CONDITIONS_KEY, H3_TEACHER_FINGERPRINT_KEY}
+    if logical_keys & teacher_keys and not teacher_keys <= logical_keys:
+        raise ValueError("H3 teacher conditioning cache must contain hidden states, token tags, and mode identity")
 
     def tensor_for(logical_key: str) -> torch.Tensor:
         matches = [tensor for key, tensor in cache_tensors.items() if logical_cache_key(key) == logical_key]
@@ -370,6 +379,18 @@ def save_text_encoder_output_cache_minimax_h3(
             raise ValueError(f"H3 {tags_key} must be int64 with shape [{hidden.shape[0]}]")
 
     validate_pair(H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY)
+    if teacher_keys <= logical_keys:
+        validate_pair(H3_TEACHER_HIDDEN_KEY, H3_TEACHER_TOKEN_TAGS_KEY)
+        teacher_mode = tensor_for(H3_TEACHER_CONDITIONS_KEY)
+        if (
+            teacher_mode.dtype is not torch.long
+            or teacher_mode.ndim != 0
+            or int(teacher_mode) not in H3_TEACHER_CONDITION_IDS.values()
+        ):
+            raise ValueError(f"H3 {H3_TEACHER_CONDITIONS_KEY} must be a scalar int64 teacher mode id")
+        fingerprint = tensor_for(H3_TEACHER_FINGERPRINT_KEY)
+        if fingerprint.dtype is not torch.uint8 or fingerprint.shape != (32,):
+            raise ValueError(f"H3 {H3_TEACHER_FINGERPRINT_KEY} must be a 32-byte uint8 identity")
     task = tensor_for(H3_CONDITIONING_TASK_KEY)
     if task.dtype != torch.long or task.ndim != 0 or int(task) not in H3_CONDITIONING_TASK_IDS.values():
         raise ValueError(f"H3 {H3_CONDITIONING_TASK_KEY} must be a scalar int64 task id")
