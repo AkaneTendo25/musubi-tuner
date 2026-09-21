@@ -2971,6 +2971,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError(
                     "--fused_backward_pass requires --max_grad_norm 0 so each gradient can be stepped and freed immediately"
                 )
+            if args.network_module:
+                logger.warning("--fused_backward_pass may be slower for LoRA training because per-parameter hooks add overhead")
         if getattr(args, "adafactor_triton", False):
             if not getattr(args, "fused_backward_pass", False):
                 raise ValueError("--adafactor_triton requires --fused_backward_pass")
