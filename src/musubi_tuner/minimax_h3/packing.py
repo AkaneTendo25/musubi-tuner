@@ -719,21 +719,43 @@ def build_row_timesteps(
             raise ValueError("H3 text rows require a single timestep")
         base = text_timestep[0]
 
-    row_timesteps = base.expand(layout.sequence_length).clone()
-    row_timesteps[target_video] = video_timestep[0] if video_timestep.numel() == 1 else video_timestep
-    row_timesteps[target_audio] = audio_timestep[0] if audio_timestep.numel() == 1 else audio_timestep
     if layout.num_condition_video_rows:
         if condition_video_timestep is None or condition_video_timestep.numel() != 1:
             raise ValueError("H3 visual conditioning requires one video timestep")
-        row_timesteps[video_indices[: layout.num_condition_video_rows]] = condition_video_timestep.reshape(1).to(
-            device=device,
-            dtype=torch.float32,
-        )[0]
+        condition_video_timestep = condition_video_timestep.reshape(1).to(device=device, dtype=torch.float32)
     if layout.num_condition_audio_rows:
         if condition_audio_timestep is None or condition_audio_timestep.numel() != 1:
             raise ValueError("H3 reference-audio conditioning requires one timestep")
-        row_timesteps[audio_indices[: layout.num_condition_audio_rows]] = condition_audio_timestep.reshape(1).to(
-            device=device,
-            dtype=torch.float32,
-        )[0]
+        condition_audio_timestep = condition_audio_timestep.reshape(1).to(device=device, dtype=torch.float32)
+
+    if video_timestep.numel() == 1 and audio_timestep.numel() == 1:
+        # Scalar fills: the unique set is just the handful of fill values, so
+        # build it directly instead of sorting the full-length row vector.
+        fills = [base.reshape(1), video_timestep[:1], audio_timestep[:1]]
+        condition_video_idx = condition_audio_idx = 0
+        if layout.num_condition_video_rows:
+            condition_video_idx = len(fills)
+            fills.append(condition_video_timestep)
+        if layout.num_condition_audio_rows:
+            condition_audio_idx = len(fills)
+            fills.append(condition_audio_timestep)
+        fills = torch.cat(fills)
+        unique = torch.unique(fills, sorted=True)
+        inverse = torch.empty(layout.sequence_length, dtype=torch.long, device=device)
+        inverse.fill_(torch.searchsorted(unique, fills[0]))
+        inverse[target_video] = torch.searchsorted(unique, fills[1])
+        inverse[target_audio] = torch.searchsorted(unique, fills[2])
+        if layout.num_condition_video_rows:
+            inverse[video_indices[: layout.num_condition_video_rows]] = torch.searchsorted(unique, fills[condition_video_idx])
+        if layout.num_condition_audio_rows:
+            inverse[audio_indices[: layout.num_condition_audio_rows]] = torch.searchsorted(unique, fills[condition_audio_idx])
+        return unique, inverse
+
+    row_timesteps = base.expand(layout.sequence_length).clone()
+    row_timesteps[target_video] = video_timestep
+    row_timesteps[target_audio] = audio_timestep
+    if layout.num_condition_video_rows:
+        row_timesteps[video_indices[: layout.num_condition_video_rows]] = condition_video_timestep[0]
+    if layout.num_condition_audio_rows:
+        row_timesteps[audio_indices[: layout.num_condition_audio_rows]] = condition_audio_timestep[0]
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
