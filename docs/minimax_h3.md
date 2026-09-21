@@ -868,7 +868,8 @@ when pinned allocations stall or fail. `--block_swap_granularity layer` streams 
 H2D-only ring and supports all 50 blocks, at the cost of more transfers; use the default `block` granularity when it fits. It
 cannot be combined with `--h3_convrot_int8` or `--int8_convrot_base`. Add
 `--gradient_checkpointing_cpu_offload` when sequence length would otherwise exceed VRAM, and set
-`PYTORCH_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
+`PYTORCH_ALLOC_CONF=expandable_segments:True` to reduce fragmentation. On hosts whose CPU also stages block-swap
+transfers, `KMP_BLOCKTIME=0 OMP_WAIT_POLICY=PASSIVE` keeps idle worker threads from spinning against the loader threads.
 
 For limited VRAM on a host with enough RAM for the BF16 checkpoint and swapped blocks, the loader can reduce and quantize
 weights while placing swapped blocks on CPU:
