@@ -21,6 +21,7 @@ the training boundary; H3 training itself remains batch-size one.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 
@@ -152,6 +153,7 @@ def unpack_audio_tokens(rows: torch.Tensor, *, num_audio_latents: int) -> torch.
     return rows.permute(0, 1, 3, 2).contiguous()
 
 
+@functools.lru_cache(maxsize=128)
 def _spatial_position_grid(dim: int, patch: int, sqrt_area: float, density_scale: float = 1.0) -> torch.Tensor:
     ratio = dim / (sqrt_area * density_scale)
     left = (1.0 - ratio) / 2.0
@@ -166,6 +168,7 @@ def _validated_density_scale(spatial_density_scale: float) -> float:
     return scale
 
 
+@functools.lru_cache(maxsize=512)
 def _temporal_position_grid(num_latent_frames: int, origin: float) -> torch.Tensor:
     # An audio-only Ref2VA target has no video rows at all. The concatenated
     # leading zero below would otherwise make a zero-frame grid one row long and
@@ -179,12 +182,14 @@ def _temporal_position_grid(num_latent_frames: int, origin: float) -> torch.Tens
     return origin + torch.cat((torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)))
 
 
+@functools.lru_cache(maxsize=512)
 def _temporal_position_span(num_latent_frames: int) -> float:
     return sum(
         _ROPE_FRAME_RESCALE * _ROPE_FRAMES_PER_LATENT[index % len(_ROPE_FRAMES_PER_LATENT)] for index in range(num_latent_frames)
     )
 
 
+@functools.lru_cache(maxsize=128)
 def _frame_position_grid(
     latent_height: int,
     latent_width: int,
