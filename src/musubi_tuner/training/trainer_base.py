@@ -2655,7 +2655,6 @@ class NetworkTrainer:
         if is_main_process:
             network = accelerator.unwrap_model(network)
 
-        accelerator.end_training()
         optimizer_eval_fn()
 
         # End of training is synchronous: drain any pending periodic save first so its
@@ -2680,6 +2679,7 @@ class NetworkTrainer:
             logger.info("model saved.")
 
         accelerator.wait_for_everyone()
+        accelerator.end_training()
         if checkpoint_stop_requested and accelerator.is_main_process:
             train_utils.consume_checkpoint_request_file(save_and_stop_request_file)
             if consume_save_request_on_stop:
