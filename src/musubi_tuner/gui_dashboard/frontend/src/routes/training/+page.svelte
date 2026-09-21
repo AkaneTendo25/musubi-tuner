@@ -658,6 +658,7 @@
 							</div>
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.flash3" checked={t.flash3 ?? false} onchange={(e) => update('flash3', e.target.checked)} tooltip="FlashAttention 3 backend" />
+								<FormToggle label="FlashAttention 4" fieldPath="training.flash4" checked={t.flash4 ?? false} onchange={(e) => update('flash4', e.target.checked)} tooltip="H3 FlashAttention 4 backend; requires a compatible installation and GPU." />
 								<FormToggle label="cuDNN Attention" fieldPath="training.cudnn_attn" checked={t.cudnn_attn ?? false} onchange={(e) => update('cudnn_attn', e.target.checked)} tooltip="PyTorch cuDNN SDPA attention backend." />
 								<FormToggle fieldPath="training.sage_attn" checked={t.sage_attn ?? false} onchange={(e) => update('sage_attn', e.target.checked)} tooltip="Sage Attention backend" />
 								<FormToggle fieldPath="training.xformers" checked={t.xformers ?? false} onchange={(e) => update('xformers', e.target.checked)} tooltip="xFormers attention" />
@@ -1146,6 +1147,8 @@
 							<div class="grid grid-cols-2 gap-x-4 gap-y-1">
 								<FormToggle label="Fused QK norm + RoPE" fieldPath="training.h3_fused_qk_norm_rope" checked={t.h3_fused_qk_norm_rope ?? false} onchange={(e) => update('h3_fused_qk_norm_rope', e.target.checked)} tooltip="Fuse H3 per-head Q/K normalization and split RoPE. Compiled blocks use Inductor fusion and eager calls use the Triton kernel." />
 								<FormToggle label="Fused indexed AdaLN" fieldPath="training.h3_fused_indexed_adaln" checked={t.h3_fused_indexed_adaln ?? false} onchange={(e) => update('h3_fused_indexed_adaln', e.target.checked)} tooltip="Fuse repeated indexed H3 AdaLN modulation in eager CUDA execution. Compiled blocks use their Inductor path." />
+								<FormToggle label="H3 fused backward" fieldPath="training.h3_fused_backward_pass" checked={t.h3_fused_backward_pass ?? false} onchange={(e) => update('h3_fused_backward_pass', e.target.checked)} tooltip="Step and release parameter gradients during backward; requires Adafactor and max grad norm 0." />
+								<FormToggle label="Triton Adafactor" fieldPath="training.h3_adafactor_triton" checked={t.h3_adafactor_triton ?? false} onchange={(e) => update('h3_adafactor_triton', e.target.checked)} disabled={!t.h3_fused_backward_pass} tooltip="Use the Triton BF16 Adafactor fast path with H3 fused backward and manual learning rate." />
 								<FormToggle label="Fused SwiGLU" fieldPath="training.h3_fused_swiglu" checked={t.h3_fused_swiglu ?? false} onchange={(e) => update('h3_fused_swiglu', e.target.checked)} tooltip="Use the native eager CUDA SwiGLU kernel. Compiled blocks use their Inductor path." />
 								<FormToggle label="Attention auto-dispatch" fieldPath="training.h3_attn_auto_dispatch" checked={t.h3_attn_auto_dispatch ?? false} onchange={(e) => update('h3_attn_auto_dispatch', e.target.checked)} tooltip="Prioritize cuDNN SDPA for eligible large CUDA BF16/FP16 attention shapes." />
 								<FormSelect label="INT8 attention" fieldPath="training.h3_int8_attention" value={t.h3_int8_attention || 'off'} options={[{value:'off',label:'Off'},{value:'aux',label:'Auxiliary forwards'},{value:'train',label:'Training + auxiliary'}]} onchange={(e) => update('h3_int8_attention', e.target.value)} disabled={t.compile} tooltip="Use the native INT8-QK forward. Auxiliary forwards accelerates guidance/preservation teachers only; Training + auxiliary also uses it for the trainable path. Masked batches fall back to the regular attention backend." />
@@ -1553,7 +1556,7 @@
 					<FormGroup title="Sparse attention and checkpointing" collapsed={true}>
 						<div class="grid grid-cols-2 xl:grid-cols-4 gap-2 pt-2">
 							<FormSelect fieldPath="training.h3_compile_attention" value={t.h3_compile_attention || 'inline'} options={['inline', 'auto', 'opaque']} onchange={(e) => update('h3_compile_attention', e.target.value)} />
-							<FormSelect fieldPath="training.h3_checkpoint_keep" value={t.h3_checkpoint_keep || 'none'} options={['none', 'attention', 'qkv']} onchange={(e) => update('h3_checkpoint_keep', e.target.value)} />
+							<FormSelect fieldPath="training.h3_checkpoint_keep" value={t.h3_checkpoint_keep || 'none'} options={['none', 'attention', 'qkv', 'adaln']} onchange={(e) => update('h3_checkpoint_keep', e.target.value)} />
 							<FormField type="number" fieldPath="training.h3_swiglu_chunk_rows" value={t.h3_swiglu_chunk_rows ?? 0} oninput={(e) => update('h3_swiglu_chunk_rows', Number(e.target.value))} min={0} />
 							<FormField type="number" fieldPath="training.h3_block_sparse_kv_fraction" value={t.h3_block_sparse_kv_fraction ?? 0} oninput={(e) => update('h3_block_sparse_kv_fraction', Number(e.target.value))} min={0} max={1} step="0.05" />
 							<FormField type="number" fieldPath="training.h3_block_sparse_threshold" value={t.h3_block_sparse_threshold ?? 0} oninput={(e) => update('h3_block_sparse_threshold', Number(e.target.value))} min={0} max={1} step="0.05" />
