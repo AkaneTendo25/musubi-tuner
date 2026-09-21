@@ -363,6 +363,8 @@ class MiniMaxH3Attention(nn.Module):
         value = materialize_wide_view(value).unflatten(-1, (self.heads, self.head_dim))
         with h3_profile_scope("h3.rope"):
             query, key = self._norm_and_rotate(query, key, rotary_emb)
+        query = query.to(value)
+        key = key.to(value)
         return query, key, value
 
     def _norm_and_rotate(
