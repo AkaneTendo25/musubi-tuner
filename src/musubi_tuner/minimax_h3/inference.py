@@ -257,13 +257,22 @@ def prepare_keyframe_image(image: Image.Image, height: int, width: int, *, stret
     return image.crop((left, top, left + width, top + height))
 
 
-def _augment_keyframe_rows(rows: torch.Tensor, rows_per_anchor: int, seed: int) -> torch.Tensor:
+def _condition_noise(rows: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """Draw from the sampling stream, then move noise to the encoded rows."""
+    return torch.randn(rows.shape, generator=generator, device=generator.device, dtype=torch.float32).to(rows.device)
+
+
+def _augment_keyframe_rows(
+    rows: torch.Tensor, rows_per_anchor: int, seed: int | None = None, *, generator: torch.Generator | None = None
+) -> torch.Tensor:
     """Apply independent released fixed-timestep condition noise to each row."""
     augmented = []
-    generator = torch.Generator(device="cpu").manual_seed(seed)
+    if generator is None:
+        if seed is None:
+            raise ValueError("MiniMax H3 condition noise requires a seed or sampling generator")
+        generator = torch.Generator(device="cpu").manual_seed(seed)
     for anchor_rows in rows.split(rows_per_anchor):
-        noise = torch.randn(anchor_rows.shape, generator=generator, dtype=torch.float32)
-        augmented.append(0.999 * anchor_rows.float() + 0.001 * noise.to(anchor_rows.device))
+        augmented.append(0.999 * anchor_rows.float() + 0.001 * _condition_noise(anchor_rows, generator))
     return torch.cat(augmented)
 
 
@@ -441,7 +450,7 @@ def _augment_reference_video_rows(
     rows: torch.Tensor,
     references: tuple[MiniMaxH3ReferenceGeometry, ...],
     patch_size: tuple[int, int, int],
-    seed: int,
+    generator: torch.Generator,
 ) -> torch.Tensor:
     augmented = []
     cursor = 0
@@ -451,9 +460,7 @@ def _augment_reference_video_rows(
             continue
         reference_rows = rows[cursor : cursor + count]
         cursor += count
-        generator = torch.Generator(device="cpu").manual_seed(seed)
-        noise = torch.randn(reference_rows.shape, generator=generator, dtype=torch.float32)
-        augmented.append(0.999 * reference_rows.float() + 0.001 * noise.to(reference_rows.device))
+        augmented.append(0.999 * reference_rows.float() + 0.001 * _condition_noise(reference_rows, generator))
     if cursor != rows.shape[0]:
         raise ValueError("MiniMax H3 Ref2VA video rows do not match their reference geometry")
     return torch.cat(augmented) if augmented else rows
@@ -472,7 +479,7 @@ def denoise_fl2va(
     device: torch.device,
     keyframe_rows: torch.Tensor | None = None,
     keyframe_anchors: tuple[str, ...] = (),
-    condition_seed: int = 0,
+    condition_seed: int = 0,  # Legacy argument; condition noise shares generator.
     show_progress: bool = True,
     init_video: torch.Tensor | None = None,
     init_audio: torch.Tensor | None = None,
@@ -519,7 +526,7 @@ def denoise_fl2va(
         if keyframe_rows is None or keyframe_rows.shape != (expected_keyframe_rows, keyframe_width):
             actual = None if keyframe_rows is None else tuple(keyframe_rows.shape)
             raise ValueError(f"MiniMax H3 keyframe rows have shape {actual}, expected {(expected_keyframe_rows, keyframe_width)}")
-        keyframe_rows = _augment_keyframe_rows(keyframe_rows, rows_per_anchor, condition_seed).to(device)
+        keyframe_rows = _augment_keyframe_rows(keyframe_rows, rows_per_anchor, generator=generator).to(device)
     elif keyframe_rows is not None:
         raise ValueError("MiniMax H3 keyframe rows require condition anchors")
     layout = build_t2va_packed_sequence(
@@ -638,7 +645,7 @@ def denoise_ref2va(
     guide_geometries: tuple[MiniMaxH3GuideGeometry, ...] = (),
     guide_video_rows: torch.Tensor | None = None,
     guide_audio_rows: torch.Tensor | None = None,
-    condition_seed: int = 0,
+    condition_seed: int = 0,  # Legacy argument; condition noise shares generator.
     show_progress: bool = True,
     init_video: torch.Tensor | None = None,
     init_audio: torch.Tensor | None = None,
@@ -712,7 +719,7 @@ def denoise_ref2va(
         if keyframe_rows is None or keyframe_rows.shape != (expected_keyframe_rows, video_width):
             actual = None if keyframe_rows is None else tuple(keyframe_rows.shape)
             raise ValueError(f"MiniMax H3 keyframe rows have shape {actual}, expected {(expected_keyframe_rows, video_width)}")
-        keyframe_rows = _augment_keyframe_rows(keyframe_rows, rows_per_anchor, condition_seed).to(device)
+        keyframe_rows = _augment_keyframe_rows(keyframe_rows, rows_per_anchor, generator=generator).to(device)
     elif keyframe_rows is not None:
         raise ValueError("MiniMax H3 keyframe rows require keyframe anchors")
     if expected_guide_video_rows:
@@ -726,7 +733,7 @@ def denoise_ref2va(
         for geometry in guide_geometries:
             rows = geometry.num_video_rows(rows_per_anchor)
             if rows:
-                chunks.append(_augment_keyframe_rows(guide_video_rows[cursor : cursor + rows], rows, condition_seed))
+                chunks.append(_augment_keyframe_rows(guide_video_rows[cursor : cursor + rows], rows, generator=generator))
                 cursor += rows
         guide_video_rows = torch.cat(chunks).to(device)
     elif guide_video_rows is not None:
@@ -744,7 +751,7 @@ def denoise_ref2va(
         references.video_rows,
         references.geometries,
         patch_size,
-        condition_seed,
+        generator,
     ).to(device)
     reference_audio = references.audio_rows.to(device)
     text_hidden = text_hidden[None].to(device)
