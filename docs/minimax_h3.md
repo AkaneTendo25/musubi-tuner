@@ -237,6 +237,7 @@ python minimax_h3_cache_latents.py \
 - Keep `--audio_vae` when any target or reference includes audio; omit it for image-only and video-only data.
 - Omit `--vae` only for audio-only targets with no visual references.
 - `--skip_existing` validates and reuses compatible caches. On a large, unchanged dataset add `--faster_check`; it fully validates `--faster_check_samples` items (default 8) first, but cannot detect a source file replaced in place.
+- `--vae_dtype` defaults to `float32` for H3. `--latent_cache_dtype {float32,float16,bfloat16}` controls the stored latent precision independently (default: VAE dtype); changing it makes existing mismatched caches recache into the same filenames.
 
 ### Cache FL2VA text embeddings
 
@@ -284,7 +285,8 @@ The example swaps 40 of the 50 main blocks.
 - Increase `--blocks_to_swap` if the weights still do not fit; remove all three block-swap options when the frozen base
   fits. Swapping moves weights every step and lowers throughput.
 - `--block_swap_h2d_only` is valid because a LoRA keeps the base frozen; it requires `--gradient_checkpointing`.
-- Add `--use_pinned_memory_for_block_swap` only when the host has enough free RAM for the pinned block buffers.
+- Prefer `--use_pinned_memory_for_block_swap` on PCIe Gen5 hosts — direct pinned transfers recover nearly all of the
+  block-swap overhead; it costs locked host RAM.
 - [Memory and speed](#memory-and-speed) lists the quantization and kernel options.
 
 **Next.** Track the run with [Validation](#validation) and, once a checkpoint exists, generate with [Inference](#inference); FL2VA also supports [sampling during training](#sampling-during-fl2va-training). [Memory and speed](#memory-and-speed) lists what to reach for when the run does not fit or is too slow.
@@ -749,11 +751,11 @@ versions.
 | `--h3_block_sparse_block_shape T,H,W` | off | Reorder target-video rows into 3D lattice tiles before block-sparse selection, then restore their original order. `T*H*W` must equal the 128-row block size; text, audio, and reference context remains dense. Has no effect without `--h3_block_sparse_kv_fraction` or `--h3_block_sparse_threshold`. |
 | `--h3_lora_token_refiner` | off | Also place LoRA adapters on the two text token-refiner blocks. This experimental target adds eight adapter modules. |
 | `--compile` | off | Regionally compile all H3 blocks with the selected backend/mode. Compatible with full or partial gradient checkpointing and with block swap; swapped Linear calls stay eager. |
-| `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It reduces separate kernel launches but changes BF16 rounding; benchmark it on the target workload. |
-| `--h3_fused_indexed_adaln` | off | Fuse main-block RMSNorm with token-indexed AdaLN shift/scale for a frozen LoRA base. Requires CUDA and Triton; unsupported layouts, trainable norm/AdaLN parameters, and compiled blocks use the regular path. It changes BF16 rounding. |
+| `--h3_fused_qk_norm_rope` / `--no_h3_fused_qk_norm_rope` | auto | Use the custom Triton Q/K RMSNorm+RoPE kernel when available outside compiled graphs; the negative flag opts out. It changes BF16 rounding. |
+| `--h3_fused_indexed_adaln` / `--no_h3_fused_indexed_adaln` | auto | Fuse main-block RMSNorm with token-indexed AdaLN shift/scale for an eligible frozen LoRA base when Triton is available; the negative flag opts out. Unsupported cases use the regular path. It changes BF16 rounding. |
 | `--fused_backward_pass` | off | Step and free each gradient during backward. Requires Adafactor, `--max_grad_norm 0`, and a single process; per-parameter hooks can slow LoRA-scale training. |
 | `--adafactor_triton` | off | Use the Triton BF16 Adafactor fast path with `--fused_backward_pass` and manual learning rate. |
-| `--h3_fused_swiglu` | off | Fuse the SwiGLU activation in main and token-refiner feed-forward layers. Requires CUDA and Triton; unsupported layouts and compiled blocks use the regular path. It changes BF16 rounding, so benchmark and validate it before a long run. |
+| `--h3_fused_swiglu` / `--no_h3_fused_swiglu` | auto | Fuse the SwiGLU activation in main and token-refiner feed-forward layers when Triton is available; the negative flag opts out. Unsupported layouts and compiled blocks use the regular path. It changes BF16 rounding. |
 | `--h3_fused_elementwise` | off | Apply each main block's AdaLN modulation (`shift + normalized * (1 + scale)`), its two gated residual adds (`hidden + gate * branch`) and the LoRA delta add as single `addcmul` / `add(alpha=)` kernels. Eager mode only (compiled blocks fuse on their own). Details below. |
 | `--h3_compile_attention {inline,auto,opaque}` | `inline` | With `--compile`, how the attention kernel call is presented to Dynamo. `inline` (the default) traces the kernel call and leaves graph partitioning as without this flag. Details below. |
 | `--h3_swiglu_chunk_rows N` | `0` | Process each main-block feed-forward layer in sequence-row chunks to reduce peak VRAM. Start with `2048`; smaller values may save more memory but add overhead. Incompatible with `--compile`. |
@@ -863,8 +865,8 @@ Block swapping streams frozen weights from host memory. It is valid only while t
   --block_swap_ring_size 2
 ```
 
-`--use_pinned_memory_for_block_swap` enables direct asynchronous host-to-device transfers at the cost of locked host RAM; time a few steps with and without it, and leave it disabled
-when pinned allocations stall or fail. `--block_swap_granularity layer` streams individual `Linear` layers through the same
+`--use_pinned_memory_for_block_swap` enables direct asynchronous host-to-device transfers at the cost of locked host RAM; recommended on PCIe Gen5 hosts whenever the
+pinned buffers fit. On older links or low-RAM hosts, time a few steps with and without it and leave it disabled when pinned allocations stall or fail. `--block_swap_granularity layer` streams individual `Linear` layers through the same
 H2D-only ring and supports all 50 blocks, at the cost of more transfers; use the default `block` granularity when it fits. It
 cannot be combined with `--h3_convrot_int8` or `--int8_convrot_base`. Add
 `--gradient_checkpointing_cpu_offload` when sequence length would otherwise exceed VRAM, and set
