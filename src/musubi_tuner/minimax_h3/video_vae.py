@@ -24,6 +24,24 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def _process_tiles(tiles: list[torch.Tensor], process: nn.Module, sample_batch_size: int) -> list[torch.Tensor]:
+    results = []
+    for start in range(0, len(tiles), 2):
+        chunk = tiles[start : start + 2]
+        try:
+            output = process(torch.cat(chunk, dim=0))
+        except torch.cuda.OutOfMemoryError:
+            if len(chunk) == 1:
+                raise
+            if chunk[0].is_cuda:
+                torch.cuda.empty_cache()
+            for tile in chunk:
+                results.append(process(tile))
+        else:
+            results.extend(output.split(sample_batch_size, dim=0))
+    return results
+
+
 class MiniMaxH3VideoCausalConv3d(nn.Conv3d):
     r"""
     3D convolution used throughout the MiniMax-H3 video encoder.
@@ -352,13 +370,14 @@ class MiniMaxH3VideoEncoderModel(nn.Module):
             height, self.tile_sample_min_height, self.tile_sample_min_overlap_height
         )
         x_starts, x_lengths, x_overlaps = self._split_tiles(width, self.tile_sample_min_width, self.tile_sample_min_overlap_width)
-        rows = []
-        for y_start, y_length in zip(y_starts, y_lengths):
-            row = []
-            for x_start, x_length in zip(x_starts, x_lengths):
-                tile = pixels[..., y_start : y_start + y_length, x_start : x_start + x_length]
-                row.append(self.quant_conv(self.encoder(tile)))
-            rows.append(row)
+        num_cols = len(x_starts)
+        tiles = [
+            pixels[..., y_start : y_start + y_length, x_start : x_start + x_length]
+            for y_start, y_length in zip(y_starts, y_lengths)
+            for x_start, x_length in zip(x_starts, x_lengths)
+        ]
+        encoded = _process_tiles(tiles, nn.Sequential(self.encoder, self.quant_conv), pixels.shape[0])
+        rows = [encoded[row_start : row_start + num_cols] for row_start in range(0, len(encoded), num_cols)]
         latent_y_overlaps = [value // self.spatial_compression_ratio for value in y_overlaps]
         latent_x_overlaps = [value // self.spatial_compression_ratio for value in x_overlaps]
         return self._stitch_tiles(rows, latent_y_overlaps, latent_x_overlaps)
@@ -634,17 +653,18 @@ class MiniMaxH3VideoDecoderModel(nn.Module):
             self.tile_sample_min_overlap_width,
         )
         ratio = self.spatial_compression_ratio
-        rows = []
-        for y_start, y_length in zip(y_starts, y_lengths):
-            row = []
-            for x_start, x_length in zip(x_starts, x_lengths):
-                tile = latents[
-                    ...,
-                    y_start // ratio : y_start // ratio + y_length // ratio,
-                    x_start // ratio : x_start // ratio + x_length // ratio,
-                ]
-                row.append(self.decoder(self.post_quant_conv(tile)))
-            rows.append(row)
+        num_cols = len(x_starts)
+        tiles = [
+            latents[
+                ...,
+                y_start // ratio : y_start // ratio + y_length // ratio,
+                x_start // ratio : x_start // ratio + x_length // ratio,
+            ]
+            for y_start, y_length in zip(y_starts, y_lengths)
+            for x_start, x_length in zip(x_starts, x_lengths)
+        ]
+        decoded = _process_tiles(tiles, nn.Sequential(self.post_quant_conv, self.decoder), latents.shape[0])
+        rows = [decoded[row_start : row_start + num_cols] for row_start in range(0, len(decoded), num_cols)]
         return self._stitch_tiles(rows, y_overlaps, x_overlaps)
 
     def _decode_temporal(self, latents: torch.Tensor) -> torch.Tensor:
