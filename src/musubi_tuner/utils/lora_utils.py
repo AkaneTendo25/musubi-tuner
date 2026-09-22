@@ -75,6 +75,7 @@ def load_safetensors_with_lora_and_fp8(
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
     allow_prequantized_fp8: bool = False,
+    quantizer=None,
 ) -> dict[str, torch.Tensor]:
     """
     Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
@@ -229,6 +230,7 @@ def load_safetensors_with_lora_and_fp8(
         disable_numpy_memmap=disable_numpy_memmap,
         weight_transform_hooks=weight_transform_hooks,
         allow_prequantized_fp8=allow_prequantized_fp8,
+        quantizer=quantizer,
     )
 
     for lora_weight_keys in list_of_lora_weight_keys:
@@ -253,10 +255,21 @@ def load_safetensors_with_fp8_optimization_and_hook(
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
     allow_prequantized_fp8: bool = False,
+    quantizer=None,
 ) -> dict[str, torch.Tensor]:
     """
     Load state dict from safetensors files and merge LoRA weights into the state dict with fp8 optimization if needed.
     """
+    if quantizer is not None:
+        assert not fp8_optimization, "quantizer and fp8_optimization are mutually exclusive"
+        return quantizer.load_and_quantize(
+            model_files,
+            calc_device,
+            move_to_device=move_to_device,
+            weight_hook=weight_hook,
+            disable_numpy_memmap=disable_numpy_memmap,
+            weight_transform_hooks=weight_transform_hooks,
+        )
     if fp8_optimization:
         logger.info(
             f"Loading state dict with FP8 optimization. Dtype of weight: {dit_weight_dtype}, hook enabled: {weight_hook is not None}"

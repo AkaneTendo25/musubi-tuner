@@ -910,7 +910,7 @@ class VideoDataset(BaseDataset):
 
 
 class DatasetGroup(torch.utils.data.ConcatDataset):
-    def __init__(self, datasets: Sequence[Union[ImageDataset, VideoDataset]]):
+    def __init__(self, datasets: Sequence[BaseDataset]):
         super().__init__(datasets)
         self.datasets: list[Union[ImageDataset, VideoDataset]] = datasets
         self.num_train_items = 0

@@ -167,13 +167,18 @@ class BucketSelector:
 
 class BucketBatchManager:
     def __init__(
-        self, bucketed_item_info: dict[tuple[Any], list[ItemInfo]], batch_size: int, num_timestep_buckets: Optional[int] = None
+        self,
+        bucketed_item_info: dict[tuple[Any], list[ItemInfo]],
+        batch_size: int,
+        num_timestep_buckets: Optional[int] = None,
+        pad_variable_tensors: bool = False,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
         self.bucket_resos = list(self.buckets.keys())
         self.bucket_resos.sort()
         self.num_timestep_buckets = num_timestep_buckets
+        self.pad_variable_tensors = pad_variable_tensors
         self.timestep_pool = None
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
@@ -271,9 +276,21 @@ class BucketBatchManager:
                 if is_varlen_key:
                     varlen_keys.add(content_key)
 
-        for key in batch_tensor_data.keys():
+        for key in list(batch_tensor_data.keys()):
             if key not in varlen_keys:
-                batch_tensor_data[key] = torch.stack(batch_tensor_data[key])
+                tensors = batch_tensor_data[key]
+                if self.pad_variable_tensors and key == "latents" and len({tuple(value.shape) for value in tensors}) > 1:
+                    max_length = max(value.shape[-1] for value in tensors)
+                    mask = torch.zeros((len(tensors), 1, max_length), dtype=torch.bool)
+                    padded = []
+                    for index, value in enumerate(tensors):
+                        length = value.shape[-1]
+                        padded.append(torch.nn.functional.pad(value, (0, max_length - length)))
+                        mask[index, :, :length] = True
+                    batch_tensor_data[key] = torch.stack(padded)
+                    batch_tensor_data["latents_mask"] = mask
+                else:
+                    batch_tensor_data[key] = torch.stack(tensors)
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps

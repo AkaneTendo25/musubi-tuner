@@ -15,6 +15,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_IDEOGRAM4_FULL,
     ARCHITECTURE_KANDINSKY5_FULL,
     ARCHITECTURE_KREA2_FULL,
+    ARCHITECTURE_MINIMAX_MUSIC3_FULL,
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_WAN_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
@@ -324,6 +325,14 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     save_file(sd, item_info.latent_cache_path, metadata=metadata)
 
 
+def save_latent_cache_minimax_music3(item_info: ItemInfo, latent: torch.Tensor):
+    """Save folded stereo DAV latents [128,T] using Musubi's latent key contract."""
+    assert latent.ndim == 2 and latent.shape[0] == 128, f"expected [128,T], got {tuple(latent.shape)}"
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_1x1x{latent.shape[-1]}_{dtype_str}": latent.detach().cpu().contiguous()}
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_MINIMAX_MUSIC3_FULL)
+
+
 def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor], is_llm: bool):
     """HunyuanVideo architecture"""
     assert embed.dim() == 1 or embed.dim() == 2, (
@@ -416,6 +425,14 @@ def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tenso
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
 
+def save_text_encoder_output_cache_minimax_music3(item_info: ItemInfo, hidden: torch.Tensor):
+    """Cache per-frame concatenated c1..c7 RVQ hidden states [frames,32768]."""
+    assert hidden.ndim == 2 and hidden.shape[-1] == 8 * 4096, f"expected [frames,32768], got {tuple(hidden.shape)}"
+    dtype_str = dtype_to_str(hidden.dtype)
+    sd = {f"varlen_music3_hidden_{dtype_str}": hidden.detach().cpu().contiguous()}
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_MINIMAX_MUSIC3_FULL, merge_existing=False)
+
+
 def save_text_encoder_output_cache_kandinsky5(
     item_info: ItemInfo, text_embeds: torch.Tensor, pooled_embed: torch.Tensor, attention_mask: torch.Tensor
 ):
@@ -492,7 +509,7 @@ def save_text_encoder_output_cache_common(
 ):
     # merge_existing keeps keys written by previous passes (e.g. HunyuanVideo caches LLM and CLIP separately).
     # Single-pass architectures that write their full key set at once should pass merge_existing=False so the
-    # cache is overwritten fresh, dropping any stale keys (e.g. optionals/dtypes) left from an earlier run.
+    # Overwriting the cache drops stale keys such as obsolete optionals or dtypes.
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
         if torch.isnan(value).any():

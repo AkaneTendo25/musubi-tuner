@@ -371,6 +371,20 @@ class Offloader:
         #     f"[{self.block_type}] Swapped weights in {time.perf_counter() - start_time:.2f}s. Count of modules swapped: {len(weight_swap_jobs)}"
         # )
 
+        # Quantized Linears carry a per-output-channel scale buffer. It must
+        # follow the INT8 weight storage exchanged above.
+        cpu_modules = dict(layer_to_cpu.named_modules())
+        for name, cuda_module in layer_to_cuda.named_modules():
+            cpu_module = cpu_modules.get(name)
+            if cpu_module is None or not hasattr(cuda_module, "scale_weight") or not hasattr(cpu_module, "scale_weight"):
+                continue
+            if sync_event is not None:
+                sync_event.synchronize()
+            cuda_scale = cuda_module.scale_weight
+            cpu_scale = cpu_module.scale_weight
+            cuda_module.scale_weight = cpu_scale.to(device, non_blocking=True)
+            cpu_module.scale_weight = cuda_scale.to("cpu", non_blocking=True)
+
         return sync_event
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):

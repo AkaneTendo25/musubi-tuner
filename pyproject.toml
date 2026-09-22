@@ -10,14 +10,14 @@ dependencies = [
     "bitsandbytes",
     "diffusers==0.32.1",
     "einops==0.7.0",
-    "huggingface-hub==0.34.3",
+    "huggingface-hub>=1.5.0,<2.0",
     "opencv-python==4.10.0.84",
     "pillow>=11.3.0",
     "safetensors==0.4.5",
     # "sageattention>=1.0.6",
     "toml==0.10.2",
     "tqdm==4.67.1",
-    "transformers==4.57.6",
+    "transformers==5.8.0",
     "voluptuous==0.15.2",
     # Wan2.1
     "ftfy==6.3.1",
@@ -27,6 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+minimax_music3 = ["soundfile>=0.12.1", "torchaudio>=2.5.0"]
 cu124 = [
     "torch>=2.5.1",
     "torchvision>=0.20.1",
