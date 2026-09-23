@@ -57,6 +57,7 @@ class ImageDatasetParams(BaseDatasetParams):
     control_directory: Optional[str] = None
     multiple_target: Optional[bool] = False
     h3_image_frame_count: Optional[int] = None
+    h3_indexed_targets: bool = False
 
     # FramePack dependent parameters
     fp_latent_window_size: Optional[int] = 9
@@ -138,6 +139,7 @@ class ConfigSanitizer:
         "control_directory": str,
         "multiple_target": bool,
         "h3_image_frame_count": int,
+        "h3_indexed_targets": bool,
         "fp_latent_window_size": int,
         "fp_1f_clean_indices": [int],
         "fp_1f_target_index": int,
@@ -340,6 +342,7 @@ def generate_dataset_group_by_blueprint(
         control_directory: "{dataset.control_directory}"
         multiple_target: {dataset.multiple_target}
         h3_image_frame_count: {dataset.h3_image_frame_count}
+        h3_indexed_targets: {dataset.h3_indexed_targets}
         fp_latent_window_size: {dataset.fp_latent_window_size}
         fp_1f_clean_indices: {dataset.fp_1f_clean_indices}
         fp_1f_target_index: {dataset.fp_1f_target_index}

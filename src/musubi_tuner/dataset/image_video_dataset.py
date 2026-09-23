@@ -488,6 +488,7 @@ class ImageDataset(BaseDataset):
         cache_directory: Optional[str] = None,
         multiple_target: bool = False,
         h3_image_frame_count: Optional[int] = None,
+        h3_indexed_targets: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
@@ -523,6 +524,9 @@ class ImageDataset(BaseDataset):
         self.control_directory = control_directory
         self.multiple_target = multiple_target
         self.h3_image_frame_count = h3_image_frame_count
+        # H3 one-frame target slots read an ordered multiple_target group with the
+        # indexed-path rules of conditioned-image mode, without its frame grid.
+        self.h3_indexed_targets = bool(h3_indexed_targets)
         self.fp_latent_window_size = fp_latent_window_size
         self.fp_1f_clean_indices = fp_1f_clean_indices
         self.fp_1f_target_index = fp_1f_target_index
@@ -570,7 +574,8 @@ class ImageDataset(BaseDataset):
                 multiple_target,
                 **mask_kwargs,
                 allow_indexed_caption_alias=(
-                    self.architecture == ARCHITECTURE_MINIMAX_H3 and self.h3_image_frame_count is not None
+                    self.architecture == ARCHITECTURE_MINIMAX_H3
+                    and (self.h3_image_frame_count is not None or self.h3_indexed_targets)
                 ),
             )
         elif image_jsonl_file is not None:
@@ -579,7 +584,10 @@ class ImageDataset(BaseDataset):
                 control_count_per_image,
                 multiple_target,
                 **mask_kwargs,
-                normalize_indexed_paths=(self.architecture == ARCHITECTURE_MINIMAX_H3 and self.h3_image_frame_count is not None),
+                normalize_indexed_paths=(
+                    self.architecture == ARCHITECTURE_MINIMAX_H3
+                    and (self.h3_image_frame_count is not None or self.h3_indexed_targets)
+                ),
             )
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")

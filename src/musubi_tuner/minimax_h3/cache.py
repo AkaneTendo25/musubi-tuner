@@ -16,6 +16,7 @@ from musubi_tuner.minimax_h3.image_training import (
     H3_ONE_FRAME_CACHE_FORMAT,
     H3_ONE_FRAME_CONTROL_INDICES_KEY,
     H3_ONE_FRAME_TARGET_INDEX_KEY,
+    H3_ONE_FRAME_TARGET_INDICES_KEY,
     file_identity,
 )
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
@@ -71,6 +72,10 @@ H3_REFERENCE_MODALITY_PROBABILITIES_KEY = "mmh3_reference_modality_probabilities
 H3_REFERENCE_TEMPORAL_CONTRACT_KEY = "mmh3_reference_temporal_contract"
 H3_REFERENCE_TEMPORAL_CONTRACT_VERSION = 1
 H3_QWEN_CONTROL_VISUALS_KEY = "mmh3_qwen_control_visuals"
+# Scalar id from ``one_frame.H3_REFERENCE_ROUTE_IDS``, written only for a route
+# other than ``dual``: the Qwen3-VL presentation is fixed when the text cache is
+# written, so an absent key means the released dual presentation.
+H3_REFERENCE_ROUTE_KEY = "mmh3_reference_route"
 
 # EXPERIMENTAL. Target-video frames presented to the Qwen3-VL conditioner on the
 # T2VA route, so custom keyframe anchors regain the conditioner visibility the
@@ -267,9 +272,14 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
     """
     cache_tensors = _validated_cache_tensors(item_info, tensors, operation="latent encoder")
     if getattr(item_info, "h3_one_frame", False):
-        target_index = int(item_info.h3_one_frame_target_index)
+        target_slots = getattr(item_info, "h3_one_frame_target_indices", None)
         control_indices = tuple(int(value) for value in item_info.h3_one_frame_control_indices)
-        cache_tensors[f"{H3_ONE_FRAME_TARGET_INDEX_KEY}_int64"] = torch.tensor(target_index, dtype=torch.long)
+        if target_slots is not None:
+            target_slots = tuple(int(value) for value in target_slots)
+            cache_tensors[f"{H3_ONE_FRAME_TARGET_INDICES_KEY}_int64"] = torch.tensor(target_slots, dtype=torch.long)
+        else:
+            target_index = int(item_info.h3_one_frame_target_index)
+            cache_tensors[f"{H3_ONE_FRAME_TARGET_INDEX_KEY}_int64"] = torch.tensor(target_index, dtype=torch.long)
         if control_indices:
             cache_tensors[f"{H3_ONE_FRAME_CONTROL_INDICES_KEY}_int64"] = torch.tensor(control_indices, dtype=torch.long)
         metadata = dict(getattr(item_info, "h3_cache_metadata", {}))

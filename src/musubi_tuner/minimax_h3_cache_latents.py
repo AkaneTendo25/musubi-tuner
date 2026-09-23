@@ -24,6 +24,7 @@ from musubi_tuner.minimax_h3.image_training import (
     H3_ONE_FRAME_CONTROL_INDICES_KEY,
     H3_ONE_FRAME_LATENT_FINGERPRINT_KEY,
     H3_ONE_FRAME_TARGET_INDEX_KEY,
+    H3_ONE_FRAME_TARGET_INDICES_KEY,
     add_image_training_arguments,
     cache_matches_fingerprint,
 )
@@ -183,9 +184,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                     keys = set(handle.keys())
                     if (handle.metadata() or {}).get("h3_cache_format") != H3_ONE_FRAME_CACHE_FORMAT:
                         return False
-                    target_key = f"{H3_ONE_FRAME_TARGET_INDEX_KEY}_int64"
-                    if target_key not in keys or int(handle.get_tensor(target_key)) != item.h3_one_frame_target_index:
-                        return False
+                    target_slots = getattr(item, "h3_one_frame_target_indices", None)
+                    if target_slots is not None:
+                        slots_key = f"{H3_ONE_FRAME_TARGET_INDICES_KEY}_int64"
+                        if slots_key not in keys or tuple(int(value) for value in handle.get_tensor(slots_key)) != tuple(
+                            target_slots
+                        ):
+                            return False
+                    else:
+                        target_key = f"{H3_ONE_FRAME_TARGET_INDEX_KEY}_int64"
+                        if target_key not in keys or int(handle.get_tensor(target_key)) != item.h3_one_frame_target_index:
+                            return False
                     control_key = f"{H3_ONE_FRAME_CONTROL_INDICES_KEY}_int64"
                     expected = tuple(item.h3_one_frame_control_indices)
                     if bool(expected) != (control_key in keys):

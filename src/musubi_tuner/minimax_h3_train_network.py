@@ -67,6 +67,14 @@ from musubi_tuner.minimax_h3.cache import (
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_decoder, load_video_vae_decoder
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
+from musubi_tuner.minimax_h3.image_training import H3_ONE_FRAME_TARGET_INDICES_KEY
+from musubi_tuner.minimax_h3.one_frame import (
+    H3_REFERENCE_ROUTES,
+    H3_TARGET_NOISE_COUPLINGS,
+    couple_target_slot_noise,
+    validate_reference_route,
+    validate_target_noise_coupling,
+)
 from musubi_tuner.minimax_h3.dop import dop_config_identity
 from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
@@ -128,6 +136,7 @@ from musubi_tuner.minimax_h3.training import (
     joint_velocity_loss,
     prepare_joint_noisy_inputs,
     shift_sigma,
+    target_slot_losses,
     unshift_sigma,
 )
 from musubi_tuner.minimax_h3.validation import (
@@ -325,12 +334,52 @@ def _one_frame_sample_inputs(parameter: dict) -> tuple[int, tuple[int, ...] | No
 
 
 def _require_one_frame_opt_in(args: argparse.Namespace, batch: dict, video_latents: torch.Tensor | None) -> None:
-    if "one_frame_target_index" not in batch:
+    slots = _one_frame_target_slot_count(batch)
+    if "one_frame_target_index" not in batch and not slots:
         return
-    if video_latents is None or video_latents.ndim != 5 or video_latents.shape[2] != 1:
+    if slots:
+        if video_latents is None or video_latents.ndim != 5 or video_latents.shape[2] != slots:
+            raise ValueError("MiniMax H3 one-frame target slots require one target latent frame per slot")
+    elif video_latents is None or video_latents.ndim != 5 or video_latents.shape[2] != 1:
         raise ValueError("MiniMax H3 one-frame index metadata requires a single-frame target latent")
     if not getattr(args, "one_frame", False):
         raise ValueError("MiniMax H3 one-frame cache requires --one_frame")
+
+
+def _one_frame_target_slot_count(batch: dict) -> int:
+    """Number of one-frame target slots a batch carries; 0 for every other cache."""
+    slots = batch.get(H3_ONE_FRAME_TARGET_INDICES_KEY)
+    if slots is None:
+        return 0
+    if isinstance(slots, (list, tuple)):
+        slots = slots[0]
+    return int(slots.shape[-1])
+
+
+def _require_slot_layouts_for_coupling(args: argparse.Namespace, layouts: tuple[tuple[int, ...], ...]) -> None:
+    """Refuse a non-independent coupling when the training config declares no target slots."""
+    coupling = getattr(args, "h3_target_noise_coupling", "independent")
+    if coupling != "independent" and not layouts:
+        raise ValueError(
+            f"--h3_target_noise_coupling {coupling} applies to one-frame target slots, "
+            "but no training dataset declares fp_1f_target_indices"
+        )
+
+
+def _target_slot_metrics(
+    prediction: torch.Tensor | None,
+    target: torch.Tensor | None,
+    mask: torch.Tensor | None,
+    slot_count: int,
+    mask_normalization: str,
+) -> dict[str, torch.Tensor]:
+    """Per-slot velocity loss, ``loss/target_slot{k}``, for batches with two or more slots."""
+    if slot_count < 2 or prediction is None or target is None:
+        return {}
+    return {
+        f"loss/target_slot{slot}": value
+        for slot, value in enumerate(target_slot_losses(prediction, target, mask, mask_normalization=mask_normalization))
+    }
 
 
 _DIRECT_SIGMA_SAMPLING = {
@@ -1517,6 +1566,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             device=reference.device, dtype=torch.float32
         )
 
+    @staticmethod
+    def _slot_coupled_noise(args: argparse.Namespace, batch: dict, video_noise: torch.Tensor) -> torch.Tensor:
+        """Apply --h3_target_noise_coupling to a full video draw of a target-slot batch.
+
+        The draw is taken at full shape first, so the coupling never changes how
+        much of the stream a step consumes; batches without slots pass through.
+        """
+        if not _one_frame_target_slot_count(batch):
+            return video_noise
+        return couple_target_slot_noise(video_noise, getattr(args, "h3_target_noise_coupling", "independent"))
+
     def _draw_step_recipe(self, accelerator: Accelerator, args: argparse.Namespace) -> str | None:
         """Draw which conditioning recipe this step trains, shared by every rank.
 
@@ -1668,13 +1728,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             video_weight=float(getattr(args, "h3_video_loss_weight", 1.0)),
             audio_weight=float(getattr(args, "h3_audio_loss_weight", 1.0)),
         )
-        train_dataset_group, _ = create_h3_dataset_group(
+        train_dataset_group, train_adapter = create_h3_dataset_group(
             user_config,
             args,
             training=True,
             num_timestep_buckets=self.num_timestep_buckets,
             shared_epoch=current_epoch,
         )
+        slot_layouts = getattr(train_adapter, "one_frame_target_slot_layouts", None)
+        self._target_slot_layouts = slot_layouts() if callable(slot_layouts) else ()
+        _require_slot_layouts_for_coupling(args, self._target_slot_layouts)
         if train_dataset_group.num_train_items == 0:
             raise ValueError(
                 "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
@@ -2397,7 +2460,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # Indexed one-frame caches carry the two-latent silence placeholder as
         # their audio stream. They still use the image schedule; audio presence
         # must not turn them back into short-video training.
-        is_image = has_video and video_latents.shape[2] == 1
+        is_image = has_video and (video_latents.shape[2] == 1 or _one_frame_target_slot_count(batch) > 0)
         _require_one_frame_opt_in(args, batch, video_latents)
         if len(observed_modes) == 1 and observed_modes[0] is not None and not (has_video and has_audio):
             raise ValueError("H3 observed-modality validation requires cached video and audio targets")
@@ -2439,7 +2502,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     stream="video-noise",
                 )
                 seed_validation_forward(video_noise_seed)
-                video_noise = torch.randn_like(video_latents)
+                video_noise = self._slot_coupled_noise(args, batch, torch.randn_like(video_latents))
             else:
                 video_noise = None
             if audio_latents is not None:
@@ -2791,7 +2854,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         # One noise draw shared by both walks: the trajectories must differ because
         # the models differ, not because they started apart.
-        start = self._rollout_noise(video_latents)
+        start = self._slot_coupled_noise(args, batch, self._rollout_noise(video_latents))
         adapted_end = walk(True, start)
         walk(False, start)
 
@@ -3743,6 +3806,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 )
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
+        target_noise_coupling = getattr(args, "h3_target_noise_coupling", "independent")
+        reference_route = getattr(args, "h3_reference_route", "dual")
+        validate_target_noise_coupling(target_noise_coupling)
+        validate_reference_route(reference_route)
+        if target_noise_coupling != "independent" and not getattr(args, "one_frame", False):
+            raise ValueError("--h3_target_noise_coupling shared applies to one-frame target slots and requires --one_frame")
+        if reference_route != "dual":
+            if not (args.h3_training_mode in ("ref2va", "ref2va_omni") or getattr(args, "one_frame", False)):
+                raise ValueError(
+                    "--h3_reference_route other than dual requires --one_frame or --h3_training_mode ref2va/ref2va_omni"
+                )
+            if args.sample_prompts:
+                raise ValueError("--h3_reference_route other than dual does not support training-time sampling")
         if args.sample_prompts:
             if args.h3_training_mode != "fl2va" and not getattr(args, "one_frame", False):
                 raise ValueError(
@@ -4616,6 +4692,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             backend_kwargs["base_lora_weights"] = base_lora_weights
             backend_kwargs["base_lora_multipliers"] = base_lora_multipliers
         self.backend = create_training_backend(**backend_kwargs)
+        reference_route = getattr(args, "h3_reference_route", "dual")
+        if reference_route != "dual":
+            self.backend.reference_route = reference_route
         transformer = self.backend.get_training_transformer()
         if not isinstance(transformer, torch.nn.Module):
             raise TypeError("H3 backend get_training_transformer() must return a torch.nn.Module")
@@ -5454,7 +5533,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         video_sigmas = shift_sigma(base, video_shift)
         audio_sigmas = shift_sigma(base, audio_shift)
 
-        video_state = None if video_latents is None else self._rollout_noise(video_latents)
+        video_state = None if video_latents is None else self._slot_coupled_noise(args, batch, self._rollout_noise(video_latents))
         audio_state = None if audio_latents is None else self._rollout_noise(audio_latents)
 
         def state_at(index: int) -> H3JointNoisyInputs:
@@ -6079,13 +6158,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 or (audio_latents is not None and audio_latents.shape != items[0][2].shape)
             ):
                 return None
-            video_noise = noise[index : index + 1].to(device=accelerator.device, dtype=dit_dtype)
+            video_noise = self._slot_coupled_noise(
+                args, item_batch, noise[index : index + 1].to(device=accelerator.device, dtype=dit_dtype)
+            )
             audio_noise = torch.randn_like(audio_latents) if audio_latents is not None else None
             items.append((item_batch, video_latents, audio_latents, video_noise, audio_noise))
 
         first_batch, first_video, first_audio, first_video_noise, first_audio_noise = items[0]
         _require_one_frame_opt_in(args, first_batch, first_video)
-        is_image = first_video.shape[2] == 1
+        is_image = first_video.shape[2] == 1 or _one_frame_target_slot_count(first_batch) > 0
         scheduler_args = args
         if is_image:
             scheduler_args = copy.copy(args)
@@ -6206,7 +6287,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video_weight=video_weight,
                 audio_weight=audio_weight,
             )
-            return result, inputs
+            return result, inputs, effective_video_mask
 
         losses: list[torch.Tensor] = []
         item_metrics: list[dict[str, float]] = []
@@ -6223,7 +6304,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 group_predictions = [prediction for index in indices for prediction in run_group([index], token_counts[index])]
             group_loss = None
             for index, prediction in zip(indices, group_predictions, strict=True):
-                result, inputs = item_loss(prediction, index)
+                result, inputs, item_video_mask = item_loss(prediction, index)
                 scaled = result.loss / batch_size
                 losses.append(scaled)
                 item_metrics.append(
@@ -6232,6 +6313,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         "loss/audio": result.audio_loss.detach(),
                         "h3/sigma_video": inputs.video_sigma.mean().detach(),
                         "h3/sigma_audio": inputs.audio_sigma.mean().detach() if inputs.audio_sigma is not None else 0.0,
+                        **_target_slot_metrics(
+                            prediction.video,
+                            inputs.video_target,
+                            item_video_mask,
+                            _one_frame_target_slot_count(items[index][0]),
+                            args.h3_loss_mask_normalization,
+                        ),
                     }
                 )
                 group_loss = scaled if group_loss is None else group_loss + scaled
@@ -6536,8 +6624,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         # One-frame caches include a silent audio placeholder for packed-layout
         # parity, but their target remains an image and uses the image schedule.
-        is_image = has_video and video_latents.shape[2] == 1
+        # Target slots are images too, one per latent frame.
+        target_slots = _one_frame_target_slot_count(batch) if has_video else 0
+        is_image = has_video and (video_latents.shape[2] == 1 or target_slots > 0)
         _require_one_frame_opt_in(args, batch, video_latents)
+        if target_slots:
+            video_noise = self._slot_coupled_noise(args, batch, video_noise)
 
         observed = args.h3_observed_modality
         if observed == "random":
@@ -7120,6 +7212,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "h3/sigma_video": inputs.video_sigma.mean().detach(),
             "h3/sigma_audio": inputs.audio_sigma.mean().detach(),
         }
+        # Only slot batches report these keys, so every other run's metric set
+        # is unchanged.
+        metrics.update(
+            _target_slot_metrics(
+                prediction.video,
+                loss_inputs.video_target,
+                effective_video_mask,
+                target_slots,
+                args.h3_loss_mask_normalization,
+            )
+        )
         if getattr(args, "h3_train_sigma_bins", False) and has_video:
             # Only the bin this step fell in is reported; the batch average keeps
             # a key wherever at least one item carried it.
@@ -7722,9 +7825,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         del args, kwargs
         raise RuntimeError("MiniMax H3 uses its joint audio-video process_batch implementation")
 
+    def _target_slot_metadata(self, args: argparse.Namespace) -> dict[str, str]:
+        """Record target slots, their noise coupling and the reference route for inference checks.
+
+        Keys appear only when a run uses slots or a non-default route, so every
+        other run's metadata is unchanged.
+        """
+        metadata: dict[str, str] = {}
+        layouts = getattr(self, "_target_slot_layouts", ())
+        if layouts:
+            metadata["ss_h3_target_slots"] = ",".join(sorted({str(len(layout)) for layout in layouts}))
+            metadata["ss_h3_target_indices"] = ",".join(";".join(str(value) for value in layout) for layout in layouts)
+            metadata["ss_h3_target_noise_coupling"] = getattr(args, "h3_target_noise_coupling", "independent")
+        route = getattr(args, "h3_reference_route", "dual")
+        if route != "dual":
+            metadata["ss_h3_reference_route"] = route
+        return metadata
+
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         return {
             "ss_minimax_h3_one_frame": str(bool(getattr(args, "one_frame", False))),
+            **self._target_slot_metadata(args),
             "ss_h3_training_mode": args.h3_training_mode,
             "ss_h3_lora_token_refiner": str(args.h3_lora_token_refiner),
             "ss_h3_lora_targets": str(args.h3_lora_targets or "default"),
@@ -7870,6 +7991,24 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--one_frame",
         action="store_true",
         help="accept MiniMax H3 one-frame caches with explicit target/control frame indices",
+    )
+    parser.add_argument(
+        "--h3_target_noise_coupling",
+        choices=H3_TARGET_NOISE_COUPLINGS,
+        default="independent",
+        help=(
+            "noise of one-frame target slots (fp_1f_target_indices): an independent draw per slot, or slot 0's draw "
+            "shared by every slot; requires --one_frame"
+        ),
+    )
+    parser.add_argument(
+        "--h3_reference_route",
+        choices=H3_REFERENCE_ROUTES,
+        default="dual",
+        help=(
+            "where one-frame timed controls and Ref2VA image references are shown: dual (released: Qwen3-VL and DiT "
+            "rows), qwen_image_only, dit_latent_only, or text_only; must match the route the text cache was written with"
+        ),
     )
     parser.add_argument(
         "--h3_teacher_matching", action="store_true", help="match a frozen same-base teacher given privileged conditions"

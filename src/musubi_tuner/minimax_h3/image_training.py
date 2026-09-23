@@ -17,6 +17,9 @@ H3_IMAGE_MODES = ("none", "first", "first_last")
 H3_TEXT_VISUAL_MAX_PIXELS = 0
 H3_ONE_FRAME_CACHE_FORMAT = "minimax-h3-one-frame-v2"
 H3_ONE_FRAME_TARGET_INDEX_KEY = "one_frame_target_index"
+# Written instead of the scalar key by the list form (``fp_1f_target_indices``):
+# one signed pixel-frame index per target slot, in latent frame order.
+H3_ONE_FRAME_TARGET_INDICES_KEY = "one_frame_target_indices"
 H3_ONE_FRAME_CONTROL_INDICES_KEY = "one_frame_control_indices"
 H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY = "one_frame_content_fingerprint"
 H3_ONE_FRAME_LATENT_FINGERPRINT_KEY = "one_frame_latent_fingerprint"
@@ -122,13 +125,19 @@ def one_frame_content_fingerprint(
     return hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def one_frame_latent_fingerprint(content_fingerprint: str, target_index: int, control_indices: Sequence[int]) -> str:
-    descriptor = {
+def one_frame_latent_fingerprint(
+    content_fingerprint: str, target_index: int | Sequence[int], control_indices: Sequence[int]
+) -> str:
+    """Latent-cache identity; a sequence ``target_index`` is the slot form and hashes as such."""
+    descriptor: dict[str, Any] = {
         "format": H3_ONE_FRAME_CACHE_FORMAT,
         "content": content_fingerprint,
-        "target_index": int(target_index),
-        "control_indices": [int(value) for value in control_indices],
     }
+    if isinstance(target_index, int):
+        descriptor["target_index"] = int(target_index)
+    else:
+        descriptor["target_indices"] = [int(value) for value in target_index]
+    descriptor["control_indices"] = [int(value) for value in control_indices]
     return hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

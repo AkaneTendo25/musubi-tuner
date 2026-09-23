@@ -71,6 +71,7 @@ Two released transformers, with different conditioning contracts:
 - [Inference](#inference)
   - [Use a learned context](#use-a-learned-context)
 - [One-frame images and ordered FL2VA controls](#one-frame-images-and-ordered-fl2va-controls)
+  - [One-frame images with several target slots](#one-frame-images-with-several-target-slots)
 - [Training dashboard](#training-dashboard)
 
 ## Quick start
@@ -2071,6 +2072,80 @@ Caption with numbered pictures --w 512 --h 512 --f 1 --s 30 --ci /images/a.png -
 `--skip_existing` rebuilds outdated one-frame latent caches; legacy endpoint caches require re-caching. Changing only timestamps rebuilds latents; changing control files also rebuilds text embeddings. Existing video caches retain their format.
 
 In the dashboard, enable **One-frame images** for caching and training, then set the image dataset's control and target indices. For generation, enable **One-frame image**, enter the ordered condition paths and frame positions, and choose an output name; the output is a PNG.
+
+### One-frame images with several target slots
+
+One-frame mode can generate and train several target images jointly in one forward pass. Each target slot is its own
+single-frame latent, encoded and decoded separately by the video VAE, placed at its own 24 fps pixel-frame index. Slot
+indices may be negative. Experimental.
+
+| Option | Where | Values | Effect |
+| --- | --- | --- | --- |
+| `fp_1f_target_indices` | dataset | TOML array of signed integers | One index per target slot, in slot order. Replaces `fp_1f_target_index`; the two cannot be combined. With it, `fp_1f_clean_indices` may also be signed. |
+| `--one_frame "target_indices=A;B;...,control_index=C;..."` | inference, `--of` in `--from_file` lines | signed integers | Same placement for generation. `target_index` keeps its non-negative single-target form. |
+| `--h3_target_noise_coupling` | training, inference | `independent` (default), `shared` | `shared` starts every slot from slot 0's noise draw; each slot keeps an N(0, 1) marginal. Applies to every noise draw of a slot batch, rollout draws included. `shared` is rejected by training when no training dataset declares `fp_1f_target_indices`, and by inference without `target_indices`. |
+| `--h3_reference_route` | text caching, training, inference | `dual` (default), `qwen_image_only`, `dit_latent_only`, `text_only` | Where one-frame timed controls and Ref2VA image references are shown: to Qwen3-VL and as DiT latent rows (`dual`, the released presentation), to Qwen3-VL only, as DiT rows only, or to neither. A route changes only which rows are emitted: dropped controls keep their part in the slot placement and dropped image references keep their rotary span, so target positions are the same under every route. |
+
+Placement requirements:
+
+- Every target and control index in the list form must be distinct. With two or more slots the dataset needs
+  `multiple_target = true` and exactly one target image per slot; all slot images of a record must have the same pixel size.
+- Indices are relative placements. When the smallest target or control index is negative, every index of that sequence is
+  shifted by the same amount so the smallest lands on the first media position; non-negative placements are unchanged. A
+  single non-negative slot packs exactly like `fp_1f_target_index`.
+- Ref2VA references stay untimed; slots are placed after the reference block.
+
+Dataset: slot images follow the conditioned-image `multiple_target` naming. In a directory, `X.png` (or `X_0.png`) with
+caption `X.txt` is slot 0 and `X_1.png`, `X_2.png`, … are the next slots. In an image JSONL, `image_path_0`, `image_path_1`,
+… are the slots (zero-padded suffixes such as `image_path_0001` are accepted; two keys for one index are an error); relative paths resolve against the JSONL. Timed controls keep `control_directory` / `control_path_N`.
+
+```toml
+[[datasets]]
+image_directory = "/data/targets"
+control_directory = "/data/controls"
+cache_directory = "/data/cache_slots"
+caption_extension = ".txt"
+resolution = [512, 512]
+batch_size = 1
+multiple_target = true
+fp_1f_target_indices = [-1, 0, 1]
+fp_1f_clean_indices = [4]
+```
+
+Cache, train, and generate:
+
+```shell
+python minimax_h3_cache_latents.py --dataset_config dataset.toml --one_frame \
+  --vae /models/MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors \
+  --audio_vae /models/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors --skip_existing
+python minimax_h3_cache_text_encoder_outputs.py --dataset_config dataset.toml --one_frame --task fl2va \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --text_encoder_quantization nvfp4_awq --h3_reference_route dual --skip_existing
+accelerate launch minimax_h3_train_network.py ... --one_frame --h3_training_mode fl2va \
+  --h3_target_noise_coupling independent --h3_reference_route dual
+python minimax_h3_generate_video.py ... --height 512 --width 512 --frame_count 1 \
+  --condition_image /images/control.png --one_frame "target_indices=-1;0;1,control_index=4" \
+  --h3_target_noise_coupling independent --output layers.png
+```
+
+Generation writes one PNG per slot, named `<output stem>_<slot>_index<index>.png` (here `layers_000_index-1.png`,
+`layers_001_index0.png`, `layers_002_index1.png`); `--output` itself is not written. Audio is not decoded.
+
+- The route's Qwen3-VL half is fixed when the text cache is written: pass the same `--h3_reference_route` to text caching,
+  training, and inference. Training rejects a text cache written with a different route. Latent caches do not depend on the
+  route. A route other than `dual` requires one-frame timed controls (`--one_frame --task fl2va`) or image-only Ref2VA
+  references, and cannot be combined with `source_modality_probabilities`, `--h3_image_mode`, teacher conditions, or
+  training-time sampling.
+- Training logs `loss/target_slot{k}` for each slot when a batch has two or more slots. A loss mask applies to every slot of
+  its record.
+- The LoRA records `ss_h3_target_slots`, `ss_h3_target_indices`, `ss_h3_target_noise_coupling`, and a non-default
+  `ss_h3_reference_route`. Inference warns when the request's route, slot count or indices, or coupling differ from the
+  LoRA's, including a slot LoRA used without `target_indices` and a LoRA without slots used with them.
+- Changing slot indices rebuilds latent caches under `--skip_existing`; changing slot images also rebuilds text caches;
+  changing the route rebuilds text caches.
+- Slots attend to each other and to the controls in one joint pass, so jointly generated slots are not equivalent to
+  generating each slot on its own, and a LoRA trained with slots expects the same slot count and placement at inference.
+- Training-time sample prompts and the dashboard support the single-target form only.
 
 ## Training dashboard
 

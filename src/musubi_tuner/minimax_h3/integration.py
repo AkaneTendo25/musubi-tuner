@@ -46,6 +46,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_MAX_CAPTION_TOKENS_KEY,
     H3_ONE_FRAME_CONTROL_INDICES_KEY,
     H3_ONE_FRAME_TARGET_INDEX_KEY,
+    H3_ONE_FRAME_TARGET_INDICES_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_ALIGNED_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
@@ -54,6 +55,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_KINDS_KEY,
+    H3_REFERENCE_ROUTE_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     H3_REFERENCE_VIDEO_FPS_KEY,
@@ -93,6 +95,13 @@ from musubi_tuner.minimax_h3.inference import (
 )
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
+from musubi_tuner.minimax_h3.one_frame import (
+    H3_REFERENCE_ROUTE_IDS,
+    route_keeps_dit_rows,
+    route_presents_qwen_images,
+    target_slot_output_paths,
+    validate_reference_route,
+)
 from musubi_tuner.minimax_h3.packing import (
     AUDIO_CHANNELS,
     MiniMaxH3GuideGeometry,
@@ -102,6 +111,7 @@ from musubi_tuner.minimax_h3.packing import (
     build_t2va_packed_sequence,
     pack_audio_latents,
     patchify_video_latents,
+    reference_time_span,
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
@@ -200,6 +210,44 @@ def _validate_inference_lora_metadata(
         )
 
 
+def warn_target_slot_metadata(path: Path, request: H3GenerationRequest) -> list[str]:
+    """Warn when a LoRA's recorded target slots, noise coupling, or route differ from the request.
+
+    Returns the warnings so callers and tests can inspect them. An absent layout
+    means the LoRA was trained without target slots, an absent coupling means
+    ``independent``, and an absent route ``dual``. Slot layouts are compared in
+    both directions, and the coupling whenever either side uses slots.
+    """
+    with safe_open(path, framework="pt") as handle:
+        metadata = handle.metadata() or {}
+    warnings = []
+    trained_route = metadata.get("ss_h3_reference_route", "dual")
+    if trained_route != request.reference_route:
+        warnings.append(f"reference route {trained_route}, inference uses {request.reference_route}")
+    no_slots = "no target slots"
+    trained_layouts = [layout for layout in metadata.get("ss_h3_target_indices", "").split(",") if layout]
+    trained_counts = {count for count in metadata.get("ss_h3_target_slots", "").split(",") if count}
+    trained_uses_slots = bool(trained_layouts or trained_counts)
+    requested = request.one_frame_target_indices
+    requested_layout = ";".join(str(value) for value in requested) if requested is not None else no_slots
+    trained_description = ", ".join(trained_layouts or sorted(trained_counts)) if trained_uses_slots else no_slots
+    if requested is None or not trained_uses_slots:
+        if trained_uses_slots != (requested is not None):
+            warnings.append(f"target slots {trained_description}, inference uses {requested_layout}")
+    else:
+        if trained_counts and str(len(requested)) not in trained_counts:
+            warnings.append(f"{', '.join(sorted(trained_counts))} target slot(s), inference uses {len(requested)}")
+        if trained_layouts and requested_layout not in trained_layouts:
+            warnings.append(f"target slot indices {trained_description}, inference uses {requested_layout}")
+    if trained_uses_slots or requested is not None:
+        trained_coupling = metadata.get("ss_h3_target_noise_coupling", "independent")
+        if trained_coupling != request.target_noise_coupling:
+            warnings.append(f"target noise coupling {trained_coupling}, inference uses {request.target_noise_coupling}")
+    for message in warnings:
+        logger.warning("H3 LoRA %s was trained with %s", path, message)
+    return warnings
+
+
 def create_latent_encoder(
     *,
     video_vae: Path | None,
@@ -255,6 +303,7 @@ def create_conditioning_encoder(
     text_visual_max_pixels: int = 0,
     max_caption_tokens: int = 0,
     keyframe_visuals: tuple[int, ...] = (),
+    reference_route: str = "dual",
 ):
     """Load the released understanding encoder and adapt its hidden-state output to Musubi."""
     from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder, load_text_conditioner
@@ -283,6 +332,7 @@ def create_conditioning_encoder(
         reference_video_fps=reference_video_fps,
         max_caption_tokens=max_caption_tokens,
         keyframe_visuals=keyframe_visuals,
+        **({} if reference_route == "dual" else {"reference_route": reference_route}),
     )
 
 
@@ -596,7 +646,7 @@ class _NativeGenerator:
     ) -> tuple[list[Image.Image], tuple[str | int, ...]]:
         images = []
         anchors = []
-        if request.one_frame_target_index is not None:
+        if request.one_frame_placed:
             for path in request.condition_images:
                 with Image.open(path) as image:
                     images.append(prepare_keyframe_image(image, height, width, stretch=True))
@@ -871,15 +921,44 @@ class _NativeGenerator:
         )
         del statistics
         try:
-            enlarged = upscaler(latents.to(self.device, torch.bfloat16), scale=self.latent_upscale_scale)
+            # Target slots are independent images, so each slot is enlarged on
+            # its own rather than as a frame of one clip.
+            slices = latents.split(1, dim=2) if latents.shape[2] > 1 and getattr(self, "_slot_latents", False) else (latents,)
+            enlarged = torch.cat(
+                [upscaler(value.to(self.device, torch.bfloat16), scale=self.latent_upscale_scale) for value in slices], dim=2
+            )
         finally:
             del upscaler
             clean_memory_on_device(self.device)
         return enlarged.float()
 
+    def _save_target_slots(self, request: H3GenerationRequest, video_latents: torch.Tensor) -> None:
+        """Decode every target slot on its own and save one image per slot.
+
+        Slots never pass through the video VAE together, so no slot is decoded
+        as the temporal neighbour of another. The audio placeholder is not decoded.
+        """
+        paths = target_slot_output_paths(request.output, request.one_frame_target_indices)
+        if video_latents.shape[2] != len(paths):
+            raise ValueError(f"MiniMax H3 produced {video_latents.shape[2]} target slots, expected {len(paths)}")
+        video_decoder = load_video_vae_decoder(self.video_vae, "cpu")
+        video_decoder.to(self.device).eval()
+        try:
+            for slot, path in enumerate(paths):
+                video = video_decoder.decode(video_latents[:, :, slot : slot + 1].to(self.device)).cpu()
+                frame = video[0, :, 0].permute(1, 2, 0).clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(frame).save(path)
+        finally:
+            video_decoder.to("cpu")
+            clean_memory_on_device(self.device)
+
     @torch.no_grad()
     def generate(self, request: H3GenerationRequest) -> None:
         metrics: dict[str, dict] = {}
+        self._slot_latents = request.one_frame_target_indices is not None
+        for path in self.lora_weights:
+            warn_target_slot_metadata(path, request)
         total_started = time.perf_counter()
         height, width = (
             (self.height, self.width) if self.height is not None else resolve_canvas_size(request.ratio, request.canvas_reference())
@@ -896,13 +975,20 @@ class _NativeGenerator:
         first_pass_kwargs: dict = {}
         references = None
         prepared_references = ()
+        route = request.reference_route
+        qwen_images_presented = route_presents_qwen_images(route)
+        dit_rows_kept = route_keeps_dit_rows(route)
         if request.mode == "reference":
             prepared_references = self._prepare_references(request, height, width)
             prepared_guides = self._prepare_guides(request, height, width)
             images, anchors = self._prepare_keyframes(request, height, width)
             conditioning = self._measure(
                 "text_conditioning",
-                lambda: self._encode_prompt(request.prompt, references=prepared_references),
+                lambda: (
+                    self._encode_prompt(request.prompt, references=prepared_references)
+                    if qwen_images_presented
+                    else self._encode_prompt(request.prompt)
+                ),
                 metrics,
             )
             references = (
@@ -916,7 +1002,7 @@ class _NativeGenerator:
                     ),
                     metrics,
                 )
-                if prepared_references
+                if prepared_references and dit_rows_kept
                 else H3EncodedReferences((), torch.empty(0, 96), torch.empty(0, 32))
             )
             guides = (
@@ -951,7 +1037,7 @@ class _NativeGenerator:
                         lambda: encode_reference_media(self.video_vae, self.audio_vae, small, self.device),
                         metrics,
                     )
-                    if small
+                    if small and dit_rows_kept
                     else H3EncodedReferences((), torch.empty(0, 96), torch.empty(0, 32))
                 )
                 small_guides = self._prepare_guides(request, *first_pass_size)
@@ -989,9 +1075,12 @@ class _NativeGenerator:
             images, anchors = self._prepare_keyframes(request, height, width)
             conditioning = self._measure(
                 "text_conditioning",
-                lambda: self._encode_prompt(request.prompt, images, keyframe_anchors=anchors),
+                lambda: self._encode_prompt(request.prompt, images if qwen_images_presented else (), keyframe_anchors=anchors),
                 metrics,
             )
+            if not dit_rows_kept:
+                # The timed controls reach the model through Qwen3-VL only.
+                images = []
             keyframe_rows = (
                 self._measure(
                     "keyframe_encoding",
@@ -1026,8 +1115,20 @@ class _NativeGenerator:
         )
         if request.one_frame_target_index is not None:
             base_kwargs["one_frame_target_index"] = request.one_frame_target_index
-            if references is None:
-                base_kwargs["one_frame_control_indices"] = request.one_frame_control_indices
+        if request.one_frame_target_indices is not None:
+            base_kwargs["one_frame_target_indices"] = request.one_frame_target_indices
+            base_kwargs["target_noise_coupling"] = request.target_noise_coupling
+        if request.one_frame_placed and references is None and dit_rows_kept:
+            base_kwargs["one_frame_control_indices"] = request.one_frame_control_indices
+        elif request.one_frame_target_indices is not None and references is None and request.one_frame_control_indices:
+            # Controls kept out of the DiT still take part in the slot placement.
+            base_kwargs["one_frame_placement_indices"] = request.one_frame_control_indices
+        if references is not None and route != "dual":
+            base_kwargs["reference_route"] = route
+            if not dit_rows_kept:
+                # Image references span one rotary unit each; the target keeps
+                # the start it has under the dual route.
+                base_kwargs["reserved_reference_time"] = float(len(reference_kinds))
         if self.null_guidance_scale > 0:
             if self._null_conditioning is None:
                 raise RuntimeError("MiniMax H3 null guidance: the null presentation was not encoded")
@@ -1084,6 +1185,10 @@ class _NativeGenerator:
         # and enlarging the latent allocates several more for its activations.
         if self.latent_upscaler is not None and self.latent_upscale_scale > 1.0:
             video_latents = self._measure("latent_upscale", lambda: self._upscale_latents(video_latents), metrics).cpu()
+
+        if request.one_frame_target_indices is not None:
+            self._measure("video_decode", lambda: self._save_target_slots(request, video_latents), metrics)
+            return
 
         if request.output.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
             video_decoder = self._measure("decoder_load", lambda: load_video_vae_decoder(self.video_vae, "cpu"), metrics)
@@ -1330,6 +1435,9 @@ class _PreparedTrainingForward:
 
 class _NativeTrainingBackend:
     supports_paired_conditioning = True
+    # --h3_reference_route; the trainer overrides it on the instance. ``dual`` is
+    # the released presentation and leaves every packed row unchanged.
+    reference_route = "dual"
 
     def __init__(
         self,
@@ -1603,6 +1711,21 @@ class _NativeTrainingBackend:
                 or int(cached_text_visual_max_pixels) != self.text_visual_max_pixels
             ):
                 raise ValueError("H3 text cache uses a different h3_text_visual_max_pixels value; re-cache conditioning")
+        # The Qwen3-VL half of the route is baked into the text cache, so the
+        # cache records it and training must request the same route.
+        reference_route = self.reference_route
+        validate_reference_route(reference_route)
+        cached_route = "dual"
+        if H3_REFERENCE_ROUTE_KEY in batch:
+            cached_route_id = int(self._one_conditioning_item(batch, H3_REFERENCE_ROUTE_KEY, expected_ndim=0))
+            cached_route = next((name for name, value in H3_REFERENCE_ROUTE_IDS.items() if value == cached_route_id), None)
+        if cached_route != reference_route:
+            raise ValueError(
+                f"H3 text cache was written with --h3_reference_route {cached_route}, but training requested "
+                f"{reference_route}; re-cache text conditioning with the requested route"
+            )
+        qwen_images_presented = route_presents_qwen_images(reference_route)
+        dit_rows_kept = route_keeps_dit_rows(reference_route)
         if self.mode in ("ref2va", "ref2va_omni"):
             cached_reference_size = batch.get(H3_REFERENCE_IMAGE_SHORT_EDGE_KEY)
             if cached_reference_size is None:
@@ -1740,12 +1863,12 @@ class _NativeTrainingBackend:
                     format_keyframe_visuals(cached_keyframe_visuals),
                     format_keyframe_visuals(pinned),
                 )
-        if task in ("i2va", "fl2va", "l2va") and not has_vision:
+        if task in ("i2va", "fl2va", "l2va") and not has_vision and qwen_images_presented:
             raise ValueError(f"MiniMax H3 {task.upper()} training requires keyframe vision rows; re-cache with --task {task}")
         aligned_guide_count = 0
         if H3_ALIGNED_GUIDE_COUNT_KEY in batch:
             aligned_guide_count = int(self._one_conditioning_item(batch, H3_ALIGNED_GUIDE_COUNT_KEY, expected_ndim=0))
-        if task == "ref2va" and not has_vision and not aligned_guide_count:
+        if task == "ref2va" and not has_vision and not aligned_guide_count and qwen_images_presented:
             # An audio-only reference set is presented to Qwen as text alone --
             # reference audio never reaches the vision tower -- so a text-only
             # presentation is legitimate exactly when the cached reference bundle
@@ -1773,7 +1896,7 @@ class _NativeTrainingBackend:
         else:
             audio_rows = pack_audio_latents(audio_hidden_states)
             num_audio_latents = int(audio_hidden_states.shape[-1])
-        one_frame_target_index, one_frame_control_indices, one_frame_rows = self._one_frame_cache(
+        one_frame_target, one_frame_control_indices, one_frame_rows = self._one_frame_cache(
             batch,
             latent_frames=latent_frames,
             latent_height=latent_height,
@@ -1782,12 +1905,22 @@ class _NativeTrainingBackend:
             device=model_device,
             dtype=present.dtype,
         )
+        # A cached scalar is the single-target placement, a cached tuple one
+        # signed index per target slot.
+        one_frame_target_index = one_frame_target if isinstance(one_frame_target, int) else None
+        one_frame_target_indices = one_frame_target if isinstance(one_frame_target, tuple) else None
+        one_frame_placed = one_frame_target is not None
         if one_frame_control_indices and (self.mode != "fl2va" or task != "fl2va"):
             raise ValueError("H3 timed one-frame controls require FL2VA training and --task fl2va text caches")
-        if one_frame_target_index is not None and (
-            condition_video_anchors or guide_geometries or extension_video_frames or extension_audio_latents
-        ):
+        if one_frame_placed and (condition_video_anchors or guide_geometries or extension_video_frames or extension_audio_latents):
             raise ValueError("H3 one-frame timing cannot be combined with video keyframes, guides, or extension")
+        # A route without DiT rows emits no control rows, but the controls keep
+        # their part in the slot placement, so the retained rows never move.
+        one_frame_placement_indices: tuple[int, ...] = ()
+        if one_frame_placed and not dit_rows_kept:
+            if one_frame_target_indices is not None:
+                one_frame_placement_indices = tuple(one_frame_control_indices)
+            one_frame_control_indices, one_frame_rows = (), None
         if self.mode in ("ref2va", "ref2va_omni"):
             references, reference_video, reference_audio = self._reference_cache(
                 batch,
@@ -1798,6 +1931,14 @@ class _NativeTrainingBackend:
                 dtype=video_rows.dtype,
                 reference_modality=reference_modality,
             )
+            reserved_reference_time = 0.0
+            if not dit_rows_kept:
+                # The references keep their rotary span, so the target starts
+                # where it starts under the dual route.
+                reserved_reference_time = reference_time_span(references)
+                references = ()
+                reference_video = reference_video.new_empty((0, reference_video.shape[-1]))
+                reference_audio = reference_audio.new_empty((0, reference_audio.shape[-1]))
             observed_aligned_guides = sum(reference.aligned_to_target for reference in references)
             if observed_aligned_guides != aligned_guide_count:
                 raise ValueError(
@@ -1816,6 +1957,8 @@ class _NativeTrainingBackend:
                 guides=guide_geometries,
                 spatial_density_scale=spatial_density_scale,
                 one_frame_target_index=one_frame_target_index,
+                one_frame_target_indices=one_frame_target_indices,
+                **({"reserved_reference_time": reserved_reference_time} if reserved_reference_time else {}),
             )
             condition_video_timestep = torch.maximum(
                 video_timestep.reshape(1).to(model_device, torch.float32),
@@ -1963,8 +2106,8 @@ class _NativeTrainingBackend:
             )
         elif task in ("i2va", "fl2va", "l2va"):
             anchors = {"i2va": ("first",), "fl2va": ("first", "last"), "l2va": ("last",)}[task]
-            if one_frame_target_index is not None:
-                if not one_frame_control_indices:
+            if one_frame_placed:
+                if not one_frame_control_indices and dit_rows_kept:
                     raise ValueError("H3 one-frame FL2VA cache is missing ordered controls; re-cache latents")
                 anchors = ()
             layout = build_t2va_packed_sequence(
@@ -1978,11 +2121,13 @@ class _NativeTrainingBackend:
                 keyframe_anchors=anchors,
                 spatial_density_scale=spatial_density_scale,
                 one_frame_target_index=one_frame_target_index,
-                one_frame_control_indices=one_frame_control_indices if one_frame_target_index is not None else None,
+                one_frame_control_indices=one_frame_control_indices if one_frame_placed else None,
+                one_frame_target_indices=one_frame_target_indices,
+                one_frame_placement_indices=one_frame_placement_indices,
             )
             keyframe_rows = (
                 one_frame_rows
-                if one_frame_target_index is not None
+                if one_frame_placed
                 else self._keyframe_cache(
                     batch,
                     anchors=anchors,
@@ -1992,8 +2137,11 @@ class _NativeTrainingBackend:
                     dtype=video_rows.dtype,
                 )
             )
-            keyframe_rows = 0.999 * keyframe_rows + 0.001 * torch.randn_like(keyframe_rows)
-            video_rows = torch.cat((keyframe_rows[None], video_rows), dim=1)
+            # A route without DiT rows leaves a one-frame FL2VA sequence with no
+            # condition rows at all; every other case prepends them as released.
+            if keyframe_rows is not None:
+                keyframe_rows = 0.999 * keyframe_rows + 0.001 * torch.randn_like(keyframe_rows)
+                video_rows = torch.cat((keyframe_rows[None], video_rows), dim=1)
             condition_video_timestep = torch.maximum(
                 video_timestep.reshape(1).to(model_device, torch.float32),
                 torch.tensor([0.999], device=model_device),
@@ -2069,6 +2217,7 @@ class _NativeTrainingBackend:
                 num_condition_audio_latents=extension_audio_latents if duplicate_context else 0,
                 spatial_density_scale=spatial_density_scale,
                 one_frame_target_index=one_frame_target_index,
+                one_frame_target_indices=one_frame_target_indices,
             )
             condition_video_timestep = None
             condition_audio_timestep = None
@@ -2237,23 +2386,38 @@ class _NativeTrainingBackend:
         """Read ordered image controls without assigning video endpoint roles."""
         control_keys = [key for key in batch if key.startswith("latents_cond_")]
         has_target = H3_ONE_FRAME_TARGET_INDEX_KEY in batch
-        if not has_target:
+        has_slots = H3_ONE_FRAME_TARGET_INDICES_KEY in batch
+        if not has_target and not has_slots:
             if control_keys or H3_ONE_FRAME_CONTROL_INDICES_KEY in batch:
                 raise ValueError("H3 one-frame cache lacks target timing; re-cache latents")
             return None, (), None
-        if latent_frames != 1:
-            raise ValueError("H3 one-frame cache requires exactly one target latent frame")
+        if has_target and has_slots:
+            raise ValueError("H3 one-frame cache carries both a target index and target slot indices; re-cache latents")
         if any(key.startswith(("latents_first", "latents_last")) for key in batch) or H3_KEYFRAME_VIDEO_ROWS_KEY in batch:
             raise ValueError("H3 legacy one-frame endpoint cache is unsupported; re-cache latents")
-        target = self._one_conditioning_item(batch, H3_ONE_FRAME_TARGET_INDEX_KEY, expected_ndim=0)
-        if target.dtype != torch.int64 or int(target) < 0:
-            raise ValueError("H3 one-frame target index must be a non-negative int64 scalar")
+        if has_slots:
+            # The slot form carries signed indices, one per target latent frame.
+            slots = self._one_conditioning_item(batch, H3_ONE_FRAME_TARGET_INDICES_KEY, expected_ndim=1)
+            if slots.dtype != torch.int64 or slots.numel() == 0:
+                raise ValueError("H3 one-frame target slot indices must be a non-empty int64 vector")
+            if latent_frames != slots.numel():
+                raise ValueError(
+                    f"H3 one-frame cache has {slots.numel()} target slots but {latent_frames} target latent frames; re-cache latents"
+                )
+            target: int | tuple[int, ...] = tuple(int(value) for value in slots)
+        else:
+            if latent_frames != 1:
+                raise ValueError("H3 one-frame cache requires exactly one target latent frame")
+            scalar = self._one_conditioning_item(batch, H3_ONE_FRAME_TARGET_INDEX_KEY, expected_ndim=0)
+            if scalar.dtype != torch.int64 or int(scalar) < 0:
+                raise ValueError("H3 one-frame target index must be a non-negative int64 scalar")
+            target = int(scalar)
         if H3_ONE_FRAME_CONTROL_INDICES_KEY not in batch:
             if control_keys:
                 raise ValueError("H3 one-frame controls lack time indices; re-cache latents")
-            return int(target), (), None
+            return target, (), None
         indices = self._one_conditioning_item(batch, H3_ONE_FRAME_CONTROL_INDICES_KEY, expected_ndim=1)
-        if indices.dtype != torch.int64 or bool((indices < 0).any()):
+        if indices.dtype != torch.int64 or (not has_slots and bool((indices < 0).any())):
             raise ValueError("H3 one-frame control indices must be non-negative int64 values")
         expected_keys = [f"latents_cond_{index:03d}" for index in range(indices.numel())]
         if set(control_keys) != set(expected_keys) or any(
@@ -2266,7 +2430,7 @@ class _NativeTrainingBackend:
             if latent.shape != (VIDEO_LATENT_CHANNELS, 1, latent_height, latent_width):
                 raise ValueError("H3 one-frame control latents must match the target canvas and contain one frame")
             rows.append(patchify_video_latents(latent[None].to(device=device, dtype=dtype), patch_size)[0])
-        return int(target), tuple(int(value) for value in indices), torch.cat(rows) if rows else None
+        return target, tuple(int(value) for value in indices), torch.cat(rows) if rows else None
 
     def _keyframe_cache(
         self,
@@ -2750,7 +2914,9 @@ class _NativeLatentEncoder:
             if getattr(item, "h3_target_mode", "av") == "audio":
                 continue
             content = item.content
-            if not isinstance(content, np.ndarray):
+            # Target slots are encoded one slice at a time below, so the VAE
+            # never sees two slots as neighbouring frames of one clip.
+            if not isinstance(content, np.ndarray) or getattr(item, "h3_one_frame_target_indices", None) is not None:
                 continue
             normalized = content[None] if content.ndim == 3 else content
             conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
@@ -2809,11 +2975,21 @@ class _NativeLatentEncoder:
             conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
             one_frame = bool(getattr(item, "h3_one_frame", False))
             is_image = target.modality is MediaModality.IMAGE and not conditioned_image
+            target_slots = getattr(item, "h3_one_frame_target_indices", None) if one_frame else None
             video = grouped_latents.get(index)
-            if video is None:
+            if target_slots is not None:
+                slots = np.asarray(item.content)
+                if not is_image or slots.ndim != 4 or slots.shape[0] != len(target_slots):
+                    raise ValueError(f"H3 one-frame target slots of {item.item_key!r} must decode to one image per slot")
+                # Each slot is its own single-image VAE encode; the slices are only
+                # stacked on the latent frame axis afterwards.
+                video = torch.cat([self._encode_video(slot, is_image=True) for slot in slots], dim=1)
+            elif video is None:
                 video = self._encode_video(item.content, is_image=is_image)
             video_frame_count = IMAGE_FRAME_COUNT if is_image else int(item.content.shape[0])
             expected_video_frames = IMAGE_FRAME_COUNT if is_image else temporal_shape(video_frame_count).video_latent_frames
+            if target_slots is not None:
+                expected_video_frames = len(target_slots)
             if video.shape[1] != expected_video_frames:
                 raise ValueError(
                     f"H3 video VAE produced {video.shape[1]} latent frames for {video_frame_count} pixels; "
@@ -2822,8 +2998,8 @@ class _NativeLatentEncoder:
             frame_shape = "x".join(str(value) for value in video.shape[-3:])
             tensors = {f"latents_{frame_shape}_{dtype_name}": video}
             if one_frame:
-                if not is_image or video.shape[1] != 1:
-                    raise ValueError("H3 one-frame caching requires a single image target")
+                if not is_image or video.shape[1] != (1 if target_slots is None else len(target_slots)):
+                    raise ValueError("H3 one-frame caching requires a single image target per slot")
                 tensors.update(
                     {
                         f"{H3_AUDIO_LATENTS_KEY}_2x32x2_{dtype_name}": self._one_frame_silence(),
@@ -2835,10 +3011,17 @@ class _NativeLatentEncoder:
                     with Image.open(path) as image:
                         content = np.asarray(image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)).copy()
                     control = self._encode_reference_video(content, image=True)
-                    if control.shape != video.shape:
+                    if control.shape != video[:, :1].shape:
                         raise ValueError("H3 one-frame control VAE output must match the target canvas")
-                    tensors[f"latents_cond_{index:03d}_{frame_shape}_{dtype_name}"] = control
-            video_loss_mask = self._video_loss_mask(item, tuple(int(value) for value in video.shape[-3:]))
+                    control_shape = "x".join(str(value) for value in control.shape[-3:])
+                    tensors[f"latents_cond_{index:03d}_{control_shape}_{dtype_name}"] = control
+            if target_slots is not None:
+                # One authored mask covers every slot: it is pooled once on the
+                # single-frame grid and repeated along the slot axis.
+                slot_mask = self._video_loss_mask(item, (1, int(video.shape[-2]), int(video.shape[-1])))
+                video_loss_mask = None if slot_mask is None else slot_mask.expand(len(target_slots), -1, -1).contiguous()
+            else:
+                video_loss_mask = self._video_loss_mask(item, tuple(int(value) for value in video.shape[-3:]))
             if video_loss_mask is not None:
                 tensors["video_loss_mask"] = video_loss_mask
             if not one_frame and target_mode != "video" and (not is_image or target.metadata.get("audio_path")):

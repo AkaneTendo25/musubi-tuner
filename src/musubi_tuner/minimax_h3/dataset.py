@@ -12,11 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+from musubi_tuner.dataset.datasources import canonicalize_indexed_paths
 from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo, VideoDataset
 from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos, resize_image_to_bucket
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
@@ -33,6 +35,7 @@ from musubi_tuner.minimax_h3.image_training import (
     validate_image_mode,
 )
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media_asset
+from musubi_tuner.minimax_h3.one_frame import validate_target_slot_indices
 from musubi_tuner.minimax_h3.references import REFERENCE_FINGERPRINT_KEY, reference_fingerprint
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
@@ -41,6 +44,10 @@ CONDITIONING_MASK_DIRECTORY_KEY = "conditioning_mask_directory"
 QWEN_CONTROL_DIRECTORY_KEY = "qwen_control_directory"
 QWEN_CONTROL_KEY = "qwen_control_path"
 TARGET_AUDIO_FINGERPRINT_KEY = "target_audio_fingerprint"
+ONE_FRAME_TARGET_INDICES_KEY = "fp_1f_target_indices"
+# Private carrier for Musubi's image dataset: resolve an ordered multiple_target
+# group with the same indexed-path rules conditioned-image mode uses.
+ONE_FRAME_SLOT_CARRIER_KEY = "h3_indexed_targets"
 SOURCE_DIRECTORY_KEYS = {
     "image": "source_image_directory",
     "video": "source_video_directory",
@@ -72,6 +79,35 @@ _CONTROL_VIDEO_PATH_PATTERN = re.compile(r"^control_video_path_(\d+)$")
 _CONTROL_AUDIO_PATH_PATTERN = re.compile(r"^control_audio_path_(\d+)$")
 _CONTROL_MODALITY_PATTERN = re.compile(r"^control_modality_(\d+)$")
 _CROP_SUFFIX_PATTERN = re.compile(r"^(?P<stem>.+)_(?P<start>\d{5})-(?P<frames>\d+)$")
+
+
+def _validate_target_slot_images(target: str, paths: Sequence[Path], slot_count: int) -> None:
+    """One ordered target image per slot, all at the primary image's pixel size."""
+    if len(paths) != slot_count:
+        raise ValueError(
+            f"MiniMax H3 one-frame target {target!r} has {len(paths)} target image(s) but "
+            f"{ONE_FRAME_TARGET_INDICES_KEY} has {slot_count} entries"
+        )
+    sizes = []
+    for path in paths:
+        with Image.open(path) as image:
+            sizes.append(image.size)
+    if len(set(sizes)) != 1:
+        raise ValueError(
+            f"MiniMax H3 one-frame target slots of {target!r} must share one resolution, got {[list(size) for size in sizes]}"
+        )
+
+
+def _stack_target_slots(key: str, content: Any, slot_count: int) -> np.ndarray:
+    """Stack decoded target slots in slot order as ``[slots, H, W, 3]``."""
+    frames = [content] if isinstance(content, np.ndarray) and content.ndim == 3 else list(content)
+    if isinstance(content, np.ndarray) and content.ndim == 4:
+        frames = list(content)
+    if len(frames) != slot_count:
+        raise ValueError(f"MiniMax H3 one-frame item {key!r} decoded {len(frames)} target slots, expected {slot_count}")
+    if any(not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape != frames[0].shape for frame in frames):
+        raise ValueError(f"MiniMax H3 one-frame target slots of {key!r} must share one bucket geometry")
+    return np.stack(frames)
 
 
 def _normal_path(path: str | Path) -> str:
@@ -784,7 +820,10 @@ class H3DatasetAdapter:
         self._target_reference_probabilities: dict[str, tuple[float, float, float]] = {}
         self._teacher_captions: dict[str, str] = {}
         self._image_frame_counts: dict[str, int] = {}
-        self._one_frame_settings: dict[tuple[str, str], tuple[int, tuple[int, ...]]] = {}
+        # (target path, cache directory) -> (target index, control indices). The
+        # target entry is an int for fp_1f_target_index and a tuple of signed slot
+        # indices for fp_1f_target_indices.
+        self._one_frame_settings: dict[tuple[str, str], tuple[int | tuple[int, ...], tuple[int, ...]]] = {}
         # Authored conditioning masks: the observed region for --h3_mask_mode
         # dataset. They are applied to the packed rows at train time, so they
         # never enter the latent cache and never change its identity.
@@ -824,8 +863,11 @@ class H3DatasetAdapter:
             "source_video_audio_embedded",
             "source_modality_probabilities",
             "aligned_guide_indices",
+            ONE_FRAME_TARGET_INDICES_KEY,
         ):
             clean_general.pop(key, None)
+        if any(section.get(ONE_FRAME_SLOT_CARRIER_KEY) is not None for section in (general, *user_config.get("datasets", []))):
+            raise ValueError(f"{ONE_FRAME_SLOT_CARRIER_KEY} is set by the H3 adapter and cannot appear in a dataset config")
 
         source_datasets = user_config.get("datasets", [])
         clean_datasets = self.musubi_config.get("datasets", [])
@@ -837,6 +879,7 @@ class H3DatasetAdapter:
                 "source_video_audio_embedded",
                 "source_modality_probabilities",
                 "aligned_guide_indices",
+                ONE_FRAME_TARGET_INDICES_KEY,
                 *SOURCE_DIRECTORY_KEYS.values(),
                 *TARGET_DIRECTORY_KEYS.values(),
             ):
@@ -956,6 +999,22 @@ class H3DatasetAdapter:
             one_frame_cache_key = (
                 _normal_path(Path(dataset_cache_directory).expanduser().resolve()) if dataset_cache_directory else ""
             )
+            # The list form places one target slot per image of an ordered
+            # multiple_target group; its indices are signed pixel frames.
+            one_frame_slots_value = _effective(source, general, ONE_FRAME_TARGET_INDICES_KEY)
+            if one_frame_slots_value is not None and (
+                not isinstance(one_frame_slots_value, list)
+                or not one_frame_slots_value
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in one_frame_slots_value)
+            ):
+                raise ValueError(f"{ONE_FRAME_TARGET_INDICES_KEY} must be a non-empty TOML array of integers")
+            one_frame_slots = (
+                tuple(int(value) for value in one_frame_slots_value)
+                if self.one_frame and one_frame_slots_value is not None and (image_directory or image_jsonl_file)
+                else None
+            )
+            if one_frame_slots is not None:
+                clean[ONE_FRAME_SLOT_CARRIER_KEY] = True
 
             records: list[dict[str, Any]] | None = None
             if video_directory:
@@ -981,7 +1040,7 @@ class H3DatasetAdapter:
                     glob_images(image_directory, caption_extension=None if allow_captionless_images else caption_extension)
                 )
                 all_images = tuple(Path(path) for path in glob_images(image_directory))
-                if self.image_mode != "none" and multiple_target and caption_extension:
+                if (self.image_mode != "none" or one_frame_slots is not None) and multiple_target and caption_extension:
                     existing = set(target_paths)
                     groups: dict[Path, list[tuple[int, Path]]] = {}
                     for candidate in all_images:
@@ -989,6 +1048,12 @@ class H3DatasetAdapter:
                         if separator and suffix.isdigit():
                             groups.setdefault(candidate.with_name(prefix), []).append((int(suffix), candidate))
                     for prefix, candidates in groups.items():
+                        # Musubi's datasource uses X_0/X_1 as the primary only when no
+                        # captioned X.<ext> exists; target slots follow the same rule.
+                        if one_frame_slots is not None and any(
+                            Path(path).parent == prefix.parent and Path(path).stem == prefix.name for path in existing
+                        ):
+                            continue
                         candidates.sort()
                         if (prefix.parent / (prefix.name + caption_extension)).is_file() and candidates[0][0] in (0, 1):
                             primary = str(candidates[0][1])
@@ -1014,6 +1079,11 @@ class H3DatasetAdapter:
                     target_sources[target_path] = (primary, *(path for _, path in indexed)) if multiple_target else (primary,)
             elif image_jsonl_file:
                 records = _read_media_jsonl(image_jsonl_file, resolve_paths=self.image_mode != "none" or self.one_frame)
+                if self.image_mode != "none" or one_frame_slots is not None:
+                    # The indexed path of Musubi's JSONL reader renames zero-padded
+                    # image_path_N keys; resolve the same slot order it will load.
+                    for record in records:
+                        canonicalize_indexed_paths(record, ("image_path",))
                 target_paths = tuple(record.get("image_path") or record.get("image_path_0") for record in records)
                 if any(not target for target in target_paths):
                     raise ValueError("H3 image JSONL records must contain image_path or image_path_0")
@@ -1067,13 +1137,30 @@ class H3DatasetAdapter:
                 else:
                     if self.image_mode != "none":
                         raise ValueError("--one_frame cannot be combined with --h3_image_mode")
-                    if multiple_target:
+                    if one_frame_slots is not None:
+                        if one_frame_target_index is not None:
+                            raise ValueError(f"use fp_1f_target_index or {ONE_FRAME_TARGET_INDICES_KEY}, not both")
+                        validate_target_slot_indices(
+                            one_frame_slots,
+                            one_frame_control_indices,
+                            label=f"{ONE_FRAME_TARGET_INDICES_KEY}/fp_1f_clean_indices",
+                        )
+                        if len(one_frame_slots) > 1 and not multiple_target:
+                            raise ValueError(
+                                f"{ONE_FRAME_TARGET_INDICES_KEY} with several slots requires multiple_target = true "
+                                "and one ordered target image per slot"
+                            )
+                        if len(one_frame_slots) == 1 and multiple_target:
+                            raise ValueError(
+                                f"a single {ONE_FRAME_TARGET_INDICES_KEY} slot takes one target image, not multiple_target"
+                            )
+                    elif multiple_target:
                         raise ValueError("MiniMax H3 one-frame image datasets do not support multiple_target")
-                    if one_frame_target_index is not None and int(one_frame_target_index) < 0:
+                    if one_frame_slots is None and one_frame_target_index is not None and int(one_frame_target_index) < 0:
                         raise ValueError("fp_1f_target_index must be non-negative")
-                    if any(value < 0 for value in one_frame_control_indices):
+                    if one_frame_slots is None and any(value < 0 for value in one_frame_control_indices):
                         raise ValueError("fp_1f_clean_indices must contain non-negative frame indices")
-                    if one_frame_control_indices and one_frame_target_index is None:
+                    if one_frame_control_indices and one_frame_target_index is None and one_frame_slots is None:
                         raise ValueError("timed one-frame controls require an explicit fp_1f_target_index")
                     if one_frame_control_indices and self.task != "fl2va":
                         raise ValueError("fp_1f_clean_indices one-frame controls require --task fl2va")
@@ -1160,6 +1247,8 @@ class H3DatasetAdapter:
                         raise ValueError("FL2VA one-frame controls require fp_1f_clean_indices")
                     elif self.task not in {"ref2va", "ref2va_omni"} and self.teacher_conditions != "subject_ref" and references:
                         raise ValueError("untimed one-frame controls are Ref2VA references and require --task ref2va")
+                    if one_frame_slots is not None:
+                        _validate_target_slot_images(target, target_sources[target], len(one_frame_slots))
                 resolved = _ResolvedTarget(Path(target), references, qwen_control_paths.get(target, ()))
                 normal = _normal_path(target)
                 companion_audio = target_audio_paths.get(target)
@@ -1212,7 +1301,10 @@ class H3DatasetAdapter:
                         self._target_audio_frame_counts[normal] = companion_audio_frames
                 if self.one_frame and modality is MediaModality.IMAGE:
                     settings_key = (normal, one_frame_cache_key)
-                    expected = (int(one_frame_target_index or 0), one_frame_control_indices)
+                    expected = (
+                        one_frame_slots if one_frame_slots is not None else int(one_frame_target_index or 0),
+                        one_frame_control_indices,
+                    )
                     existing_settings = self._one_frame_settings.get(settings_key)
                     if existing_settings is not None and existing_settings != expected:
                         raise ValueError(f"conflicting one-frame time positions share cache_directory for target path: {target}")
@@ -1267,6 +1359,14 @@ class H3DatasetAdapter:
                 f"the dataset declares conditioning masks ({CONDITIONING_MASK_DIRECTORY_KEY}/{CONDITIONING_MASK_KEY}) "
                 f"but --h3_mask_mode {mask_mode} draws its own; pass --h3_mask_mode dataset to use them"
             )
+
+    def one_frame_target_slot_layouts(self) -> tuple[tuple[int, ...], ...]:
+        """Distinct fp_1f_target_indices layouts in the config, in first-seen order."""
+        layouts: dict[tuple[int, ...], None] = {}
+        for target, _ in self._one_frame_settings.values():
+            if isinstance(target, tuple):
+                layouts.setdefault(target)
+        return tuple(layouts)
 
     def conditioning_mask_paths_by_item_key(self) -> dict[str, str]:
         """Map the cached item key -- the target's basename -- to its mask file.
@@ -1409,7 +1509,13 @@ class H3DatasetAdapter:
             target_index, control_indices = one_frame_settings
             controls = tuple(reference.path for reference in resolved.references) if control_indices else ()
             item.h3_one_frame = True
-            item.h3_one_frame_target_index = target_index
+            if isinstance(target_index, tuple):
+                item.h3_one_frame_target_index = None
+                item.h3_one_frame_target_indices = target_index
+                if item.content is not None:
+                    item.content = _stack_target_slots(item.item_key, item.content, len(target_index))
+            else:
+                item.h3_one_frame_target_index = target_index
             item.h3_one_frame_control_indices = control_indices
             item.h3_condition_paths = controls
             item.h3_target_paths = self._target_source_paths[normal]

@@ -6,6 +6,7 @@ from enum import Enum
 from pathlib import Path
 
 from musubi_tuner.minimax_h3.architecture import VIDEO_FPS, H3TemporalShape, temporal_shape
+from musubi_tuner.minimax_h3.one_frame import validate_reference_route, validate_target_noise_coupling, validate_target_slot_indices
 
 
 class ReferenceKind(str, Enum):
@@ -84,6 +85,10 @@ class H3GenerationRequest:
     condition_images: tuple[Path, ...] = field(default_factory=tuple)
     one_frame_target_index: int | None = None
     one_frame_control_indices: tuple[int, ...] | None = None
+    #: Signed pixel-frame index of each one-frame target slot, generated jointly.
+    one_frame_target_indices: tuple[int, ...] | None = None
+    target_noise_coupling: str = "independent"
+    reference_route: str = "dual"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "output", Path(self.output))
@@ -92,7 +97,13 @@ class H3GenerationRequest:
         object.__setattr__(self, "condition_images", tuple(Path(path) for path in self.condition_images))
         if self.one_frame_control_indices is not None:
             object.__setattr__(self, "one_frame_control_indices", tuple(self.one_frame_control_indices))
+        if self.one_frame_target_indices is not None:
+            object.__setattr__(self, "one_frame_target_indices", tuple(self.one_frame_target_indices))
         self.validate()
+
+    @property
+    def one_frame_placed(self) -> bool:
+        return self.one_frame_target_index is not None or self.one_frame_target_indices is not None
 
     def canvas_reference(self) -> Path | None:
         """Image whose proportions govern the canvas under ``adaptive``.
@@ -137,10 +148,20 @@ class H3GenerationRequest:
         ordinary = self._with_role(ReferenceRole.REFERENCE)
         if len(first_frames) > 1 or len(last_frames) > 1:
             raise ValueError("at most one first-frame and one last-frame image are supported")
-        if self.one_frame_target_index is not None:
+        validate_target_noise_coupling(self.target_noise_coupling)
+        validate_reference_route(self.reference_route)
+        if self.target_noise_coupling != "independent" and self.one_frame_target_indices is None:
+            raise ValueError("target noise coupling applies to one-frame target slots only")
+        if self.one_frame_placed:
             if self.frame_count_override != 1:
                 raise ValueError("one-frame placement requires frame_count_override=1")
-            if (
+            if self.one_frame_target_indices is not None:
+                if self.one_frame_target_index is not None:
+                    raise ValueError("one-frame placement takes a target index or target slot indices, not both")
+                validate_target_slot_indices(self.one_frame_target_indices, self.one_frame_control_indices or (), label="one-frame")
+                if self.output.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                    raise ValueError("one-frame target slots are saved as images; use an image extension for the output")
+            elif (
                 isinstance(self.one_frame_target_index, bool)
                 or not isinstance(self.one_frame_target_index, int)
                 or self.one_frame_target_index < 0
@@ -157,12 +178,24 @@ class H3GenerationRequest:
                 raise ValueError("one-frame controls require one control index per image")
             if not controls and self.one_frame_control_indices is not None:
                 raise ValueError("one-frame control indices require condition images")
-            if self.one_frame_control_indices is not None and any(
-                isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in self.one_frame_control_indices
+            if (
+                self.one_frame_target_indices is None
+                and self.one_frame_control_indices is not None
+                and any(
+                    isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in self.one_frame_control_indices
+                )
             ):
                 raise ValueError("one-frame control indices must be non-negative integers")
         elif self.condition_images or self.one_frame_control_indices is not None:
             raise ValueError("condition_images require one-frame placement")
+        if self.reference_route != "dual":
+            # The route selects where image conditions are shown, so it needs
+            # image conditions it can move: one-frame timed controls or ordinary
+            # image references, never keyframes, guides, or video/audio references.
+            one_frame_controls = self.one_frame_placed and bool(self.condition_images or first_frames or last_frames)
+            image_references = bool(ordinary) and all(ref.kind is ReferenceKind.IMAGE for ref in ordinary)
+            if keyframes or self.guides or not (one_frame_controls or image_references):
+                raise ValueError("a reference route other than dual requires one-frame condition images or image-only references")
         latent_frames = self.temporal_shape.video_latent_frames
         indices = [self.resolve_keyframe_index(ref.latent_index) for ref in keyframes]
         if len(set(indices)) != len(indices):

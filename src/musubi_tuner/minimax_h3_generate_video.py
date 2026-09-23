@@ -8,7 +8,12 @@ from pathlib import Path
 
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_generator
-from musubi_tuner.minimax_h3.one_frame import parse_one_frame_options
+from musubi_tuner.minimax_h3.one_frame import (
+    H3_REFERENCE_ROUTES,
+    H3_TARGET_NOISE_COUPLINGS,
+    parse_one_frame_options,
+    target_slot_output_paths,
+)
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODES,
@@ -55,7 +60,25 @@ def create_parser() -> argparse.ArgumentParser:
         const="",
         default=None,
         metavar="target_index=N,control_index=A;B",
-        help="generate one latent frame with optional 24 fps timeline placement",
+        help=(
+            "generate one latent frame with optional 24 fps timeline placement; target_indices=A;B;... generates one "
+            "target slot per signed index in one joint pass and saves <output stem>_<slot>_index<index> images"
+        ),
+    )
+    parser.add_argument(
+        "--h3_target_noise_coupling",
+        choices=H3_TARGET_NOISE_COUPLINGS,
+        default="independent",
+        help="initial noise of one-frame target slots: an independent draw per slot, or slot 0's draw shared by all",
+    )
+    parser.add_argument(
+        "--h3_reference_route",
+        choices=H3_REFERENCE_ROUTES,
+        default="dual",
+        help=(
+            "where one-frame condition images or image references are shown: dual (released: Qwen3-VL and DiT), "
+            "qwen_image_only, dit_latent_only, or text_only; match the route the LoRA was trained with"
+        ),
     )
     parser.add_argument(
         "--h3_image_mode",
@@ -297,6 +320,9 @@ def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
     if args.condition_image and (first_frame or last_frame):
         raise ValueError("--condition_image cannot be combined with --first_frame/--last_frame")
     target_index, control_indices = parse_one_frame_options(args.one_frame)
+    target_indices = None
+    if isinstance(target_index, tuple):
+        target_indices, target_index = target_index, None
     if args.condition_image and not one_frame:
         raise ValueError("--condition_image requires --frame_count 1")
     references = make_references(
@@ -320,7 +346,23 @@ def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
         tuple(Path(path) for path in args.condition_image),
         target_index if one_frame else None,
         control_indices if one_frame else None,
+        target_indices if one_frame else None,
+        getattr(args, "h3_target_noise_coupling", "independent"),
+        getattr(args, "h3_reference_route", "dual"),
     )
+
+
+def expected_outputs(request: H3GenerationRequest) -> tuple[Path, ...]:
+    """Files a finished request writes: one image per target slot, or the output itself."""
+    if request.one_frame_target_indices is not None:
+        return target_slot_output_paths(request.output, request.one_frame_target_indices)
+    return (request.output,)
+
+
+def _require_outputs(request: H3GenerationRequest) -> None:
+    missing = [path for path in expected_outputs(request) if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"H3 implementation returned without creating {', '.join(str(path) for path in missing)}")
 
 
 def parse_prompt_line(line: str) -> dict[str, object]:
@@ -464,8 +506,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             for item, request in zip(item_args, requests):
                 generator = generator_from_args(item, request)
                 generator.generate(request)
-                if not request.output.is_file():
-                    raise RuntimeError(f"H3 implementation returned without creating {request.output}")
+                _require_outputs(request)
             return
         if not args.prompt:
             raise ValueError("--prompt is required unless --from_file is used")
@@ -493,8 +534,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         request.output.parent.mkdir(parents=True, exist_ok=True)
         generator = generator_from_args(args, request)
         generator.generate(request)
-        if not request.output.is_file():
-            raise RuntimeError(f"H3 implementation returned without creating {request.output}")
+        _require_outputs(request)
     except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))
 

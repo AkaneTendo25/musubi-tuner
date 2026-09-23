@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
+from musubi_tuner.minimax_h3.one_frame import one_frame_origin_shift, validate_target_slot_indices
 
 _AUDIO_CHANNELS = 2
 # Public alias: callers outside this module slice packed audio by channel and
@@ -232,6 +233,59 @@ def _fill_audio_positions(
     )
 
 
+def reference_time_span(references: tuple[MiniMaxH3ReferenceGeometry, ...]) -> float:
+    """Rotary time the unaligned references of a Ref2VA sequence occupy before the target."""
+    span = 0.0
+    for reference in references:
+        if reference.aligned_to_target:
+            continue
+        if reference.kind == 0:
+            span += 1.0
+        elif reference.kind == 2:
+            span += float(reference.num_audio_latents)
+        else:
+            span += max(float(reference.num_audio_latents), _temporal_position_span(reference.num_latent_frames))
+    return span
+
+
+def _one_frame_slot_placement(
+    target_indices: tuple[int, ...],
+    control_indices: tuple[int, ...] | None,
+    num_latent_frames: int,
+    placement_indices: tuple[int, ...] = (),
+) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+    """Validate one-frame target slots and return them with the index shift.
+
+    Slot ``k`` is latent frame ``k`` of the target block. Indices are signed
+    24 fps pixel frames; the shift from :func:`one_frame_origin_shift` moves the
+    earliest target or control onto the media origin, so a negative index never
+    reaches the rotary coordinates of the text rows. ``placement_indices`` are
+    controls that emit no rows (a reference route keeps them out of the DiT) but
+    still take part in the shift, so a route never moves the retained rows.
+    """
+    if isinstance(target_indices, (str, bytes)) or not isinstance(target_indices, (tuple, list)):
+        raise TypeError("H3 one-frame target slot indices must be a sequence of integers")
+    if control_indices and placement_indices:
+        raise ValueError("H3 one-frame controls are either emitted or placement-only, not both")
+    targets, controls = validate_target_slot_indices(
+        target_indices, control_indices or tuple(placement_indices), label="H3 one-frame"
+    )
+    if num_latent_frames != len(targets):
+        raise ValueError(
+            f"H3 one-frame target slots require one latent frame per slot: {len(targets)} slots, {num_latent_frames} frames"
+        )
+    shift = one_frame_origin_shift(targets, controls)
+    return targets, (() if placement_indices else controls), shift
+
+
+def _one_frame_slot_times(origin: float, target_indices: tuple[int, ...], index_shift: int) -> torch.Tensor:
+    """Rotary time of each target slot: ``origin + 5/3 * (index + shift)``."""
+    return torch.tensor(
+        [origin + _ROPE_FRAME_RESCALE * (int(index) + index_shift) for index in target_indices],
+        dtype=torch.float64,
+    )
+
+
 def build_t2va_packed_sequence(
     text_token_tags: torch.Tensor,
     *,
@@ -246,6 +300,8 @@ def build_t2va_packed_sequence(
     one_frame_target_index: int | None = None,
     one_frame_control_indices: tuple[int, ...] | None = None,
     pad_text_rows_to: int | None = None,
+    one_frame_target_indices: tuple[int, ...] | None = None,
+    one_frame_placement_indices: tuple[int, ...] = (),
 ) -> MiniMaxH3PackedSequence:
     """Build FL2VA's ``[text | keyframes | condition audio | target audio | target video]`` layout.
 
@@ -263,6 +319,11 @@ def build_t2va_packed_sequence(
     ``spatial_density_scale`` rescales the area normalization of every spatial
     grid in the sequence, keyframe rows included, so a scale above 1.0 packs the
     frames more densely; see :func:`_frame_position_grid`.
+
+    ``one_frame_target_indices`` places one target slot per latent frame at its
+    own signed pixel-frame index; ``one_frame_placement_indices`` are controls
+    that take part in that placement without emitting rows. See
+    :func:`_one_frame_slot_placement`.
     """
     if text_token_tags.ndim != 1 or text_token_tags.numel() == 0:
         raise ValueError("H3 text token tags must be a non-empty one-dimensional tensor")
@@ -298,7 +359,17 @@ def build_t2va_packed_sequence(
     num_text_rows = true_text_rows if pad_text_rows_to is None else max(true_text_rows, int(pad_text_rows_to))
     # "first" and an explicit index 0 name the same coordinate, so they collide;
     # "last" names the final pixel frame and never collides with an index.
-    if one_frame_target_index is not None:
+    slot_indices = None
+    index_shift = 0
+    if one_frame_target_indices is not None:
+        if one_frame_target_index is not None:
+            raise ValueError("H3 one-frame placement takes a target index or target slot indices, not both")
+        if keyframe_anchors and one_frame_control_indices is None:
+            raise ValueError("H3 one-frame controls require one control index per condition")
+        slot_indices, one_frame_control_indices, index_shift = _one_frame_slot_placement(
+            one_frame_target_indices, one_frame_control_indices, num_latent_frames, tuple(one_frame_placement_indices)
+        )
+    elif one_frame_target_index is not None:
         if num_latent_frames != 1:
             raise ValueError("H3 one-frame time placement requires exactly one target latent frame")
         if isinstance(one_frame_target_index, bool) or not isinstance(one_frame_target_index, int) or one_frame_target_index < 0:
@@ -312,10 +383,11 @@ def build_t2va_packed_sequence(
     elif one_frame_control_indices is not None:
         raise ValueError("H3 one-frame control indices require a target index")
 
+    one_frame = one_frame_target_index is not None or slot_indices is not None
     anchor_identities: list[object] = []
-    anchors_to_resolve = one_frame_control_indices if one_frame_target_index is not None else keyframe_anchors
+    anchors_to_resolve = one_frame_control_indices if one_frame else keyframe_anchors
     for anchor in anchors_to_resolve:
-        if one_frame_target_index is not None:
+        if one_frame:
             anchor_identities.append(anchor)
             continue
         if isinstance(anchor, bool) or not isinstance(anchor, (str, int)):
@@ -331,7 +403,7 @@ def build_t2va_packed_sequence(
             anchor_identities.append(int(resolved_anchor))
         else:
             raise ValueError("H3 keyframe anchors must be 'first', 'last', or a latent frame index")
-    if one_frame_target_index is None and len(set(anchor_identities)) != len(anchor_identities):
+    if not one_frame and len(set(anchor_identities)) != len(anchor_identities):
         raise ValueError("H3 keyframe anchors must be unique")
 
     condition_count = len(one_frame_control_indices) if one_frame_control_indices is not None else len(keyframe_anchors)
@@ -360,8 +432,8 @@ def build_t2va_packed_sequence(
 
     latent_starts = _temporal_position_grid(num_latent_frames, float(num_text_rows)) if num_latent_frames else None
     for index, identity in enumerate(anchor_identities):
-        if one_frame_target_index is not None:
-            anchor_time = float(num_text_rows) + _ROPE_FRAME_RESCALE * int(identity)
+        if one_frame:
+            anchor_time = float(num_text_rows) + _ROPE_FRAME_RESCALE * (int(identity) + index_shift)
         elif identity == "last":
             anchor_time = float(num_text_rows) + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
         else:
@@ -373,6 +445,12 @@ def build_t2va_packed_sequence(
     target_origin = float(num_text_rows)
     if one_frame_target_index is not None:
         target_origin += _ROPE_FRAME_RESCALE * one_frame_target_index
+    slot_times = None
+    if slot_indices is not None:
+        slot_times = _one_frame_slot_times(float(num_text_rows), slot_indices, index_shift)
+        # The audio placeholder starts at slot 0, as it starts at the single
+        # target of an unslotted one-frame sequence.
+        target_origin = float(slot_times[0])
 
     # Condition audio duplicates the target's opening span and therefore shares
     # its coordinates. Shifting the complete target by the context length would
@@ -393,7 +471,7 @@ def build_t2va_packed_sequence(
     )
 
     video_positions = torch.empty(num_latent_frames, rows_per_frame, 3, dtype=torch.float64)
-    target_times = _temporal_position_grid(num_latent_frames, target_origin)
+    target_times = slot_times if slot_times is not None else _temporal_position_grid(num_latent_frames, target_origin)
     video_positions[:, :, 0] = target_times[:, None]
     video_positions[:, :, 1:] = frame_grid[None]
     position_ids[video_start:] = video_positions.reshape(-1, 3)
@@ -423,12 +501,21 @@ def build_ref2va_packed_sequence(
     spatial_density_scale: float = 1.0,
     one_frame_target_index: int | None = None,
     pad_text_rows_to: int | None = None,
+    one_frame_target_indices: tuple[int, ...] | None = None,
+    reserved_reference_time: float = 0.0,
 ) -> MiniMaxH3PackedSequence:
     """Build ``[text | references | guides | target audio | target video]``.
 
     ``spatial_density_scale`` rescales the area normalization of every spatial
     grid in the sequence. References and target share the one factor, so their
     coordinates stay in correspondence; see :func:`_frame_position_grid`.
+
+    ``one_frame_target_indices`` places one target slot per latent frame at its
+    own signed pixel-frame index, measured from the end of the reference block.
+
+    ``reserved_reference_time`` is the rotary span of references a reference
+    route keeps out of the DiT: no rows are emitted for them, but the target
+    starts where it would start with them, so a route never moves the target.
     """
     if text_token_tags.ndim != 1 or text_token_tags.numel() == 0:
         raise ValueError("H3 Ref2VA text token tags must be a non-empty vector")
@@ -460,7 +547,15 @@ def build_ref2va_packed_sequence(
             if observed != expected:
                 raise ValueError(f"aligned H3 video reference geometry {observed} must match target geometry {expected}")
     density_scale = _validated_density_scale(spatial_density_scale)
-    if one_frame_target_index is not None:
+    slot_indices = None
+    index_shift = 0
+    if one_frame_target_indices is not None:
+        if one_frame_target_index is not None:
+            raise ValueError("H3 one-frame placement takes a target index or target slot indices, not both")
+        if keyframe_anchors or guides or any(reference.aligned_to_target for reference in references):
+            raise ValueError("H3 one-frame target slots cannot be combined with keyframes, guides, or aligned references")
+        slot_indices, _, index_shift = _one_frame_slot_placement(one_frame_target_indices, None, num_latent_frames)
+    elif one_frame_target_index is not None:
         if num_latent_frames != 1:
             raise ValueError("H3 one-frame time placement requires exactly one target latent frame")
         if isinstance(one_frame_target_index, bool) or not isinstance(one_frame_target_index, int) or one_frame_target_index < 0:
@@ -559,9 +654,17 @@ def build_ref2va_packed_sequence(
             rotary_time += float(reference.num_audio_latents)
         else:
             rotary_time += max(float(reference.num_audio_latents), _temporal_position_span(reference.num_latent_frames))
-    target_time = rotary_time
+    if reserved_reference_time < 0:
+        raise ValueError("H3 reserved reference time must be non-negative")
+    target_time = rotary_time + float(reserved_reference_time)
     if one_frame_target_index is not None:
         target_time += _ROPE_FRAME_RESCALE * one_frame_target_index
+    slot_times = None
+    if slot_indices is not None:
+        slot_times = _one_frame_slot_times(target_time, slot_indices, index_shift)
+        # The audio placeholder starts at slot 0, as it starts at the single
+        # target of an unslotted one-frame sequence.
+        target_time = float(slot_times[0])
     rotary_time = float(num_text_rows)
     for reference in references:
         if reference.kind == 0:
@@ -611,7 +714,7 @@ def build_ref2va_packed_sequence(
             if not reference.aligned_to_target:
                 rotary_time += max(float(reference.num_audio_latents), _temporal_position_span(reference.num_latent_frames))
 
-    target_frame_time = _temporal_position_grid(num_latent_frames, target_time)
+    target_frame_time = slot_times if slot_times is not None else _temporal_position_grid(num_latent_frames, target_time)
     for guide in all_guides:
         anchor_time = target_time + _ROPE_FRAME_RESCALE * guide.frame_index
         if guide.num_video_latents:

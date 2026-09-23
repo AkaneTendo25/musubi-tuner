@@ -180,6 +180,7 @@ def create_conditioning_encoder(
     reference_video_fps: float = REFERENCE_VIDEO_FPS,
     text_visual_max_pixels: int = 0,
     keyframe_visuals: tuple[int, ...] = (),
+    reference_route: str = "dual",
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
     _validate_dtype(dtype)
@@ -202,6 +203,7 @@ def create_conditioning_encoder(
         **_reference_video_sizing_kwargs(reference_video_short_edge, reference_video_max_pixels),
         **_reference_video_fps_kwargs(reference_video_fps),
         **({} if not keyframe_visuals else {"keyframe_visuals": tuple(keyframe_visuals)}),
+        **({} if reference_route == "dual" else {"reference_route": reference_route}),
     )
 
 

@@ -403,6 +403,29 @@ class ImageDirectoryDatasource(ImageDatasource):
         return self.image_paths[idx]
 
 
+def canonicalize_indexed_paths(item: dict, prefixes: tuple[str, ...] = ("image_path", "control_path")) -> dict:
+    """Rename zero-padded indexed keys (``image_path_0001``) to ``image_path_1`` in place.
+
+    Every suffix must be numeric, and two keys naming the same index are rejected.
+    """
+    for prefix in prefixes:
+        indexed = []
+        for key in tuple(item):
+            if key.startswith(prefix + "_"):
+                suffix = key[len(prefix) + 1 :]
+                if not suffix.isdigit():
+                    raise ValueError(f"{key} must end in a numeric index")
+                indexed.append((int(suffix), key))
+        indexed.sort()
+        for index, key in indexed:
+            canonical = f"{prefix}_{index}"
+            if canonical in item and canonical != key:
+                raise ValueError(f"duplicate {prefix} index {index}")
+            if canonical != key:
+                item[canonical] = item.pop(key)
+    return item
+
+
 class ImageJsonlDatasource(ImageDatasource):
     def __init__(
         self,
@@ -444,21 +467,7 @@ class ImageJsonlDatasource(ImageDatasource):
             # historical path handling.
             base_directory = Path(self.image_jsonl_file).parent
             for item in self.data:
-                for prefix in ("image_path", "control_path"):
-                    indexed = []
-                    for key in tuple(item):
-                        if key.startswith(prefix + "_"):
-                            suffix = key[len(prefix) + 1 :]
-                            if not suffix.isdigit():
-                                raise ValueError(f"{key} must end in a numeric index")
-                            indexed.append((int(suffix), key))
-                    indexed.sort()
-                    for index, key in indexed:
-                        canonical = f"{prefix}_{index}"
-                        if canonical in item and canonical != key:
-                            raise ValueError(f"duplicate {prefix} index {index}")
-                        if canonical != key:
-                            item[canonical] = item.pop(key)
+                canonicalize_indexed_paths(item)
                 for key in tuple(item):
                     if key in {"image_path", "control_path"} or key.startswith(("image_path_", "control_path_")):
                         path = Path(item[key]).expanduser()

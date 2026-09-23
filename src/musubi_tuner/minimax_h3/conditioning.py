@@ -29,6 +29,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
+    H3_REFERENCE_ROUTE_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
     H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     H3_REFERENCE_VIDEO_FPS_KEY,
@@ -56,6 +57,7 @@ from musubi_tuner.minimax_h3.component_loader import resolve_nvfp4_awq_text_enco
 from musubi_tuner.minimax_h3.dop import dop_config_identity, rewrite_dop_caption
 from musubi_tuner.minimax_h3.media import MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
+from musubi_tuner.minimax_h3.one_frame import H3_REFERENCE_ROUTE_IDS, route_presents_qwen_images, validate_reference_route
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
@@ -404,6 +406,7 @@ class MiniMaxH3ConditioningEncoder:
         reference_video_fps: float = REFERENCE_VIDEO_FPS,
         max_caption_tokens: int = 0,
         keyframe_visuals: tuple[int, ...] = (),
+        reference_route: str = "dual",
     ) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -423,6 +426,13 @@ class MiniMaxH3ConditioningEncoder:
         if keyframe_visuals and task != "t2va":
             raise ValueError("MiniMax H3 keyframe visuals require --task t2va")
         self.keyframe_visuals = tuple(keyframe_visuals)
+        # Which half of a one-frame or Ref2VA image condition this presentation
+        # shows to Qwen3-VL. ``dual`` is the released presentation; routes other
+        # than dual apply to image references and one-frame timed controls only.
+        validate_reference_route(reference_route)
+        if reference_route != "dual" and task not in ("fl2va", "ref2va", "ref2va_omni"):
+            raise ValueError("MiniMax H3 --h3_reference_route other than dual requires --task fl2va, ref2va, or ref2va_omni")
+        self.reference_route = reference_route
         # Even T2VA enumerates decoded video crops so its cache filename shares
         # the same crop identity as FL2VA and the corresponding latent cache.
         self.conditioning_requires_content = True
@@ -679,6 +689,36 @@ class MiniMaxH3ConditioningEncoder:
             Image.fromarray(content[-1].astype(np.uint8)),
         ]
 
+    def _route_presentation(
+        self,
+        item: Any,
+        images: list[Image.Image] | None,
+        references: tuple[H3PreparedReference, ...] | None,
+    ) -> tuple[list[Image.Image] | None, tuple[H3PreparedReference, ...] | None]:
+        """Apply a non-dual reference route to one item's Qwen3-VL presentation.
+
+        The route covers Ref2VA image references and one-frame timed controls.
+        Routes without Qwen images drop them from the presentation; the DiT half
+        is applied by the trainer and generator from the recorded route.
+        """
+        if self.task in ("ref2va", "ref2va_omni"):
+            if any(reference.kind is not H3ReferenceKind.IMAGE or reference.aligned_to_target for reference in references or ()):
+                raise ValueError(
+                    f"MiniMax H3 --h3_reference_route {self.reference_route} applies to image references only: {item.item_key}"
+                )
+            if getattr(item, "h3_reference_modality_probabilities", None) is not None:
+                raise ValueError(
+                    "MiniMax H3 --h3_reference_route other than dual cannot be combined with source_modality_probabilities"
+                )
+        elif not (getattr(item, "h3_one_frame", False) and getattr(item, "h3_condition_paths", ())):
+            raise ValueError(
+                f"MiniMax H3 --h3_reference_route {self.reference_route} with --task fl2va requires one-frame timed controls: "
+                f"{item.item_key}"
+            )
+        if route_presents_qwen_images(self.reference_route):
+            return images, references
+        return None, (() if references is not None else None)
+
     def encode_prompt(self, prompt: str, images: list[Image.Image] | None = None) -> dict[str, torch.Tensor]:
         """Encode one FL2VA-family prompt with optional prepared endpoint keyframes."""
         if images and self.text_visual_max_pixels > 0:
@@ -828,6 +868,8 @@ class MiniMaxH3ConditioningEncoder:
             # trainer draws between the two per step without re-encoding.
             control_dropout = bool(include_qwen_control_dropout and qwen_controls)
             images = self._images_for_item(item)
+            if self.reference_route != "dual":
+                images, references = self._route_presentation(item, images, all_references)
             hidden, tags = self._encode_prompt(item.caption, images, references, qwen_controls=qwen_controls)
             tensors = {
                 f"varlen_{H3_TEXT_HIDDEN_KEY}_{dtype_name}": hidden,
@@ -844,6 +886,8 @@ class MiniMaxH3ConditioningEncoder:
                 tensors[H3_DOP_CONFIG_CACHE_KEY] = dop_config_identity(dop_trigger, dop_class_prompt or "", dop_caption_mode)
             if aligned_guide_count:
                 tensors[H3_ALIGNED_GUIDE_COUNT_KEY] = torch.tensor(aligned_guide_count, dtype=torch.long)
+            if self.reference_route != "dual":
+                tensors[H3_REFERENCE_ROUTE_KEY] = torch.tensor(H3_REFERENCE_ROUTE_IDS[self.reference_route], dtype=torch.long)
             if self.keyframe_visuals:
                 # The marker doubles as the cache identity: the tags alone cannot
                 # tell a keyframe span apart from a control span or a stale cache.

@@ -42,6 +42,7 @@ from musubi_tuner.minimax_h3.architecture import (
 )
 from musubi_tuner.minimax_h3.cache import H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_encoder, load_video_vae_encoder
+from musubi_tuner.minimax_h3.one_frame import couple_target_slot_noise, route_keeps_dit_rows
 from musubi_tuner.minimax_h3.packing import (
     MiniMaxH3GuideGeometry,
     MiniMaxH3ReferenceGeometry,
@@ -466,6 +467,17 @@ def _augment_reference_video_rows(
     return torch.cat(augmented) if augmented else rows
 
 
+def _target_video_latent_frames(shape, frame_count: int, target_indices: tuple[int, ...] | None) -> int:
+    """Target latent frames: one per one-frame target slot, else the clip's own count."""
+    if target_indices is None:
+        return shape.video_latent_frames
+    if frame_count != 1:
+        raise ValueError("MiniMax H3 one-frame target slots require frame_count 1")
+    if not target_indices:
+        raise ValueError("MiniMax H3 one-frame target slots must not be empty")
+    return len(target_indices)
+
+
 @torch.no_grad()
 def denoise_fl2va(
     transformer: torch.nn.Module,
@@ -487,6 +499,9 @@ def denoise_fl2va(
     null_guidance: H3NullGuidance | None = None,
     one_frame_target_index: int | None = None,
     one_frame_control_indices: tuple[int, ...] | None = None,
+    one_frame_target_indices: tuple[int, ...] | None = None,
+    target_noise_coupling: str = "independent",
+    one_frame_placement_indices: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate FL2VA joint latents with optional first/last keyframe conditioning.
 
@@ -494,18 +509,27 @@ def denoise_fl2va(
     of starting from noise: they are re-noised to ``denoise_strength`` and only
     the remaining part of the schedule is walked. This is what a second pass at a
     larger canvas needs.
+
+    ``one_frame_target_indices`` generates one single-frame target slot per
+    signed index in one joint pass; ``target_noise_coupling`` selects whether the
+    slots start from independent or shared noise. ``one_frame_placement_indices``
+    are controls a reference route keeps out of the DiT: they emit no rows but
+    keep their part in the slot placement.
     """
     _validate_geometry(height, width, frame_count)
     shape = temporal_shape(frame_count)
     config = transformer.config
     latent_height = height // VIDEO_SPATIAL_COMPRESSION
     latent_width = width // VIDEO_SPATIAL_COMPRESSION
+    video_latent_frames = _target_video_latent_frames(shape, frame_count, one_frame_target_indices)
     video = torch.randn(
-        (1, config.in_channels, shape.video_latent_frames, latent_height, latent_width),
+        (1, config.in_channels, video_latent_frames, latent_height, latent_width),
         generator=generator,
         device=device,
         dtype=torch.float32,
     )
+    if one_frame_target_indices is not None:
+        video = couple_target_slot_noise(video, target_noise_coupling)
     audio = torch.randn(
         (1, 2, config.audio_in_channels, shape.audio_latent_frames),
         generator=generator,
@@ -531,7 +555,7 @@ def denoise_fl2va(
         raise ValueError("MiniMax H3 keyframe rows require condition anchors")
     layout = build_t2va_packed_sequence(
         text_tags,
-        num_latent_frames=shape.video_latent_frames,
+        num_latent_frames=video_latent_frames,
         latent_height=latent_height,
         latent_width=latent_width,
         num_audio_latents=shape.audio_latent_frames,
@@ -539,6 +563,8 @@ def denoise_fl2va(
         keyframe_anchors=keyframe_anchors if one_frame_control_indices is None else tuple(range(condition_count)),
         one_frame_target_index=one_frame_target_index,
         one_frame_control_indices=one_frame_control_indices,
+        one_frame_target_indices=one_frame_target_indices,
+        one_frame_placement_indices=one_frame_placement_indices,
     )
     text_hidden = text_hidden[None].to(device)
     token_tags = layout.token_tags.to(device)
@@ -601,7 +627,7 @@ def denoise_fl2va(
             )
         video_prediction = unpatchify_video_tokens(
             output.video[:, layout.num_condition_video_rows :],
-            latent_shape=(config.in_channels, shape.video_latent_frames, latent_height, latent_width),
+            latent_shape=(config.in_channels, video_latent_frames, latent_height, latent_width),
             patch_size=tuple(config.patch_size),
         )
         # Strip observed audio the same way Ref2VA does. The FL2VA layout carries
@@ -652,6 +678,10 @@ def denoise_ref2va(
     denoise_strength: float = 1.0,
     null_guidance: H3NullGuidance | None = None,
     one_frame_target_index: int | None = None,
+    one_frame_target_indices: tuple[int, ...] | None = None,
+    target_noise_coupling: str = "independent",
+    reference_route: str = "dual",
+    reserved_reference_time: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate joint AV latents with ordered Ref2VA image, video, and audio context.
 
@@ -659,21 +689,31 @@ def denoise_ref2va(
     of starting from noise: they are re-noised to ``denoise_strength`` and only
     the remaining part of the schedule is walked. This is what a second pass at a
     larger canvas needs.
+
+    A ``reference_route`` without DiT rows (``qwen_image_only``, ``text_only``)
+    runs with an empty reference block; ``reserved_reference_time`` keeps the
+    rotary span those references take under ``dual``.
     """
     _validate_geometry(height, width, frame_count)
-    if not references.geometries and not guide_geometries:
-        raise ValueError("MiniMax H3 Ref2VA denoising requires a reference or guide")
+    if route_keeps_dit_rows(reference_route):
+        if not references.geometries and not guide_geometries:
+            raise ValueError("MiniMax H3 Ref2VA denoising requires a reference or guide")
+    elif references.geometries:
+        raise ValueError(f"MiniMax H3 --h3_reference_route {reference_route} carries no DiT reference rows")
     shape = temporal_shape(frame_count)
     config = transformer.config
     patch_size = tuple(config.patch_size)
     latent_height = height // VIDEO_SPATIAL_COMPRESSION
     latent_width = width // VIDEO_SPATIAL_COMPRESSION
+    video_latent_frames = _target_video_latent_frames(shape, frame_count, one_frame_target_indices)
     video = torch.randn(
-        (1, config.in_channels, shape.video_latent_frames, latent_height, latent_width),
+        (1, config.in_channels, video_latent_frames, latent_height, latent_width),
         generator=generator,
         device=device,
         dtype=torch.float32,
     )
+    if one_frame_target_indices is not None:
+        video = couple_target_slot_noise(video, target_noise_coupling)
     audio = torch.randn(
         (1, 2, config.audio_in_channels, shape.audio_latent_frames),
         generator=generator,
@@ -689,7 +729,7 @@ def denoise_ref2va(
     layout = build_ref2va_packed_sequence(
         text_tags,
         references.geometries,
-        num_latent_frames=shape.video_latent_frames,
+        num_latent_frames=video_latent_frames,
         latent_height=latent_height,
         latent_width=latent_width,
         num_audio_latents=shape.audio_latent_frames,
@@ -697,6 +737,8 @@ def denoise_ref2va(
         keyframe_anchors=keyframe_anchors,
         guides=guide_geometries,
         one_frame_target_index=one_frame_target_index,
+        one_frame_target_indices=one_frame_target_indices,
+        **({"reserved_reference_time": reserved_reference_time} if reserved_reference_time else {}),
     )
     video_width = config.in_channels * patch_size[0] * patch_size[1] * patch_size[2]
     expected_reference_video_rows = sum(geometry.num_video_rows(patch_size) for geometry in references.geometries)
@@ -827,7 +869,7 @@ def denoise_ref2va(
             )
         video_prediction = unpatchify_video_tokens(
             output.video[:, layout.num_condition_video_rows :],
-            latent_shape=(config.in_channels, shape.video_latent_frames, latent_height, latent_width),
+            latent_shape=(config.in_channels, video_latent_frames, latent_height, latent_width),
             patch_size=patch_size,
         )
         audio_prediction = unpack_audio_tokens(

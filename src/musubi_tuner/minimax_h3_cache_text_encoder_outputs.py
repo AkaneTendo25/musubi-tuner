@@ -30,6 +30,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_IMAGE_SIZE_MODE_KEY,
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
+    H3_REFERENCE_ROUTE_KEY,
     H3_REFERENCE_VIDEO_FPS_KEY,
     H3_REFERENCE_VIDEO_MAX_PIXELS_KEY,
     H3_REFERENCE_VIDEO_SHORT_EDGE_KEY,
@@ -58,6 +59,7 @@ from musubi_tuner.minimax_h3.image_training import (
     add_image_training_arguments,
     cache_matches_fingerprint,
 )
+from musubi_tuner.minimax_h3.one_frame import H3_REFERENCE_ROUTE_IDS, H3_REFERENCE_ROUTES
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_FINGERPRINT_KEY,
     REFERENCE_IMAGE_SHORT_EDGE,
@@ -218,6 +220,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=["class", "bare"],
         help="how the DOP caption is derived: class replaces the trigger with --h3_dop_class_prompt, bare removes it",
     )
+    parser.add_argument(
+        "--h3_reference_route",
+        choices=H3_REFERENCE_ROUTES,
+        default="dual",
+        help=(
+            "where one-frame timed controls and Ref2VA image references are shown: dual (released: Qwen3-VL and DiT), "
+            "qwen_image_only, dit_latent_only, or text_only. The Qwen3-VL half is fixed here; pass the same route to "
+            "training and inference"
+        ),
+    )
     add_image_training_arguments(parser, text_visual=True)
     return parser
 
@@ -241,6 +253,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--h3_text_visual_max_pixels must be non-negative")
     if args.h3_max_caption_tokens < 0:
         parser.error("--h3_max_caption_tokens must be non-negative")
+    if args.h3_reference_route != "dual":
+        if not (args.task in {"ref2va", "ref2va_omni"} or (args.task == "fl2va" and args.one_frame)):
+            parser.error("--h3_reference_route other than dual requires --task ref2va/ref2va_omni, or --one_frame --task fl2va")
+        if args.h3_image_mode != "none" or args.teacher_conditions:
+            parser.error("--h3_reference_route other than dual cannot be combined with --h3_image_mode or --teacher_conditions")
     args.h3_dop_trigger = args.h3_dop_trigger.strip()
     args.h3_dop_class_prompt = " ".join(args.h3_dop_class_prompt.split())
     if args.h3_dop_caption_mode == "bare":
@@ -294,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         reference_video_fps=args.reference_video_fps,
         text_visual_max_pixels=args.h3_text_visual_max_pixels,
         keyframe_visuals=keyframe_visuals,
+        reference_route=args.h3_reference_route,
     )
 
     def encode(batch: list[ItemInfo]) -> None:
@@ -345,6 +363,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if bool(qwen_controls) != (H3_QWEN_CONTROL_VISUALS_KEY in keys):
                     return False
                 if H3_CONDITIONING_TASK_KEY not in keys:
+                    return False
+                # The route decides what Qwen3-VL was shown; an absent marker is dual.
+                cached_route = int(handle.get_tensor(H3_REFERENCE_ROUTE_KEY)) if H3_REFERENCE_ROUTE_KEY in keys else 0
+                if cached_route != H3_REFERENCE_ROUTE_IDS[args.h3_reference_route]:
                     return False
                 if int(handle.get_tensor(H3_CONDITIONING_TASK_KEY)) != H3_CONDITIONING_TASK_IDS[args.task]:
                     return False

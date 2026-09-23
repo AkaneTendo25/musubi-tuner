@@ -551,6 +551,35 @@ def _joint_loss(
     return H3JointLoss(loss, video_mean, audio_mean, video_elements, audio_elements)
 
 
+@torch.no_grad()
+def target_slot_losses(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    mask_normalization: str = "weighted",
+) -> list[torch.Tensor]:
+    """Detached video velocity loss of each one-frame target slot.
+
+    Slot ``k`` is latent frame ``k`` of a ``[B, C, slots, H, W]`` target. The
+    loss mask is broadcast to the full target first and then sliced with it, so
+    each slot is reduced exactly as the video loss reduces its own elements.
+    """
+    if prediction.ndim != 5 or prediction.shape != target.shape:
+        raise ValueError(f"H3 target slot losses need matching [B, C, slots, H, W] tensors, got {tuple(prediction.shape)}")
+    full_mask = None if mask is None else _broadcast_mask(mask, target)
+    return [
+        _modality_loss(
+            prediction[:, :, slot : slot + 1],
+            target[:, :, slot : slot + 1],
+            None if full_mask is None else full_mask[:, :, slot : slot + 1],
+            None,
+            mask_normalization,
+        )[0].detach()
+        for slot in range(target.shape[2])
+    ]
+
+
 def joint_velocity_loss(
     prediction: H3ModelPrediction,
     inputs: H3JointNoisyInputs,
