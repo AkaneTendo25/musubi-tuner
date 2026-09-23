@@ -3465,6 +3465,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_null_anchor_sigma_min must be finite and lie in [0, 1)")
         if anchor_sigma_min > 0 and anchor_weight <= 0:
             raise ValueError("--h3_guidance_null_anchor_sigma_min requires --h3_guidance_null_anchor_weight above 0")
+        if getattr(args, "h3_null_anchor_reuse_empty", False) and (
+            args.h3_guidance_distillation_scale is None or args.h3_guidance_null_source != "frozen" or anchor_weight <= 0
+        ):
+            logger.warning(
+                "--h3_null_anchor_reuse_empty never engages without --h3_guidance_distillation_scale, "
+                "--h3_guidance_null_source frozen, and --h3_guidance_null_anchor_weight above 0"
+            )
         if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
             raise ValueError("--h3_base_preservation_probability must be finite and lie in (0, 1]")
         if not math.isfinite(args.h3_dop_loss_weight) or args.h3_dop_loss_weight < 0:
@@ -6981,16 +6988,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 anchor_int8 = getattr(transformer, "int8_attention_context", None)
                 with self._trainable_block_swap(transformer, auxiliary_block_swap):
                     null_anchor_student = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
-                with (
-                    torch.random.fork_rng(devices=anchor_devices),
-                    torch.no_grad(),
-                    anchor_int8(auxiliary=True) if callable(anchor_int8) else nullcontext(),
-                ):
-                    null_anchor_toggle(False)
-                    try:
-                        null_anchor_reference = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
-                    finally:
-                        null_anchor_toggle(True)
+                if getattr(args, "h3_null_anchor_reuse_empty", False) and use_guidance and args.h3_guidance_null_source == "frozen":
+                    # The guidance step already computed exactly this tensor: the
+                    # frozen base's empty-prompt prediction at this state, under
+                    # the same no-grad/int8-aux context. The two forwards differed
+                    # only in which draw of the 0.001-sigma conditioning noise they
+                    # consumed -- the reference now shares the guidance branch's
+                    # draw, which is an equally valid sample of the same
+                    # conditioning distribution (the student's own draw is
+                    # independent of both either way).
+                    null_anchor_reference = empty_prediction
+                else:
+                    with (
+                        torch.random.fork_rng(devices=anchor_devices),
+                        torch.no_grad(),
+                        anchor_int8(auxiliary=True) if callable(anchor_int8) else nullcontext(),
+                    ):
+                        null_anchor_toggle(False)
+                        try:
+                            null_anchor_reference = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                        finally:
+                            null_anchor_toggle(True)
             if preservation_active and not fused_teachers_completed:
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_base_preservation_loss_weight")
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
@@ -7925,6 +7943,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_null_anchor_weight_end": str(getattr(args, "h3_guidance_null_anchor_weight_end", None)),
             "ss_h3_guidance_null_anchor_probability": str(_anchor_probability(args)),
             "ss_h3_guidance_null_anchor_sigma_min": str(float(getattr(args, "h3_guidance_null_anchor_sigma_min", 0.0) or 0.0)),
+            "ss_h3_null_anchor_reuse_empty": str(bool(getattr(args, "h3_null_anchor_reuse_empty", False))),
             "ss_h3_rollout_supervision": str(bool(getattr(args, "h3_rollout_supervision", False))),
             "ss_h3_rollout_probability": str(args.h3_rollout_probability),
             "ss_h3_rollout_steps": str(args.h3_rollout_steps),
@@ -8898,6 +8917,19 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "prediction below sigma 0.5 and 0.7 above 0.9), so at low sigma the anchor pins the prompted branch as "
             "much as the empty one. Not a sparse estimator: nothing is rescaled. Reported as h3/null_anchor_active. "
             "0 (default) anchors at every sigma"
+        ),
+    )
+    parser.add_argument(
+        "--h3_null_anchor_reuse_empty",
+        action="store_true",
+        help=(
+            "SPEED. When the guidance distillation already evaluated the frozen base's empty-prompt prediction this "
+            "step (--h3_guidance_distillation_scale with --h3_guidance_null_source frozen), reuse that tensor as the "
+            "null anchor's frozen reference instead of running a second identical forward -- one less transformer "
+            "pass on every anchored prompted step. The reference then shares the guidance branch's conditioning-noise "
+            "draw rather than drawing its own; both are samples of the same 0.001-sigma conditioning distribution, "
+            "and the anchored student's draw is independent of either. No effect without guidance distillation, a "
+            "frozen null source, or an active anchor"
         ),
     )
     parser.add_argument(

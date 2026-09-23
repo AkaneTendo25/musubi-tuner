@@ -3644,6 +3644,89 @@ def test_h3_fused_frozen_teachers_fall_back_before_sequential_rng_replay():
     assert network.events == [False, True, False, True, False, True]
 
 
+def _run_null_anchor_step(reuse_empty, *, null_source="frozen", guidance=True, fused=False):
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 3.0 if guidance else None
+    args.h3_guidance_null_source = null_source
+    args.h3_guidance_null_anchor_weight = 0.7
+    args.h3_null_anchor_reuse_empty = reuse_empty
+    args.h3_fuse_frozen_teachers = fused
+    if fused:
+        args.h3_base_preservation_loss_weight = 0.1
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = _PairedStochasticPreservationBackend() if fused else _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    torch.manual_seed(123)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+    return loss.detach(), metrics, backend, network
+
+
+def test_h3_null_anchor_reuse_empty_skips_second_frozen_forward():
+    baseline = _run_null_anchor_step(False)
+    reused = _run_null_anchor_step(True)
+
+    assert baseline[2].calls == [
+        ("empty", False),  # guidance empty branch, frozen
+        ("empty", True),  # anchor's student branch, grad
+        ("empty", False),  # anchor's frozen reference -- the deduplicated arm
+        ("prompt", True),  # trainable pass
+    ]
+    assert reused[2].calls == [("empty", False), ("empty", True), ("prompt", True)]
+    # The skipped reference ran inside an RNG fork whose draws are rolled back on
+    # exit, so removing it leaves every remaining draw -- and therefore the
+    # trainable pass and the rest of the step -- bit-identical.
+    assert reused[2].random_draws[-1] == baseline[2].random_draws[-1]
+    assert reused[2].random_draws[0] == baseline[2].random_draws[0]
+    # The reference now shares the guidance branch's conditioning draw; the
+    # anchor term still fires and the adapter is left re-enabled.
+    assert torch.isfinite(reused[0])
+    assert "loss/guidance_null_anchor" in reused[1]
+    assert reused[3].events == [False, True]
+    assert baseline[3].events == [False, True, False, True]
+
+
+def test_h3_null_anchor_reuse_empty_stays_off_without_frozen_null_source():
+    # A live null source makes the guidance empty the adapter's own prediction,
+    # not the frozen base's -- reuse would anchor to the wrong object.
+    live = _run_null_anchor_step(True, null_source="live")
+    assert live[2].calls == [("empty", False), ("empty", True), ("empty", False), ("prompt", True)]
+
+
+def test_h3_null_anchor_reuse_empty_stays_off_without_guidance():
+    # No guidance distillation: no frozen empty prediction exists to reuse.
+    noguide = _run_null_anchor_step(True, guidance=False)
+    assert noguide[2].calls == [("empty", True), ("empty", False), ("prompt", True)]
+
+
+def test_h3_null_anchor_reuse_empty_reuses_paired_teacher_arm():
+    fused = _run_null_anchor_step(True, fused=True)
+    assert fused[2].calls == [(("empty", "prompt"), False), ("empty", True), ("prompt", True)]
+
+
 def test_h3_auxiliary_forwards_use_forward_only_block_swap_then_restore_training():
     args = create_parser().parse_args([])
     args.h3_base_preservation_loss_weight = 0.1
