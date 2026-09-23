@@ -23,6 +23,7 @@ import toml
 import voluptuous
 from voluptuous import Any, ExactSequence, MultipleInvalid, Object, Schema
 
+from musubi_tuner.dataset.audio_dataset import AudioDataset
 from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ImageDataset, VideoDataset
 
 import logging
@@ -77,10 +78,34 @@ class VideoDatasetParams(BaseDatasetParams):
     fp_latent_window_size: Optional[int] = 9
 
 
+# audio dataset keys must not share a name with any trainer/cache CLI flag: BlueprintGenerator falls back to the
+# whole argparse namespace, so a same-named flag would silently become a dataset parameter
+@dataclass
+class AudioDatasetParams(BaseDatasetParams):
+    audio_directory: Optional[str] = None
+    audio_jsonl_file: Optional[str] = None
+    lyrics_extension: Optional[str] = ".lyrics.txt"
+    abc_extension: Optional[str] = ".abc.txt"
+    song_id_extension: Optional[str] = ".song.txt"
+    caption_format: str = "auto"  # auto | plain | tags_lyrics | json
+    trigger: Optional[str] = None
+    segment_extraction: str = "full"  # full | head | chunk | slide
+    segment_seconds: Optional[float] = None
+    segment_stride_seconds: Optional[float] = None
+    max_segments: Optional[int] = None
+    min_seconds: float = 5.0
+    max_seconds: float = 360.0
+    validation_split: float = 0.0
+    validation_split_seed: int = 0
+    is_validation: bool = False
+    abc_mode: Optional[str] = None  # dataset-wide ABC flavour (melody | full) for records that do not name one
+
+
 @dataclass
 class DatasetBlueprint:
     is_image_dataset: bool
-    params: Union[ImageDatasetParams, VideoDatasetParams]
+    params: Union[ImageDatasetParams, VideoDatasetParams, AudioDatasetParams]
+    is_audio_dataset: bool = False
 
 
 @dataclass
@@ -145,6 +170,29 @@ class ConfigSanitizer:
         "source_fps": float,
         "fp_latent_window_size": int,
     }
+    # audio keys that may also be set in [general]
+    AUDIO_DATASET_ASCENDABLE_SCHEMA = {
+        "lyrics_extension": str,
+        "abc_extension": str,
+        "song_id_extension": str,
+        "caption_format": Any("auto", "plain", "tags_lyrics", "json"),
+        "trigger": str,
+        "min_seconds": Any(float, int),
+        "max_seconds": Any(float, int),
+        "segment_extraction": Any("full", "head", "chunk", "slide"),
+        "segment_seconds": Any(float, int),
+        "segment_stride_seconds": Any(float, int),
+        "max_segments": int,
+    }
+    AUDIO_DATASET_DISTINCT_SCHEMA = {
+        "audio_directory": str,
+        "audio_jsonl_file": str,
+        "cache_directory": str,
+        "validation_split": Any(float, int),
+        "validation_split_seed": int,
+        "is_validation": bool,
+        "abc_mode": Any("melody", "full"),
+    }
 
     # options handled by argparse but not handled by user config
     ARGPARSE_SPECIFIC_SCHEMA = {
@@ -160,9 +208,16 @@ class ConfigSanitizer:
             self.DATASET_ASCENDABLE_SCHEMA,
             self.VIDEO_DATASET_DISTINCT_SCHEMA,
         )
+        self.audio_dataset_schema = self.__merge_dict(
+            self.DATASET_ASCENDABLE_SCHEMA,
+            self.AUDIO_DATASET_ASCENDABLE_SCHEMA,
+            self.AUDIO_DATASET_DISTINCT_SCHEMA,
+        )
 
         def validate_flex_dataset(dataset_config: dict):
-            if "video_directory" in dataset_config or "video_jsonl_file" in dataset_config:
+            if "audio_directory" in dataset_config or "audio_jsonl_file" in dataset_config:
+                return Schema(self.audio_dataset_schema)(dataset_config)
+            elif "video_directory" in dataset_config or "video_jsonl_file" in dataset_config:
                 return Schema(self.video_dataset_schema)(dataset_config)
             else:
                 return Schema(self.image_dataset_schema)(dataset_config)
@@ -171,6 +226,7 @@ class ConfigSanitizer:
 
         self.general_schema = self.__merge_dict(
             self.DATASET_ASCENDABLE_SCHEMA,
+            self.AUDIO_DATASET_ASCENDABLE_SCHEMA,
         )
         self.user_config_validator = Schema(
             {
@@ -230,8 +286,13 @@ class BlueprintGenerator:
 
         dataset_blueprints = []
         for dataset_config in sanitized_user_config.get("datasets", []):
-            is_image_dataset = "image_directory" in dataset_config or "image_jsonl_file" in dataset_config
-            if is_image_dataset:
+            is_audio_dataset = "audio_directory" in dataset_config or "audio_jsonl_file" in dataset_config
+            is_image_dataset = not is_audio_dataset and (
+                "image_directory" in dataset_config or "image_jsonl_file" in dataset_config
+            )
+            if is_audio_dataset:
+                dataset_params_klass = AudioDatasetParams
+            elif is_image_dataset:
                 dataset_params_klass = ImageDatasetParams
             else:
                 dataset_params_klass = VideoDatasetParams
@@ -239,7 +300,7 @@ class BlueprintGenerator:
             params = self.generate_params_by_fallbacks(
                 dataset_params_klass, [dataset_config, general_config, argparse_config, runtime_params]
             )
-            dataset_blueprints.append(DatasetBlueprint(is_image_dataset, params))
+            dataset_blueprints.append(DatasetBlueprint(is_image_dataset, params, is_audio_dataset=is_audio_dataset))
 
         dataset_group_blueprint = DatasetGroupBlueprint(dataset_blueprints)
 
@@ -275,10 +336,12 @@ def generate_dataset_group_by_blueprint(
     shared_epoch: SharedEpoch = None,
     audio_spec: Optional["AudioSpec"] = None,
 ) -> DatasetGroup:
-    datasets: List[Union[ImageDataset, VideoDataset]] = []
+    datasets: List[Union[ImageDataset, VideoDataset, AudioDataset]] = []
 
     for dataset_blueprint in dataset_group_blueprint.datasets:
-        if dataset_blueprint.is_image_dataset:
+        if dataset_blueprint.is_audio_dataset:
+            dataset_klass = AudioDataset
+        elif dataset_blueprint.is_image_dataset:
             dataset_klass = ImageDataset
         else:
             dataset_klass = VideoDataset
@@ -302,10 +365,12 @@ def generate_dataset_group_by_blueprint(
     info = ""
     for i, dataset in enumerate(datasets):
         is_image_dataset = isinstance(dataset, ImageDataset)
+        is_audio_dataset = isinstance(dataset, AudioDataset)
         info += dedent(
             f"""\
       [Dataset {i}]
         is_image_dataset: {is_image_dataset}
+        is_audio_dataset: {is_audio_dataset}
         resolution: {dataset.resolution}
         batch_size: {dataset.batch_size}
         num_repeats: {dataset.num_repeats}
@@ -331,6 +396,31 @@ def generate_dataset_group_by_blueprint(
         fp_1f_no_post: {dataset.fp_1f_no_post}
         no_resize_control: {dataset.no_resize_control}
         control_resolution: {dataset.control_resolution}
+    \n"""
+                ),
+                "    ",
+            )
+        elif is_audio_dataset:
+            info += indent(
+                dedent(
+                    f"""\
+        audio_directory: "{dataset.audio_directory}"
+        audio_jsonl_file: "{dataset.audio_jsonl_file}"
+        lyrics_extension: "{dataset.lyrics_extension}"
+        abc_extension: "{dataset.abc_extension}"
+        song_id_extension: "{dataset.song_id_extension}"
+        caption_format: {dataset.caption_format}
+        trigger: {dataset.trigger}
+        segment_extraction: {dataset.segment_extraction}
+        segment_seconds: {dataset.segment_seconds}
+        segment_stride_seconds: {dataset.segment_stride_seconds}
+        max_segments: {dataset.max_segments}
+        min_seconds: {dataset.min_seconds}
+        max_seconds: {dataset.max_seconds}
+        validation_split: {dataset.validation_split}
+        validation_split_seed: {dataset.validation_split_seed}
+        is_validation: {dataset.is_validation}
+        abc_mode: {dataset.abc_mode}
     \n"""
                 ),
                 "    ",

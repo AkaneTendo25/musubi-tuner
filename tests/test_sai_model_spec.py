@@ -1,6 +1,6 @@
 import unittest
 
-from musubi_tuner.dataset.architectures import ARCHITECTURE_IDEOGRAM4, ARCHITECTURE_MINIMAX_H3
+from musubi_tuner.dataset.architectures import ARCHITECTURE_IDEOGRAM4, ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_YUE2
 from musubi_tuner.utils import sai_model_spec
 
 
@@ -28,6 +28,13 @@ class SaiModelSpecTest(unittest.TestCase):
         self.assertEqual(metadata["modelspec.architecture"], "MiniMax-H3/lora")
         self.assertEqual(metadata["modelspec.implementation"], "https://huggingface.co/MiniMaxAI/MiniMax-H3")
         self.assertEqual(metadata["modelspec.resolution"], "1280x720")
+
+    def test_build_metadata_supports_yue2_lora(self):
+        metadata = sai_model_spec.build_metadata(None, ARCHITECTURE_YUE2, 0, title="yue2_lora_test")
+
+        self.assertEqual(metadata["modelspec.architecture"], "YuE2-3B/lora")
+        self.assertEqual(metadata["modelspec.implementation"], "https://github.com/multimodal-art-projection/YuE")
+        self.assertEqual(metadata["modelspec.resolution"], "48000x2")
 
 
 if __name__ == "__main__":

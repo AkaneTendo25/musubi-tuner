@@ -397,6 +397,10 @@ def find_keys(safetensors_file: str, starts_with: Optional[str] = None, ends_wit
 
 @dataclass
 class WeightTransformHooks:
+    """``split_hook`` wins over ``concat_hook``: return ``(None, None)`` from ``split_hook`` for every key that is to be
+    concatenated. ``concat_hook(first_key, tensors)`` receives the parts as ``{original_key: tensor}`` in file (header)
+    order, which is often alphabetical; it must order them by role itself (e.g. q, k, v), not by dict order."""
+
     split_hook: Optional[callable] = None
     concat_hook: Optional[callable] = None
 
@@ -414,8 +418,6 @@ class TensorWeightAdapter:
 
     No need to implement __enter__ and __exit__ methods, as they are handled by the original MemoryEfficientSafeOpen.
     Do not use this wrapper as a context manager directly, like `with WeightConvertHookWrapper(...) as f:`.
-
-    **concat_hook is not tested yet.**
     """
 
     def __init__(self, weight_convert_hook: WeightTransformHooks, original_f: MemoryEfficientSafeOpen):
@@ -444,11 +446,11 @@ class TensorWeightAdapter:
                     if converted_key not in self.concat_key_set:  # first time seeing this concatenated key
                         self.concat_key_set.add(converted_key)
                         self.new_key_to_original_key_map[converted_key] = []
+                        # list the concatenated key once: loaders call get_tensor (and merge/quantize hooks) per key
+                        self.new_keys.append(converted_key)
 
                     # multiple original keys map to the same concatenated key
                     self.new_key_to_original_key_map[converted_key].append(key)
-
-                    self.new_keys.append(converted_key)
                     continue  # skip to next key
 
             # direct mapping

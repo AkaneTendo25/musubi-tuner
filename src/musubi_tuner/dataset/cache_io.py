@@ -19,6 +19,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_MINIMAX_H3_FULL,
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_WAN_FULL,
+    ARCHITECTURE_YUE2_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
 )
 from musubi_tuner.minimax_h3 import packing as h3_packing
@@ -667,6 +668,146 @@ def save_text_encoder_output_cache_minimax_h3(
         ARCHITECTURE_MINIMAX_H3_FULL,
         merge_existing=False,
         additional_metadata=metadata,
+    )
+
+
+# YuE2: one latent cache per audio segment, one token-id text cache per record.
+# Latent file: `latents_{T}x64_<dtype>` [T,64] (the collator folds it to batch["latents"] [B,T,64]), optional
+# `codes_int64` [T] semantic codec indices, and `yue2_seg_int64` [3] = (song start frame, song frames, truncated).
+# Text file: `varlen_yue2_text_{cot}_int64` / `varlen_yue2_neg_{cot}_int64` ([EOD] + instruction/prompt ids per cot),
+# `varlen_yue2_abc_int64` (ABC ids, [0] when absent), scalars `yue2_has_abc_int64` and `yue2_abc_mode_int64`.
+YUE2_LATENT_CACHE_VERSION = "1"
+YUE2_TEXT_CACHE_VERSION = "1"
+YUE2_LATENT_CHANNELS = 64
+YUE2_TEXT_KEY_FMT = "varlen_yue2_text_{cot}_int64"
+YUE2_NEG_KEY_FMT = "varlen_yue2_neg_{cot}_int64"
+YUE2_ABC_KEY = "varlen_yue2_abc_int64"
+YUE2_HAS_ABC_KEY = "yue2_has_abc_int64"
+YUE2_ABC_MODE_KEY = "yue2_abc_mode_int64"
+YUE2_CODES_KEY = "codes_int64"
+YUE2_SEG_KEY = "yue2_seg_int64"
+YUE2_ABC_MODE_IDS = {None: 0, "melody": 1, "full": 2}
+
+
+def yue2_latent_key(frames: int, dtype: torch.dtype) -> str:
+    return f"latents_{frames}x{YUE2_LATENT_CHANNELS}_{dtype_to_str(dtype)}"
+
+
+def yue2_segment_info(item_info: ItemInfo) -> tuple[int, int, bool]:
+    """(song start frame, song frames, truncated) of a YuE2 segment item (see dataset/audio_dataset.py)."""
+    start = getattr(item_info, "song_start_frame", None)
+    if start is None:
+        start = item_info.frame_pos
+    song_frames = getattr(item_info, "song_frames", None)
+    truncated = getattr(item_info, "truncated", None)
+    if start is None or song_frames is None or truncated is None or item_info.frame_count is None:
+        raise ValueError(f"YuE2 latent cache item is missing its segment provenance: {item_info.item_key}")
+    if start < 0 or start + item_info.frame_count > song_frames:
+        raise ValueError(
+            f"YuE2 segment [{start}, {start + item_info.frame_count}) lies outside the song ({song_frames} frames): {item_info.item_key}"
+        )
+    return int(start), int(song_frames), bool(truncated)
+
+
+def _merge_yue2_metadata(required: dict[str, str], metadata: Optional[dict[str, str]]) -> dict[str, str]:
+    for key, value in required.items():
+        if metadata is not None and key in metadata and metadata[key] != value:
+            raise ValueError(f"YuE2 cache metadata {key}={metadata[key]!r} contradicts the item ({value!r})")
+    return _merge_cache_metadata(required, metadata)
+
+
+def save_latent_cache_yue2(
+    item_info: ItemInfo,
+    latents: torch.Tensor,
+    codes: Optional[torch.Tensor],
+    metadata: Optional[dict[str, str]] = None,
+    dtype: torch.dtype = torch.float32,
+):
+    """YuE2 architecture: VAE latents [T,64] of one segment, optional semantic codes [T], segment provenance."""
+    from musubi_tuner.yue2.yue2_protocol import CODEC_SIZE
+
+    frames = item_info.frame_count
+    if latents.ndim != 2 or latents.shape[1] != YUE2_LATENT_CHANNELS:
+        raise ValueError(f"YuE2 latents must be [T,{YUE2_LATENT_CHANNELS}], got {tuple(latents.shape)}")
+    if latents.shape[0] != frames:
+        raise ValueError(f"YuE2 latents have {latents.shape[0]} frames, the item has {frames}: {item_info.item_key}")
+    if not dtype.is_floating_point:
+        raise ValueError(f"YuE2 latent dtype must be floating point, got {dtype}")
+    start, song_frames, truncated = yue2_segment_info(item_info)
+
+    sd = {yue2_latent_key(frames, dtype): latents.detach().to("cpu", dtype).contiguous()}
+    if codes is not None:
+        if codes.shape != (frames,) or codes.dtype.is_floating_point or codes.dtype == torch.bool:
+            raise ValueError(f"YuE2 codes must be integer [{frames}], got {codes.dtype} {tuple(codes.shape)}")
+        codes = codes.detach().to("cpu", torch.int64).contiguous()
+        if codes.numel() and (int(codes.min()) < 0 or int(codes.max()) >= CODEC_SIZE):
+            raise ValueError(f"YuE2 codes must be in [0, {CODEC_SIZE})")
+        sd[YUE2_CODES_KEY] = codes
+    sd[YUE2_SEG_KEY] = torch.tensor([start, song_frames, int(truncated)], dtype=torch.int64)
+
+    required = {
+        "yue2_cache_version": YUE2_LATENT_CACHE_VERSION,
+        "yue2_start_frame": str(start),
+        "yue2_frames": str(frames),
+        "yue2_song_frames": str(song_frames),
+        "yue2_truncated": str(int(truncated)),
+        "yue2_has_codes": str(int(codes is not None)),
+    }
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_YUE2_FULL, _merge_yue2_metadata(required, metadata))
+
+
+def _yue2_ids(ids, what: str, upper: int, allow_empty: bool = False) -> torch.Tensor:
+    ids = torch.as_tensor(ids)
+    if ids.ndim != 1 or ids.dtype.is_floating_point or ids.dtype == torch.bool:
+        raise ValueError(f"YuE2 {what} must be a 1-D integer tensor, got {ids.dtype} {tuple(ids.shape)}")
+    if ids.numel() == 0 and not allow_empty:
+        raise ValueError(f"YuE2 {what} must not be empty")
+    ids = ids.detach().to("cpu", torch.int64).contiguous()
+    if ids.numel() and (int(ids.min()) < 0 or int(ids.max()) > upper):
+        raise ValueError(f"YuE2 {what} must be in [0, {upper}]")
+    return ids
+
+
+def save_text_encoder_output_cache_yue2(
+    item_info: ItemInfo,
+    texts: Mapping[str, torch.Tensor],
+    negatives: Mapping[str, torch.Tensor],
+    abc_ids: Optional[torch.Tensor],
+    abc_mode,
+    metadata: Optional[dict[str, str]] = None,
+):
+    """YuE2 architecture: positive and negative text ids for every cot mode plus the record's ABC ids.
+
+    ``abc_mode`` is 0/1/2 or None/"melody"/"full" (YUE2_ABC_MODE_IDS); it must be 0 exactly when there is no ABC.
+    """
+    from musubi_tuner.yue2.yue2_protocol import COT_MODES, EOD
+
+    for name, table in (("texts", texts), ("negatives", negatives)):
+        if set(table) != set(COT_MODES):
+            raise ValueError(f"YuE2 {name} must hold exactly the cot modes {COT_MODES}, got {sorted(table)}")
+    if not isinstance(abc_mode, int) or isinstance(abc_mode, bool):
+        if abc_mode not in YUE2_ABC_MODE_IDS:
+            raise ValueError(f"YuE2 abc_mode must be one of {list(YUE2_ABC_MODE_IDS)}, got {abc_mode!r}")
+        abc_mode = YUE2_ABC_MODE_IDS[abc_mode]
+    if abc_mode not in YUE2_ABC_MODE_IDS.values():
+        raise ValueError(f"YuE2 abc_mode id must be one of {sorted(YUE2_ABC_MODE_IDS.values())}, got {abc_mode}")
+
+    abc = _yue2_ids(abc_ids if abc_ids is not None else torch.zeros(0, dtype=torch.int64), "ABC ids", EOD - 1, True)
+    has_abc = abc.numel() > 0
+    if has_abc != (abc_mode != 0):
+        raise ValueError(f"YuE2 abc_mode {abc_mode} does not match the ABC ids (present: {has_abc})")
+
+    sd = {}
+    for cot in COT_MODES:
+        sd[YUE2_TEXT_KEY_FMT.format(cot=cot)] = _yue2_ids(texts[cot], f"{cot} text ids", EOD)
+        sd[YUE2_NEG_KEY_FMT.format(cot=cot)] = _yue2_ids(negatives[cot], f"{cot} negative text ids", EOD)
+    sd[YUE2_ABC_KEY] = abc
+    sd[YUE2_HAS_ABC_KEY] = torch.tensor(int(has_abc), dtype=torch.int64)
+    sd[YUE2_ABC_MODE_KEY] = torch.tensor(abc_mode, dtype=torch.int64)
+
+    required = {"yue2_text_cache_version": YUE2_TEXT_CACHE_VERSION}
+    save_text_encoder_output_cache_common(
+        item_info, sd, ARCHITECTURE_YUE2_FULL, merge_existing=False, additional_metadata=_merge_yue2_metadata(required, metadata)
     )
 
 

@@ -128,6 +128,36 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["ref"].append(m.group(1).strip())
                 continue
 
+            m = re.match(r"lyf (.+)", parg, re.IGNORECASE)
+            if m:  # lyrics file (YuE2)
+                prompt_dict["lyrics_file"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"cot (\S+)", parg, re.IGNORECASE)
+            if m:  # ABC chain-of-thought mode off|melody|full (YuE2)
+                prompt_dict["cot"] = m.group(1).strip().lower()
+                continue
+
+            m = re.match(r"abcf (.+)", parg, re.IGNORECASE)
+            if m:  # ABC score file (YuE2)
+                prompt_dict["abc_file"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"sec ([\d\.]+)", parg, re.IGNORECASE)
+            if m:  # song length in seconds (YuE2)
+                prompt_dict["seconds"] = float(m.group(1))
+                continue
+
+            m = re.match(r"mode (\S+)", parg, re.IGNORECASE)
+            if m:  # render | reconstruct (YuE2)
+                prompt_dict["mode"] = m.group(1).strip().lower()
+                continue
+
+            m = re.match(r"recon (.+)", parg, re.IGNORECASE)
+            if m:  # latent cache to reconstruct from (YuE2)
+                prompt_dict["reconstruct_cache"] = m.group(1).strip()
+                continue
+
             logger.warning(f"Unknown prompt option ignored / 不明なオプションを無視します: --{parg}")
 
         except ValueError as ex:

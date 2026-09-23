@@ -476,6 +476,57 @@ The dataset configuration with metadata JSONL file is  same as the video dataset
 
 </details>
 
+### Audio Datasets (YuE2)
+
+Music models (currently YuE2) use audio datasets. Select a directory with `audio_directory` or a JSONL file with `audio_jsonl_file`. Each record is an audio file (`.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.opus`, `.wav`; decoded with PyAV and resampled to the model's rate) or a JSONL line. It contains a style caption, lyrics and an optional ABC score.
+
+```toml
+[general]
+caption_extension = ".caption.txt"   # style/tags (default for audio datasets)
+lyrics_extension = ".lyrics.txt"
+abc_extension = ".abc.txt"
+batch_size = 1
+
+[[datasets]]
+audio_directory = "/path/to/songs"
+cache_directory = "/path/to/songs/cache_yue2"
+trigger = "sv_artist"          # optional; prepended to the style: "sv_artist, <style>"
+segment_extraction = "full"    # full | head | chunk | slide
+min_seconds = 5.0
+max_seconds = 360.0
+validation_split = 0.1         # fraction of songs held out for validation (by song id)
+validation_split_seed = 0
+num_repeats = 1
+```
+
+Directory datasets read sidecars with the same stem as each audio file (`song1.flac`, `song1.caption.txt`, `song1.lyrics.txt`, `song1.abc.txt`, `song1.song.txt`). Stems must be unique (case-insensitively). If the lyrics file is missing, the record is cached with the instrumental lyrics placeholder (`[instrumental]` by default).
+
+The caption file may also contain lyrics. `caption_format = "auto"` (default) reads JSON (`{"style": ..., "lyrics": ..., "abc": ...}`) when the text starts with `{`. It reads `[Tags]`/`[Lyrics]`/`[ABC]` sections (or legacy `<CAPTION>`/`<LYRICS>` tags) when a `[Lyrics]` section is present, and plain style text otherwise. Use `plain`, `tags_lyrics` or `json` to force a format. Values from the caption take precedence over sidecars.
+
+JSONL datasets have one record per line. Relative `audio_path` values resolve like video JSONL paths: the working directory first, then the JSONL directory. Use `start`/`end` (seconds) to select an excerpt of the file. Repeated file stems get item keys `<stem>-r<line index>`. `cache_directory` is required.
+
+```json
+{"audio_path": "a.flac", "caption": "dark synthwave, female vocals", "lyrics": "[Verse 1]\n...", "abc": "X:1\n...", "abc_mode": "full", "song_id": "a", "start": 12.0, "end": 72.0}
+```
+
+- `segment_extraction`: `full` caches each record once (capped at `max_seconds`); `head` caches its first `segment_seconds`; `chunk` caches consecutive `segment_seconds` pieces (the tail is dropped); `slide` caches windows every `segment_stride_seconds` (default: `segment_seconds`). `max_segments` keeps at most that many windows per record, spread evenly. Records shorter than `min_seconds` (or than one segment) are skipped. Segment latents are sliced from one encode of the whole record, so segment edges use real audio context. Only segments that start at the beginning of a song train the AR (codec token) branch. The NAR branch trains on every segment.
+- `abc_mode` (`melody` or `full`): the ABC flavour of the records. Per record it comes from the JSONL `abc_mode` field, else from a first line `%%yue2_abc_mode melody|full` of the ABC text (written by your own transcription tooling; no ABC transcription script is shipped), else from the dataset-level `abc_mode`, else from the score itself (`full` when it contains quoted chord symbols).
+- `song_id` (JSONL key, `.song.txt` sidecar, else the file stem) groups records and excerpts of one song; `validation_split` holds out whole songs, deterministically for a given `validation_split_seed`. Held-out songs are cached like the others but never trained on. `is_validation = true` makes a whole dataset validation-only.
+- Cache files: `{item_key}_{start:06d}-{frames:06d}_yue2.safetensors` per segment and `{item_key}_yue2_te.safetensors` per record.
+
+<details>
+<summary>日本語</summary>
+
+音楽モデル（現在は YuE2）では、`audio_directory` または `audio_jsonl_file` で音声データセットを指定します。各レコードは、音声ファイル（PyAV でデコードし、モデルのサンプルレートにリサンプリング）または JSONL の 1 行です。スタイルキャプション、歌詞、任意の ABC 譜面を含みます。
+
+ディレクトリ指定では、同じ stem のサイドカーファイル（`.caption.txt`、`.lyrics.txt`、`.abc.txt`、`.song.txt`）を読み込みます。stem は大文字小文字を区別せず一意にしてください。歌詞ファイルがない場合は、インストゥルメンタル用のプレースホルダ（既定 `[instrumental]`）でキャッシュします。`caption_format`（`auto`/`plain`/`tags_lyrics`/`json`）を指定すると、キャプションファイル内の歌詞と ABC も読み込めます。
+
+JSONL では、`start`/`end`（秒）でファイルの一部を指定できます。同じ stem のレコードには `<stem>-r<行番号>` のキーが付きます。`cache_directory` は必須です。
+
+`segment_extraction`（`full`/`head`/`chunk`/`slide`）、`segment_seconds`、`segment_stride_seconds`、`max_segments`、`min_seconds`、`max_seconds` で切り出し方を指定します。セグメントの latent は、レコード全体を一度エンコードしてから切り出します。曲の先頭から始まるセグメントだけが AR ブランチの学習対象です。`validation_split` は `song_id` 単位で曲を検証用に確保します。`is_validation = true` を指定すると、データセット全体が検証専用になります。`abc_mode` は ABC の種類（`melody`/`full`）です。
+
+</details>
+
 ## Architecture-specific Settings / アーキテクチャ固有の設定
 
 The dataset configuration is shared across all architectures. However, some architectures may require additional settings or have specific requirements for the dataset.

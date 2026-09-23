@@ -66,6 +66,8 @@ dev = [
   "matplotlib==3.10.0",
   "tensorboard",
   "prompt-toolkit==3.0.51",
+  # YuE2 qwen.tiktoken tokenizer backend (optional at runtime; its parity tests skip without it)
+  "tiktoken",
   # ruff 0.16.0 enabled many new lint rules by default, producing ~2000 new findings;
   # pinned below 0.16 until those are triaged and resolved
   "ruff>=0.12.10,<0.16",
@@ -158,6 +160,7 @@ extend-exclude = [
   "src/musubi_tuner/wan/modules/xlm_roberta.py",
   "src/musubi_tuner/wan/utils/fm_solvers.py",
   "src/musubi_tuner/wan/utils/fm_solvers_unipc.py",
+  "tests/yue2_ref/*.py",
   "src/musubi_tuner/wan/utils/utils.py",
 ]
 

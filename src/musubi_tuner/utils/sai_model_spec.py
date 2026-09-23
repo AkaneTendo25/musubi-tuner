@@ -24,6 +24,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_KREA2,
     ARCHITECTURE_MINIMAX_H3,
+    ARCHITECTURE_YUE2,
     ARCHITECTURE_Z_IMAGE,
 )
 
@@ -96,6 +97,7 @@ ARCH_HIDREAM_O1 = "HiDream-O1-Image"
 ARCH_IDEOGRAM4 = "Ideogram-4"
 ARCH_KREA2 = "Krea-2"
 ARCH_MINIMAX_H3 = "MiniMax-H3"
+ARCH_YUE2 = "YuE2-3B"
 
 ADAPTER_LORA = "lora"
 
@@ -114,6 +116,7 @@ IMPL_HIDREAM_O1 = "https://github.com/HiDream-ai/HiDream-O1-Image"
 IMPL_IDEOGRAM4 = "https://huggingface.co/Comfy-Org/Ideogram-4"
 IMPL_KREA2 = "https://github.com/krea-ai/krea-2"
 IMPL_MINIMAX_H3 = "https://huggingface.co/MiniMaxAI/MiniMax-H3"
+IMPL_YUE2 = "https://github.com/multimodal-art-projection/YuE"
 
 PRED_TYPE_EPSILON = "epsilon"
 # PRED_TYPE_V = "v"
@@ -237,6 +240,9 @@ def build_metadata(
     elif architecture == ARCHITECTURE_MINIMAX_H3:
         arch = ARCH_MINIMAX_H3
         impl = IMPL_MINIMAX_H3
+    elif architecture == ARCHITECTURE_YUE2:
+        arch = ARCH_YUE2
+        impl = IMPL_YUE2
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 
@@ -308,6 +314,8 @@ def build_metadata(
             reso = (1024, 1024)
         elif architecture == ARCHITECTURE_KREA2:
             reso = (1024, 1024)
+        elif architecture == ARCHITECTURE_YUE2:
+            reso = (48000, 2)  # audio: sample rate x channels
         else:
             reso = (1280, 720)
     if isinstance(reso, int):

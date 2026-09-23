@@ -41,7 +41,7 @@
 
 ## Introduction
 
-This repository provides scripts for training LoRA (Low-Rank Adaptation) models with HunyuanVideo, Wan2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2 dev/klein, Qwen-Image, Z-Image, and MiniMax-H3 architectures.
+This repository provides scripts for training LoRA (Low-Rank Adaptation) models with HunyuanVideo, Wan2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2 dev/klein, Qwen-Image, Z-Image, and MiniMax-H3 architectures, and the YuE2 music model.
 
 This repository is unofficial and not affiliated with the official repositories of these architectures.
 
@@ -149,6 +149,7 @@ For detailed information on specific architectures, configurations, and advanced
 - [FLUX.2](./docs/flux_2.md)
 - [MiniMax-H3](./docs/minimax_h3.md)
 - [MiniMax-H3 (Single Frame)](./docs/minimax_h3_1f.md)
+- [YuE2 (music, AR + NAR LoRA)](./docs/yue2.md)
 
 **Common Configuration & Usage:**
 - [Dataset Configuration](./docs/dataset_config.md)

@@ -1,0 +1,14 @@
+Vendored upstream YuE2 reference code (test-only)
+
+Files: modeling_yue2.py, modeling_vae.py, protocol.py, tokenization_yue2.py, storage.py
+Source: yue2_infer 0.1.5 (wheel shipped in https://huggingface.co/m-a-p/YuE2-3B), unmodified.
+The wheel's license files are copied verbatim into licenses/:
+
+- licenses/LICENSE: the YuE2 model-weight license (CC BY-NC 4.0), which covers the checkpoint
+  weights only and states that it does not replace separately applicable licenses for code.
+- licenses/THIRD_PARTY_NOTICES.md, licenses/stable-audio-tools-MIT.txt,
+  licenses/SnakeBeta-NVIDIA-MIT.txt: MIT notices for the Oobleck VAE / SnakeBeta code in
+  modeling_vae.py.
+
+The wheel carries no separate license text for the remaining Python sources. These files are
+used only by the test suite as a numerical reference and are not imported by musubi_tuner.
