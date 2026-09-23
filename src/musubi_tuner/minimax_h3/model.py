@@ -908,7 +908,13 @@ class MiniMaxH3Transformer(nn.Module):
     @contextmanager
     def int8_attention_context(self, *, auxiliary: bool):
         enabled = self.int8_attention_mode == "train" or (auxiliary and self.int8_attention_mode == "aux")
-        modules = [module for module in self.modules() if isinstance(module, MiniMaxH3Attention)]
+        modules = getattr(self, "_int8_attention_modules", None)
+        if modules is None:
+            # The attention-module set is fixed at construction, and a fused
+            # forward re-enters this context once per stage of every auxiliary
+            # arm, so the module-tree walk happens once, not per entry.
+            modules = [module for module in self.modules() if isinstance(module, MiniMaxH3Attention)]
+            self._int8_attention_modules = modules
         previous = [module.int8_attention for module in modules]
         try:
             for module in modules:

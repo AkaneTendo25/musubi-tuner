@@ -1,8 +1,9 @@
 """Truncated on-policy rollout supervision (D-OPSD) for MiniMax H3."""
 
+import itertools
 import json
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
@@ -715,7 +716,9 @@ def _flag_args(*extra, teacher=None):
     return create_parser().parse_args(argv)
 
 
-def _run_step(*flags, teacher=None, active=True, guidance_active=True, seed=0, backend=None, batch=None, teacher_cache=None):
+def _run_step(
+    *flags, teacher=None, active=True, guidance_active=True, seed=0, backend=None, batch=None, teacher_cache=None, transformer=None
+):
     args = _flag_args(*flags, teacher=teacher)
     trainer = MiniMaxH3NetworkTrainer()
     trainer.handle_model_specific_args(args)
@@ -725,7 +728,7 @@ def _run_step(*flags, teacher=None, active=True, guidance_active=True, seed=0, b
     trainer._rollout_teacher = _StubTeacherCache() if teacher_cache is None else teacher_cache
     trainer._rollout_supervision_active = lambda accelerator, probability: active
     trainer._guidance_distillation_active = lambda accelerator, probability: guidance_active
-    transformer = _ScaleTransformer()
+    transformer = _ScaleTransformer() if transformer is None else transformer
     network = _ToggleNetwork(transformer)
     video, step_batch = _rollout_batch() if batch is None else batch
 
@@ -1472,6 +1475,64 @@ def test_fused_teacher_arm_carries_no_graph_and_the_student_arm_does():
     assert any(module.lora_up.weight.grad is not None for module in network.unet_loras)
 
 
+def test_int8_aux_contexts_mark_only_the_frozen_arm_in_a_real_fused_forward():
+    """The kernel flag flips per arm through the real ``forward_fused``.
+
+    ``int8_attention`` is read inside each attention call, and a fused arm's
+    ``run`` context is re-entered around every one of its stages, so layering
+    the auxiliary bracket into the frozen arm's factory must quantize its calls
+    alone. The spy records the flag at call time and clears it before the real
+    forward continues, so the CPU-only test never reaches the Triton kernel.
+    """
+    from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
+    from musubi_tuner.minimax_h3.model import MiniMaxH3Attention
+    from musubi_tuner.minimax_h3.training import H3FusedArm
+    from musubi_tuner.minimax_h3_train_network import _aux_int8_run
+
+    transformer = _tiny_transformer()
+    transformer.int8_attention_mode = "aux"
+    network = _tiny_adapter(transformer)
+    backend = _NativeTrainingBackend(transformer)
+    student_batch, privileged_batch = _fused_arm_batches()
+    video = torch.randn(1, 4, 2, 4, 4)
+    audio = torch.randn(1, 2, 6, 3)
+    timestep = torch.tensor([0.4])
+
+    seen = []
+    attention_modules = [module for module in transformer.modules() if isinstance(module, MiniMaxH3Attention)]
+    originals = [module.forward for module in attention_modules]
+    for module, forward in zip(attention_modules, originals):
+
+        def spy(*args, _forward=forward, _module=module, **kwargs):
+            seen.append(_module.int8_attention)
+            _module.int8_attention = False
+            return _forward(*args, **kwargs)
+
+        module.forward = spy
+    try:
+        run = _aux_int8_run(
+            MiniMaxH3NetworkTrainer._frozen_arm_context(network.set_enabled),
+            transformer.int8_attention_context,
+        )
+        backend.predict_training_fused(
+            transformer,
+            [
+                H3FusedArm(call=_fused_call(student_batch, video, audio, timestep)),
+                H3FusedArm(call=_fused_call(privileged_batch, video, audio, timestep), run=run),
+            ],
+        )
+    finally:
+        for module, forward in zip(attention_modules, originals):
+            module.forward = forward
+
+    # Stage by stage the student runs first and the teacher second, so the
+    # recorded flags must strictly alternate False, True, False, True ...
+    groups = [flag for flag, _ in itertools.groupby(seen)]
+    assert len(groups) >= 4
+    assert all(flag == bool(index % 2) for index, flag in enumerate(groups))
+    assert not any(module.int8_attention for module in attention_modules)
+
+
 class _RecordingOffloader:
     """Counts the block-ring traffic a forward asks for."""
 
@@ -1550,6 +1611,74 @@ class _FusedRolloutBackend(_RolloutBackend):
         return predictions
 
 
+class _Int8AwareScaleTransformer(_ScaleTransformer):
+    """The stub field with the transformer's INT8 surface attached.
+
+    ``int8_attention_context`` mirrors the real one: the mode decides whether an
+    entry enables the flag, and exit restores whatever it found. The flag is
+    observable per call so a test can see which arm ran quantized.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.int8_attention_mode = "aux"
+        self.int8_active = False
+
+    def set_int8_attention_mode(self, mode):
+        self.int8_attention_mode = mode
+
+    @contextmanager
+    def int8_attention_context(self, *, auxiliary):
+        was = self.int8_active
+        self.int8_active = self.int8_attention_mode == "train" or (auxiliary and self.int8_attention_mode == "aux")
+        try:
+            yield
+        finally:
+            self.int8_active = was
+
+
+class _Int8RecordingFusedBackend(_FusedRolloutBackend):
+    """Records, per call, whether the transformer was in its INT8 bracket."""
+
+    def predict_training(self, transformer, *args, **kwargs):
+        prediction = super().predict_training(transformer, *args, **kwargs)
+        self.calls[-1]["int8"] = getattr(transformer, "int8_active", False)
+        return prediction
+
+
+def test_the_fused_rollout_gives_int8_to_the_frozen_arms_only(tmp_path):
+    """Under --h3_int8_attention aux the teacher arm runs INT8, the student bf16.
+
+    The flag is read inside each attention call and a fused arm's ``run``
+    context is re-entered around every one of its block calls, so entering the
+    INT8 bracket inside the frozen arm's factory quantizes that arm alone. The
+    expected flag sequence is exactly the one the unfused window produces: the
+    data forward and the graded student dense, the no-grad prefix and the
+    teacher arms quantized.
+    """
+    teacher = tmp_path / "teacher.toml"
+    teacher.write_text("[general]\n", encoding="utf-8")
+    flags = (*_ROLLOUT_FLAGS, "--h3_rollout_steps", "1", "--h3_rollout_window", "2", "--h3_int8_attention", "aux")
+
+    unfused_backend, unfused_loss, unfused_metrics, _ = _run_step(
+        *flags, teacher=teacher, backend=_Int8RecordingFusedBackend(), transformer=_Int8AwareScaleTransformer()
+    )
+    fused_backend, fused_loss, fused_metrics, _ = _run_step(
+        *flags,
+        "--h3_rollout_fused_teacher",
+        teacher=teacher,
+        backend=_Int8RecordingFusedBackend(),
+        transformer=_Int8AwareScaleTransformer(),
+    )
+
+    expected = [False, True, False, True, False, True]
+    assert [call["int8"] for call in unfused_backend.calls] == expected
+    assert [call["int8"] for call in fused_backend.calls] == expected
+    assert fused_backend.fused_calls == 2
+    torch.testing.assert_close(fused_loss, unfused_loss, rtol=0, atol=0)
+    assert fused_metrics == unfused_metrics
+
+
 def test_the_fused_rollout_step_produces_the_same_loss_as_the_unfused_one(tmp_path):
     teacher = tmp_path / "teacher.toml"
     teacher.write_text("[general]\n", encoding="utf-8")
@@ -1596,26 +1725,19 @@ def test_the_fused_teacher_flag_requires_the_switch():
         MiniMaxH3NetworkTrainer()._validate_rollout_args(_flag_args("--h3_rollout_fused_teacher"))
 
 
-def test_the_fused_teacher_cannot_select_int8_for_the_teacher_arm_alone(tmp_path):
-    args = _flag_args(
-        *_ROLLOUT_FLAGS,
-        "--h3_rollout_fused_teacher",
-        "--h3_int8_attention",
-        "aux",
-        teacher=_teacher_file(tmp_path),
-    )
-    with pytest.raises(ValueError, match="INT8 for the teacher arm alone"):
-        MiniMaxH3NetworkTrainer()._validate_rollout_args(args)
-    # The modes that apply to both arms alike compose with fusion unchanged.
-    for mode in ("off", "train"):
-        pinned = _flag_args(
+def test_the_fused_teacher_accepts_every_int8_attention_mode(tmp_path):
+    # "aux" is expressed per arm: each frozen arm's own context enters the INT8
+    # bracket around its block calls, so the kernel can be selected for the
+    # teacher without touching the student. All three modes validate.
+    for mode in ("off", "aux", "train"):
+        args = _flag_args(
             *_ROLLOUT_FLAGS,
             "--h3_rollout_fused_teacher",
             "--h3_int8_attention",
             mode,
             teacher=_teacher_file(tmp_path),
         )
-        MiniMaxH3NetworkTrainer()._validate_rollout_args(pinned)
+        MiniMaxH3NetworkTrainer()._validate_rollout_args(args)
 
 
 def test_the_fused_rollout_is_recorded_in_adapter_metadata(tmp_path):

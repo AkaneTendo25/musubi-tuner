@@ -1261,6 +1261,26 @@ def _forked_frozen_build(fork_devices: list, set_enabled):
             set_enabled(True)
 
 
+def _aux_int8_run(run, int8_context):
+    """Layer the auxiliary-INT8 context into a frozen fused arm's ``run`` factory.
+
+    ``run`` is re-entered around every stage of its arm -- the embedding, each
+    block call, the final layer -- and the INT8 kernel flag is read inside each
+    attention call, so entering the context inside the arm's own factory toggles
+    it for that arm's attention calls alone. The adapter toggle and ``no_grad``
+    stay outermost, exactly as the unfused path nests them over the same arms.
+    """
+    if int8_context is None:
+        return run
+
+    @contextmanager
+    def enter():
+        with run(), int8_context(auxiliary=True):
+            yield
+
+    return enter
+
+
 def _parse_guide_specs(spec: str) -> tuple[tuple[int, int, int], ...]:
     """Parse ``START:VIDEO_LATENTS:AUDIO_LATENTS`` guide recipes."""
     if not spec:
@@ -5204,16 +5224,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "(--h3_guidance_null_anchor_weight or --h3_rollout_null_anchor_weight) holds. Without one the floor "
                 "does not bound that field"
             )
-        if getattr(args, "h3_rollout_fused_teacher", False) and getattr(args, "h3_int8_attention", "off") == "aux":
-            # Fusing puts the student and the teacher inside one pass over the
-            # blocks, where the attention kernel is chosen per block and not per
-            # forward. "aux" asks for INT8 on the auxiliary forwards ONLY, which
-            # that pass cannot express; "train" and "off" apply to both arms alike
-            # and compose with fusion unchanged.
-            raise ValueError(
-                "--h3_rollout_fused_teacher shares one pass over the blocks with the student, so --h3_int8_attention aux "
-                "cannot select INT8 for the teacher arm alone; use --h3_int8_attention train or off, or drop the fusion"
-            )
+        # --h3_int8_attention aux composes with the fused teacher: each frozen
+        # arm's per-stage context enters the INT8 bracket around its own block
+        # calls alone (``_aux_int8_run``), so the student arm keeps the dense
+        # kernel while the teacher and floor/anchor arms quantize -- the same
+        # per-arm coverage the unfused window gives them.
         if getattr(args, "h3_rollout_fused_teacher", False) and (
             float(getattr(args, "h3_block_sparse_kv_fraction", 0.0) or 0.0) > 0
             or float(getattr(args, "h3_block_sparse_threshold", 0.0) or 0.0) > 0
@@ -5414,6 +5429,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         twice per sub-step and this one pays not at all.
         """
         run = self._frozen_arm_context(set_enabled)
+        int8_context = getattr(transformer, "int8_attention_context", None)
+        if callable(int8_context) and getattr(transformer, "int8_attention_mode", "off") == "aux":
+            # INT8 on the auxiliary arms only: ``run`` is re-entered around every
+            # stage of exactly the arms it is attached to, so the kernel flag
+            # toggles per attention call of the teacher and floor/anchor arms
+            # alone -- the same coverage the unfused window gives those arms.
+            # The student and its empty branch keep the dense kernel.
+            run = _aux_int8_run(run, int8_context)
         student = H3FusedArm(call=self._predict_call(accelerator, batch, state, conditioning=conditioning))
         teacher = H3FusedArm(
             call=self._predict_call(
