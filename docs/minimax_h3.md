@@ -872,14 +872,15 @@ pinned buffers fit. On older links or low-RAM hosts, time a few steps with and w
 H2D-only ring and supports all 50 blocks, at the cost of more transfers; use the default `block` granularity when it fits. It
 cannot be combined with `--h3_convrot_int8` or `--int8_convrot_base`. Add
 `--gradient_checkpointing_cpu_offload` when sequence length would otherwise exceed VRAM, and set
-`PYTORCH_ALLOC_CONF=expandable_segments:True` to reduce fragmentation. On hosts whose CPU also stages block-swap
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation (on torch builds that warn it is deprecated,
+also set the alias `PYTORCH_ALLOC_CONF` — some builds read only one spelling, so setting both is the safe form). On hosts whose CPU also stages block-swap
 transfers, `KMP_BLOCKTIME=0 OMP_WAIT_POLICY=PASSIVE` keeps idle worker threads from spinning against the loader threads.
 
 For limited VRAM on a host with enough RAM for the BF16 checkpoint and swapped blocks, the loader can reduce and quantize
 weights while placing swapped blocks on CPU:
 
 ```shell
-PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch minimax_h3_train_network.py \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch minimax_h3_train_network.py \
   --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_bf16.safetensors \
   --dataset_config dataset.toml \
   --network_module networks.lora_minimax_h3 \
@@ -1424,7 +1425,7 @@ against a frozen timestep table and writes the checkpoint in the pruned layout, 
 checkpoints without the flag and cannot be reduced a second time.
 
 ```shell
-PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch \
   --num_processes 1 --num_cpu_threads_per_process 1 \
   minimax_h3_train.py \
   --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_bf16.safetensors \
