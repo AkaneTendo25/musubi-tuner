@@ -57,7 +57,6 @@ from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_g
 from musubi_tuner.minimax_h3.image_training import (
     H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY,
     add_image_training_arguments,
-    cache_matches_fingerprint,
 )
 from musubi_tuner.minimax_h3.one_frame import H3_REFERENCE_ROUTE_IDS, H3_REFERENCE_ROUTES
 from musubi_tuner.minimax_h3.references import (
@@ -336,29 +335,35 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     def existing_cache_valid(item: ItemInfo, path: str) -> bool:
         attach_h3_media((item,), dataset_adapter, decode_one_frame_controls=False)
-        if getattr(item, "h3_one_frame", False) and not cache_matches_fingerprint(
-            path,
-            item.h3_cache_metadata[H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY],
-            H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY,
-        ):
-            return False
-        if args.h3_image_mode != "none" and not cache_matches_fingerprint(path, item.h3_cache_metadata["sample_fingerprint"]):
-            return False
-        if reference_assets(item) and not cache_matches_fingerprint(
-            path, item.h3_cache_metadata[REFERENCE_FINGERPRINT_KEY], REFERENCE_FINGERPRINT_KEY
-        ):
-            return False
-        # Qwen control visuals live only in the text presentation, so their file
-        # identity is a parallel fingerprint: editing or swapping a control file
-        # rebuilds this cache and leaves the latent cache untouched.
-        qwen_controls = qwen_control_assets(item)
-        if qwen_controls and not cache_matches_fingerprint(
-            path, item.h3_cache_metadata[QWEN_CONTROL_FINGERPRINT_KEY], QWEN_CONTROL_FINGERPRINT_KEY
-        ):
-            return False
         try:
             with safe_open(path, framework="pt", device="cpu") as handle:
+                # One open per item: every fingerprint and key check below reads
+                # this handle instead of re-opening the safetensors each time.
+                metadata = handle.metadata() or {}
                 keys = set(handle.keys())
+
+                def fingerprint(fingerprint_value: str, key: str = "sample_fingerprint") -> bool:
+                    return metadata.get(key) == fingerprint_value
+
+                if getattr(item, "h3_one_frame", False) and not fingerprint(
+                    item.h3_cache_metadata[H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY],
+                    H3_ONE_FRAME_CONTENT_FINGERPRINT_KEY,
+                ):
+                    return False
+                if args.h3_image_mode != "none" and not fingerprint(item.h3_cache_metadata["sample_fingerprint"]):
+                    return False
+                if reference_assets(item) and not fingerprint(
+                    item.h3_cache_metadata[REFERENCE_FINGERPRINT_KEY], REFERENCE_FINGERPRINT_KEY
+                ):
+                    return False
+                # Qwen control visuals live only in the text presentation, so their file
+                # identity is a parallel fingerprint: editing or swapping a control file
+                # rebuilds this cache and leaves the latent cache untouched.
+                qwen_controls = qwen_control_assets(item)
+                if qwen_controls and not fingerprint(
+                    item.h3_cache_metadata[QWEN_CONTROL_FINGERPRINT_KEY], QWEN_CONTROL_FINGERPRINT_KEY
+                ):
+                    return False
                 logical_keys = {logical_cache_key(key) for key in keys}
                 if bool(qwen_controls) != (H3_QWEN_CONTROL_VISUALS_KEY in keys):
                     return False

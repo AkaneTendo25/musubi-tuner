@@ -26,7 +26,6 @@ from musubi_tuner.minimax_h3.image_training import (
     H3_ONE_FRAME_TARGET_INDEX_KEY,
     H3_ONE_FRAME_TARGET_INDICES_KEY,
     add_image_training_arguments,
-    cache_matches_fingerprint,
 )
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_FINGERPRINT_KEY,
@@ -175,14 +174,22 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     def existing_cache_valid(item: ItemInfo, path: str) -> bool:
         attach_h3_media((item,), dataset_adapter, decode_one_frame_controls=False)
-        if getattr(item, "h3_one_frame", False):
-            fingerprint = item.h3_cache_metadata[H3_ONE_FRAME_LATENT_FINGERPRINT_KEY]
-            if not cache_matches_fingerprint(path, fingerprint, H3_ONE_FRAME_LATENT_FINGERPRINT_KEY):
-                return False
-            try:
-                with safe_open(path, framework="pt", device="cpu") as handle:
-                    keys = set(handle.keys())
-                    if (handle.metadata() or {}).get("h3_cache_format") != H3_ONE_FRAME_CACHE_FORMAT:
+        try:
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                # One open per item: every fingerprint and key check below reads
+                # this handle instead of re-opening the safetensors each time.
+                metadata = handle.metadata() or {}
+                keys = set(handle.keys())
+
+                def fingerprint(fingerprint_value: str, key: str = "sample_fingerprint") -> bool:
+                    return metadata.get(key) == fingerprint_value
+
+                if getattr(item, "h3_one_frame", False):
+                    if not fingerprint(
+                        item.h3_cache_metadata[H3_ONE_FRAME_LATENT_FINGERPRINT_KEY], H3_ONE_FRAME_LATENT_FINGERPRINT_KEY
+                    ):
+                        return False
+                    if metadata.get("h3_cache_format") != H3_ONE_FRAME_CACHE_FORMAT:
                         return False
                     target_slots = getattr(item, "h3_one_frame_target_indices", None)
                     if target_slots is not None:
@@ -201,18 +208,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                         return False
                     if expected and tuple(int(value) for value in handle.get_tensor(control_key)) != expected:
                         return False
-            except (OSError, RuntimeError, ValueError):
-                return False
-        if args.h3_image_mode != "none" and not cache_matches_fingerprint(path, item.h3_cache_metadata["sample_fingerprint"]):
-            return False
-        target_audio_fingerprint = getattr(item, "h3_cache_metadata", {}).get(TARGET_AUDIO_FINGERPRINT_KEY)
-        if target_audio_fingerprint is not None and not cache_matches_fingerprint(
-            path, target_audio_fingerprint, TARGET_AUDIO_FINGERPRINT_KEY
-        ):
-            return False
-        try:
-            with safe_open(path, framework="pt", device="cpu") as handle:
-                keys = set(handle.keys())
+                if args.h3_image_mode != "none" and not fingerprint(item.h3_cache_metadata["sample_fingerprint"]):
+                    return False
+                target_audio_fingerprint = getattr(item, "h3_cache_metadata", {}).get(TARGET_AUDIO_FINGERPRINT_KEY)
+                if target_audio_fingerprint is not None and not fingerprint(target_audio_fingerprint, TARGET_AUDIO_FINGERPRINT_KEY):
+                    return False
                 requested_dtype = args.latent_cache_dtype or args.vae_dtype or "float32"
                 latent_keys = [
                     key
@@ -232,24 +232,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                     key = f"{H3_LOSS_MASK_POOLING_KEY}_int64"
                     if key not in keys or int(handle.get_tensor(key)) != H3_LOSS_MASK_POOLING_CODES[args.h3_loss_mask_pooling]:
                         return False
-        except (OSError, RuntimeError, ValueError):
-            return False
-        if not reference_assets(item):
-            return True
-        if not cache_matches_fingerprint(path, item.h3_cache_metadata[REFERENCE_FINGERPRINT_KEY], REFERENCE_FINGERPRINT_KEY):
-            return False
-        suffix = reference_key_suffix(
-            args.reference_image_short_edge,
-            args.reference_image_size_mode,
-            args.reference_image_max_pixels,
-            args.reference_video_short_edge,
-            args.reference_video_max_pixels,
-            args.reference_video_fps,
-        )
-        kinds_key = f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64"
-        try:
-            with safe_open(path, framework="pt", device="cpu") as handle:
-                return kinds_key in set(handle.keys())
+                if not reference_assets(item):
+                    return True
+                if not fingerprint(item.h3_cache_metadata[REFERENCE_FINGERPRINT_KEY], REFERENCE_FINGERPRINT_KEY):
+                    return False
+                suffix = reference_key_suffix(
+                    args.reference_image_short_edge,
+                    args.reference_image_size_mode,
+                    args.reference_image_max_pixels,
+                    args.reference_video_short_edge,
+                    args.reference_video_max_pixels,
+                    args.reference_video_fps,
+                )
+                kinds_key = f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64"
+                return kinds_key in keys
         except (OSError, RuntimeError, ValueError):
             return False
 

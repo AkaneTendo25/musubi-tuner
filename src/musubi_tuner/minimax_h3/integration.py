@@ -2716,7 +2716,7 @@ class _NativeLatentEncoder:
 
     def _encode_video(self, content: np.ndarray, *, is_image: bool) -> torch.Tensor:
         pixels = self._video_pixels(content)
-        with torch.no_grad():
+        with torch.inference_mode():
             encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
             return encode(pixels)[0].to(self.output_dtype)
 
@@ -2776,14 +2776,14 @@ class _NativeLatentEncoder:
         pixel_mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
         pixel_std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
         pixels = ((pixels - pixel_mean) / pixel_std).to(weight_dtype)
-        with torch.no_grad():
+        with torch.inference_mode():
             return self.video_encoder.encode_reference(pixels, image=image)[0].to(self.output_dtype)
 
     def _encode_reference_audio(self, waveform: torch.Tensor) -> torch.Tensor:
         if self.audio_encoder is None:
             raise ValueError("MiniMax H3 audio references require --audio_vae during latent caching")
         device = next(self.audio_encoder.parameters()).device
-        with torch.no_grad():
+        with torch.inference_mode():
             latents = self.audio_encoder.encode(waveform.to(device=device, dtype=torch.float32).unsqueeze(1))
         return latents.to(self.output_dtype)
 
@@ -2894,7 +2894,7 @@ class _NativeLatentEncoder:
             raise RuntimeError("H3 target audio policy unexpectedly dropped the target")
         device = next(self.audio_encoder.parameters()).device
         waveform = clip.waveform.to(device=device, dtype=torch.float32).unsqueeze(1)
-        with torch.no_grad():
+        with torch.inference_mode():
             latents = self.audio_encoder.encode(waveform).to(self.output_dtype)
         mask = audio_valid_mask_to_latent_mask(clip.valid_mask)
         if mask.shape != (latents.shape[-1],):
@@ -2932,7 +2932,7 @@ class _NativeLatentEncoder:
                 latents = None
                 try:
                     pixels = torch.cat([self._video_pixels(batch[index].content) for index in chunk], dim=0)
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
                         latents = encode(pixels)
                     for index, latent in zip(chunk, latents):
