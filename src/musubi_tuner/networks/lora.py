@@ -74,6 +74,46 @@ def _profile_scope(name: str):
     return nullcontext()
 
 
+class _FusedLoraLinearBF16(torch.autograd.Function):
+    """``x @ W^T + ((x @ A^T) * s) @ B^T`` with the delta add folded into the base GEMM epilogue.
+
+    ``addmm(delta, x, W^T)`` lets cuBLAS accumulate the adapter delta into the base output inside
+    the GEMM epilogue, so no separate full-width add kernel or extra output temporary exists.
+    Rank-16 arithmetic stays on plain ``mm`` calls; only the memory-bound tail is fused.
+
+    The base weight is re-read from the module in backward: under block swap the weight tensor is
+    a ring view that may be rebound between forward and backward, so the live module is the only
+    safe reference (the same rule the ConvRot INT8 fused path follows). Backward recomputes the
+    small down-projection intermediates from the saved tensors; ``dX`` is again an ``addmm`` so the
+    LoRA branch rides the base GEMM's epilogue in reverse too.
+    """
+
+    @staticmethod
+    def forward(ctx, x, base_module, down_weight, up_weight, scale):
+        x2 = x.reshape(-1, x.shape[-1])
+        lx = torch.mm(x2, down_weight.t()) * scale
+        delta = torch.mm(lx, up_weight.t())
+        out = torch.addmm(delta, x2, base_module.weight.t())
+        ctx.save_for_backward(x, lx, down_weight, up_weight)
+        ctx.base_module = base_module
+        ctx.scale = scale
+        ctx.x_shape = x.shape
+        return out.view(x.shape[:-1] + (-1,))
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, lx, down_weight, up_weight = ctx.saved_tensors
+        base_weight = ctx.base_module.weight
+        scale = ctx.scale
+        g2 = grad_out.reshape(-1, grad_out.shape[-1])
+        x2 = x.reshape(-1, x.shape[-1])
+        dlx_raw = torch.mm(g2, up_weight) * scale
+        dx = torch.addmm(torch.mm(dlx_raw, down_weight), g2, base_weight)
+        d_down = torch.mm(dlx_raw.t(), x2)
+        d_up = torch.mm(g2.t(), lx)
+        return dx.view(ctx.x_shape), None, d_down, d_up, None
+
+
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -177,6 +217,8 @@ class LoRAModule(torch.nn.Module):
         # Opt in to ``add(org, delta, alpha=multiplier * scale)`` for factors that are not powers
         # of two, where the single fused rounding differs from multiply-then-add by bf16 ulps.
         self.fused_scale_add = False
+        # Opt in to the addmm-epilogue fused bf16 path (--h3_lora_fused_bf16).
+        self.lora_fused_bf16 = False
 
     def _down_modules(self):
         return [self.lora_down] if self.split_dims is None else list(self.lora_down)
@@ -323,6 +365,28 @@ class LoRAModule(torch.nn.Module):
                     self.effective_down_weight(self.lora_down),
                     self.lora_up.weight,
                     self.multiplier * self.scale,
+                )
+        if (
+            self.lora_fused_bf16
+            and self.split_dims is None
+            and self.dropout is None
+            and self.rank_dropout is None
+            and self.module_dropout is None
+            and self.nora != "forward"
+            and isinstance(base_module, torch.nn.Linear)
+            and base_module.bias is None
+            and self.lora_down.bias is None
+            and self.lora_up.bias is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and base_module.weight.dtype == torch.bfloat16
+            and self.lora_down.weight.dtype == torch.bfloat16
+            and self.lora_up.weight.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
+            with _profile_scope("h3.lora.fused"):
+                return _FusedLoraLinearBF16.apply(
+                    x, base_module, self.lora_down.weight, self.lora_up.weight, self.multiplier * self.scale
                 )
         with _profile_scope("h3.lora.base"):
             org_forwarded = self.org_forward(x)

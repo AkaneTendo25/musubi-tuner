@@ -659,6 +659,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--h3_convrot_int8_bwd", t.h3_convrot_int8_bwd]
         if t.h3_convrot_int8_lora_fused:
             cmd.append("--h3_convrot_int8_lora_fused")
+    if t.h3_lora_fused_bf16:
+        cmd.append("--h3_lora_fused_bf16")
     if t.h3_adaln_rank is not None and not t.int8_convrot_base:
         cmd += ["--h3_adaln_rank", str(t.h3_adaln_rank)]
     for field in ("h3_fused_qk_norm_rope", "h3_fused_indexed_adaln", "h3_fused_swiglu"):

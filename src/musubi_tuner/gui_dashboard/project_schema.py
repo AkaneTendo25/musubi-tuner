@@ -348,6 +348,7 @@ class TrainingConfig(BaseModel):
     h3_convrot_int8_fwd: Literal["int8", "bf16"] = "int8"
     h3_convrot_int8_bwd: Literal["bf16", "int8"] = "bf16"
     h3_convrot_int8_lora_fused: bool = False
+    h3_lora_fused_bf16: bool = False
     h3_gradient_checkpointing_blocks: Optional[int] = None
     h3_gradient_checkpointing_cpu_offload_pin_memory: bool = False
     h3_reusable_activation_offload: bool = False

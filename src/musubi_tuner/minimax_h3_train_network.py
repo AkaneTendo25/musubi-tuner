@@ -3908,6 +3908,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             for module in network.modules():
                 if hasattr(module, "fused_scale_add"):
                     module.fused_scale_add = True
+        if getattr(args, "h3_lora_fused_bf16", False) and isinstance(network, torch.nn.Module):
+            enabled = 0
+            for module in network.modules():
+                if hasattr(module, "lora_fused_bf16"):
+                    module.lora_fused_bf16 = True
+                    enabled += 1
+            if enabled == 0:
+                raise RuntimeError("--h3_lora_fused_bf16 found no LoRA modules to fuse")
+            logger.info("--h3_lora_fused_bf16: addmm-epilogue LoRA path enabled on %d modules", enabled)
         self._h3_profiler = None
         steps = int(getattr(args, "h3_profile_steps", 0) or 0)
         if steps <= 0:
@@ -9195,6 +9204,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "INT8 kernel; 'bf16' undoes the rotation on the weight instead and hands the vendor GEMM an ordinary "
             "matrix. The stored weights and the arithmetic result are the same either way, so this trades "
             "quantized compute for a better-tuned kernel and is worth measuring on GPUs with fast BF16"
+        ),
+    )
+    parser.add_argument(
+        "--h3_lora_fused_bf16",
+        action="store_true",
+        help=(
+            "fold the LoRA delta add into the base Linear's cuBLAS GEMM epilogue (addmm) on bf16 layers; "
+            "falls back to the unfused path for dropout/split_dims/bias/quantized or non-bf16 modules and "
+            "inside torch.compile regions"
         ),
     )
     parser.add_argument(
