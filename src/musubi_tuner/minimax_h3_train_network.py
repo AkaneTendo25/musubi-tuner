@@ -4567,16 +4567,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         video_latents = video_latents.cpu()
         audio_latents = audio_latents.cpu()
 
+        keep_resident = getattr(self, "_h3_sample_keep_dit_resident", False)
         block_swap_suspended = bool(self.blocks_to_swap)
-        if block_swap_suspended:
-            transformer.offload_block_swap_to_cpu()
-        else:
-            transformer.to("cpu")
+        evacuated = False
+        if not keep_resident:
+            if block_swap_suspended:
+                transformer.offload_block_swap_to_cpu()
+            else:
+                transformer.to("cpu")
+            evacuated = True
         clean_memory_on_device(device)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         decode_started = time.perf_counter()
-        try:
+
+        def decode_media():
             if frame_count == 1:
                 # The two-latent audio stream is only the model's structural
                 # placeholder in image mode. Decoding it wastes memory and can
@@ -4585,15 +4590,30 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video = decoder_bundle.video_decoder.decode(video_latents.to(device)).cpu()
                 decoder_bundle.video_decoder.to("cpu")
                 clean_memory_on_device(device)
-                media = SimpleNamespace(video=video, audio=None)
-            else:
-                media = decode_latents_sequentially(
-                    decoder_bundle.video_decoder,
-                    decoder_bundle.audio_decoder,
-                    video_latents,
-                    audio_latents,
-                    device,
-                )
+                return SimpleNamespace(video=video, audio=None)
+            return decode_latents_sequentially(
+                decoder_bundle.video_decoder,
+                decoder_bundle.audio_decoder,
+                video_latents,
+                audio_latents,
+                device,
+            )
+
+        try:
+            try:
+                media = decode_media()
+            except torch.cuda.OutOfMemoryError:
+                if not keep_resident:
+                    raise
+                # Headroom estimate was wrong: evacuate the DiT after all and
+                # retry the decode once instead of losing the sample run.
+                if block_swap_suspended:
+                    transformer.offload_block_swap_to_cpu()
+                else:
+                    transformer.to("cpu")
+                evacuated = True
+                clean_memory_on_device(device)
+                media = decode_media()
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             sample_metrics["sequential_av_decode"] = {
@@ -4604,11 +4624,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._last_sample_metrics = sample_metrics
             logger.info("MiniMax H3 training sample metrics: %s", sample_metrics)
         finally:
-            if block_swap_suspended:
-                transformer.move_to_device_except_swap_blocks(device)
-                transformer.switch_block_swap_for_inference()
-            else:
-                transformer.to(device)
+            if evacuated:
+                if block_swap_suspended:
+                    transformer.move_to_device_except_swap_blocks(device)
+                    transformer.switch_block_swap_for_inference()
+                else:
+                    transformer.to(device)
         return media, height, width, frame_count, sample_steps, seed
 
     def sample_image_inference(
@@ -4624,6 +4645,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         steps,
     ):
         del dit_dtype
+        self._h3_sample_keep_dit_resident = bool(getattr(args, "h3_sample_keep_dit_resident", False))
         media, height, width, frame_count, sample_steps, seed = self._generate_sample(
             accelerator,
             transformer,
@@ -8191,6 +8213,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "FlashAttention) on the real packed Q/K/V once per shape bucket and use the measured winner; "
             "requires --sdpa and replaces --h3_attn_auto_dispatch's fixed priority with an actual timing. Masked, "
             "block-sparse, and INT8 calls keep their existing paths"
+        ),
+    )
+    parser.add_argument(
+        "--h3_sample_keep_dit_resident",
+        action="store_true",
+        help=(
+            "keep the DiT on the GPU while sample decoders run instead of evacuating ~66GB to CPU and back per "
+            "sample; requires enough free VRAM for the VAE decode beside the resident weights (a decode OOM "
+            "falls back to the evacuate-and-retry path automatically)"
         ),
     )
     parser.add_argument(

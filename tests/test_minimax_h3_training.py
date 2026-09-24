@@ -8305,3 +8305,109 @@ def test_batched_microbatch_replays_a_failed_group_item_by_item():
     # group never backwarded.
     assert backend.invocations == [(1, 4), (1, 4)]
     assert torch.isfinite(loss)
+
+
+def _sample_trainer_stub(**overrides):
+    trainer = object.__new__(h3_train_network.MiniMaxH3NetworkTrainer)
+    trainer.blocks_to_swap = 0
+    trainer._overlay_training_only = False
+    trainer._overlay_network = None
+    trainer._h3_sample_keep_dit_resident = False
+    trainer._last_sample_metrics = {}
+    for name, value in overrides.items():
+        setattr(trainer, name, value)
+    return trainer
+
+
+class _EvacuatingTransformer:
+    def __init__(self):
+        self.calls = []
+
+    def to(self, device):
+        self.calls.append(("to", str(device)))
+
+    def offload_block_swap_to_cpu(self):
+        self.calls.append(("offload",))
+
+    def move_to_device_except_swap_blocks(self, device):
+        self.calls.append(("restore", str(device)))
+
+    def switch_block_swap_for_inference(self):
+        self.calls.append(("inference",))
+
+
+class _StubVideoDecoder:
+    def __init__(self, fail_once=False):
+        self.fail_once = fail_once
+        self.decoded = 0
+
+    def to(self, _device):
+        return self
+
+    def eval(self):
+        return self
+
+    def decode(self, latents):
+        self.decoded += 1
+        if self.fail_once:
+            self.fail_once = False
+            raise torch.cuda.OutOfMemoryError("stub OOM")
+        return torch.zeros(1, 3, 1, 2, 2)
+
+
+def _sample_inputs_stub():
+    return {
+        h3_train_network.H3_TEXT_HIDDEN_KEY: torch.zeros(1, 4, 12),
+        h3_train_network.H3_TEXT_TOKEN_TAGS_KEY: torch.zeros(1, 4, dtype=torch.long),
+        "frame_count": 1,
+        "sample_steps": 1,
+    }
+
+
+def test_h3_sample_evacuates_dit_for_decode_by_default(monkeypatch):
+    monkeypatch.setattr(h3_train_network, "denoise_fl2va", lambda *a, **k: (torch.zeros(1, 2), torch.zeros(1, 1)))
+    transformer = _EvacuatingTransformer()
+    decoder = _StubVideoDecoder()
+    trainer = _sample_trainer_stub()
+
+    media, *_ = trainer._generate_sample(
+        SimpleNamespace(device=torch.device("cpu")),
+        transformer,
+        SimpleNamespace(video_decoder=decoder, audio_decoder=None),
+        _sample_inputs_stub(),
+    )
+
+    assert transformer.calls == [("to", "cpu"), ("to", "cpu")]
+    assert media.video is not None
+
+
+def test_h3_sample_keep_dit_resident_skips_evacuation(monkeypatch):
+    monkeypatch.setattr(h3_train_network, "denoise_fl2va", lambda *a, **k: (torch.zeros(1, 2), torch.zeros(1, 1)))
+    transformer = _EvacuatingTransformer()
+    trainer = _sample_trainer_stub(_h3_sample_keep_dit_resident=True, blocks_to_swap=8)
+
+    trainer._generate_sample(
+        SimpleNamespace(device=torch.device("cpu")),
+        transformer,
+        SimpleNamespace(video_decoder=_StubVideoDecoder(), audio_decoder=None),
+        _sample_inputs_stub(),
+    )
+
+    assert transformer.calls == []
+
+
+def test_h3_sample_keep_dit_resident_oom_falls_back_to_evacuation(monkeypatch):
+    monkeypatch.setattr(h3_train_network, "denoise_fl2va", lambda *a, **k: (torch.zeros(1, 2), torch.zeros(1, 1)))
+    transformer = _EvacuatingTransformer()
+    decoder = _StubVideoDecoder(fail_once=True)
+    trainer = _sample_trainer_stub(_h3_sample_keep_dit_resident=True, blocks_to_swap=8)
+
+    trainer._generate_sample(
+        SimpleNamespace(device=torch.device("cpu")),
+        transformer,
+        SimpleNamespace(video_decoder=decoder, audio_decoder=None),
+        _sample_inputs_stub(),
+    )
+
+    assert transformer.calls == [("offload",), ("restore", "cpu"), ("inference",)]
+    assert decoder.decoded == 2
