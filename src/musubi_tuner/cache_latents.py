@@ -1,5 +1,6 @@
 import argparse
 import os
+import zlib
 from typing import Callable, Optional, Union
 
 import numpy as np
@@ -326,6 +327,10 @@ def encode_datasets(
 ):
     """Common function to encode datasets. This function is called from multiple architecture scripts."""
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
+    num_shards = getattr(args, "num_shards", 1) or 1
+    shard_index = getattr(args, "shard_index", 0) or 0
+    if num_shards < 1 or not 0 <= shard_index < num_shards:
+        raise ValueError(f"--shard_index must be in [0, {num_shards}), got {shard_index} (num_shards={num_shards})")
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_latent_cache_paths = []
@@ -376,6 +381,17 @@ def encode_datasets(
                         item.content = [img[..., :3] if img.shape[-1] == 4 else img for img in item.content]
 
             all_latent_cache_paths.extend([item.latent_cache_path for item in batch])
+
+            if num_shards > 1:
+                # Retrieval order is executor completion order, not dataset order, so
+                # shard assignment keys on the item's cache path — stable across processes.
+                batch = [
+                    item
+                    for item in batch
+                    if zlib.crc32(os.path.normpath(item.latent_cache_path).encode()) % num_shards == shard_index
+                ]
+                if len(batch) == 0:
+                    continue
 
             if args.skip_existing:
                 if existing_latent_cache_paths is not None:
@@ -498,6 +514,20 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="number of existing caches validated in full before --faster_check trusts cache names (default 8)",
     )
     parser.add_argument("--keep_cache", action="store_true", help="keep cache files not in dataset")
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="split the dataset into this many shards; run one process per shard index (e.g. one per GPU) to parallelize"
+        " cache generation (default 1 = whole dataset)",
+    )
+    parser.add_argument(
+        "--shard_index",
+        type=int,
+        default=0,
+        help="which shard this process encodes; items are assigned by a stable hash of the cache path, so retrieval"
+        " order does not matter (default 0)",
+    )
     parser.add_argument("--debug_mode", type=str, default=None, choices=["image", "console", "video"], help="debug mode")
     parser.add_argument("--console_width", type=int, default=80, help="debug mode: console width")
     parser.add_argument(

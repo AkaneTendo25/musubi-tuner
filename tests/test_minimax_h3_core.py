@@ -5124,3 +5124,188 @@ def test_owner_purge_of_a_borrowed_directory_warns(tmp_path, caplog):
             [Stub(owner), Stub(borrower)], lambda batch: None, Namespace(num_workers=1, skip_existing=False, keep_cache=True)
         )
     assert not [r for r in caplog.records if "--keep_cache" in r.getMessage()]
+
+
+class _ShardLatentDataset:
+    """Minimal dataset stub for sharded encode_datasets: yields (key, items) batches
+    and owns a cache directory so purge bookkeeping runs."""
+
+    def __init__(self, tmp_path, n_items, batch_of=3):
+        self.latent_cache_directory = str(tmp_path / "latents")
+        self.cache_directory = self.latent_cache_directory
+        Path(self.latent_cache_directory).mkdir(parents=True, exist_ok=True)
+        self.items = [
+            ItemInfo(
+                f"clip_{i}",
+                "caption",
+                (512, 512),
+                (512, 512),
+                frame_count=22,
+                latent_cache_path=str(Path(self.latent_cache_directory) / f"clip_{i}_mmh3.safetensors"),
+            )
+            for i in range(n_items)
+        ]
+        for item in self.items:
+            item.content = None
+        self.batch_of = batch_of
+
+    def retrieve_latent_cache_batches(self, num_workers):
+        for i in range(0, len(self.items), self.batch_of):
+            yield ("key", self.items[i : i + self.batch_of])
+
+    def get_all_latent_cache_files(self):
+        return [str(p) for p in Path(self.latent_cache_directory).glob("*.safetensors")]
+
+
+def test_latent_cache_sharding_partitions_items_without_overlap(tmp_path):
+    from musubi_tuner import cache_latents
+
+    dataset = _ShardLatentDataset(tmp_path, 10)
+    encoded_per_shard = []
+    for shard_index in range(3):
+        encoded = []
+        cache_latents.encode_datasets(
+            [dataset],
+            lambda batch: encoded.extend(item.item_key for item in batch),
+            Namespace(num_workers=1, skip_existing=False, keep_cache=True, batch_size=4, num_shards=3, shard_index=shard_index),
+        )
+        encoded_per_shard.append(encoded)
+
+    flattened = [key for shard in encoded_per_shard for key in shard]
+    assert sorted(flattened) == [item.item_key for item in dataset.items]
+    for a in range(3):
+        for b in range(a + 1, 3):
+            assert not set(encoded_per_shard[a]) & set(encoded_per_shard[b])
+
+    # Assignment is keyed on the cache path, so a shuffled retrieval order
+    # reproduces the identical partition.
+    dataset.items = list(reversed(dataset.items))
+    encoded = []
+    cache_latents.encode_datasets(
+        [dataset],
+        lambda batch: encoded.extend(item.item_key for item in batch),
+        Namespace(num_workers=1, skip_existing=False, keep_cache=True, batch_size=4, num_shards=3, shard_index=0),
+    )
+    assert sorted(encoded) == sorted(encoded_per_shard[0])
+
+
+def test_latent_cache_shard_run_does_not_purge_other_shards_files(tmp_path):
+    import zlib
+
+    from musubi_tuner import cache_latents
+
+    dataset = _ShardLatentDataset(tmp_path, 6)
+    # An item whose cache path hashes to another shard — its file must survive
+    # shard 0's purge even though shard 0 never encodes it.
+    other_item = next(item for item in dataset.items if zlib.crc32(os.path.normpath(item.latent_cache_path).encode()) % 3 != 0)
+    other_shard_file = Path(other_item.latent_cache_path)
+    other_shard_file.write_bytes(b"latent")
+    stale = Path(dataset.latent_cache_directory) / "stray_mmh3.safetensors"
+    stale.write_bytes(b"latent")
+
+    cache_latents.encode_datasets(
+        [dataset],
+        lambda batch: None,
+        Namespace(num_workers=1, skip_existing=False, keep_cache=False, batch_size=4, num_shards=3, shard_index=0),
+    )
+    # Shard 0's run registers every item's path, so shard 1's existing cache survives;
+    # only genuinely stray files are purged.
+    assert other_shard_file.exists()
+    assert not stale.exists()
+
+
+def test_cache_sharding_rejects_out_of_range_index(tmp_path):
+    from musubi_tuner import cache_latents
+    from musubi_tuner.cache_text_encoder_outputs import process_text_encoder_batches
+
+    dataset = _ShardLatentDataset(tmp_path, 4)
+    with pytest.raises(ValueError, match="shard_index"):
+        cache_latents.encode_datasets(
+            [dataset],
+            lambda batch: None,
+            Namespace(num_workers=1, skip_existing=False, keep_cache=True, batch_size=4, num_shards=2, shard_index=2),
+        )
+    with pytest.raises(ValueError, match="shard_index"):
+        process_text_encoder_batches(1, False, 4, [dataset], [set()], [set()], lambda batch: None, num_shards=0, shard_index=0)
+
+
+class _ShardTextDataset:
+    """Caption-only stub for sharded process_text_encoder_batches."""
+
+    def __init__(self, tmp_path, n_items):
+        self.items = []
+        for i in range(n_items):
+            item = ItemInfo(f"clip_{i}", "caption", (512, 512), (512, 512), frame_count=22)
+            item.text_encoder_output_cache_path = str(tmp_path / f"clip_{i}_mmh3_te.safetensors")
+            self.items.append(item)
+
+    def retrieve_text_encoder_output_cache_batches(self, num_workers):
+        for i in range(0, len(self.items), 4):
+            yield self.items[i : i + 4]
+
+
+def test_text_encoder_cache_sharding_partitions_items(tmp_path):
+    from musubi_tuner.cache_text_encoder_outputs import process_text_encoder_batches
+
+    dataset = _ShardTextDataset(tmp_path, 9)
+    encoded_per_shard = []
+    for shard_index in range(4):
+        encoded = []
+        process_text_encoder_batches(
+            1,
+            False,
+            4,
+            [dataset],
+            [set()],
+            [set()],
+            lambda batch: encoded.extend(item.item_key for item in batch),
+            num_shards=4,
+            shard_index=shard_index,
+        )
+        encoded_per_shard.append(encoded)
+
+    flattened = [key for shard in encoded_per_shard for key in shard]
+    assert sorted(flattened) == [item.item_key for item in dataset.items]
+    for a in range(4):
+        for b in range(a + 1, 4):
+            assert not set(encoded_per_shard[a]) & set(encoded_per_shard[b])
+
+
+def test_text_encoder_sharding_composes_with_skip_existing(tmp_path):
+    import zlib
+
+    from musubi_tuner.cache_text_encoder_outputs import process_text_encoder_batches
+
+    dataset = _ShardTextDataset(tmp_path, 6)
+    owner = {
+        item.item_key: zlib.crc32(os.path.normpath(item.text_encoder_output_cache_path).encode()) % 2 for item in dataset.items
+    }
+    # Pre-create caches for every item shard 0 owns — only missing in-shard items get encoded.
+    existing = {os.path.normpath(item.text_encoder_output_cache_path) for item in dataset.items if owner[item.item_key] == 0}
+    encoded = []
+    process_text_encoder_batches(
+        1,
+        True,
+        4,
+        [dataset],
+        [existing],
+        [set()],
+        lambda batch: encoded.extend(item.item_key for item in batch),
+        num_shards=2,
+        shard_index=0,
+    )
+    assert encoded == []
+
+    encoded = []
+    process_text_encoder_batches(
+        1,
+        True,
+        4,
+        [dataset],
+        [existing],
+        [set()],
+        lambda batch: encoded.extend(item.item_key for item in batch),
+        num_shards=2,
+        shard_index=1,
+    )
+    assert encoded == [item.item_key for item in dataset.items if owner[item.item_key] == 1]

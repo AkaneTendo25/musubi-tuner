@@ -1,5 +1,6 @@
 import argparse
 import os
+import zlib
 from typing import Callable, Optional, Union
 
 import torch
@@ -84,12 +85,16 @@ def process_text_encoder_batches(
     existing_cache_valid: Optional[Callable[[ItemInfo, str], bool]] = None,
     faster_check: bool = False,
     faster_check_samples: int = FASTER_CACHE_PROBE_SAMPLES,
+    num_shards: int = 1,
+    shard_index: int = 0,
 ):
     """
     Architecture independent processing of text encoder batches.
     """
 
     num_workers = num_workers if num_workers is not None else max(1, os.cpu_count() - 1)
+    if num_shards < 1 or not 0 <= shard_index < num_shards:
+        raise ValueError(f"--shard_index must be in [0, {num_shards}), got {shard_index} (num_shards={num_shards})")
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_cache_files = all_cache_files_for_dataset[i]
@@ -144,6 +149,17 @@ def process_text_encoder_batches(
             # caption-only batches and image content batches.
             batch = unwrap_batch(batch)
             all_cache_paths.update([os.path.normpath(item.text_encoder_output_cache_path) for item in batch])
+
+            if num_shards > 1:
+                # Retrieval order is executor completion order, not dataset order, so
+                # shard assignment keys on the item's cache path — stable across processes.
+                batch = [
+                    item
+                    for item in batch
+                    if zlib.crc32(os.path.normpath(item.text_encoder_output_cache_path).encode()) % num_shards == shard_index
+                ]
+                if len(batch) == 0:
+                    continue
 
             # skip existing cache files
             if skip_existing:
@@ -238,6 +254,8 @@ def main():
         all_cache_paths_for_dataset,
         encode_for_text_encoder_1,
         faster_check=args.faster_check,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
     del text_encoder_1
 
@@ -262,6 +280,8 @@ def main():
         all_cache_paths_for_dataset,
         encode_for_text_encoder_2,
         faster_check=args.faster_check,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
     del text_encoder_2
 
@@ -292,6 +312,20 @@ def setup_parser_common():
         help="number of existing caches validated in full before --faster_check trusts cache names (default 8)",
     )
     parser.add_argument("--keep_cache", action="store_true", help="keep cache files not in dataset")
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="split the dataset into this many shards; run one process per shard index (e.g. one per GPU) to parallelize"
+        " cache generation (default 1 = whole dataset)",
+    )
+    parser.add_argument(
+        "--shard_index",
+        type=int,
+        default=0,
+        help="which shard this process encodes; items are assigned by a stable hash of the cache path, so retrieval"
+        " order does not matter (default 0)",
+    )
     return parser
 
 

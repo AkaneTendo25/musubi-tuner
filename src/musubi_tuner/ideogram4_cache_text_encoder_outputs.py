@@ -117,6 +117,8 @@ def main():
         requires_content=False,
         faster_check=args.faster_check,
         faster_check_samples=args.faster_check_samples,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
     cache_text_encoder_outputs.post_process_cache_files(
         datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache

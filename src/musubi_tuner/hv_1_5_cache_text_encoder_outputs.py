@@ -131,6 +131,8 @@ def main():
         encode_for_text_encoders,
         faster_check=args.faster_check,
         faster_check_samples=args.faster_check_samples,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
     del text_encoder_vlm, text_encoder_byt5
 

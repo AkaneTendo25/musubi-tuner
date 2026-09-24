@@ -510,6 +510,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         existing_cache_valid=existing_cache_valid,
         faster_check=args.faster_check,
         faster_check_samples=args.faster_check_samples,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
     encoder.close()
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files, all_cache_paths, args.keep_cache)

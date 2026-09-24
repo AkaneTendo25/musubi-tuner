@@ -104,6 +104,8 @@ def main():
         encode_for_text_encoder,
         faster_check=args.faster_check,
         faster_check_samples=args.faster_check_samples,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
     del text_encoder1
     del text_encoder2

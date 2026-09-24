@@ -166,6 +166,8 @@ def main():
         requires_content=args.is_edit,
         faster_check=args.faster_check,
         faster_check_samples=args.faster_check_samples,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
     del text_encoder
 

@@ -84,6 +84,8 @@ def main():
         requires_content=any(getattr(dataset, "has_control", False) for dataset in datasets),
         faster_check=args.faster_check,
         faster_check_samples=args.faster_check_samples,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
 
     cache_text_encoder_outputs.post_process_cache_files(
