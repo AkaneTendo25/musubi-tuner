@@ -316,14 +316,16 @@ class LoRAModule(torch.nn.Module):
         ):
             from musubi_tuner.modules.convrot_int8_utils import convrot_int8_lora_forward
 
-            return convrot_int8_lora_forward(
-                base_module,
-                x,
-                self.effective_down_weight(self.lora_down),
-                self.lora_up.weight,
-                self.multiplier * self.scale,
-            )
-        org_forwarded = self.org_forward(x)
+            with _profile_scope("h3.lora.convrot"):
+                return convrot_int8_lora_forward(
+                    base_module,
+                    x,
+                    self.effective_down_weight(self.lora_down),
+                    self.lora_up.weight,
+                    self.multiplier * self.scale,
+                )
+        with _profile_scope("h3.lora.base"):
+            org_forwarded = self.org_forward(x)
 
         # module dropout
         if self.module_dropout is not None and self.training:
