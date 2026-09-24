@@ -215,7 +215,56 @@ def test_h3_attention_auto_dispatch_is_opt_in_and_sdpa_only():
         flash_model.enable_attention_auto_dispatch()
 
 
-def test_h3_attention_auto_dispatch_keeps_cpu_on_ordinary_sdpa(monkeypatch):
+def test_h3_attention_autotune_is_opt_in_and_sdpa_only():
+    model = MiniMaxH3Transformer(_tiny_config())
+    attentions = [module for module in model.modules() if isinstance(module, h3_model.MiniMaxH3Attention)]
+
+    assert attentions
+    assert not any(module.attn_autotune for module in attentions)
+
+    model.enable_attention_autotune()
+
+    assert all(module.attn_autotune for module in attentions)
+
+    flash_model = MiniMaxH3Transformer(_tiny_config(), attention_mode="flash")
+    with pytest.raises(ValueError, match="requires SDPA"):
+        flash_model.enable_attention_autotune()
+
+
+def test_h3_attention_autotune_cpu_falls_back_to_sdpa():
+    torch.manual_seed(11)
+    module = h3_model.MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5)
+    reference = h3_model.MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5)
+    reference.load_state_dict(module.state_dict())
+    module.attn_autotune = True
+
+    inputs = torch.randn(1, 16, 16)
+    expected = reference(inputs)
+    actual = module(inputs)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_h3_attention_autotune_masked_calls_keep_plain_sdpa(monkeypatch):
+    called = []
+
+    def probe(query, key, value):
+        called.append(True)
+        return "torch"
+
+    monkeypatch.setattr(h3_model, "_autotune_attention_choice", probe)
+    module = h3_model.MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5)
+    module.attn_autotune = True
+
+    unmasked = torch.randn(1, 16, 16)
+    module(unmasked)
+    assert called  # unmasked call consults the probe
+
+    called.clear()
+    pairwise_mask = torch.ones(16, 16, dtype=torch.bool)
+    module(unmasked, None, pairwise_mask)
+    assert not called  # masked calls keep the exact SDPA path untouched
+
     def forbidden_priority(*_args, **_kwargs):
         raise AssertionError("CPU attention must not enter the cuDNN priority context")
 

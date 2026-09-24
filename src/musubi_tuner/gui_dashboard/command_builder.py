@@ -667,6 +667,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd.append(f"--{field}" if value else f"--no_{field}")
     if t.h3_attn_auto_dispatch:
         cmd.append("--h3_attn_auto_dispatch")
+    if t.h3_attn_autotune:
+        cmd.append("--h3_attn_autotune")
     if t.h3_int8_attention != "off":
         cmd += ["--h3_int8_attention", t.h3_int8_attention]
     if t.h3_lora_token_refiner:

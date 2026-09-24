@@ -4964,6 +4964,28 @@ def test_h3_attention_auto_dispatch_requires_sdpa():
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
+def test_h3_attention_autotune_requires_sdpa():
+    args = create_parser().parse_args(["--flash_attn", "--h3_attn_autotune"])
+
+    with pytest.raises(ValueError, match="requires --sdpa"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_attention_autotune_rejects_fixed_priority_dispatch():
+    args = create_parser().parse_args(["--sdpa", "--h3_attn_autotune", "--h3_attn_auto_dispatch"])
+
+    with pytest.raises(ValueError, match="redundant"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_attention_autotune_accepts_plain_sdpa():
+    args = create_parser().parse_args(["--sdpa", "--h3_attn_autotune"])
+
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.h3_attn_autotune is True
+
+
 def test_h3_trainer_warns_when_h2d_swap_uses_unpinned_host_memory(caplog):
     args = create_parser().parse_args(["--sdpa", "--blocks_to_swap", "2", "--block_swap_h2d_only"])
 

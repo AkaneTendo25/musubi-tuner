@@ -116,6 +116,93 @@ def _use_cudnn_auto_dispatch(query: torch.Tensor, key: torch.Tensor, value: torc
     )
 
 
+# One probe result per (sequence-length bucket, heads, head_dim, dtype, device) is
+# shared by every block -- all of them see the same packed sequence.
+_ATTN_AUTOTUNE_CACHE: dict[tuple, str] = {}
+_ATTN_AUTOTUNE_BUCKET = 4096
+_ATTN_AUTOTUNE_REPS = 3
+
+
+def _autotune_attention_choice(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> str:
+    """Time each runnable unmasked attention backend on the real Q/K/V once per shape, return the winner."""
+    if query.device.type != "cuda" or query.dtype not in {torch.float16, torch.bfloat16}:
+        return "torch"
+    cache_key = (
+        query.shape[1] // _ATTN_AUTOTUNE_BUCKET,
+        key.shape[1] // _ATTN_AUTOTUNE_BUCKET,
+        query.shape[2],
+        query.shape[3],
+        str(query.dtype),
+        query.device.index,
+    )
+    cached = _ATTN_AUTOTUNE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    def sdpa_call() -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), dropout_p=0.0, is_causal=False
+        )
+
+    candidates: list[tuple[str, Callable[[], torch.Tensor]]] = [("torch", sdpa_call)]
+    if sdpa_kernel is not None and _SDPA_HAS_SET_PRIORITY:
+
+        def cudnn_call() -> torch.Tensor:
+            with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
+                return sdpa_call()
+
+        candidates.append(("cudnn", cudnn_call))
+    import musubi_tuner.modules.attention as _attention_module
+
+    flash_funcs = {
+        "flash": _attention_module.flash_attn_func,
+        "flash3": _attention_module.flash_attn_3_func,
+        "flash4": _attention_module.flash_attn_4_func,
+    }
+    for mode, func in flash_funcs.items():
+        if func is None:
+            continue
+
+        def flash_call(mode: str = mode) -> torch.Tensor:
+            return musubi_attention([query, key, value], attn_params=AttentionParams.create_attention_params(mode, False))
+
+        candidates.append((mode, flash_call))
+
+    timings: dict[str, float] = {}
+    with torch.no_grad():
+        for name, call in candidates:
+            try:
+                call()  # warmup; also the validity probe -- a backend that rejects the shape is simply skipped
+            except Exception:
+                logger.debug("H3 attention autotune: %s rejected this call", name)
+                continue
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize(query.device)
+            start.record()
+            for _ in range(_ATTN_AUTOTUNE_REPS):
+                call()
+            end.record()
+            torch.cuda.synchronize(query.device)
+            timings[name] = start.elapsed_time(end)
+    if not timings:
+        _ATTN_AUTOTUNE_CACHE[cache_key] = "torch"
+        return "torch"
+    winner = min(timings, key=timings.get)
+    logger.info(
+        "H3 attention autotune: q~%d kv~%d rows, %d heads, dim %d, %s -> %s (%s)",
+        query.shape[1],
+        key.shape[1],
+        query.shape[2],
+        query.shape[3],
+        str(query.dtype).removeprefix("torch."),
+        winner,
+        ", ".join(f"{name} {ms / _ATTN_AUTOTUNE_REPS:.2f} ms" for name, ms in sorted(timings.items(), key=lambda item: item[1])),
+    )
+    _ATTN_AUTOTUNE_CACHE[cache_key] = winner
+    return winner
+
+
 SDPA_INT32_EXTENT = 2**31
 
 
@@ -303,6 +390,7 @@ class MiniMaxH3Attention(nn.Module):
         self.head_dim = head_dim
         self.attention_mode = attention_mode
         self.auto_dispatch = False
+        self.attn_autotune = False
         self.int8_attention = False
         self.block_sparse_config: BlockSparseConfig | None = None
         self.block_sparse_plan: SequencePlan | None = None
@@ -410,6 +498,29 @@ class MiniMaxH3Attention(nn.Module):
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
             hidden_states = int8_attention(query, key, value).transpose(1, 2).flatten(2, 3)
+        elif self.attn_autotune and attention_mask is None:
+            # Probed once per packed shape on the real Q/K/V: the CLI backend
+            # choice is only the fallback for masked calls now.
+            choice = _autotune_attention_choice(query, key, value)
+            if choice in {"flash", "flash3", "flash4"}:
+                hidden_states = musubi_attention(
+                    [query, key, value],
+                    attn_params=AttentionParams.create_attention_params(choice, False),
+                )
+            else:
+                query = query.transpose(1, 2)
+                key = key.transpose(1, 2)
+                value = value.transpose(1, 2)
+                if choice == "cudnn":
+                    with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
+                        hidden_states = F.scaled_dot_product_attention(
+                            query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
+                        )
+                else:
+                    hidden_states = F.scaled_dot_product_attention(
+                        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
+                    )
+                hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         elif self.attention_mode in {"flash", "flash3", "flash4"} and attention_mask is None:
             hidden_states = musubi_attention(
                 [query, key, value],
@@ -901,6 +1012,13 @@ class MiniMaxH3Transformer(nn.Module):
                 if module.attention_mode != "torch":
                     raise ValueError("MiniMax H3 attention auto-dispatch requires SDPA attention")
                 module.auto_dispatch = True
+
+    def enable_attention_autotune(self) -> None:
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                if module.attention_mode != "torch":
+                    raise ValueError("MiniMax H3 attention autotune requires SDPA attention")
+                module.attn_autotune = True
 
     def enable_fused_qk_norm_rope(self) -> None:
         for module in self.modules():

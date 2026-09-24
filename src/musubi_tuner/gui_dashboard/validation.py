@@ -1800,6 +1800,27 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_attn_autotune:
+            if not t.sdpa:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_attn_autotune",
+                        "H3 attention autotune requires SDPA.",
+                        label="H3 Attention Autotune",
+                        page="training",
+                    )
+                )
+            elif t.h3_attn_auto_dispatch:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_attn_autotune",
+                        "H3 attention autotune already probes cuDNN; auto-dispatch is redundant with it.",
+                        label="H3 Attention Autotune",
+                        page="training",
+                    )
+                )
         if t.blocks_to_swap is not None and t.blocks_to_swap < 0:
             errors.append(
                 _make_issue(

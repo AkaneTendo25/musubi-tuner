@@ -3817,6 +3817,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 training requires --sdpa, --flash_attn, --flash3, or --flash4")
         if args.h3_attn_auto_dispatch and not args.sdpa:
             raise ValueError("--h3_attn_auto_dispatch requires --sdpa")
+        if getattr(args, "h3_attn_autotune", False):
+            if not args.sdpa:
+                raise ValueError("--h3_attn_autotune requires --sdpa")
+            if args.h3_attn_auto_dispatch:
+                raise ValueError("--h3_attn_autotune already probes cuDNN; --h3_attn_auto_dispatch is redundant with it")
         if getattr(args, "h3_int8_attention", "off") != "off" and args.compile:
             raise ValueError("--h3_int8_attention cannot currently be combined with --compile")
         if getattr(args, "h3_compile_attention", "inline") == "opaque" and getattr(args, "compile_fullgraph", False):
@@ -4742,6 +4747,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise TypeError("H3 backend get_training_transformer() must return a torch.nn.Module")
         if args.h3_attn_auto_dispatch:
             transformer.enable_attention_auto_dispatch()
+        if getattr(args, "h3_attn_autotune", False):
+            transformer.enable_attention_autotune()
         if base_weight_paths:
             args.base_weights = None
             args.base_weights_multiplier = None
@@ -7923,6 +7930,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
             "ss_h3_guide_specs": str(getattr(args, "h3_guide_specs", "") or "none"),
             "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
+            "ss_h3_attn_autotune": str(bool(getattr(args, "h3_attn_autotune", False))),
             "ss_h3_fused_indexed_adaln": str(args.h3_fused_indexed_adaln),
             "ss_h3_fused_swiglu": str(args.h3_fused_swiglu),
             "ss_h3_fused_elementwise": str(getattr(args, "h3_fused_elementwise", False)),
@@ -8170,6 +8178,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "prioritize cuDNN SDPA for large maskless CUDA BF16/FP16 attention shapes; "
             "short, masked, CPU, and FP32 workloads retain ordinary SDPA"
+        ),
+    )
+    parser.add_argument(
+        "--h3_attn_autotune",
+        action="store_true",
+        help=(
+            "probe every runnable unmasked attention backend (plain SDPA, cuDNN-priority SDPA, and each installed "
+            "FlashAttention) on the real packed Q/K/V once per shape bucket and use the measured winner; "
+            "requires --sdpa and replaces --h3_attn_auto_dispatch's fixed priority with an actual timing. Masked, "
+            "block-sparse, and INT8 calls keep their existing paths"
         ),
     )
     parser.add_argument(

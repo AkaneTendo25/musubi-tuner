@@ -336,6 +336,7 @@ class TrainingConfig(BaseModel):
     h3_overlay_weights_multiplier: float = 1.0
     h3_overlay_training_only: bool = False
     h3_attn_auto_dispatch: bool = False
+    h3_attn_autotune: bool = False
     h3_int8_attention: Literal["off", "aux", "train"] = "off"
     h3_lora_token_refiner: bool = False
     h3_fused_qk_norm_rope: Optional[bool] = None

@@ -450,7 +450,7 @@ def _estimate_h3_training_step_time_sec(training: dict, dataset: dict, caching: 
             transfer_cost = 0.010 if training.get("block_swap_h2d_only") else 0.016
             step_time *= 1.0 + blocks_to_swap * transfer_cost
 
-    if training.get("h3_attn_auto_dispatch"):
+    if training.get("h3_attn_auto_dispatch") or training.get("h3_attn_autotune"):
         step_time *= 0.94
     if training.get("h3_fused_qk_norm_rope"):
         step_time *= 0.95
