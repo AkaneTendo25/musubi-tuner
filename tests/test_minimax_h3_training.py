@@ -3644,12 +3644,13 @@ def test_h3_fused_frozen_teachers_fall_back_before_sequential_rng_replay():
     assert network.events == [False, True, False, True, False, True]
 
 
-def _run_null_anchor_step(reuse_empty, *, null_source="frozen", guidance=True, fused=False):
+def _run_null_anchor_step(reuse_empty, *, null_source="frozen", guidance=True, fused=False, shared_draws=False):
     args = create_parser().parse_args([])
     args.h3_guidance_distillation_scale = 3.0 if guidance else None
     args.h3_guidance_null_source = null_source
     args.h3_guidance_null_anchor_weight = 0.7
     args.h3_null_anchor_reuse_empty = reuse_empty
+    args.h3_null_anchor_shared_draws = shared_draws
     args.h3_fuse_frozen_teachers = fused
     if fused:
         args.h3_base_preservation_loss_weight = 0.1
@@ -3725,6 +3726,22 @@ def test_h3_null_anchor_reuse_empty_stays_off_without_guidance():
 def test_h3_null_anchor_reuse_empty_reuses_paired_teacher_arm():
     fused = _run_null_anchor_step(True, fused=True)
     assert fused[2].calls == [(("empty", "prompt"), False), ("empty", True), ("prompt", True)]
+
+
+def test_h3_null_anchor_shared_draws_replays_student_rng():
+    baseline = _run_null_anchor_step(False)
+    shared = _run_null_anchor_step(False, shared_draws=True)
+
+    # calls: guidance empty (frozen), anchor student (grad), anchor reference
+    # (frozen), trainable pass. Without the flag the reference draws the
+    # continuation of the student's stream; with it the pair shares one draw.
+    assert baseline[2].calls == [("empty", False), ("empty", True), ("empty", False), ("prompt", True)]
+    assert shared[2].calls == baseline[2].calls
+    assert baseline[2].random_draws[1] != baseline[2].random_draws[2]
+    assert shared[2].random_draws[2] == shared[2].random_draws[1]
+    # The fork rolls back on exit, so the trainable pass's draw is untouched.
+    assert shared[2].random_draws[-1] == baseline[2].random_draws[-1]
+    assert "loss/guidance_null_anchor" in shared[1]
 
 
 def test_h3_auxiliary_forwards_use_forward_only_block_swap_then_restore_training():

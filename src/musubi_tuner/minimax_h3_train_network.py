@@ -3492,6 +3492,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "--h3_null_anchor_reuse_empty never engages without --h3_guidance_distillation_scale, "
                 "--h3_guidance_null_source frozen, and --h3_guidance_null_anchor_weight above 0"
             )
+        if getattr(args, "h3_null_anchor_shared_draws", False) and anchor_weight <= 0:
+            logger.warning("--h3_null_anchor_shared_draws never engages without --h3_guidance_null_anchor_weight above 0")
         if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
             raise ValueError("--h3_base_preservation_probability must be finite and lie in (0, 1]")
         if not math.isfinite(args.h3_dop_loss_weight) or args.h3_dop_loss_weight < 0:
@@ -7022,6 +7024,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 null_anchor_toggle = self._runtime_network_toggle(accelerator, network, "--h3_guidance_null_anchor_weight")
                 anchor_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
                 anchor_int8 = getattr(transformer, "int8_attention_context", None)
+                if getattr(args, "h3_null_anchor_shared_draws", False):
+                    # The same discipline the rollout pairs use: capture the entry RNG
+                    # so the frozen reference draws the SAME conditioning noise as the
+                    # student rather than the continuation of its stream. ``fork_rng``
+                    # alone would only restore the state the student left behind.
+                    anchor_cpu_rng = torch.get_rng_state()
+                    anchor_cuda_rng = [torch.cuda.get_rng_state(device) for device in anchor_devices]
                 with self._trainable_block_swap(transformer, auxiliary_block_swap):
                     null_anchor_student = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
                 if getattr(args, "h3_null_anchor_reuse_empty", False) and use_guidance and args.h3_guidance_null_source == "frozen":
@@ -7040,6 +7049,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         torch.no_grad(),
                         anchor_int8(auxiliary=True) if callable(anchor_int8) else nullcontext(),
                     ):
+                        if getattr(args, "h3_null_anchor_shared_draws", False):
+                            torch.set_rng_state(anchor_cpu_rng)
+                            for device, rng_state in zip(anchor_devices, anchor_cuda_rng):
+                                torch.cuda.set_rng_state(rng_state, device)
                         null_anchor_toggle(False)
                         try:
                             null_anchor_reference = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
@@ -7980,6 +7993,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_null_anchor_probability": str(_anchor_probability(args)),
             "ss_h3_guidance_null_anchor_sigma_min": str(float(getattr(args, "h3_guidance_null_anchor_sigma_min", 0.0) or 0.0)),
             "ss_h3_null_anchor_reuse_empty": str(bool(getattr(args, "h3_null_anchor_reuse_empty", False))),
+            "ss_h3_null_anchor_shared_draws": str(bool(getattr(args, "h3_null_anchor_shared_draws", False))),
             "ss_h3_rollout_supervision": str(bool(getattr(args, "h3_rollout_supervision", False))),
             "ss_h3_rollout_probability": str(args.h3_rollout_probability),
             "ss_h3_rollout_steps": str(args.h3_rollout_steps),
@@ -8953,6 +8967,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "prediction below sigma 0.5 and 0.7 above 0.9), so at low sigma the anchor pins the prompted branch as "
             "much as the empty one. Not a sparse estimator: nothing is rescaled. Reported as h3/null_anchor_active. "
             "0 (default) anchors at every sigma"
+        ),
+    )
+    parser.add_argument(
+        "--h3_null_anchor_shared_draws",
+        action="store_true",
+        help=(
+            "replay the anchored empty-prompt student's entry RNG for the frozen null-anchor reference, so the pair "
+            "describes one conditioning-noise sample like the rollout pairs do instead of the reference drawing the "
+            "continuation of the student's stream; no effect without an active --h3_guidance_null_anchor_weight, and "
+            "unused while --h3_null_anchor_reuse_empty supplies the reference"
         ),
     )
     parser.add_argument(
