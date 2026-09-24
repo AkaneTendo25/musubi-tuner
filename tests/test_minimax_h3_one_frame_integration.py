@@ -25,7 +25,8 @@ class ImageEncoder(torch.nn.Module):
         self.marker = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
 
     def encode_image(self, pixels):
-        return torch.full((1, 24, 1, 2, 2), float(pixels.mean()))
+        means = pixels.float().mean(dim=(1, 2, 3, 4))
+        return means.view(-1, 1, 1, 1, 1).expand(-1, 24, 1, 2, 2).contiguous()
 
     def encode_reference(self, pixels, *, image):
         assert image
@@ -83,7 +84,7 @@ def test_one_frame_encoder_preserves_three_control_slots_and_silent_audio(tmp_pa
     )
     silence_encoder = SilenceEncoder()
     encoder = _NativeLatentEncoder(ImageEncoder(), silence_encoder, torch.float32)
-    encoder._encode_references = lambda item: {}
+    encoder._encode_references = lambda item, references=None, pooled_video=None: {}
     (tensors,) = encoder.encode_latents([item])
     batch = {re.sub(r"_\d+x\d+x\d+$", "", logical_cache_key(key)): value for key, value in tensors.items()}
     assert batch["latents"].shape == (24, 1, 2, 2)

@@ -427,7 +427,10 @@ class MiniMaxH3VideoEncoderModel(nn.Module):
         moments = self._encode_clip(pixels) if image else self.encode_moments(pixels)
         latent_mean, latent_logvar = moments.chunk(2, dim=1)
         generator = torch.Generator(device="cpu").manual_seed(42)
-        noise = torch.randn(latent_mean.shape, generator=generator, dtype=torch.float32).to(latent_mean.device)
+        # Per-item noise shape broadcast over the batch: a stacked call then gives
+        # every item the identical draw a solo call would produce from this seed,
+        # which is what makes reference encodes batchable bit-exactly.
+        noise = torch.randn(latent_mean.shape[1:], generator=generator, dtype=torch.float32).to(latent_mean.device)
         latent = latent_mean.float() + torch.exp(0.5 * latent_logvar.float().clamp(-30.0, 20.0)) * noise
         # Ref2VA intentionally rounds the posterior sample before normalization.
         latent = latent.to(torch.float16).float()

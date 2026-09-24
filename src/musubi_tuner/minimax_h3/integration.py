@@ -2764,9 +2764,7 @@ class _NativeLatentEncoder:
         # region without turning every non-zero value into full-strength loss.
         return torch.cat(pooled).clamp_(0.0, 1.0).to(dtype=torch.float32)
 
-    def _encode_reference_video(self, content: np.ndarray, *, image: bool) -> torch.Tensor:
-        if self.video_encoder is None:
-            raise ValueError("MiniMax H3 visual references require --vae during latent caching")
+    def _reference_pixels(self, content: np.ndarray) -> torch.Tensor:
         if content.ndim == 3:
             content = content[None]
         pixels = torch.from_numpy(np.array(content, copy=True, order="C")).permute(3, 0, 1, 2).unsqueeze(0)
@@ -2775,9 +2773,30 @@ class _NativeLatentEncoder:
         pixels = pixels.to(device=device, dtype=torch.float32).div_(255.0)
         pixel_mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
         pixel_std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-        pixels = ((pixels - pixel_mean) / pixel_std).to(weight_dtype)
+        return ((pixels - pixel_mean) / pixel_std).to(weight_dtype)
+
+    def _encode_reference_video(self, content: np.ndarray, *, image: bool) -> torch.Tensor:
+        if self.video_encoder is None:
+            raise ValueError("MiniMax H3 visual references require --vae during latent caching")
+        pixels = self._reference_pixels(content)
         with torch.inference_mode():
             return self.video_encoder.encode_reference(pixels, image=image)[0].to(self.output_dtype)
+
+    def _encode_reference_video_batch(self, contents: list[np.ndarray], *, image: bool) -> list[torch.Tensor]:
+        """One VAE forward for several same-shape references/keyframes.
+
+        ``encode_reference`` draws its posterior noise per item from a fixed
+        seed, so the stacked call reproduces the per-item latents bit-exactly.
+        Callers must only group contents with identical pixel shapes.
+        """
+        if self.video_encoder is None:
+            raise ValueError("MiniMax H3 visual references require --vae during latent caching")
+        pixels = torch.cat([self._reference_pixels(content) for content in contents], dim=0)
+        with torch.inference_mode():
+            latents = self.video_encoder.encode_reference(pixels, image=image)
+        if latents.shape[0] != len(contents):
+            return [self._encode_reference_video(content, image=image) for content in contents]
+        return [latent.to(self.output_dtype) for latent in latents]
 
     def _encode_reference_audio(self, waveform: torch.Tensor) -> torch.Tensor:
         if self.audio_encoder is None:
@@ -2799,16 +2818,22 @@ class _NativeLatentEncoder:
             self._one_frame_silence_latents = cached
         return cached
 
-    def _encode_references(self, item: Any) -> dict[str, torch.Tensor]:
-        references = prepare_references(
-            item,
-            self.reference_image_short_edge,
-            self.reference_image_size_mode,
-            self.reference_image_max_pixels,
-            self.reference_video_short_edge,
-            self.reference_video_max_pixels,
-            self.reference_video_fps,
-        )
+    def _encode_references(
+        self,
+        item: Any,
+        references: list[Any] | None = None,
+        pooled_video: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if references is None:
+            references = prepare_references(
+                item,
+                self.reference_image_short_edge,
+                self.reference_image_size_mode,
+                self.reference_image_max_pixels,
+                self.reference_video_short_edge,
+                self.reference_video_max_pixels,
+                self.reference_video_fps,
+            )
         if not references:
             return {}
         video_rows: list[torch.Tensor] = []
@@ -2817,10 +2842,13 @@ class _NativeLatentEncoder:
         audio_lengths: list[int] = []
         kinds: list[int] = []
         aligned: list[bool] = []
-        for reference in references:
+        for ref_index, reference in enumerate(references):
             kinds.append(int(reference.kind))
             aligned.append(bool(reference.aligned_to_target))
-            if reference.kind is H3ReferenceKind.IMAGE:
+            latent = None
+            if pooled_video is not None and ref_index in pooled_video:
+                latent = pooled_video[ref_index]
+            elif reference.kind is H3ReferenceKind.IMAGE:
                 if reference.image is None:
                     raise ValueError("H3 prepared image reference has no image")
                 latent = self._encode_reference_video(np.asarray(reference.image), image=True)
@@ -2829,8 +2857,6 @@ class _NativeLatentEncoder:
                     raise ValueError("H3 prepared video reference has no frames")
                 frames = reference.frames[: trim_reference_frames(reference.frames.shape[0])]
                 latent = self._encode_reference_video(frames, image=False)
-            else:
-                latent = None
             if latent is None:
                 video_shapes.append((0, 0, 0))
             else:
@@ -2906,8 +2932,7 @@ class _NativeLatentEncoder:
         # Items in a bucket share resolution and frame count, so their visual
         # targets can run through the VAE as one batch per identical shape.
         # encode/encode_image read only the posterior mean, which makes the
-        # stacked call reproduce the per-item latents exactly; references stay
-        # per-item because encode_reference draws seeded posterior noise.
+        # stacked call reproduce the per-item latents exactly.
         grouped_latents: dict[int, torch.Tensor] = {}
         groups: dict[tuple[bool, tuple[int, ...]], list[int]] = {}
         for index, item in enumerate(batch):
@@ -2950,6 +2975,66 @@ class _NativeLatentEncoder:
             # dataset bucket size. A split also rescues batches that exceed VRAM.
             for start in range(0, len(indices), 4):
                 encode_indices(indices[start : start + 4])
+
+        # Reference-side encodes (visual references, keyframes, one-frame
+        # controls) batch the same way as targets: encode_reference draws its
+        # posterior noise per item from a fixed seed, so stacking same-shape
+        # inputs reproduces every solo call's latents exactly.
+        prepared_refs: dict[int, list[Any]] = {}
+        ref_pending: dict[tuple[bool, tuple[int, ...]], list[tuple[tuple[int, str, int], np.ndarray]]] = {}
+        for index, item in enumerate(batch):
+            references = list(
+                prepare_references(
+                    item,
+                    self.reference_image_short_edge,
+                    self.reference_image_size_mode,
+                    self.reference_image_max_pixels,
+                    self.reference_video_short_edge,
+                    self.reference_video_max_pixels,
+                    self.reference_video_fps,
+                )
+            )
+            prepared_refs[index] = references
+            for ref_index, reference in enumerate(references):
+                if reference.kind is H3ReferenceKind.IMAGE and reference.image is not None:
+                    content = np.asarray(reference.image)
+                    ref_pending.setdefault((True, tuple(content.shape)), []).append(((index, "ref", ref_index), content))
+                elif reference.kind is H3ReferenceKind.VIDEO and reference.frames is not None:
+                    frames = reference.frames[: trim_reference_frames(reference.frames.shape[0])]
+                    ref_pending.setdefault((False, tuple(frames.shape)), []).append(((index, "ref", ref_index), frames))
+            if getattr(item, "h3_target_mode", "av") == "audio":
+                continue
+            target = self._target_asset(item)
+            conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
+            is_image = target.modality is MediaModality.IMAGE and not conditioned_image
+            one_frame = bool(getattr(item, "h3_one_frame", False))
+            if one_frame and is_image:
+                width, height = item.bucket_size
+                for cindex, path in enumerate(item.h3_condition_paths):
+                    with Image.open(path) as image:
+                        content = np.asarray(image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)).copy()
+                    ref_pending.setdefault((True, tuple(content.shape)), []).append(((index, "ctrl", cindex), content))
+            if not is_image and not one_frame:
+                if conditioned_image:
+                    from musubi_tuner.minimax_h3.image_training import condition_images
+
+                    height, width = int(item.content.shape[1]), int(item.content.shape[2])
+                    first_content, last_content = tuple(
+                        np.asarray(image.resize((width, height), Image.Resampling.LANCZOS)).copy()
+                        for image in condition_images(item.h3_image_mode, item.h3_condition_paths)
+                    )
+                else:
+                    first_content, last_content = item.content[0], item.content[-1]
+                ref_pending.setdefault((True, tuple(first_content.shape)), []).append(((index, "kf", 0), first_content))
+                ref_pending.setdefault((True, tuple(last_content.shape)), []).append(((index, "kf", 1), last_content))
+        ref_pool: dict[tuple[int, str, int], torch.Tensor] = {}
+        for (image, _), jobs in ref_pending.items():
+            for start in range(0, len(jobs), 4):
+                chunk = jobs[start : start + 4]
+                latents = self._encode_reference_video_batch([content for _, content in chunk], image=image)
+                for (key, _), latent in zip(chunk, latents):
+                    ref_pool[key] = latent
+
         results = []
         for index, item in enumerate(batch):
             target = self._target_asset(item)
@@ -2969,7 +3054,10 @@ class _NativeLatentEncoder:
                 # An audio target has no video rows of its own, but Ref2VA references are
                 # cached exactly as they are for a video target: the packed sequence keeps
                 # the reference prefix and only the target video block is empty.
-                tensors.update(self._encode_references(item))
+                pooled = {
+                    slot: latent for (item_index, tag, slot), latent in ref_pool.items() if item_index == index and tag == "ref"
+                }
+                tensors.update(self._encode_references(item, prepared_refs[index], pooled))
                 results.append(tensors)
                 continue
             conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
@@ -3007,14 +3095,16 @@ class _NativeLatentEncoder:
                     }
                 )
                 width, height = item.bucket_size
-                for index, path in enumerate(item.h3_condition_paths):
-                    with Image.open(path) as image:
-                        content = np.asarray(image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)).copy()
-                    control = self._encode_reference_video(content, image=True)
+                for cindex, path in enumerate(item.h3_condition_paths):
+                    control = ref_pool.get((index, "ctrl", cindex))
+                    if control is None:
+                        with Image.open(path) as image:
+                            content = np.asarray(image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)).copy()
+                        control = self._encode_reference_video(content, image=True)
                     if control.shape != video[:, :1].shape:
                         raise ValueError("H3 one-frame control VAE output must match the target canvas")
                     control_shape = "x".join(str(value) for value in control.shape[-3:])
-                    tensors[f"latents_cond_{index:03d}_{control_shape}_{dtype_name}"] = control
+                    tensors[f"latents_cond_{cindex:03d}_{control_shape}_{dtype_name}"] = control
             if target_slots is not None:
                 # One authored mask covers every slot: it is pooled once on the
                 # single-frame grid and repeated along the slot axis.
@@ -3037,19 +3127,24 @@ class _NativeLatentEncoder:
                     }
                 )
             if not is_image:
-                if conditioned_image:
-                    from musubi_tuner.minimax_h3.image_training import condition_images
+                first = ref_pool.get((index, "kf", 0))
+                last = ref_pool.get((index, "kf", 1))
+                if first is None or last is None:
+                    if conditioned_image:
+                        from musubi_tuner.minimax_h3.image_training import condition_images
 
-                    height, width = int(item.content.shape[1]), int(item.content.shape[2])
-                    prepared = tuple(
-                        np.asarray(image.resize((width, height), Image.Resampling.LANCZOS)).copy()
-                        for image in condition_images(item.h3_image_mode, item.h3_condition_paths)
-                    )
-                    first_content, last_content = prepared
-                else:
-                    first_content, last_content = item.content[0], item.content[-1]
-                first = self._encode_reference_video(first_content, image=True)
-                last = self._encode_reference_video(last_content, image=True)
+                        height, width = int(item.content.shape[1]), int(item.content.shape[2])
+                        prepared = tuple(
+                            np.asarray(image.resize((width, height), Image.Resampling.LANCZOS)).copy()
+                            for image in condition_images(item.h3_image_mode, item.h3_condition_paths)
+                        )
+                        first_content, last_content = prepared
+                    else:
+                        first_content, last_content = item.content[0], item.content[-1]
+                    if first is None:
+                        first = self._encode_reference_video(first_content, image=True)
+                    if last is None:
+                        last = self._encode_reference_video(last_content, image=True)
                 keyframe_rows = torch.cat(
                     (
                         patchify_video_latents(first[None], VIDEO_DIT_PATCH_SIZE)[0],
@@ -3057,6 +3152,7 @@ class _NativeLatentEncoder:
                     )
                 )
                 tensors[f"varlen_{H3_KEYFRAME_VIDEO_ROWS_KEY}_{dtype_name}"] = keyframe_rows
-            tensors.update(self._encode_references(item))
+            pooled = {slot: latent for (item_index, tag, slot), latent in ref_pool.items() if item_index == index and tag == "ref"}
+            tensors.update(self._encode_references(item, prepared_refs[index], pooled))
             results.append(tensors)
         return tuple(results)

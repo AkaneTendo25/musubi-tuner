@@ -1681,7 +1681,9 @@ def test_native_latent_encoder_caches_references_for_an_audio_target():
     encoder = h3_integration._NativeLatentEncoder(None, None, torch.float32)
     latent_frames = temporal_shape(124).audio_latent_frames
     encoder._encode_audio = lambda item: (torch.zeros(2, 32, latent_frames), torch.ones(latent_frames, dtype=torch.bool))
-    encoder._encode_references = lambda item: {f"varlen_{H3_REFERENCE_KINDS_KEY}_int64": torch.tensor([0])}
+    encoder._encode_references = lambda item, references=None, pooled_video=None: {
+        f"varlen_{H3_REFERENCE_KINDS_KEY}_int64": torch.tensor([0])
+    }
     item = SimpleNamespace(
         item_key="tone.wav",
         h3_target_mode="audio",
@@ -2986,15 +2988,15 @@ def test_native_latent_encoder_caches_fl2va_keyframes_for_video_only_target():
 
         def encode_reference(self, pixels, *, image):
             assert image
-            value = float(pixels.mean())
-            self.anchor_values.append(value)
-            return torch.full((1, 24, 1, 2, 2), value)
+            means = pixels.float().mean(dim=(1, 2, 3, 4))
+            self.anchor_values.extend(means.tolist())
+            return means.view(-1, 1, 1, 1, 1).expand(-1, 24, 1, 2, 2).contiguous()
 
     video_encoder = VideoEncoder()
     audio_encoder = torch.nn.Linear(1, 1, bias=False)
     encoder = h3_integration._NativeLatentEncoder(video_encoder, audio_encoder, torch.float32)
     encoder._encode_audio = lambda item: (_ for _ in ()).throw(AssertionError("video-only target must not encode audio"))
-    encoder._encode_references = lambda item: {}
+    encoder._encode_references = lambda item, references=None, pooled_video=None: {}
     content = np.zeros((5, 32, 32, 3), dtype=np.uint8)
     content[-1] = 255
     item = SimpleNamespace(
@@ -3030,7 +3032,7 @@ def test_native_latent_encoder_uses_direct_image_vae_path_and_omits_audio():
 
     video_encoder = VideoEncoder()
     encoder = h3_integration._NativeLatentEncoder(video_encoder, None, torch.float32)
-    encoder._encode_references = lambda item: {}
+    encoder._encode_references = lambda item, references=None, pooled_video=None: {}
     item = SimpleNamespace(
         content=np.zeros((32, 32, 3), dtype=np.uint8),
         item_key="image.png",
@@ -3058,7 +3060,7 @@ def test_native_latent_encoder_bounds_image_batches_and_splits_on_oom():
 
     video_encoder = VideoEncoder()
     encoder = h3_integration._NativeLatentEncoder(video_encoder, None, torch.float32)
-    encoder._encode_references = lambda item: {}
+    encoder._encode_references = lambda item, references=None, pooled_video=None: {}
     items = [
         SimpleNamespace(
             content=np.zeros((32, 32, 3), dtype=np.uint8),
@@ -3090,7 +3092,7 @@ def test_native_latent_encoder_caches_image_and_separate_audio_targets():
         torch.zeros(2, 32, audio_frames),
         torch.ones(audio_frames, dtype=torch.bool),
     )
-    encoder._encode_references = lambda item: {}
+    encoder._encode_references = lambda item, references=None, pooled_video=None: {}
     item = SimpleNamespace(
         content=np.zeros((32, 32, 3), dtype=np.uint8),
         item_key="image.png",
@@ -3201,7 +3203,7 @@ def test_native_latent_encoder_uses_temporal_vae_external_controls_and_audio_for
     )
     video_encoder = VideoEncoder()
     encoder = h3_integration._NativeLatentEncoder(video_encoder, None, torch.float32)
-    encoder._encode_references = lambda item: {}
+    encoder._encode_references = lambda item, references=None, pooled_video=None: {}
     audio_frames = temporal_shape(5).audio_latent_frames
     encoder._encode_audio = lambda item: (
         torch.zeros(2, 32, audio_frames),
@@ -3244,7 +3246,7 @@ def test_native_latent_encoder_pools_pixel_loss_masks_to_h3_latent_windows():
         h3_media_assets=(MediaAsset(Path("masked.mp4"), MediaModality.VIDEO, "target"),),
     )
     encoder = h3_integration._NativeLatentEncoder(VideoEncoder(), None, torch.float32)
-    encoder._encode_references = lambda item: {}
+    encoder._encode_references = lambda item, references=None, pooled_video=None: {}
 
     (tensors,) = encoder.encode_latents([item])
 
