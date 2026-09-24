@@ -451,8 +451,36 @@ class MiniMaxH3ConditioningEncoder:
         null_instruction: bool = False,
         qwen_controls: tuple[H3PreparedReference, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        job = self._build_presentation(
+            prompt,
+            images,
+            references,
+            null_instruction=null_instruction,
+            qwen_controls=qwen_controls,
+        )
+        return self._run_presentation_jobs([job])[0], job["tags"]
+
+    def _build_presentation(
+        self,
+        prompt: str,
+        images: list[Image.Image] | None = None,
+        references: tuple[H3PreparedReference, ...] | None = None,
+        null_instruction: bool = False,
+        qwen_controls: tuple[H3PreparedReference, ...] | None = None,
+        vision_cache: dict | None = None,
+    ) -> dict[str, Any]:
         if images and references:
             raise ValueError("H3 conditioning accepts keyframes or Ref2VA references, not both")
+        # The memo key uses the caller's objects: capping below rebuilds
+        # H3PreparedReference rows each call, but the visuals a presentation
+        # shows are a pure function of the passed sets.
+        vision_key = None
+        if vision_cache is not None:
+            vision_key = (
+                tuple(id(image) for image in images or ()),
+                tuple(id(reference) for reference in references or ()),
+                tuple(id(control) for control in qwen_controls or ()),
+            )
         if references:
             references = _cap_reference_visuals(references, self.text_visual_max_pixels)
         # Qwen control visuals are a third population: they compose with either of
@@ -486,42 +514,77 @@ class MiniMaxH3ConditioningEncoder:
                 control_images.append(control.image)
         image_token_counts: list[int] = []
         control_image_token_counts: list[int] = []
-        if prepared_images or control_images:
-            # One processor call keeps the flattened patch tensor in the same
-            # order the vision spans are emitted in: primaries first, controls
-            # after them.
-            vision = self.processor.image_processor(images=[*prepared_images, *control_images], return_tensors="pt")
-            pixel_values = vision["pixel_values"]
-            image_grid_thw = vision["image_grid_thw"]
-            counts = [int(grid.prod()) // merge_size for grid in image_grid_thw]
-            image_token_counts = counts[: len(prepared_images)]
-            control_image_token_counts = counts[len(prepared_images) :]
-
         video_token_counts: list[int] = []
         control_video_token_counts: list[int] = []
         videos = [reference for reference in references or () if reference.kind is H3ReferenceKind.VIDEO]
         control_videos = [control for control in qwen_controls if control.kind is H3ReferenceKind.VIDEO]
-        if videos or control_videos:
-            if any(reference.frames is None for reference in (*videos, *control_videos)):
-                raise ValueError("H3 prepared video reference has no frames")
-            sampled = [
-                sample_reference_video_frames(reference.frames, reference.sample_fps) for reference in (*videos, *control_videos)
-            ]
-            for reference, (_, timestamps) in zip((*videos, *control_videos), sampled):
-                reference.block_timestamps = timestamps
-            vision = self.processor.video_processor(
-                videos=[np.stack(frames) for frames, _ in sampled],
-                do_sample_frames=False,
-                return_tensors="pt",
-            )
-            pixel_values_videos = vision["pixel_values_videos"]
-            video_grid_thw = vision["video_grid_thw"]
-            counts = [int(grid[1]) * int(grid[2]) // merge_size for grid in video_grid_thw]
-            video_token_counts = counts[: len(videos)]
-            control_video_token_counts = counts[len(videos) :]
-            for reference, grid in zip((*videos, *control_videos), video_grid_thw):
-                if int(grid[0]) != len(reference.block_timestamps):
-                    raise ValueError("H3 reference video timestamps do not match Qwen3-VL vision blocks")
+        # Presentations of one item repeat identical visual sets (main, null and
+        # DOP twins share every image and frame); the processor outputs are pure
+        # functions of those objects, so a per-item memo keyed by object identity
+        # skips the repeated preprocessing without changing any bytes.
+        if vision_key is not None:
+            cached_vision = vision_cache.get(vision_key)
+            if cached_vision is not None:
+                (
+                    pixel_values,
+                    image_grid_thw,
+                    image_token_counts,
+                    control_image_token_counts,
+                    pixel_values_videos,
+                    video_grid_thw,
+                    video_token_counts,
+                    control_video_token_counts,
+                    cached_timestamps,
+                ) = cached_vision
+                for reference, timestamps in zip((*videos, *control_videos), cached_timestamps):
+                    reference.block_timestamps = list(timestamps)
+        if vision_key is None or vision_key not in vision_cache:
+            cached_timestamps: list[list[float]] = []
+            if prepared_images or control_images:
+                # One processor call keeps the flattened patch tensor in the same
+                # order the vision spans are emitted in: primaries first, controls
+                # after them.
+                vision = self.processor.image_processor(images=[*prepared_images, *control_images], return_tensors="pt")
+                pixel_values = vision["pixel_values"]
+                image_grid_thw = vision["image_grid_thw"]
+                counts = [int(grid.prod()) // merge_size for grid in image_grid_thw]
+                image_token_counts = counts[: len(prepared_images)]
+                control_image_token_counts = counts[len(prepared_images) :]
+            if videos or control_videos:
+                if any(reference.frames is None for reference in (*videos, *control_videos)):
+                    raise ValueError("H3 prepared video reference has no frames")
+                sampled = [
+                    sample_reference_video_frames(reference.frames, reference.sample_fps)
+                    for reference in (*videos, *control_videos)
+                ]
+                for reference, (_, timestamps) in zip((*videos, *control_videos), sampled):
+                    reference.block_timestamps = timestamps
+                cached_timestamps = [list(timestamps) for _, timestamps in sampled]
+                vision = self.processor.video_processor(
+                    videos=[np.stack(frames) for frames, _ in sampled],
+                    do_sample_frames=False,
+                    return_tensors="pt",
+                )
+                pixel_values_videos = vision["pixel_values_videos"]
+                video_grid_thw = vision["video_grid_thw"]
+                counts = [int(grid[1]) * int(grid[2]) // merge_size for grid in video_grid_thw]
+                video_token_counts = counts[: len(videos)]
+                control_video_token_counts = counts[len(videos) :]
+                for reference, grid in zip((*videos, *control_videos), video_grid_thw):
+                    if int(grid[0]) != len(reference.block_timestamps):
+                        raise ValueError("H3 reference video timestamps do not match Qwen3-VL vision blocks")
+            if vision_key is not None:
+                vision_cache[vision_key] = (
+                    pixel_values,
+                    image_grid_thw,
+                    image_token_counts,
+                    control_image_token_counts,
+                    pixel_values_videos,
+                    video_grid_thw,
+                    video_token_counts,
+                    control_video_token_counts,
+                    cached_timestamps,
+                )
 
         def emit_text(value: str) -> None:
             ids = self.tokenizer(value, add_special_tokens=False)["input_ids"]
@@ -603,39 +666,88 @@ class MiniMaxH3ConditioningEncoder:
         if not token_ids:
             hidden = torch.empty((0, self.model.config.text_config.hidden_size), dtype=self.output_dtype)
             tags = torch.empty((0,), dtype=torch.long)
-            return hidden, tags
+            return {"token_ids": token_ids, "tags": tags, "empty": True}
         if len(token_ids) > 32_768:
             raise ValueError(f"MiniMax H3 Qwen3-VL presentation has {len(token_ids)} tokens; maximum is 32768")
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.model.device)
-        mm_token_type_ids = torch.zeros_like(input_ids)
+        return {
+            "token_ids": token_ids,
+            "tags": torch.tensor(token_tags, dtype=torch.long),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "empty": False,
+        }
+
+    def _run_presentation_jobs(self, jobs: list[dict[str, Any]], chunk_size: int = 8) -> list[torch.Tensor]:
+        """Run several presentations through Qwen3-VL in padded batched forwards.
+
+        Each item's cached presentations (main, null twin, modality variants,
+        control-dropout twins) differ only in token layout; batching them into
+        right-padded rows turns ~12 sequential forwards into ~2 launches while
+        each job keeps its own pixel rows and grid tables. Outputs are sliced
+        back to per-presentation lengths.
+        """
+        hidden_size = self.model.config.text_config.hidden_size
+        outputs: list[torch.Tensor | None] = [None] * len(jobs)
+        order = sorted(
+            (index for index, job in enumerate(jobs) if not job["empty"]),
+            key=lambda index: len(jobs[index]["token_ids"]),
+        )
         image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         video_pad_id = self.tokenizer.convert_tokens_to_ids("<|video_pad|>")
-        mm_token_type_ids[input_ids == image_pad_id] = 1
-        mm_token_type_ids[input_ids == video_pad_id] = 2
-        with torch.no_grad():
-            bnb_logger = logging.getLogger("bitsandbytes.autograd._functions")
-            previous_bnb_level = bnb_logger.level
-            if getattr(self.model, "is_loaded_in_8bit", False):
-                bnb_logger.setLevel(logging.ERROR)
-            try:
-                hidden = self.model(
-                    input_ids=input_ids,
-                    attention_mask=torch.ones_like(input_ids),
-                    mm_token_type_ids=mm_token_type_ids,
-                    pixel_values=None if pixel_values is None else pixel_values.to(self.model.device, dtype=self.model.dtype),
-                    image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.model.device),
-                    pixel_values_videos=(
-                        None if pixel_values_videos is None else pixel_values_videos.to(self.model.device, dtype=self.model.dtype)
-                    ),
-                    video_grid_thw=None if video_grid_thw is None else video_grid_thw.to(self.model.device),
-                    use_cache=False,
-                    return_dict=True,
-                ).last_hidden_state[0]
-            finally:
-                bnb_logger.setLevel(previous_bnb_level)
-        hidden = hidden.to(dtype=self.output_dtype, device="cpu")
-        tags = torch.tensor(token_tags, dtype=torch.long)
-        return hidden, tags
+        bnb_logger = logging.getLogger("bitsandbytes.autograd._functions")
+        for start in range(0, len(order), chunk_size):
+            chunk = order[start : start + chunk_size]
+            lengths = [len(jobs[index]["token_ids"]) for index in chunk]
+            width = max(lengths)
+            input_ids = torch.zeros((len(chunk), width), dtype=torch.long, device=self.model.device)
+            attention_mask = torch.zeros_like(input_ids)
+            for row, (index, length) in enumerate(zip(chunk, lengths)):
+                input_ids[row, :length] = torch.tensor(jobs[index]["token_ids"], dtype=torch.long, device=self.model.device)
+                attention_mask[row, :length] = 1
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[input_ids == image_pad_id] = 1
+            mm_token_type_ids[input_ids == video_pad_id] = 2
+            pixel_chunks = [jobs[index]["pixel_values"] for index in chunk if jobs[index]["pixel_values"] is not None]
+            video_chunks = [jobs[index]["pixel_values_videos"] for index in chunk if jobs[index]["pixel_values_videos"] is not None]
+            pixel_values = torch.cat(pixel_chunks, dim=0) if pixel_chunks else None
+            image_grid_thw = (
+                torch.cat([jobs[index]["image_grid_thw"] for index in chunk if jobs[index]["image_grid_thw"] is not None], dim=0)
+                if pixel_chunks
+                else None
+            )
+            pixel_values_videos = torch.cat(video_chunks, dim=0) if video_chunks else None
+            video_grid_thw = (
+                torch.cat([jobs[index]["video_grid_thw"] for index in chunk if jobs[index]["video_grid_thw"] is not None], dim=0)
+                if video_chunks
+                else None
+            )
+            with torch.no_grad():
+                previous_bnb_level = bnb_logger.level
+                if getattr(self.model, "is_loaded_in_8bit", False):
+                    bnb_logger.setLevel(logging.ERROR)
+                try:
+                    hidden = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        mm_token_type_ids=mm_token_type_ids,
+                        pixel_values=None if pixel_values is None else pixel_values.to(self.model.device, dtype=self.model.dtype),
+                        image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.model.device),
+                        pixel_values_videos=(
+                            None
+                            if pixel_values_videos is None
+                            else pixel_values_videos.to(self.model.device, dtype=self.model.dtype)
+                        ),
+                        video_grid_thw=None if video_grid_thw is None else video_grid_thw.to(self.model.device),
+                        use_cache=False,
+                        return_dict=True,
+                    ).last_hidden_state
+                finally:
+                    bnb_logger.setLevel(previous_bnb_level)
+            for row, (index, length) in enumerate(zip(chunk, lengths)):
+                outputs[index] = hidden[row, :length].to(dtype=self.output_dtype, device="cpu")
+        return [output if output is not None else torch.empty((0, hidden_size), dtype=self.output_dtype) for output in outputs]
 
     def _null_token_id(self) -> int:
         """The filler token that stands in for a removed instruction."""
@@ -841,6 +953,18 @@ class MiniMaxH3ConditioningEncoder:
         dtype_name = dtype_to_str(self.output_dtype)
         results = []
         for item in batch:
+            # One item's presentations (main, null, DOP, modality variants,
+            # control-dropout twins) are encoded as deferred jobs and flushed
+            # through a single padded batch at the end; the vision memo is safe
+            # only while this item's prepared references are alive, so it is
+            # scoped to the item.
+            vision_cache: dict = {}
+            pending: list[tuple[str, str, dict[str, Any]]] = []
+
+            def enqueue(hidden_key: str, tags_key: str, *args: Any, **kwargs: Any) -> None:
+                job = self._build_presentation(*args, vision_cache=vision_cache, **kwargs)
+                pending.append((hidden_key, tags_key, job))
+
             all_references = (
                 prepare_references(
                     item,
@@ -870,19 +994,17 @@ class MiniMaxH3ConditioningEncoder:
             images = self._images_for_item(item)
             if self.reference_route != "dual":
                 images, references = self._route_presentation(item, images, all_references)
-            hidden, tags = self._encode_prompt(item.caption, images, references, qwen_controls=qwen_controls)
+            enqueue(H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY, item.caption, images, references, qwen_controls=qwen_controls)
             tensors = {
-                f"varlen_{H3_TEXT_HIDDEN_KEY}_{dtype_name}": hidden,
-                f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
                 H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
             if dop_trigger is not None:
                 if self.task in ("ref2va", "ref2va_omni"):
                     raise ValueError("H3 DOP conditioning is not supported for Ref2VA")
                 dop_caption = rewrite_dop_caption(item.caption, dop_trigger, dop_class_prompt or "", dop_caption_mode)
-                dop_hidden, dop_tags = self._encode_prompt(dop_caption, images, references, qwen_controls=qwen_controls)
-                tensors[f"varlen_{H3_DOP_TEXT_HIDDEN_KEY}_{dtype_name}"] = dop_hidden
-                tensors[f"varlen_{H3_DOP_TEXT_TOKEN_TAGS_KEY}_int64"] = dop_tags
+                enqueue(
+                    H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY, dop_caption, images, references, qwen_controls=qwen_controls
+                )
                 tensors[H3_DOP_CONFIG_CACHE_KEY] = dop_config_identity(dop_trigger, dop_class_prompt or "", dop_caption_mode)
             if aligned_guide_count:
                 tensors[H3_ALIGNED_GUIDE_COUNT_KEY] = torch.tensor(aligned_guide_count, dtype=torch.long)
@@ -902,9 +1024,13 @@ class MiniMaxH3ConditioningEncoder:
                 # span apart from a keyframe or reference span.
                 tensors[H3_QWEN_CONTROL_VISUALS_KEY] = torch.tensor(len(qwen_controls), dtype=torch.long)
             if control_dropout:
-                dropped_hidden, dropped_tags = self._encode_prompt(item.caption, images, references)
-                tensors[f"varlen_{qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY)}_{dtype_name}"] = dropped_hidden
-                tensors[f"varlen_{qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY)}_int64"] = dropped_tags
+                enqueue(
+                    qwen_control_dropout_key(H3_TEXT_HIDDEN_KEY),
+                    qwen_control_dropout_key(H3_TEXT_TOKEN_TAGS_KEY),
+                    item.caption,
+                    images,
+                    references,
+                )
             probabilities = getattr(item, "h3_reference_modality_probabilities", None)
             if probabilities is not None:
                 if references is None:
@@ -914,31 +1040,37 @@ class MiniMaxH3ConditioningEncoder:
                     if modality == "av" or probability <= 0:
                         continue
                     variant = reference_modality_variant(references, modality)
-                    variant_hidden, variant_tags = self._encode_prompt(
-                        item.caption, references=variant, qwen_controls=qwen_controls
+                    enqueue(
+                        reference_variant_key(H3_TEXT_HIDDEN_KEY, modality),
+                        reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality),
+                        item.caption,
+                        references=variant,
+                        qwen_controls=qwen_controls,
                     )
-                    tensors[f"varlen_{reference_variant_key(H3_TEXT_HIDDEN_KEY, modality)}_{dtype_name}"] = variant_hidden
-                    tensors[f"varlen_{reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = variant_tags
                     if control_dropout:
-                        dropped_variant_hidden, dropped_variant_tags = self._encode_prompt(item.caption, references=variant)
-                        hidden_key = qwen_control_dropout_key(reference_variant_key(H3_TEXT_HIDDEN_KEY, modality))
-                        tags_key = qwen_control_dropout_key(reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality))
-                        tensors[f"varlen_{hidden_key}_{dtype_name}"] = dropped_variant_hidden
-                        tensors[f"varlen_{tags_key}_int64"] = dropped_variant_tags
-                    if include_empty:
-                        empty_hidden, empty_tags = self._encode_prompt(
-                            item.caption, references=variant, null_instruction=True, qwen_controls=qwen_controls
+                        enqueue(
+                            qwen_control_dropout_key(reference_variant_key(H3_TEXT_HIDDEN_KEY, modality)),
+                            qwen_control_dropout_key(reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality)),
+                            item.caption,
+                            references=variant,
                         )
-                        tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality)}_{dtype_name}"] = empty_hidden
-                        tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = empty_tags
+                    if include_empty:
+                        enqueue(
+                            reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality),
+                            reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality),
+                            item.caption,
+                            references=variant,
+                            null_instruction=True,
+                            qwen_controls=qwen_controls,
+                        )
                         if control_dropout:
-                            dropped_empty_hidden, dropped_empty_tags = self._encode_prompt(
-                                item.caption, references=variant, null_instruction=True
+                            enqueue(
+                                qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality)),
+                                qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality)),
+                                item.caption,
+                                references=variant,
+                                null_instruction=True,
                             )
-                            hidden_key = qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality))
-                            tags_key = qwen_control_dropout_key(reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality))
-                            tensors[f"varlen_{hidden_key}_{dtype_name}"] = dropped_empty_hidden
-                            tensors[f"varlen_{tags_key}_int64"] = dropped_empty_tags
             if self.task in ("ref2va", "ref2va_omni"):
                 tensors[H3_REFERENCE_IMAGE_SHORT_EDGE_KEY] = torch.tensor(self.reference_image_short_edge, dtype=torch.long)
                 tensors[H3_REFERENCE_IMAGE_SIZE_MODE_KEY] = torch.tensor(
@@ -953,16 +1085,27 @@ class MiniMaxH3ConditioningEncoder:
                         H3_REFERENCE_TEMPORAL_CONTRACT_VERSION, dtype=torch.long
                     )
             if include_empty:
-                empty_hidden, empty_tags = self._encode_prompt(
-                    item.caption, images, references, null_instruction=True, qwen_controls=qwen_controls
+                enqueue(
+                    H3_EMPTY_TEXT_HIDDEN_KEY,
+                    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+                    item.caption,
+                    images,
+                    references,
+                    null_instruction=True,
+                    qwen_controls=qwen_controls,
                 )
-                tensors[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_{dtype_name}"] = empty_hidden
-                tensors[f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64"] = empty_tags
                 if control_dropout:
-                    dropped_empty_hidden, dropped_empty_tags = self._encode_prompt(
-                        item.caption, images, references, null_instruction=True
+                    enqueue(
+                        qwen_control_dropout_key(H3_EMPTY_TEXT_HIDDEN_KEY),
+                        qwen_control_dropout_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY),
+                        item.caption,
+                        images,
+                        references,
+                        null_instruction=True,
                     )
-                    tensors[f"varlen_{qwen_control_dropout_key(H3_EMPTY_TEXT_HIDDEN_KEY)}_{dtype_name}"] = dropped_empty_hidden
-                    tensors[f"varlen_{qwen_control_dropout_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY)}_int64"] = dropped_empty_tags
+            hiddens = self._run_presentation_jobs([job for _, _, job in pending])
+            for (hidden_key, tags_key, job), hidden in zip(pending, hiddens):
+                tensors[f"varlen_{hidden_key}_{dtype_name}"] = hidden
+                tensors[f"varlen_{tags_key}_int64"] = job["tags"]
             results.append(tensors)
         return tuple(results)

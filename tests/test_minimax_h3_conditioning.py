@@ -143,8 +143,10 @@ def test_empty_conditioning_preserves_the_prompt_row_count():
     empty_tags = result[f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64"]
     assert empty_hidden.shape == hidden.shape
     assert torch.equal(empty_tags, result[f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64"])
-    # Instruction rows carry the filler token, not the caption.
-    positive_ids, null_ids = model.calls[0][0], model.calls[1][0]
+    # Instruction rows carry the filler token, not the caption. Presentations are
+    # batched into one padded forward: row order follows enqueue order.
+    batched_ids = model.calls[0][0]
+    positive_ids, null_ids = batched_ids[0:1], batched_ids[1:2]
     assert not torch.equal(positive_ids, null_ids)
     assert torch.equal(null_ids, torch.full((1, 3), _Tokenizer.pad_token_id, dtype=torch.long))
 
@@ -175,8 +177,11 @@ def test_null_conditioning_keeps_the_vision_prefix_intact():
     assert empty_hidden.shape == hidden.shape
     # The trailing two instruction rows became filler; everything before them,
     # including both vision blocks, is byte-identical to the positive branch.
+    # Batched forward: row 0 is the prompted presentation, row 1 the null twin.
     prefix = hidden.shape[0] - 2
-    (positive_ids, positive_types), (null_ids, null_types) = model.calls[0], model.calls[1]
+    batched_ids, batched_types = model.calls[0]
+    positive_ids, null_ids = batched_ids[0:1], batched_ids[1:2]
+    positive_types, null_types = batched_types[0:1], batched_types[1:2]
     assert torch.equal(null_ids[0, prefix:], torch.full((2,), _Tokenizer.pad_token_id, dtype=torch.long))
     assert torch.equal(null_ids[0, :prefix], positive_ids[0, :prefix])
     assert torch.equal(null_types, positive_types)
@@ -336,8 +341,16 @@ def test_ref2va_video_conditioning_records_reference_temporal_contract(monkeypat
     monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_references", lambda *_args, **_kwargs: references)
     monkeypatch.setattr(
         encoder,
-        "_encode_prompt",
-        lambda *_args, **_kwargs: (torch.zeros(2, 5120, dtype=torch.bfloat16), torch.ones(2, dtype=torch.long)),
+        "_build_presentation",
+        lambda *_args, **_kwargs: {
+            "token_ids": [0, 0],
+            "tags": torch.ones(2, dtype=torch.long),
+            "pixel_values": None,
+            "image_grid_thw": None,
+            "pixel_values_videos": None,
+            "video_grid_thw": None,
+            "empty": False,
+        },
     )
     item = SimpleNamespace(caption="video reference", content=np.zeros((5, 4, 4, 3), dtype=np.uint8))
 
@@ -359,9 +372,17 @@ def test_aligned_external_guide_is_cached_but_not_presented_to_qwen(monkeypatch)
 
     def encode(_caption, _images=(), references=(), **_kwargs):
         observed["references"] = references
-        return torch.zeros(2, 5120, dtype=torch.bfloat16), torch.ones(2, dtype=torch.long)
+        return {
+            "token_ids": [0, 0],
+            "tags": torch.ones(2, dtype=torch.long),
+            "pixel_values": None,
+            "image_grid_thw": None,
+            "pixel_values_videos": None,
+            "video_grid_thw": None,
+            "empty": False,
+        }
 
-    monkeypatch.setattr(encoder, "_encode_prompt", encode)
+    monkeypatch.setattr(encoder, "_build_presentation", encode)
     cached = encoder.encode_conditioning([SimpleNamespace(caption="prompt")])[0]
 
     assert observed["references"] == (ordinary,)
