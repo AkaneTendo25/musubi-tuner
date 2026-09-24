@@ -4749,6 +4749,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             transformer.enable_attention_auto_dispatch()
         if getattr(args, "h3_attn_autotune", False):
             transformer.enable_attention_autotune()
+        if getattr(args, "h3_varlen_padding", False):
+            transformer.enable_varlen_padding()
         if base_weight_paths:
             args.base_weights = None
             args.base_weights_multiplier = None
@@ -7931,6 +7933,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guide_specs": str(getattr(args, "h3_guide_specs", "") or "none"),
             "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
             "ss_h3_attn_autotune": str(bool(getattr(args, "h3_attn_autotune", False))),
+            "ss_h3_varlen_padding": str(bool(getattr(args, "h3_varlen_padding", False))),
             "ss_h3_fused_indexed_adaln": str(args.h3_fused_indexed_adaln),
             "ss_h3_fused_swiglu": str(args.h3_fused_swiglu),
             "ss_h3_fused_elementwise": str(getattr(args, "h3_fused_elementwise", False)),
@@ -8188,6 +8191,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "FlashAttention) on the real packed Q/K/V once per shape bucket and use the measured winner; "
             "requires --sdpa and replaces --h3_attn_auto_dispatch's fixed priority with an actual timing. Masked, "
             "block-sparse, and INT8 calls keep their existing paths"
+        ),
+    )
+    parser.add_argument(
+        "--h3_varlen_padding",
+        action="store_true",
+        help=(
+            "run [B,1,S] key-validity padding masks as a flat flash-attn varlen call: each row's valid tokens are "
+            "gathered, attended once, and scattered back instead of paying the O(S^2) masked SDPA path on every "
+            "block. Semantics are identical (pad-row outputs are discarded downstream); requires flash_attn and "
+            "falls back to masked SDPA when unavailable or when the mask is pairwise"
         ),
     )
     parser.add_argument(

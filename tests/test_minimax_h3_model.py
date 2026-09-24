@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.nn import functional as F
 from accelerate import init_empty_weights
 from safetensors.torch import save_file
 
@@ -275,6 +276,98 @@ def test_h3_attention_autotune_masked_calls_keep_plain_sdpa(monkeypatch):
     output = module(torch.randn(1, 16, 16))
 
     assert output.shape == (1, 16, 16)
+
+
+def _fake_varlen_attention(query, key, value, cu_q, cu_k, _max_q, _max_k):
+    """Reference varlen: per-segment SDPA over the flat [total, heads, dim] layout."""
+    outputs = []
+    for row in range(cu_q.shape[0] - 1):
+        qs, qe = int(cu_q[row]), int(cu_q[row + 1])
+        ks, ke = int(cu_k[row]), int(cu_k[row + 1])
+        out = F.scaled_dot_product_attention(
+            query[qs:qe].transpose(0, 1).unsqueeze(0),
+            key[ks:ke].transpose(0, 1).unsqueeze(0),
+            value[ks:ke].transpose(0, 1).unsqueeze(0),
+        )
+        outputs.append(out.transpose(1, 2).squeeze(0))
+    return torch.cat(outputs)
+
+
+def test_h3_varlen_padding_is_opt_in():
+    model = MiniMaxH3Transformer(_tiny_config())
+    attentions = [module for module in model.modules() if isinstance(module, h3_model.MiniMaxH3Attention)]
+
+    assert attentions
+    assert not any(module.varlen_padding for module in attentions)
+
+    model.enable_varlen_padding()
+
+    assert all(module.varlen_padding for module in attentions)
+
+
+def test_h3_varlen_padding_matches_masked_forward(monkeypatch):
+    torch.manual_seed(2)
+    calls = []
+    monkeypatch.setattr(h3_model, "flash_attn_varlen_func", lambda *a: (calls.append(a), _fake_varlen_attention(*a))[1])
+
+    model = MiniMaxH3Transformer(_tiny_config())
+    template = _tiny_inputs()
+    tags_a = template["token_tags"]
+    tags_b = template["token_tags"].clone()
+    tags_b[2] = -1
+    batched = {
+        "video_hidden_states": torch.randn(2, 2, 16, generator=torch.Generator().manual_seed(7)),
+        "audio_hidden_states": torch.randn(2, 4, 8, generator=torch.Generator().manual_seed(8)),
+        "encoder_hidden_states": torch.randn(2, 3, 12, generator=torch.Generator().manual_seed(9)),
+        "timestep": template["timestep"],
+        "timestep_indices": template["timestep_indices"],
+        "token_tags": torch.stack([tags_a, tags_b]),
+        "token_tags_have_padding": True,
+        "position_ids": template["position_ids"],
+        "video_indices": template["video_indices"],
+        "audio_indices": template["audio_indices"],
+        "text_indices": template["text_indices"],
+    }
+
+    masked = model(**batched)
+    model.enable_varlen_padding()
+    varlen = model(**batched)
+
+    assert calls  # every block routed through the varlen call
+    cu_q, cu_k = calls[0][3], calls[0][4]
+    assert cu_q.tolist() == [0, 9, 17]  # row B drops its padded tag row
+    torch.testing.assert_close(varlen.video, masked.video)
+    torch.testing.assert_close(varlen.audio, masked.audio)
+
+
+def test_h3_varlen_padding_pairwise_mask_keeps_sdpa(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("pairwise masks must not enter the varlen path")
+
+    monkeypatch.setattr(h3_model, "flash_attn_varlen_func", forbidden)
+    model = MiniMaxH3Transformer(_tiny_config())
+    model.enable_varlen_padding()
+
+    output = model(**_tiny_inputs(), attention_mask=torch.tril(torch.ones(9, 9, dtype=torch.bool)))
+
+    assert output.video.shape == (1, 2, 16)
+
+
+def test_h3_varlen_padding_without_flash_attn_falls_back(monkeypatch):
+    monkeypatch.setattr(h3_model, "flash_attn_varlen_func", None)
+    model = MiniMaxH3Transformer(_tiny_config())
+    model.enable_varlen_padding()
+
+    inputs = _tiny_inputs()
+    inputs["token_tags"] = inputs["token_tags"].unsqueeze(0).expand(2, -1).clone()
+    inputs["token_tags"][1, 2] = -1
+    inputs["token_tags_have_padding"] = True
+    for key in ("video_hidden_states", "audio_hidden_states", "encoder_hidden_states"):
+        inputs[key] = inputs[key].expand(2, -1, -1).clone()
+
+    output = model(**inputs)
+
+    assert output.video.shape == (2, 2, 16)
 
 
 def test_h3_fused_qk_norm_rope_cpu_falls_back_exactly():

@@ -95,6 +95,11 @@ except (ImportError, AttributeError, TypeError, ValueError):
     _CUDNN_SDPA_ORDER = None
     _SDPA_HAS_SET_PRIORITY = False
 
+try:
+    from flash_attn import flash_attn_varlen_func
+except (ImportError, AttributeError):
+    flash_attn_varlen_func = None
+
 
 def _cudnn_auto_workload_is_large(query_length: int, key_length: int, head_dim: int) -> bool:
     return (
@@ -391,6 +396,7 @@ class MiniMaxH3Attention(nn.Module):
         self.attention_mode = attention_mode
         self.auto_dispatch = False
         self.attn_autotune = False
+        self.varlen_padding = False
         self.int8_attention = False
         self.block_sparse_config: BlockSparseConfig | None = None
         self.block_sparse_plan: SequencePlan | None = None
@@ -525,6 +531,31 @@ class MiniMaxH3Attention(nn.Module):
             hidden_states = musubi_attention(
                 [query, key, value],
                 attn_params=AttentionParams.create_attention_params(self.attention_mode, False),
+            )
+        elif (
+            self.varlen_padding
+            and flash_attn_varlen_func is not None
+            and attention_mask is not None
+            and attention_mask.dtype == torch.bool
+            and attention_mask.shape == (query.shape[0], 1, query.shape[1])
+        ):
+            # The [B, 1, S] key-validity padding mask is exactly a per-row
+            # sequence-length restriction: compact each row's valid tokens into
+            # one flat varlen call instead of paying the O(S^2) masked SDPA.
+            # Pad-row outputs are discarded downstream either way.
+            batch, seq_len = query.shape[0], query.shape[1]
+            key_valid = attention_mask[:, 0, :].to(query.device)
+            flat_index = key_valid.reshape(-1).nonzero(as_tuple=True)[0]
+            counts = key_valid.sum(dim=1, dtype=torch.int32)
+            cu_seqlens = torch.zeros(batch + 1, dtype=torch.int32, device=query.device)
+            cu_seqlens[1:] = counts.cumsum(0)
+            max_seqlen = int(counts.max())
+            flat = lambda t: t.reshape(batch * seq_len, self.heads, self.head_dim).index_select(0, flat_index)
+            attended = flash_attn_varlen_func(flat(query), flat(key), flat(value), cu_seqlens, cu_seqlens, max_seqlen, max_seqlen)
+            hidden_states = (
+                query.new_zeros((batch * seq_len, self.heads * self.head_dim))
+                .index_copy(0, flat_index, attended.flatten(1, 2))
+                .reshape(batch, seq_len, self.heads * self.head_dim)
             )
         else:
             # Padding uses a pairwise mask which FlashAttention cannot express.
@@ -1019,6 +1050,11 @@ class MiniMaxH3Transformer(nn.Module):
                 if module.attention_mode != "torch":
                     raise ValueError("MiniMax H3 attention autotune requires SDPA attention")
                 module.attn_autotune = True
+
+    def enable_varlen_padding(self) -> None:
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module.varlen_padding = True
 
     def enable_fused_qk_norm_rope(self) -> None:
         for module in self.modules():
