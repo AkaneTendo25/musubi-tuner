@@ -97,7 +97,7 @@ def _run(
 
 
 @pytest.mark.parametrize("lora", [False, True], ids=["plain", "lora"])
-@pytest.mark.parametrize("keep", ["attention", "qkv", "adaln"])
+@pytest.mark.parametrize("keep", ["attention", "qkv", "adaln", "mlp"])
 def test_keeping_activations_is_bit_identical_to_plain_checkpointing(keep, lora):
     num_blocks = _tiny_config().num_layers
     reference_loss, reference_grads, plain, _ = _run("none", lora=lora)
@@ -114,22 +114,30 @@ def test_keeping_activations_is_bit_identical_to_plain_checkpointing(keep, lora)
     # output is replayed from the cache instead. The refiner block is untouched.
     assert plain[_CPU_ATTENTION] - kept[_CPU_ATTENTION] == num_blocks
     assert saved.attention == num_blocks
-    if keep in ("qkv", "adaln"):
+    if keep in ("qkv", "adaln", "mlp"):
         # Exactly the base projection matmul per block is kept; under LoRA the
-        # down/up matmuls of the adapter are still recomputed.
+        # down/up matmuls of the adapter are still recomputed. The mlp level
+        # keeps the fc1 matmul as well -- another bias-free ``aten::mm``.
         assert saved.projection == num_blocks
         _, _, attention_only, _ = _run("attention", lora=lora)
-        assert attention_only["aten::mm"] - kept["aten::mm"] == num_blocks
+        assert attention_only["aten::mm"] - kept["aten::mm"] == num_blocks * (2 if keep == "mlp" else 1)
     else:
         assert saved.projection == 0
         assert plain["aten::mm"] == kept["aten::mm"]
-    if keep == "adaln":
+    if keep in ("adaln", "mlp"):
         # The modulation matmul per block is kept on top of the QKV projection.
         assert saved.adaln == num_blocks
         _, _, qkv_only, _ = _run("qkv", lora=lora)
         assert qkv_only["aten::addmm"] - kept["aten::addmm"] == num_blocks
     else:
         assert saved.adaln == 0
+    if keep == "mlp":
+        # The SwiGLU input projection matmul per block is kept on top of adaln.
+        assert saved.mlp == num_blocks
+        _, _, adaln_only, _ = _run("adaln", lora=lora)
+        assert adaln_only["aten::mm"] - kept["aten::mm"] == num_blocks
+    else:
+        assert saved.mlp == 0
 
 
 def test_plain_checkpointing_matches_no_checkpointing():
@@ -252,6 +260,66 @@ def test_projection_region_is_installed_once_and_gated():
     with _Probe():
         attention.qkv_proj(hidden)
     assert seen == [None]
+
+
+def test_mlp_region_is_installed_once_and_gated():
+    model = MiniMaxH3Transformer(_tiny_config(num_layers=1))
+    feed_forward = model.blocks[0].mlp
+    original_forward = feed_forward.fc1.forward
+    model.set_checkpoint_keep("mlp")
+    wrapped = feed_forward.fc1.forward
+    assert wrapped is not original_forward
+    model.set_checkpoint_keep("mlp")
+    assert feed_forward.fc1.forward is wrapped
+    assert feed_forward.checkpoint_keep_mlp
+    seen: list[tuple[int, int] | None] = []
+    hidden = torch.randn(1, 3, 32)
+    original = torch.ops.aten.mm.default
+
+    class _Probe(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func is original:
+                seen.append(sc._mlp_shape.get())
+            return func(*args, **(kwargs or {}))
+
+    with _Probe():
+        feed_forward.fc1(hidden)
+    assert seen == [(32, 128)]
+    model.set_checkpoint_keep("none")
+    assert feed_forward.fc1.forward is wrapped
+    seen.clear()
+    with _Probe():
+        feed_forward.fc1(hidden)
+    assert seen == [None]
+
+
+def test_mlp_policy_saves_the_input_projection_matmul_only():
+    ctx = SimpleNamespace(is_recompute=False)
+    saved = sc.SavedActivations()
+    hidden = torch.zeros(9, 32)
+    weight_t = torch.zeros(32, 128)
+    mm = torch.ops.aten.mm.default
+    with sc.mlp_projection_region(32, 128):
+        assert sc.checkpoint_policy("mlp", saved, ctx, mm, hidden, weight_t) is CheckpointPolicy.MUST_SAVE
+        assert saved.mlp == 1
+        # The down projection's weight shape differs; adaln ignores the region.
+        assert (
+            sc.checkpoint_policy("mlp", saved, ctx, mm, torch.zeros(9, 64), torch.zeros(64, 32))
+            is CheckpointPolicy.PREFER_RECOMPUTE
+        )
+        assert sc.checkpoint_policy("adaln", saved, ctx, mm, hidden, weight_t) is CheckpointPolicy.PREFER_RECOMPUTE
+    assert sc._mlp_shape.get() is None
+
+
+def test_a_pass_whose_mlp_projection_bypassed_the_region_is_refused():
+    model = MiniMaxH3Transformer(_tiny_config())
+    model.enable_gradient_checkpointing()
+    model.set_checkpoint_keep("mlp")
+    for block in model.blocks:
+        projection = block.mlp.fc1
+        projection.forward = lambda x, weight=projection.weight: torch.nn.functional.linear(x, weight.detach())
+    with pytest.raises(RuntimeError, match="saved 0 SwiGLU input projection outputs"):
+        model(**_tiny_inputs())
 
 
 def test_attention_kernel_visibility_and_mode_validation():

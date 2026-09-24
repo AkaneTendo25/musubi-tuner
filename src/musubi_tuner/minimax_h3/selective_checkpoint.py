@@ -18,7 +18,10 @@ The levels are expressed as a ``torch.utils.checkpoint`` selective policy:
   matmul is recognised by its weight operand's ``(in_features, out_features)``
   shape, which ConvRot's group rotations do not have;
 - ``adaln`` additionally saves each block's AdaLN modulation matmul, marked by
-  the same shape-keyed region around ``adaln_proj.linear``.
+  the same shape-keyed region around ``adaln_proj.linear``;
+- ``mlp`` additionally saves each block's SwiGLU input projection matmul
+  (``mlp.fc1``) -- the largest single activation tensor in the block, and the
+  largest matmul left to recompute.
 
 The policy sees dispatcher ops only. A kernel invoked through a plain Python
 binding (an old ``flash_attn`` build without its ``torch.library`` ops, the
@@ -42,7 +45,7 @@ from typing import Any
 import torch
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-CHECKPOINT_KEEP_MODES = ("none", "attention", "qkv", "adaln")
+CHECKPOINT_KEEP_MODES = ("none", "attention", "qkv", "adaln", "mlp")
 
 # Fused attention forwards whose backward needs only their own outputs. The
 # ``flash_attn`` names are the ``torch.library`` ops flash-attn >= 2.7.1
@@ -87,6 +90,9 @@ _projection_shape: ContextVar[tuple[int, int] | None] = ContextVar("h3_projectio
 # Identify the AdaLN modulation matmul by its projection weight shape.
 _adaln_shape: ContextVar[tuple[int, int] | None] = ContextVar("h3_adaln_shape", default=None)
 
+# Identify the SwiGLU input projection's matmul by its weight shape.
+_mlp_shape: ContextVar[tuple[int, int] | None] = ContextVar("h3_mlp_shape", default=None)
+
 
 @dataclass
 class SavedActivations:
@@ -95,11 +101,13 @@ class SavedActivations:
     attention: int = 0
     projection: int = 0
     adaln: int = 0
+    mlp: int = 0
 
     def reset(self) -> None:
         self.attention = 0
         self.projection = 0
         self.adaln = 0
+        self.mlp = 0
 
 
 @contextmanager
@@ -120,6 +128,16 @@ def adaln_projection_region(in_features: int, out_features: int) -> Iterator[Non
         yield
     finally:
         _adaln_shape.reset(token)
+
+
+@contextmanager
+def mlp_projection_region(in_features: int, out_features: int) -> Iterator[None]:
+    """Mark the SwiGLU input projection's own forward so the ``mlp`` level can find its matmul."""
+    token = _mlp_shape.set((int(in_features), int(out_features)))
+    try:
+        yield
+    finally:
+        _mlp_shape.reset(token)
 
 
 def op_name(func: Any) -> str:
@@ -176,13 +194,17 @@ def checkpoint_policy(
         if counting:
             saved.attention += 1
         return CheckpointPolicy.MUST_SAVE
-    if keep in ("qkv", "adaln") and _is_projection_matmul(name, args, _projection_shape.get()):
+    if keep in ("qkv", "adaln", "mlp") and _is_projection_matmul(name, args, _projection_shape.get()):
         if counting:
             saved.projection += 1
         return CheckpointPolicy.MUST_SAVE
-    if keep == "adaln" and _is_projection_matmul(name, args, _adaln_shape.get()):
+    if keep in ("adaln", "mlp") and _is_projection_matmul(name, args, _adaln_shape.get()):
         if counting:
             saved.adaln += 1
+        return CheckpointPolicy.MUST_SAVE
+    if keep == "mlp" and _is_projection_matmul(name, args, _mlp_shape.get()):
+        if counting:
+            saved.mlp += 1
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
 

@@ -3780,7 +3780,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("--h3_checkpoint_keep cannot be combined with block-sparse attention")
             if (args.blocks_to_swap or 0) > 0 and getattr(args, "block_swap_granularity", "block") == "layer":
                 raise ValueError("--h3_checkpoint_keep cannot be combined with --block_swap_granularity layer")
-            if checkpoint_keep in ("qkv", "adaln") and args.h3_convrot_int8_lora_fused:
+            if checkpoint_keep in ("qkv", "adaln", "mlp") and args.h3_convrot_int8_lora_fused:
                 # The fused kernel runs base and adapter in one Triton launch,
                 # bypassing the base projection's forward the region wraps.
                 raise ValueError(f"--h3_checkpoint_keep {checkpoint_keep} cannot be combined with --h3_convrot_int8_lora_fused")
@@ -9252,17 +9252,19 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--h3_checkpoint_keep",
-        choices=("none", "attention", "qkv", "adaln"),
+        choices=("none", "attention", "qkv", "adaln", "mlp"),
         default="none",
         help=(
             "what block gradient checkpointing keeps instead of recomputing: 'attention' keeps each block's fused "
             "attention output so the recompute skips the attention forward; 'qkv' also keeps the base QKV projection "
-            "output; 'adaln' additionally keeps each block's AdaLN modulation output. Costs one (or four) "
-            "rows-by-hidden activations per checkpointed block and needs a fused attention "
+            "output; 'adaln' additionally keeps each block's AdaLN modulation output; 'mlp' additionally keeps "
+            "each block's SwiGLU input projection output, the largest single activation in the block. Costs one (or four, "
+            "or the mlp rows-by-2x-ffn tensor) "
+            "activations per checkpointed block and needs a fused attention "
             "kernel (SDPA flash/cuDNN/efficient or registered flash-attn ops); a batch that falls back to SDPA's math "
             "backend stops with an error. Requires --gradient_checkpointing; incompatible with "
             "--gradient_checkpointing_cpu_offload, --compile, --h3_int8_attention train, block-sparse attention, "
-            "--block_swap_granularity layer and, for 'qkv' or 'adaln', --h3_convrot_int8_lora_fused"
+            "--block_swap_granularity layer and, for 'qkv', 'adaln' or 'mlp', --h3_convrot_int8_lora_fused"
         ),
     )
     parser.add_argument(

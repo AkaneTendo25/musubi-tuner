@@ -1556,7 +1556,7 @@
 					<FormGroup title="Sparse attention and checkpointing" collapsed={true}>
 						<div class="grid grid-cols-2 xl:grid-cols-4 gap-2 pt-2">
 							<FormSelect fieldPath="training.h3_compile_attention" value={t.h3_compile_attention || 'inline'} options={['inline', 'auto', 'opaque']} onchange={(e) => update('h3_compile_attention', e.target.value)} />
-							<FormSelect fieldPath="training.h3_checkpoint_keep" value={t.h3_checkpoint_keep || 'none'} options={['none', 'attention', 'qkv', 'adaln']} onchange={(e) => update('h3_checkpoint_keep', e.target.value)} />
+							<FormSelect fieldPath="training.h3_checkpoint_keep" value={t.h3_checkpoint_keep || 'none'} options={['none', 'attention', 'qkv', 'adaln', 'mlp']} onchange={(e) => update('h3_checkpoint_keep', e.target.value)} />
 							<FormField type="number" fieldPath="training.h3_swiglu_chunk_rows" value={t.h3_swiglu_chunk_rows ?? 0} oninput={(e) => update('h3_swiglu_chunk_rows', Number(e.target.value))} min={0} />
 							<FormField type="number" fieldPath="training.h3_block_sparse_kv_fraction" value={t.h3_block_sparse_kv_fraction ?? 0} oninput={(e) => update('h3_block_sparse_kv_fraction', Number(e.target.value))} min={0} max={1} step="0.05" />
 							<FormField type="number" fieldPath="training.h3_block_sparse_threshold" value={t.h3_block_sparse_threshold ?? 0} oninput={(e) => update('h3_block_sparse_threshold', Number(e.target.value))} min={0} max={1} step="0.05" />

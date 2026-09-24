@@ -398,7 +398,7 @@ class TrainingConfig(BaseModel):
     h3_fused_elementwise: bool = False
     h3_compile_attention: Literal["inline", "auto", "opaque"] = "inline"
     h3_swiglu_chunk_rows: int = 0
-    h3_checkpoint_keep: Literal["none", "attention", "qkv", "adaln"] = "none"
+    h3_checkpoint_keep: Literal["none", "attention", "qkv", "adaln", "mlp"] = "none"
     h3_block_sparse_kv_fraction: float = 0.0
     h3_block_sparse_threshold: float = 0.0
     h3_block_sparse_start_block: int = 0
