@@ -4726,6 +4726,47 @@ def test_h3_partial_checkpointing_rejects_block_swap():
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
+def test_h3_swapped_checkpointing_rejects_without_gradient_checkpointing():
+    args = create_parser().parse_args(["--sdpa", "--h3_gradient_checkpointing_swapped", "--blocks_to_swap", "10"])
+
+    with pytest.raises(ValueError, match="requires --gradient_checkpointing"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_swapped_checkpointing_rejects_without_block_swap():
+    args = create_parser().parse_args(["--sdpa", "--gradient_checkpointing", "--h3_gradient_checkpointing_swapped"])
+
+    with pytest.raises(ValueError, match="requires --blocks_to_swap"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_swapped_checkpointing_rejects_partial_blocks():
+    args = create_parser().parse_args(
+        [
+            "--sdpa",
+            "--gradient_checkpointing",
+            "--h3_gradient_checkpointing_swapped",
+            "--h3_gradient_checkpointing_blocks",
+            "25",
+            "--blocks_to_swap",
+            "10",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with --h3_gradient_checkpointing_blocks"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_swapped_checkpointing_accepts_swap_combo():
+    args = create_parser().parse_args(
+        ["--sdpa", "--gradient_checkpointing", "--h3_gradient_checkpointing_swapped", "--blocks_to_swap", "10"]
+    )
+
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.h3_gradient_checkpointing_swapped
+
+
 def test_h3_pinned_activation_offload_requires_cpu_checkpoint_offload():
     valid = create_parser().parse_args(
         [

@@ -699,6 +699,8 @@ class MiniMaxH3Transformer(nn.Module):
         self.final_layer = MiniMaxH3FinalLayer(config)
         self.gradient_checkpointing = False
         self.gradient_checkpointing_blocks: int | None = None
+        self.gradient_checkpointing_swapped = False
+        self._swapped_block_set_cache: frozenset[int] | None = None
         self.checkpoint_keep = "none"
         self._checkpoint_saved = SavedActivations()
         self._checkpointed_blocks = 0
@@ -738,6 +740,36 @@ class MiniMaxH3Transformer(nn.Module):
         if blocks is not None and not 0 <= blocks <= len(self.blocks):
             raise ValueError(f"H3 gradient checkpoint block count must be in [0, {len(self.blocks)}], got {blocks}")
         self.gradient_checkpointing_blocks = blocks
+
+    def set_gradient_checkpointing_swapped(self, enabled: bool) -> None:
+        self.gradient_checkpointing_swapped = bool(enabled)
+        self._swapped_block_set_cache = None
+
+    def _swapped_block_set(self) -> frozenset[int]:
+        """The blocks whose weights block-swap streams and repoints.
+
+        Those are the only blocks an eager call cannot safely save for backward:
+        a swapped block's saved weight view is repointed to a reused ring slot or
+        a CPU master once its forward is consumed, while a resident block's
+        weights are never touched. Resolved once from the configured offloader.
+        """
+        if self._swapped_block_set_cache is None:
+            offloader = self.offloader
+            if offloader is None or not self.blocks_to_swap:
+                raise RuntimeError("H3 swapped-block checkpointing requires block swap")
+            is_stream = getattr(offloader, "is_stream", None)
+            if is_stream is not None:
+                indices = {i for i, streamed in enumerate(is_stream) if streamed}
+            else:
+                indices = getattr(offloader, "stream_idx", None) or getattr(offloader, "stream_blocks", None)
+                if indices is None:
+                    # ModelOffloader evicts the first S blocks as forward
+                    # consumes them and streams the last S in from the CPU.
+                    num_blocks, swapped = len(self.blocks), self.blocks_to_swap
+                    indices = list(range(swapped)) + list(range(num_blocks - swapped, num_blocks))
+                indices = frozenset(indices)
+            self._swapped_block_set_cache = frozenset(indices)
+        return self._swapped_block_set_cache
 
     def set_checkpoint_keep(self, keep: str) -> None:
         """Choose what block checkpointing keeps instead of recomputing.
@@ -1054,6 +1086,11 @@ class MiniMaxH3Transformer(nn.Module):
     def _checkpoint_start(self) -> int:
         return 0 if self.gradient_checkpointing_blocks is None else len(self.blocks) - self.gradient_checkpointing_blocks
 
+    def _is_checkpointed(self, block_index: int) -> bool:
+        if self.gradient_checkpointing_swapped:
+            return block_index in self._swapped_block_set()
+        return block_index >= self._checkpoint_start
+
     def _run_block(self, block: MiniMaxH3TransformerBlock, block_index: int, state: MiniMaxH3PackedState) -> torch.Tensor:
         """One block applied to one packed sequence, checkpointed or not.
 
@@ -1061,7 +1098,7 @@ class MiniMaxH3Transformer(nn.Module):
         separates a graph-carrying arm from a no-grad one when several arms share
         a single pass over the blocks.
         """
-        if torch.is_grad_enabled() and self.gradient_checkpointing and block_index >= self._checkpoint_start:
+        if torch.is_grad_enabled() and self.gradient_checkpointing and self._is_checkpointed(block_index):
             return self._checkpointed_block(
                 block,
                 block_index,

@@ -3738,6 +3738,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 --int8_convrot_base cannot be combined with --fp8_base")
         if args.blocks_to_swap is not None and args.blocks_to_swap < 0:
             raise ValueError("MiniMax H3 --blocks_to_swap must be non-negative")
+        if getattr(args, "h3_gradient_checkpointing_swapped", False):
+            if not args.gradient_checkpointing:
+                raise ValueError("--h3_gradient_checkpointing_swapped requires --gradient_checkpointing")
+            if not (args.blocks_to_swap or 0) > 0:
+                raise ValueError("--h3_gradient_checkpointing_swapped requires --blocks_to_swap")
+            if args.h3_gradient_checkpointing_blocks is not None:
+                raise ValueError(
+                    "--h3_gradient_checkpointing_swapped cannot be combined with --h3_gradient_checkpointing_blocks: "
+                    "both choose which blocks are checkpointed"
+                )
         if args.h3_gradient_checkpointing_blocks is not None:
             checkpoint_blocks = args.h3_gradient_checkpointing_blocks
             if not 0 <= checkpoint_blocks <= 50:
@@ -4049,6 +4059,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
         transformer.set_gradient_checkpointing_blocks(args.h3_gradient_checkpointing_blocks)
+        set_swapped = getattr(transformer, "set_gradient_checkpointing_swapped", None)
+        if callable(set_swapped):
+            set_swapped(getattr(args, "h3_gradient_checkpointing_swapped", False))
         transformer.set_activation_cpu_offload_pin_memory(args.h3_gradient_checkpointing_cpu_offload_pin_memory)
         checkpoint_keep = getattr(args, "h3_checkpoint_keep", "none")
         if checkpoint_keep != "none":
@@ -9226,6 +9239,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "checkpoint only the last N of H3's 50 main blocks; default checkpoints all blocks. "
             "Lower values trade more VRAM for less recomputation and require resident eager blocks"
+        ),
+    )
+    parser.add_argument(
+        "--h3_gradient_checkpointing_swapped",
+        action="store_true",
+        help=(
+            "checkpoint exactly the blocks block-swap streams and leave the resident blocks eager, skipping "
+            "their recomputation; requires --gradient_checkpointing and --blocks_to_swap and cannot be combined "
+            "with --h3_gradient_checkpointing_blocks"
         ),
     )
     parser.add_argument(

@@ -485,6 +485,77 @@ def test_h3_partial_gradient_checkpointing_matches_dense_gradients():
         torch.testing.assert_close(actual.grad, expected.grad, msg=name)
 
 
+def test_h3_swapped_gradient_checkpointing_targets_streamed_blocks(monkeypatch):
+    model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    model.enable_gradient_checkpointing()
+    model.set_gradient_checkpointing_swapped(True)
+    model.blocks_to_swap = 2
+
+    class StubOffloader:
+        is_stream = [False, True, False, True]
+
+        def wait_for_block(self, _index):
+            pass
+
+        def submit_move_blocks_forward(self, _blocks, _index):
+            pass
+
+    model.offloader = StubOffloader()
+    original = model._checkpointed_block
+    seen = []
+
+    def recorded(block, *args):
+        seen.append(next(index for index, candidate in enumerate(model.blocks) if candidate is block))
+        return original(block, *args)
+
+    monkeypatch.setattr(model, "_checkpointed_block", recorded)
+
+    model(**_tiny_inputs())
+
+    assert seen == [1, 3]
+
+
+def test_h3_swapped_gradient_checkpointing_matches_dense_gradients():
+    torch.manual_seed(0)
+    reference = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    swapped = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    swapped.load_state_dict(reference.state_dict())
+    reference.enable_gradient_checkpointing()
+    swapped.enable_gradient_checkpointing()
+    swapped.set_gradient_checkpointing_swapped(True)
+    swapped.blocks_to_swap = 2
+
+    class StubOffloader:
+        is_stream = [False, True, False, True]
+
+        def wait_for_block(self, _index):
+            pass
+
+        def submit_move_blocks_forward(self, _blocks, _index):
+            pass
+
+    swapped.offloader = StubOffloader()
+
+    inputs = _tiny_inputs()
+    reference(**inputs).video.sum().backward()
+    swapped(**inputs).video.sum().backward()
+
+    for (name, expected), (_, actual) in zip(reference.named_parameters(), swapped.named_parameters()):
+        if expected.grad is None:
+            assert actual.grad is None, name
+            continue
+        torch.testing.assert_close(actual.grad, expected.grad, msg=name)
+
+
+def test_h3_swapped_gradient_checkpointing_requires_block_swap():
+    model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    model.enable_gradient_checkpointing()
+    model.set_gradient_checkpointing_swapped(True)
+
+    with pytest.raises(RuntimeError, match="requires block swap"):
+        model(**_tiny_inputs())
+
+
 def test_h3_partial_gradient_checkpointing_validates_depth():
     model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
 
