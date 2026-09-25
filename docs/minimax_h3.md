@@ -56,9 +56,9 @@ Two released transformers, with different conditioning contracts:
   - [Train a slider LoRA](#train-a-slider-lora)
   - [Full-parameter BF16 training](#full-parameter-bf16-training)
 - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
-  - [Methods](#methods)
+  - [Recommended: training adapter](#recommended-training-adapter)
+  - [Experimental alternatives](#experimental-alternatives)
     - [Plain LoRA](#plain-lora)
-    - [De-distilling adapter](#de-distilling-adapter)
     - [Teacher matching](#teacher-matching)
     - [Contrastive guidance loss](#contrastive-guidance-loss)
     - [Frozen-null target with the null anchor](#frozen-null-target-with-the-null-anchor)
@@ -67,7 +67,7 @@ Two released transformers, with different conditioning contracts:
     - [NAFP: Null-Anchored Field Preservation](#nafp-null-anchored-field-preservation)
     - [Stability controls](#stability-controls)
   - [Metrics](#metrics)
-  - [Current recommended settings](#current-recommended-settings)
+  - [Experimental recipe examples](#experimental-recipe-examples)
 - [Inference](#inference)
   - [Use a learned context](#use-a-learned-context)
 - [One-frame images and ordered FL2VA controls](#one-frame-images-and-ordered-fl2va-controls)
@@ -1052,7 +1052,7 @@ Every objective here is off unless its flag is given; a run that names none of t
 | `--h3_guidance_null_source {live,frozen}` | `live` (default) evaluates the null-conditioning branch with the trainable adapter active, so that branch drifts along with training. `frozen` disables the adapter for that forward only, giving the guidance correction a fixed base-model anchor. Requires a network that supports runtime disabling; it replaces the existing empty forward rather than adding one. |
 | `--h3_fuse_frozen_teachers` | Experimental opt-in for runs that use both `--h3_guidance_null_source frozen` and base preservation. It batches the active empty-guidance and preservation teachers into one forward when their cached text layouts match, otherwise it safely uses the sequential path. It may increase transient teacher memory. |
 | `--h3_guidance_cfg_zero` | CFG-Zero* rescale of the null branch before the guidance form is applied: per sample and per modality, `alpha = <conditional, null> / (‖null‖² + 1e-8)` projects the null field onto the conditional one, so a null branch orthogonal to the conditional field collapses instead of being extrapolated away from. |
-| `--h3_base_preservation_loss_weight 0.02` | Recommended starting value. Penalizes drift from the frozen base's prediction and anchors to whichever base is loaded, quantized or not. |
+| `--h3_base_preservation_loss_weight 0.02` | Experimental starting value. Penalizes drift from the frozen base's prediction and anchors to whichever base is loaded, quantized or not. |
 | `--h3_base_preservation_probability 1.0` | Evaluate preservation on a synchronized random fraction of batches and scale active losses by `1 / probability`. `1` applies the objective every batch; `0.25` evaluates it on a quarter of them at four times the weight. |
 | `--h3_guidance_null_anchor_weight 0.0` | Penalizes movement of the EMPTY-prompt prediction away from the frozen base's, weighted by this value, and leaves the prompted prediction free; unlike `--h3_base_preservation_loss_weight` it does not pull the prompted branch and so does not fight the data term directly. Details below. |
 | `--h3_guidance_null_anchor_probability 1.0` | Evaluate the null anchor on a synchronized random fraction of prompted steps and divide the active term by it, so the expected gradient is the dense anchor's at a fraction of its two forwards a step. Reported as `h3/null_anchor_active`. |
@@ -1279,7 +1279,7 @@ Samples are written to `OUTPUT_DIR/sample` as synchronized MP4 files with JSON s
 
 `--h3_profile_steps` investigates step time: it profiles a fixed window and stops, so it does not belong in a command line
 you intend to keep. The two validation probes cost extra no-grad forwards per validation; the recipes in
-[Current recommended settings](#current-recommended-settings) enable both because checkpoint selection reads
+[Experimental recipe examples](#experimental-recipe-examples) enable both because checkpoint selection reads
 `val/drift/prompted_rel` and `val/rollout/field_cos` from them. Drop them from runs that no longer track the field.
 
 | Option | Purpose |
@@ -1502,36 +1502,25 @@ with classifier-free guidance, the empty-prompt prediction plus a scale times th
 The flow-matching loss does not know this. Its minimum is the un-amplified prediction, so plain fine-tuning removes
 the amplification: the loss goes down, prompt adherence, contrast and detail go with it.
 
-The methods below keep the frozen checkpoint in the objective. Each entry gives a short description, advantages,
-disadvantages with the step cost relative to a plain LoRA step, and the flags. Metrics and the recommended settings
-per checkpoint follow.
+For FL2VA, train over a frozen training adapter as described below. The other objectives and recipes in this section
+remain experimental; validate them against an adapter-trained baseline on the target checkpoint and dataset.
 
 Terms. The *field* is the prompted prediction minus the empty-prompt prediction, the quantity the amplification
 scales. *Field length* is its norm, *field direction* its orientation. The *null branch* is the empty-prompt
 prediction. Costs are step-time ratios, approximate.
 
-### Methods
+### Recommended: training adapter
 
-#### Plain LoRA
-
-The unmodified flow-matching loss. Nothing references the frozen checkpoint. The field length drops to a fraction
-of the checkpoint's within a few hundred steps.
-
-- **Applies to:** FL2VA and Ref2VA.
-- **Advantages:** cheapest; fastest concept acquisition. A baseline, not a deliverable.
-- **Disadvantages:** removes the amplification. Visible artifacts (soft, low-contrast, incoherent frames) at every
-  prompt, the training resolution and length included. Cost **1x**, the reference for the ratios below.
-- **Flags:** none.
-
+<a id="de-distilling-adapter"></a>
 <a id="de-distilling-adapter---base_weights"></a>
-
-#### De-distilling adapter
 
 Use a frozen training adapter matched to the exact H3 checkpoint:
 
 ```shell
 --h3_overlay_weights training_adapter.safetensors --h3_overlay_training_only
 ```
+
+Use the ordinary flow-matching objective for this baseline; leave guidance, rollout, and preservation objectives off.
 
 The adapter stays a separate live module, including on an INT8 ConvRot base: it is never merged, optimized, or
 included in the saved LoRA. It is active during training and, unless `--h3_validate_without_overlay` is set,
@@ -1547,12 +1536,35 @@ every validation metric describes the learned LoRA on the original checkpoint, t
 It cannot be combined with `--base_weights`.
 The probes then compare against the original checkpoint.
 The adapter approximates undistilled behavior; it does not guarantee preservation of the checkpoint's behavior.
-It adds LoRA computation but no extra transformer forward. Available adapters include
-`ostris/minimax_h3_training_adapter` and `DiffSynth-Studio/MiniMax-H3-TrainingAdapter`; check checkpoint compatibility.
+It adds LoRA computation but no extra transformer forward. For the FL2VA checkpoint, use one of:
 
-Alternatively, `--base_weights adapter.safetensors` merges the adapter into the frozen training base at load time,
-with strength set by `--base_weights_multiplier`. This avoids live-overlay computation, but cannot disable the
-adapter for previews. The field and rollout validation probes reject merged base weights.
+| Training adapter | Intended data |
+| --- | --- |
+| [CircleStone Labs image adapter](https://huggingface.co/circlestone-labs/MiniMax-H3-Image-Training-Adapter) (`minimax_h3_image_training_adapter.safetensors`) | Image training; validate separately for video or mixed data. |
+| [Ostris v3](https://huggingface.co/ostris/minimax_h3_training_adapter/tree/main) (`minimax_h3_training_adapter_v3.safetensors`) | FL2VA training; validate on the intended data modality. |
+
+Use an adapter built for the checkpoint being trained. Do not apply these FL2VA adapters to Ref2VA weights.
+
+### Experimental alternatives
+
+The following objectives and combinations are research options, not recommended defaults. Plain LoRA is a baseline.
+
+`--base_weights adapter.safetensors` is an alternative loader that merges the adapter into the frozen base at load
+time. It cannot disable the adapter for previews, and the field and rollout probes reject merged base weights.
+
+#### Plain LoRA
+
+The unmodified flow-matching loss. Nothing references the frozen checkpoint. The field length drops to a fraction
+of the checkpoint's within a few hundred steps.
+
+- **Applies to:** FL2VA and Ref2VA.
+- **Advantages:** cheapest; fastest concept acquisition. A baseline, not a deliverable.
+- **Disadvantages:** removes the amplification. Visible artifacts (soft, low-contrast, incoherent frames) at every
+  prompt, the training resolution and length included. Cost **1x**, the reference for the ratios below.
+- **Flags:** none.
+
+The [DiffSynth-Studio training adapter](https://huggingface.co/DiffSynth-Studio/MiniMax-H3-TrainingAdapter)
+is another experimental adapter option; verify its checkpoint and task compatibility before use.
 
 #### Teacher matching
 
@@ -1743,7 +1755,7 @@ together. The anchor fixes the reference point, the teacher sets the direction, 
   Ref2VA. The anchor limits how much of an unconditional change (a rendering style) can be learned: with a trigger
   word the concept stays weaker than H-OPSD's even under the sigma gates, and without the gates anchor 0.3 gives a
   partial concept and anchor 1.0 none. Reference conditioning takes anchor 1.0 at every sigma.
-- **Flags:** the union of the three sections above; the exact set is under *Current recommended settings*.
+- **Flags:** the union of the three sections above; example configurations are under *Experimental recipe examples*.
 
 #### Two-teacher distillation
 
@@ -1843,7 +1855,7 @@ Checkpoint selection: take the step at which `val/drift/prompted_rel` is still b
 the geometry you generate at. Training past that point adds memorisation of the training clips, not concept quality.
 The number of steps this takes depends on the dataset: with few clips it comes in a few hundred steps.
 
-### Current recommended settings
+### Experimental recipe examples
 
 Weights, thresholds and step counts below are starting points; they depend on the dataset. Validate every 250 steps
 and pick the checkpoint by the rule in *Metrics*. Hardware flags (block swap, attention backend, precision) are left
