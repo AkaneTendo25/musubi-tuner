@@ -55,3 +55,41 @@ def test_overlay_training_only_rejects_preview_validation_probes(tmp_path: Path)
     config.training.h3_validation_rollout_probe = 8
     rollout_report = validate_training_config(config)
     assert "training.h3_overlay_training_only" in rollout_report["field_errors"]
+
+
+def test_validate_without_overlay_admits_probes_and_is_emitted(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.training.h3_overlay_weights = "models/frozen-overlay.safetensors"
+    config.training.h3_overlay_training_only = True
+    config.training.h3_validate_without_overlay = True
+    config.training.h3_validation_field_probe = True
+    config.training.h3_validation_rollout_probe = 8
+
+    report = validate_training_config(config)
+
+    assert "training.h3_overlay_training_only" not in report["field_errors"]
+    assert "training.h3_validate_without_overlay" not in report["field_errors"]
+    assert "--h3_validate_without_overlay" in build_training_cmd(config)
+
+
+def test_validate_without_overlay_requires_training_only(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.training.h3_overlay_weights = "models/frozen-overlay.safetensors"
+    config.training.h3_validate_without_overlay = True
+
+    report = validate_training_config(config)
+
+    assert "training.h3_validate_without_overlay" in report["field_errors"]
+    assert "--h3_validate_without_overlay" not in build_training_cmd(config)
+
+
+def test_validate_without_overlay_rejects_base_weights(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.training.h3_overlay_weights = "models/frozen-overlay.safetensors"
+    config.training.h3_overlay_training_only = True
+    config.training.h3_validate_without_overlay = True
+    config.training.base_weights = "models/merged.safetensors"
+
+    report = validate_training_config(config)
+
+    assert "training.h3_validate_without_overlay" in report["field_errors"]

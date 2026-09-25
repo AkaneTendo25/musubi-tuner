@@ -857,7 +857,8 @@ Generic LoRAs passed through `--base_weights` are merged into the frozen base at
 `--h3_overlay_weights` applies a LoRA as a separate frozen module instead of merging it: base weights are not modified, so
 it also works on an INT8 ConvRot base. The overlay is excluded from the optimizer and from saved checkpoints, and is active
 on all forwards by default, including previews and the base-preservation reference. Add `--h3_overlay_training_only`
-to disable it during previews while retaining the learned LoRA. Training and data-loss validation keep it active.
+to disable it during previews while retaining the learned LoRA. Training and data-loss validation keep it active;
+`--h3_validate_without_overlay` (requires `--h3_overlay_training_only`) also disables it for the whole validation pass.
 `--h3_overlay_weights_multiplier` (default `1.0`, negative allowed) scales its delta. Incompatible with full fine-tuning.
 
 `--h3_adaln_rank` excludes the reduced AdaLN projections from quantization, so it composes with FP8 and with ConvRot INT8.
@@ -1529,14 +1530,18 @@ Use a frozen training adapter matched to the exact H3 checkpoint:
 ```
 
 The adapter stays a separate live module, including on an INT8 ConvRot base: it is never merged, optimized, or
-included in the saved LoRA. It is active during training and data-loss validation, and disabled during previews;
+included in the saved LoRA. It is active during training and, unless `--h3_validate_without_overlay` is set,
+data-loss validation, and disabled during previews;
 the learned LoRA stays active. Sampling restores the overlay's previous state even if generation fails.
 For final inference, load only the learned LoRA onto the original checkpoint.
 
 `--h3_overlay_weights_multiplier` sets the training adapter strength (default `1.0`). Omitting
 `--h3_overlay_training_only` keeps the overlay active during previews too. Full fine-tuning is unsupported.
-With training-only mode, `--h3_validation_field_probe` and `--h3_validation_rollout_probe` are unsupported;
-use data-loss validation and previews to evaluate the run.
+With training-only mode, `--h3_validation_field_probe` and `--h3_validation_rollout_probe` require
+`--h3_validate_without_overlay`. That flag disables the overlay for the whole validation pass, data loss included, so
+every validation metric describes the learned LoRA on the original checkpoint, the configuration used at inference.
+It cannot be combined with `--base_weights`.
+The probes then compare against the original checkpoint.
 The adapter approximates undistilled behavior; it does not guarantee preservation of the checkpoint's behavior.
 It adds LoRA computation but no extra transformer forward. Available adapters include
 `ostris/minimax_h3_training_adapter` and `DiffSynth-Studio/MiniMax-H3-TrainingAdapter`; check checkpoint compatibility.

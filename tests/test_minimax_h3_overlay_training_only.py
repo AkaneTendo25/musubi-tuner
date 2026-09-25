@@ -105,6 +105,90 @@ def test_training_only_rejects_diagnostics_that_would_mislabel_the_overlay_as_st
         MiniMaxH3NetworkTrainer().handle_model_specific_args(_args(*extra))
 
 
+def test_validate_without_overlay_requires_training_only(tmp_path):
+    overlay = tmp_path / "overlay.safetensors"
+    overlay.touch()
+    with pytest.raises(ValueError, match="requires --h3_overlay_training_only"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _args("--h3_overlay_weights", str(overlay), "--h3_validate_without_overlay")
+        )
+
+
+def test_validate_without_overlay_rejects_merged_base_weights(tmp_path):
+    overlay = tmp_path / "overlay.safetensors"
+    overlay.touch()
+    merged = tmp_path / "merged.safetensors"
+    merged.touch()
+    args = _args(
+        "--h3_overlay_weights",
+        str(overlay),
+        "--h3_overlay_training_only",
+        "--h3_validate_without_overlay",
+        "--base_weights",
+        str(merged),
+    )
+    with pytest.raises(ValueError, match="cannot be disabled"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("probe", ["field", "rollout"])
+def test_validate_without_overlay_allows_probes(tmp_path, probe):
+    overlay = tmp_path / "overlay.safetensors"
+    overlay.touch()
+    validation = tmp_path / "validation.toml"
+    validation.write_text("", encoding="utf-8")
+    extra = [
+        "--h3_overlay_weights",
+        str(overlay),
+        "--h3_overlay_training_only",
+        "--h3_validate_without_overlay",
+        "--validation_dataset_config",
+        str(validation),
+    ]
+    extra += ["--h3_validation_field_probe"] if probe == "field" else ["--h3_validation_rollout_probe", "2"]
+    args = _args(*extra)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+
+    assert trainer.extra_metadata(args)["ss_h3_validate_without_overlay"] == "True"
+
+
+@pytest.mark.parametrize("without_overlay", [False, True])
+def test_validation_pass_sees_overlay_only_by_default(monkeypatch, without_overlay):
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._overlay_training_only = True
+    trainer._validate_without_overlay = without_overlay
+    trainer._overlay_network = _Overlay((True, False))
+    trainable = _Module(True)
+    observed = []
+
+    def validation_pass(*_args):
+        observed.append((trainable.enabled, tuple(module.enabled for module in trainer._overlay_network.unet_loras)))
+
+    monkeypatch.setattr(trainer, "_validate_pass", validation_pass)
+    trainer.validate(None, None, None, None, 0, 0)
+
+    assert observed == [(True, (False, False) if without_overlay else (True, False))]
+    assert tuple(module.enabled for module in trainer._overlay_network.unet_loras) == (True, False)
+
+
+def test_validation_error_restores_exact_overlay_module_states(monkeypatch):
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._overlay_training_only = True
+    trainer._validate_without_overlay = True
+    trainer._overlay_network = _Overlay((False, True))
+
+    def fail(*_args):
+        assert all(not module.enabled for module in trainer._overlay_network.unet_loras)
+        raise RuntimeError("validation failed")
+
+    monkeypatch.setattr(trainer, "_validate_pass", fail)
+    with pytest.raises(RuntimeError, match="validation failed"):
+        trainer.validate(None, None, None, None, 0, 0)
+
+    assert tuple(module.enabled for module in trainer._overlay_network.unet_loras) == (False, True)
+
+
 @pytest.mark.parametrize("route", ["fl2va", "ref2va"])
 def test_preview_disables_only_overlay_then_restores_mixed_module_state(monkeypatch, route):
     trainer = MiniMaxH3NetworkTrainer()

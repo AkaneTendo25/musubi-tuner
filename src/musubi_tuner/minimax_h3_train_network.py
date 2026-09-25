@@ -1655,6 +1655,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._qwen_control_dropout_generator: torch.Generator | None = None
         self._overlay_network = None
         self._overlay_training_only = False
+        self._validate_without_overlay = False
         self._h3_profiler: H3StepProfiler | None = None
         self._clean_latent_cache: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         # The frozen base's field is a property of the checkpoint and the validation
@@ -1984,6 +1985,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     @torch.no_grad()
     def validate(
+        self,
+        accelerator,
+        args,
+        transformer,
+        network,
+        global_step,
+        epoch,
+    ) -> None:
+        with self._overlay_disabled(self._validate_without_overlay):
+            self._validate_pass(accelerator, args, transformer, network, global_step, epoch)
+
+    def _validate_pass(
         self,
         accelerator,
         args,
@@ -3382,13 +3395,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_overlay_weights_multiplier requires --h3_overlay_weights")
         if self._overlay_training_only and not overlay_weights:
             raise ValueError("--h3_overlay_training_only requires --h3_overlay_weights")
-        if self._overlay_training_only and (
-            getattr(args, "h3_validation_field_probe", False) or int(getattr(args, "h3_validation_rollout_probe", 0) or 0) > 0
+        self._validate_without_overlay = bool(getattr(args, "h3_validate_without_overlay", False))
+        if self._validate_without_overlay and not self._overlay_training_only:
+            raise ValueError("--h3_validate_without_overlay requires --h3_overlay_training_only")
+        if self._validate_without_overlay and getattr(args, "base_weights", None):
+            raise ValueError(
+                "--h3_validate_without_overlay validates against the stock checkpoint, but --base_weights is merged into "
+                "it and cannot be disabled; drop --base_weights or the flag"
+            )
+        if (
+            self._overlay_training_only
+            and not self._validate_without_overlay
+            and (getattr(args, "h3_validation_field_probe", False) or int(getattr(args, "h3_validation_rollout_probe", 0) or 0) > 0)
         ):
             raise ValueError(
                 "--h3_overlay_training_only cannot be combined with --h3_validation_field_probe or "
                 "--h3_validation_rollout_probe: those diagnostics label their disabled-adapter reference as the "
-                "stock checkpoint, but the live overlay remains part of that reference"
+                "stock checkpoint, but the live overlay remains part of that reference. Add "
+                "--h3_validate_without_overlay to validate with the overlay disabled"
             )
         if overlay_weights and not Path(overlay_weights).is_file():
             raise FileNotFoundError(f"--h3_overlay_weights file not found: {overlay_weights}")
@@ -4362,11 +4386,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._overlay_network = overlay
         return overlay
 
-    @contextmanager
     def _preview_overlay_disabled(self):
         """Temporarily remove only the frozen overlay from sample generation."""
+        return self._overlay_disabled(self._overlay_training_only)
+
+    @contextmanager
+    def _overlay_disabled(self, active: bool):
+        """Temporarily remove only the frozen overlay; the trainable network keeps its state."""
         overlay = self._overlay_network
-        if not self._overlay_training_only or overlay is None:
+        if not active or overlay is None:
             yield
             return
         modules = list(getattr(overlay, "text_encoder_loras", ())) + list(getattr(overlay, "unet_loras", ()))
@@ -7997,6 +8025,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_overlay_weights": str(getattr(args, "h3_overlay_weights", None) or "none"),
             "ss_h3_overlay_weights_multiplier": str(getattr(args, "h3_overlay_weights_multiplier", 1.0)),
             "ss_h3_overlay_training_only": str(bool(getattr(args, "h3_overlay_training_only", False))),
+            "ss_h3_validate_without_overlay": str(bool(getattr(args, "h3_validate_without_overlay", False))),
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_guidance_loss_schedule": args.h3_guidance_loss_schedule,
             "ss_h3_guidance_null_source": args.h3_guidance_null_source,
@@ -8320,8 +8349,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_overlay_training_only",
         action="store_true",
         help=(
-            "keep --h3_overlay_weights active for training and data-loss validation, but disable only that frozen "
-            "overlay during sample generation; the trainable LoRA remains active"
+            "keep --h3_overlay_weights active for training and (unless --h3_validate_without_overlay) data-loss "
+            "validation, but disable only that frozen overlay during sample generation; the trainable LoRA remains active"
+        ),
+    )
+    parser.add_argument(
+        "--h3_validate_without_overlay",
+        action="store_true",
+        help=(
+            "run validation (data loss and every probe) with the --h3_overlay_weights overlay disabled, so metrics "
+            "describe the saved LoRA on the stock checkpoint; requires --h3_overlay_training_only"
         ),
     )
     parser.add_argument(

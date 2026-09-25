@@ -821,6 +821,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--h3_overlay_weights_multiplier", str(t.h3_overlay_weights_multiplier)]
         if t.h3_overlay_training_only:
             cmd.append("--h3_overlay_training_only")
+            if t.h3_validate_without_overlay:
+                cmd.append("--h3_validate_without_overlay")
     if t.network_weights and not learned_context:
         cmd += ["--network_weights", t.network_weights]
     if t.dim_from_weights and not learned_context:

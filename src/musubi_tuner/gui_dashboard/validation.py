@@ -1016,12 +1016,36 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
-        if t.h3_overlay_training_only and (t.h3_validation_field_probe or t.h3_validation_rollout_probe > 0):
+        if t.h3_validate_without_overlay and t.base_weights:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_validate_without_overlay",
+                    "Validating without the overlay measures against the stock checkpoint and cannot be combined with base weights.",
+                    label="H3 Validate Without Overlay",
+                    page="training",
+                )
+            )
+        if t.h3_validate_without_overlay and not t.h3_overlay_training_only:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_validate_without_overlay",
+                    "Validating without the overlay requires H3 training-only overlay mode.",
+                    label="H3 Validate Without Overlay",
+                    page="training",
+                )
+            )
+        if (
+            t.h3_overlay_training_only
+            and not t.h3_validate_without_overlay
+            and (t.h3_validation_field_probe or t.h3_validation_rollout_probe > 0)
+        ):
             errors.append(
                 _make_issue(
                     "error",
                     "training.h3_overlay_training_only",
-                    "H3 training-only overlay mode cannot be used with validation field or rollout probes.",
+                    "H3 training-only overlay mode needs Validate Without Overlay to use validation field or rollout probes.",
                     label="H3 Overlay Training Only",
                     page="training",
                 )

@@ -335,6 +335,7 @@ class TrainingConfig(BaseModel):
     h3_overlay_weights: str = ""
     h3_overlay_weights_multiplier: float = 1.0
     h3_overlay_training_only: bool = False
+    h3_validate_without_overlay: bool = False
     h3_attn_auto_dispatch: bool = False
     h3_attn_autotune: bool = False
     h3_int8_attention: Literal["off", "aux", "train"] = "off"
