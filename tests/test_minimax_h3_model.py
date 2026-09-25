@@ -278,6 +278,52 @@ def test_h3_attention_autotune_masked_calls_keep_plain_sdpa(monkeypatch):
     assert output.shape == (1, 16, 16)
 
 
+def test_h3_attention_autotune_cache_key_uses_exact_batch_and_sequence_shape():
+    base = torch.zeros(1, 16, 2, 8)
+    same = torch.zeros(1, 16, 2, 8)
+    other_batch = torch.zeros(2, 16, 2, 8)
+    other_sequence = torch.zeros(1, 17, 2, 8)
+
+    assert h3_model._attention_autotune_key(base, base) == h3_model._attention_autotune_key(same, same)
+    assert h3_model._attention_autotune_key(base, base) != h3_model._attention_autotune_key(other_batch, other_batch)
+    assert h3_model._attention_autotune_key(base, base) != h3_model._attention_autotune_key(other_sequence, other_sequence)
+
+
+def test_h3_attention_autotune_evicts_rejected_backend_and_falls_back(monkeypatch):
+    module = h3_model.MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5)
+    reference = h3_model.MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5)
+    reference.load_state_dict(module.state_dict())
+    module.attn_autotune = True
+    inputs = torch.randn(1, 16, 16)
+    projected = module.qkv_proj(inputs).unflatten(-1, (3, module.heads, module.head_dim))
+    query, key, _value = projected.unbind(2)
+    cache_key = h3_model._attention_autotune_key(query, key)
+    h3_model._ATTN_AUTOTUNE_CACHE[cache_key] = "flash"
+    monkeypatch.setattr(h3_model, "_autotune_attention_choice", lambda *_args: "flash")
+
+    def rejected(*_args, **_kwargs):
+        raise RuntimeError("backend not supported for this workload")
+
+    monkeypatch.setattr(h3_model, "musubi_attention", rejected)
+    actual = module(inputs)
+
+    torch.testing.assert_close(actual, reference(inputs))
+    assert h3_model._ATTN_AUTOTUNE_CACHE[cache_key] == "torch"
+
+
+def test_h3_attention_autotune_does_not_mask_unrelated_runtime_errors(monkeypatch):
+    module = h3_model.MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5)
+    module.attn_autotune = True
+    monkeypatch.setattr(h3_model, "_autotune_attention_choice", lambda *_args: "flash")
+
+    def failed(*_args, **_kwargs):
+        raise RuntimeError("sentinel execution failure")
+
+    monkeypatch.setattr(h3_model, "musubi_attention", failed)
+    with pytest.raises(RuntimeError, match="sentinel execution failure"):
+        module(torch.randn(1, 16, 16))
+
+
 def _fake_varlen_attention(query, key, value, cu_q, cu_k, _max_q, _max_k):
     """Reference varlen: per-segment SDPA over the flat [total, heads, dim] layout."""
     outputs = []
@@ -309,6 +355,7 @@ def test_h3_varlen_padding_matches_masked_forward(monkeypatch):
     torch.manual_seed(2)
     calls = []
     monkeypatch.setattr(h3_model, "flash_attn_varlen_func", lambda *a: (calls.append(a), _fake_varlen_attention(*a))[1])
+    monkeypatch.setattr(h3_model, "_flash_varlen_supported", lambda _query: True)
 
     model = MiniMaxH3Transformer(_tiny_config())
     template = _tiny_inputs()
@@ -358,6 +405,25 @@ def test_h3_varlen_padding_without_flash_attn_falls_back(monkeypatch):
     model = MiniMaxH3Transformer(_tiny_config())
     model.enable_varlen_padding()
 
+    inputs = _tiny_inputs()
+    inputs["token_tags"] = inputs["token_tags"].unsqueeze(0).expand(2, -1).clone()
+    inputs["token_tags"][1, 2] = -1
+    inputs["token_tags_have_padding"] = True
+    for key in ("video_hidden_states", "audio_hidden_states", "encoder_hidden_states"):
+        inputs[key] = inputs[key].expand(2, -1, -1).clone()
+
+    output = model(**inputs)
+
+    assert output.video.shape == (2, 2, 16)
+
+
+def test_h3_varlen_padding_with_flash_attn_falls_back_for_cpu(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("CPU tensors must not enter the FlashAttention varlen path")
+
+    monkeypatch.setattr(h3_model, "flash_attn_varlen_func", forbidden)
+    model = MiniMaxH3Transformer(_tiny_config())
+    model.enable_varlen_padding()
     inputs = _tiny_inputs()
     inputs["token_tags"] = inputs["token_tags"].unsqueeze(0).expand(2, -1).clone()
     inputs["token_tags"][1, 2] = -1

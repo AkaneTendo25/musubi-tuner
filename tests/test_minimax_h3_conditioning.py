@@ -113,6 +113,39 @@ class _TextModel(torch.nn.Module):
         return SimpleNamespace(last_hidden_state=torch.ones(shape, dtype=torch.bfloat16))
 
 
+def test_presentation_batch_splits_on_oom():
+    class OOMTextModel(_TextModel):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes = []
+
+        def forward(self, input_ids, attention_mask, mm_token_type_ids, **kwargs):
+            self.batch_sizes.append(input_ids.shape[0])
+            if input_ids.shape[0] > 2:
+                raise torch.OutOfMemoryError("simulated text encoder OOM")
+            return super().forward(input_ids, attention_mask, mm_token_type_ids, **kwargs)
+
+    model = OOMTextModel()
+    encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "t2va")
+    jobs = [
+        {
+            "token_ids": list(range(index + 1)),
+            "tags": torch.zeros(index + 1, dtype=torch.long),
+            "pixel_values": None,
+            "image_grid_thw": None,
+            "pixel_values_videos": None,
+            "video_grid_thw": None,
+            "empty": False,
+        }
+        for index in range(4)
+    ]
+
+    outputs = encoder._run_presentation_jobs(jobs)
+
+    assert model.batch_sizes == [4, 2, 2]
+    assert [output.shape for output in outputs] == [(index + 1, 5120) for index in range(4)]
+
+
 def test_conditioning_cache_is_raw_text_rows_with_text_tags():
     model = _TextModel()
     encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "t2va")

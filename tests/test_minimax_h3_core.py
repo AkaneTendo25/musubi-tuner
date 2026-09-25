@@ -3077,6 +3077,31 @@ def test_native_latent_encoder_bounds_image_batches_and_splits_on_oom():
     assert all(result["latents_1x2x2_float32"].shape == (24, 1, 2, 2) for result in results)
 
 
+def test_native_latent_encoder_splits_reference_batches_on_oom():
+    class VideoEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+            self.calls = []
+
+        def encode_reference(self, pixels, *, image):
+            assert image
+            self.calls.append(pixels.shape[0])
+            if pixels.shape[0] > 2:
+                raise torch.OutOfMemoryError("simulated reference VAE OOM")
+            return torch.zeros(pixels.shape[0], 24, 1, 2, 2)
+
+    video_encoder = VideoEncoder()
+    encoder = h3_integration._NativeLatentEncoder(video_encoder, None, torch.float32)
+    contents = [np.zeros((32, 32, 3), dtype=np.uint8) for _ in range(5)]
+
+    latents = encoder._encode_reference_video_batch(contents, image=True)
+
+    assert video_encoder.calls == [5, 2, 3, 1, 2]
+    assert len(latents) == 5
+    assert all(latent.shape == (24, 1, 2, 2) for latent in latents)
+
+
 def test_native_latent_encoder_caches_image_and_separate_audio_targets():
     class VideoEncoder(torch.nn.Module):
         def __init__(self):
@@ -5224,6 +5249,12 @@ def test_cache_sharding_rejects_out_of_range_index(tmp_path):
             [dataset],
             lambda batch: None,
             Namespace(num_workers=1, skip_existing=False, keep_cache=True, batch_size=4, num_shards=2, shard_index=2),
+        )
+    with pytest.raises(ValueError, match="shard_index"):
+        cache_latents.encode_datasets(
+            [dataset],
+            lambda batch: None,
+            Namespace(num_workers=1, skip_existing=False, keep_cache=True, batch_size=4, num_shards=0, shard_index=0),
         )
     with pytest.raises(ValueError, match="shard_index"):
         process_text_encoder_batches(1, False, 4, [dataset], [set()], [set()], lambda batch: None, num_shards=0, shard_index=0)

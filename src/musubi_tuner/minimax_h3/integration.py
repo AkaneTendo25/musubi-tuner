@@ -2791,9 +2791,24 @@ class _NativeLatentEncoder:
         """
         if self.video_encoder is None:
             raise ValueError("MiniMax H3 visual references require --vae during latent caching")
-        pixels = torch.cat([self._reference_pixels(content) for content in contents], dim=0)
-        with torch.inference_mode():
-            latents = self.video_encoder.encode_reference(pixels, image=image)
+
+        def attempt(batch: list[np.ndarray]) -> torch.Tensor | None:
+            try:
+                pixels = torch.cat([self._reference_pixels(content) for content in batch], dim=0)
+                with torch.inference_mode():
+                    return self.video_encoder.encode_reference(pixels, image=image)
+            except torch.OutOfMemoryError:
+                return None
+
+        latents = attempt(contents)
+        if latents is None:
+            if len(contents) == 1:
+                raise torch.OutOfMemoryError("H3 visual reference does not fit as a single-item VAE batch")
+            midpoint = len(contents) // 2
+            return [
+                *self._encode_reference_video_batch(contents[:midpoint], image=image),
+                *self._encode_reference_video_batch(contents[midpoint:], image=image),
+            ]
         if latents.shape[0] != len(contents):
             return [self._encode_reference_video(content, image=image) for content in contents]
         return [latent.to(self.output_dtype) for latent in latents]

@@ -352,6 +352,8 @@ def _h3_cache_common_args(cmd: list[str], section) -> None:
         cmd.append("--keep_cache")
     if section.num_workers is not None:
         cmd += ["--num_workers", str(section.num_workers)]
+    if section.h3_num_shards != 1:
+        cmd += ["--num_shards", str(section.h3_num_shards), "--shard_index", str(section.h3_shard_index)]
 
 
 def _build_h3_cache_latents_cmd(config: ProjectConfig) -> list[str]:
@@ -905,6 +907,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--gradient_checkpointing_cpu_offload")
     if t.h3_gradient_checkpointing_blocks is not None:
         cmd += ["--h3_gradient_checkpointing_blocks", str(t.h3_gradient_checkpointing_blocks)]
+    if t.h3_gradient_checkpointing_swapped:
+        cmd.append("--h3_gradient_checkpointing_swapped")
     if t.h3_gradient_checkpointing_cpu_offload_pin_memory:
         cmd.append("--h3_gradient_checkpointing_cpu_offload_pin_memory")
     if t.h3_reusable_activation_offload:
@@ -1083,6 +1087,10 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             "h3_validation_std",
             "h3_adapter_prompt_only",
             "h3_fused_elementwise",
+            "h3_null_anchor_reuse_empty",
+            "h3_null_anchor_shared_draws",
+            "h3_varlen_padding",
+            "h3_sample_keep_dit_resident",
         )
     ):
         if getattr(t, name):

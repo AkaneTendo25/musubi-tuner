@@ -101,6 +101,10 @@ except (ImportError, AttributeError):
     flash_attn_varlen_func = None
 
 
+def _flash_varlen_supported(query: torch.Tensor) -> bool:
+    return query.is_cuda and query.dtype in (torch.float16, torch.bfloat16)
+
+
 def _cudnn_auto_workload_is_large(query_length: int, key_length: int, head_dim: int) -> bool:
     return (
         min(query_length, key_length) >= _CUDNN_AUTO_MIN_SEQUENCE
@@ -121,25 +125,37 @@ def _use_cudnn_auto_dispatch(query: torch.Tensor, key: torch.Tensor, value: torc
     )
 
 
-# One probe result per (sequence-length bucket, heads, head_dim, dtype, device) is
-# shared by every block -- all of them see the same packed sequence.
+# Cache only exact workloads; backend support and speed vary with batch and sequence size.
 _ATTN_AUTOTUNE_CACHE: dict[tuple, str] = {}
-_ATTN_AUTOTUNE_BUCKET = 4096
 _ATTN_AUTOTUNE_REPS = 3
+
+
+def _attention_autotune_key(query: torch.Tensor, key: torch.Tensor) -> tuple:
+    return (
+        query.shape[0],
+        query.shape[1],
+        key.shape[1],
+        query.shape[2],
+        query.shape[3],
+        str(query.dtype),
+        query.device.type,
+        query.device.index,
+    )
+
+
+def _attention_backend_rejected(error: RuntimeError) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in ("not supported", "unsupported", "no available kernel", "invalid configuration", "requires cuda")
+    )
 
 
 def _autotune_attention_choice(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> str:
     """Time each runnable unmasked attention backend on the real Q/K/V once per shape, return the winner."""
     if query.device.type != "cuda" or query.dtype not in {torch.float16, torch.bfloat16}:
         return "torch"
-    cache_key = (
-        query.shape[1] // _ATTN_AUTOTUNE_BUCKET,
-        key.shape[1] // _ATTN_AUTOTUNE_BUCKET,
-        query.shape[2],
-        query.shape[3],
-        str(query.dtype),
-        query.device.index,
-    )
+    cache_key = _attention_autotune_key(query, key)
     cached = _ATTN_AUTOTUNE_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -505,28 +521,44 @@ class MiniMaxH3Attention(nn.Module):
             value = value.transpose(1, 2)
             hidden_states = int8_attention(query, key, value).transpose(1, 2).flatten(2, 3)
         elif self.attn_autotune and attention_mask is None:
-            # Probed once per packed shape on the real Q/K/V: the CLI backend
-            # choice is only the fallback for masked calls now.
             choice = _autotune_attention_choice(query, key, value)
-            if choice in {"flash", "flash3", "flash4"}:
-                hidden_states = musubi_attention(
-                    [query, key, value],
-                    attn_params=AttentionParams.create_attention_params(choice, False),
-                )
-            else:
-                query = query.transpose(1, 2)
-                key = key.transpose(1, 2)
-                value = value.transpose(1, 2)
-                if choice == "cudnn":
-                    with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
-                        hidden_states = F.scaled_dot_product_attention(
-                            query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
-                        )
-                else:
-                    hidden_states = F.scaled_dot_product_attention(
-                        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
+            try:
+                if choice in {"flash", "flash3", "flash4"}:
+                    hidden_states = musubi_attention(
+                        [query, key, value],
+                        attn_params=AttentionParams.create_attention_params(choice, False),
                     )
-                hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+                else:
+                    sdpa_query = query.transpose(1, 2)
+                    sdpa_key = key.transpose(1, 2)
+                    sdpa_value = value.transpose(1, 2)
+                    if choice == "cudnn":
+                        with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
+                            hidden_states = F.scaled_dot_product_attention(
+                                sdpa_query, sdpa_key, sdpa_value, attn_mask=None, dropout_p=0.0, is_causal=False
+                            )
+                    else:
+                        hidden_states = F.scaled_dot_product_attention(
+                            sdpa_query, sdpa_key, sdpa_value, attn_mask=None, dropout_p=0.0, is_causal=False
+                        )
+                    hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+            except RuntimeError as error:
+                if choice == "torch" or not _attention_backend_rejected(error):
+                    raise
+                cache_key = _attention_autotune_key(query, key)
+                _ATTN_AUTOTUNE_CACHE[cache_key] = "torch"
+                logger.warning("H3 attention autotune: cached %s backend rejected the exact workload; using SDPA", choice)
+                hidden_states = (
+                    F.scaled_dot_product_attention(
+                        query.transpose(1, 2),
+                        key.transpose(1, 2),
+                        value.transpose(1, 2),
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )
+                    .transpose(1, 2)
+                    .flatten(2, 3)
+                )
         elif self.attention_mode in {"flash", "flash3", "flash4"} and attention_mask is None:
             hidden_states = musubi_attention(
                 [query, key, value],
@@ -535,6 +567,7 @@ class MiniMaxH3Attention(nn.Module):
         elif (
             self.varlen_padding
             and flash_attn_varlen_func is not None
+            and _flash_varlen_supported(query)
             and attention_mask is not None
             and attention_mask.dtype == torch.bool
             and attention_mask.shape == (query.shape[0], 1, query.shape[1])

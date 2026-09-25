@@ -1344,6 +1344,30 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         page="training",
                     )
                 )
+        if t.h3_null_anchor_reuse_empty and (
+            t.h3_guidance_distillation_scale is None
+            or t.h3_guidance_null_source != "frozen"
+            or t.h3_guidance_null_anchor_weight <= 0
+        ):
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "training.h3_null_anchor_reuse_empty",
+                    "Null-anchor empty reuse has no effect without guidance, a frozen null source, and a positive null-anchor weight.",
+                    label="Reuse Empty Null Anchor",
+                    page="training",
+                )
+            )
+        if t.h3_null_anchor_shared_draws and t.h3_guidance_null_anchor_weight <= 0:
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "training.h3_null_anchor_shared_draws",
+                    "Shared null-anchor draws have no effect without a positive null-anchor weight.",
+                    label="Shared Null-Anchor Draws",
+                    page="training",
+                )
+            )
         if t.h3_fuse_frozen_teachers and (
             (t.h3_guidance_distillation_scale is None and not t.h3_guidance_scale_range)
             or t.h3_guidance_null_source != "frozen"
@@ -1907,6 +1931,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_lora_fused_bf16 and t.h3_training_type == "learned_context":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_lora_fused_bf16",
+                    "Fused BF16 LoRA requires LoRA or slider training.",
+                    label="Fused BF16 LoRA",
+                    page="training",
+                )
+            )
         checkpoint_blocks = t.h3_gradient_checkpointing_blocks
         if checkpoint_blocks is not None:
             if not 0 <= checkpoint_blocks <= 50:
@@ -1936,6 +1970,37 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         "training.h3_gradient_checkpointing_blocks",
                         "Partial H3 gradient checkpointing cannot be combined with block swap.",
                         label="Checkpointed H3 Blocks",
+                        page="training",
+                    )
+                )
+        if t.h3_gradient_checkpointing_swapped:
+            if not t.gradient_checkpointing:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_gradient_checkpointing_swapped",
+                        "Checkpointing swapped H3 blocks requires gradient checkpointing.",
+                        label="Checkpoint Swapped H3 Blocks",
+                        page="training",
+                    )
+                )
+            if not (t.blocks_to_swap or 0) > 0:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_gradient_checkpointing_swapped",
+                        "Checkpointing swapped H3 blocks requires block swap.",
+                        label="Checkpoint Swapped H3 Blocks",
+                        page="training",
+                    )
+                )
+            if checkpoint_blocks is not None:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.h3_gradient_checkpointing_swapped",
+                        "Checkpointing swapped H3 blocks cannot be combined with an explicit checkpointed-block count.",
+                        label="Checkpoint Swapped H3 Blocks",
                         page="training",
                     )
                 )
@@ -4314,11 +4379,35 @@ def _validate_sample_prompt_path(
         )
 
 
+def _validate_h3_cache_shards(c, errors: list[dict[str, Any]]) -> None:
+    if c.h3_num_shards < 1:
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.h3_num_shards",
+                "H3 cache shard count must be at least 1.",
+                label="H3 Cache Shards",
+                page="caching",
+            )
+        )
+    if c.h3_shard_index < 0 or c.h3_shard_index >= c.h3_num_shards:
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.h3_shard_index",
+                "H3 cache shard index must be between 0 and the shard count minus 1.",
+                label="H3 Shard Index",
+                page="caching",
+            )
+        )
+
+
 def validate_cache_latents_config(config: ProjectConfig) -> dict[str, Any]:
     c = config.caching
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     if c.model_type == "minimax_h3":
+        _validate_h3_cache_shards(c, errors)
         requires_video, requires_audio = _h3_required_vaes(config)
         if (
             any(entry.fp_1f_clean_indices is not None for entry in (*config.dataset.datasets, *config.dataset.validation_datasets))
@@ -4443,6 +4532,7 @@ def validate_cache_text_config(config: ProjectConfig) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     if c.model_type == "minimax_h3":
+        _validate_h3_cache_shards(c, errors)
         if not _has_text(c.h3_text_encoder):
             errors.append(
                 _make_issue(

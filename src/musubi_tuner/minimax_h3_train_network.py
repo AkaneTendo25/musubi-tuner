@@ -7996,6 +7996,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_fused_indexed_adaln": str(args.h3_fused_indexed_adaln),
             "ss_h3_fused_swiglu": str(args.h3_fused_swiglu),
             "ss_h3_fused_elementwise": str(getattr(args, "h3_fused_elementwise", False)),
+            "ss_h3_lora_fused_bf16": str(bool(getattr(args, "h3_lora_fused_bf16", False))),
             "ss_h3_compile_attention": str(getattr(args, "h3_compile_attention", "inline")),
             "ss_h3_swiglu_chunk_rows": str(args.h3_swiglu_chunk_rows),
             "ss_h3_int8_attention": args.h3_int8_attention,
@@ -8248,7 +8249,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "probe every runnable unmasked attention backend (plain SDPA, cuDNN-priority SDPA, and each installed "
-            "FlashAttention) on the real packed Q/K/V once per shape bucket and use the measured winner; "
+            "FlashAttention) on the real packed Q/K/V once per exact shape and use the measured winner; "
             "requires --sdpa and replaces --h3_attn_auto_dispatch's fixed priority with an actual timing. Masked, "
             "block-sparse, and INT8 calls keep their existing paths"
         ),

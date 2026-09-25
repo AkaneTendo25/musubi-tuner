@@ -175,6 +175,8 @@ class CachingConfig(BaseModel):
     h3_max_caption_tokens: int = 0
     h3_keyframe_visuals: str = ""
     h3_qwen_control_dropout: bool = False
+    h3_num_shards: int = 1
+    h3_shard_index: int = 0
     cache_batch_size: Optional[int] = None
     gemma_root: str = ""
     gemma_safetensors: str = ""
@@ -315,6 +317,8 @@ class TrainingConfig(BaseModel):
     h3_guidance_loss_form: Literal["normalized", "contrastive"] = "normalized"
     h3_guidance_loss_schedule: Literal["sigma", "constant"] = "sigma"
     h3_guidance_null_source: Literal["live", "frozen"] = "live"
+    h3_null_anchor_reuse_empty: bool = False
+    h3_null_anchor_shared_draws: bool = False
     h3_guidance_cfg_zero: bool = False
     h3_fuse_frozen_teachers: bool = False
     h3_base_preservation_loss_weight: float = 0.0
@@ -351,8 +355,11 @@ class TrainingConfig(BaseModel):
     h3_convrot_int8_lora_fused: bool = False
     h3_lora_fused_bf16: bool = False
     h3_gradient_checkpointing_blocks: Optional[int] = None
+    h3_gradient_checkpointing_swapped: bool = False
     h3_gradient_checkpointing_cpu_offload_pin_memory: bool = False
     h3_reusable_activation_offload: bool = False
+    h3_varlen_padding: bool = False
+    h3_sample_keep_dit_resident: bool = False
     # Complete MiniMax H3 trainer option surface.
     h3_lora_targets: Optional[str] = None
     h3_audio_only_spatial_tokens: bool = False

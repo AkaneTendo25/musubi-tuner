@@ -697,8 +697,8 @@ class MiniMaxH3ConditioningEncoder:
         image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         video_pad_id = self.tokenizer.convert_tokens_to_ids("<|video_pad|>")
         bnb_logger = logging.getLogger("bitsandbytes.autograd._functions")
-        for start in range(0, len(order), chunk_size):
-            chunk = order[start : start + chunk_size]
+
+        def run_chunk(chunk: list[int]) -> None:
             lengths = [len(jobs[index]["token_ids"]) for index in chunk]
             width = max(lengths)
             input_ids = torch.zeros((len(chunk), width), dtype=torch.long, device=self.model.device)
@@ -723,30 +723,52 @@ class MiniMaxH3ConditioningEncoder:
                 if video_chunks
                 else None
             )
-            with torch.no_grad():
+
+            def attempt() -> torch.Tensor | None:
                 previous_bnb_level = bnb_logger.level
                 if getattr(self.model, "is_loaded_in_8bit", False):
                     bnb_logger.setLevel(logging.ERROR)
                 try:
-                    hidden = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        mm_token_type_ids=mm_token_type_ids,
-                        pixel_values=None if pixel_values is None else pixel_values.to(self.model.device, dtype=self.model.dtype),
-                        image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.model.device),
-                        pixel_values_videos=(
-                            None
-                            if pixel_values_videos is None
-                            else pixel_values_videos.to(self.model.device, dtype=self.model.dtype)
-                        ),
-                        video_grid_thw=None if video_grid_thw is None else video_grid_thw.to(self.model.device),
-                        use_cache=False,
-                        return_dict=True,
-                    ).last_hidden_state
+                    with torch.no_grad():
+                        return self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            mm_token_type_ids=mm_token_type_ids,
+                            pixel_values=(
+                                None if pixel_values is None else pixel_values.to(self.model.device, dtype=self.model.dtype)
+                            ),
+                            image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.model.device),
+                            pixel_values_videos=(
+                                None
+                                if pixel_values_videos is None
+                                else pixel_values_videos.to(self.model.device, dtype=self.model.dtype)
+                            ),
+                            video_grid_thw=None if video_grid_thw is None else video_grid_thw.to(self.model.device),
+                            use_cache=False,
+                            return_dict=True,
+                        ).last_hidden_state
+                except torch.OutOfMemoryError:
+                    return None
                 finally:
                     bnb_logger.setLevel(previous_bnb_level)
+
+            hidden = attempt()
+            if hidden is None:
+                if len(chunk) == 1:
+                    raise torch.OutOfMemoryError("Qwen3-VL presentation does not fit as a single-item batch")
+                # Release the failed chunk's padded inputs before retrying smaller
+                # chunks; retaining them would reduce the memory available to the retry.
+                del input_ids, attention_mask, mm_token_type_ids
+                del pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
+                midpoint = len(chunk) // 2
+                run_chunk(chunk[:midpoint])
+                run_chunk(chunk[midpoint:])
+                return
             for row, (index, length) in enumerate(zip(chunk, lengths)):
                 outputs[index] = hidden[row, :length].to(dtype=self.output_dtype, device="cpu")
+
+        for start in range(0, len(order), chunk_size):
+            run_chunk(order[start : start + chunk_size])
         return [output if output is not None else torch.empty((0, hidden_size), dtype=self.output_dtype) for output in outputs]
 
     def _null_token_id(self) -> int:

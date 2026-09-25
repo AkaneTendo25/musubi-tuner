@@ -7,7 +7,12 @@ from musubi_tuner.gui_dashboard.command_builder import (
     build_training_cmd,
 )
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
-from musubi_tuner.gui_dashboard.validation import validate_training_config
+from musubi_tuner.gui_dashboard.validation import (
+    validate_cache_latents_config,
+    validate_cache_text_config,
+    validate_training_config,
+)
+from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
 
 
 def _config(tmp_path: Path) -> ProjectConfig:
@@ -69,6 +74,11 @@ def test_every_new_h3_training_control_emits_its_flag(tmp_path: Path) -> None:
         "h3_guidance_null_anchor_probability": 0.5,
         "h3_guidance_null_anchor_sigma_min": 0.8,
         "h3_fused_elementwise": True,
+        "h3_null_anchor_reuse_empty": True,
+        "h3_null_anchor_shared_draws": True,
+        "h3_varlen_padding": True,
+        "h3_sample_keep_dit_resident": True,
+        "h3_lora_fused_bf16": True,
         "h3_compile_attention": "opaque",
         "h3_swiglu_chunk_rows": 1024,
         "h3_checkpoint_keep": "attention",
@@ -81,6 +91,71 @@ def test_every_new_h3_training_control_emits_its_flag(tmp_path: Path) -> None:
         setattr(config.training, name, value)
     command = build_training_cmd(config)
     assert not {f"--{name}" for name in values}.difference(command)
+
+
+def test_h3_swapped_checkpointing_control_and_validation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.training.h3_gradient_checkpointing_swapped = True
+
+    report = validate_training_config(config)
+    assert "training.h3_gradient_checkpointing_swapped" in report["field_errors"]
+
+    config.training.gradient_checkpointing = True
+    config.training.blocks_to_swap = 10
+    report = validate_training_config(config)
+    assert "training.h3_gradient_checkpointing_swapped" not in report["field_errors"]
+    assert "--h3_gradient_checkpointing_swapped" in build_training_cmd(config)
+
+    config.training.h3_gradient_checkpointing_blocks = 50
+    report = validate_training_config(config)
+    assert "training.h3_gradient_checkpointing_swapped" in report["field_errors"]
+
+
+def test_new_h3_controls_are_present_in_training_ui() -> None:
+    source = (Path(__file__).parents[1] / "src/musubi_tuner/gui_dashboard/frontend/src/routes/training/+page.svelte").read_text(
+        encoding="utf-8"
+    )
+    for field in (
+        "h3_null_anchor_reuse_empty",
+        "h3_null_anchor_shared_draws",
+        "h3_gradient_checkpointing_swapped",
+        "h3_varlen_padding",
+        "h3_sample_keep_dit_resident",
+        "h3_lora_fused_bf16",
+    ):
+        assert f"training.{field}" in source
+
+
+def test_h3_lora_fused_bf16_metadata() -> None:
+    args = create_parser().parse_args(["--sdpa", "--h3_lora_fused_bf16"])
+    assert MiniMaxH3NetworkTrainer().extra_metadata(args)["ss_h3_lora_fused_bf16"] == "True"
+
+
+def test_h3_cache_shards_emit_for_both_cache_commands(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.caching.model_type = "minimax_h3"
+    config.caching.h3_num_shards = 4
+    config.caching.h3_shard_index = 2
+
+    for command in (build_cache_latents_cmd(config), build_cache_text_cmd(config)):
+        assert command[command.index("--num_shards") + 1] == "4"
+        assert command[command.index("--shard_index") + 1] == "2"
+
+
+def test_h3_cache_shard_range_is_validated(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.caching.model_type = "minimax_h3"
+    config.caching.h3_num_shards = 2
+    config.caching.h3_shard_index = 2
+
+    for report in (validate_cache_latents_config(config), validate_cache_text_config(config)):
+        assert "caching.h3_shard_index" in report["field_errors"]
+
+    source = (Path(__file__).parents[1] / "src/musubi_tuner/gui_dashboard/frontend/src/routes/caching/+page.svelte").read_text(
+        encoding="utf-8"
+    )
+    assert "caching.h3_num_shards" in source
+    assert "caching.h3_shard_index" in source
 
 
 def test_h3_attention_and_fused_backward_controls(tmp_path: Path) -> None:

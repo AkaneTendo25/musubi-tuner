@@ -327,7 +327,7 @@ def encode_datasets(
 ):
     """Common function to encode datasets. This function is called from multiple architecture scripts."""
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
-    num_shards = getattr(args, "num_shards", 1) or 1
+    num_shards = getattr(args, "num_shards", 1)
     shard_index = getattr(args, "shard_index", 0) or 0
     if num_shards < 1 or not 0 <= shard_index < num_shards:
         raise ValueError(f"--shard_index must be in [0, {num_shards}), got {shard_index} (num_shards={num_shards})")
