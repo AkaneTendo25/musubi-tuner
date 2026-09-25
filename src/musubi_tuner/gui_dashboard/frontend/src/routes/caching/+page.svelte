@@ -476,8 +476,12 @@
 				<FormToggle fieldPath="caching.skip_existing" checked={caching.skip_existing ?? false} onchange={(e) => updateCaching('skip_existing', e.target.checked)} tooltip="Skip files that already have cached outputs" />
 				<FormToggle label="Faster checking" fieldPath="caching.faster_check" checked={caching.faster_check ?? false} onchange={(e) => updateCaching('faster_check', e.target.checked)} tooltip="When Skip Existing is enabled, recognize caches by filename instead of opening each one. A sample of caches is still validated in full first, and any mismatch falls back to checking every cache." />
 				<FormToggle fieldPath="caching.atomic_cache_writes" checked={caching.atomic_cache_writes ?? false} onchange={(e) => updateCaching('atomic_cache_writes', e.target.checked)} tooltip="Write cache files through a temporary sibling file, then atomically replace the final cache path after a successful save." />
-				<FormToggle fieldPath="caching.cache_distributed" checked={caching.cache_distributed ?? false} onchange={(e) => updateCaching('cache_distributed', e.target.checked)} tooltip="Shard caching work across multiple processes (opt-in multi-process cache sharding)." />
+				{#if caching.model_type !== 'minimax_h3'}<FormToggle fieldPath="caching.cache_distributed" checked={caching.cache_distributed ?? false} onchange={(e) => updateCaching('cache_distributed', e.target.checked)} tooltip="Shard caching work across multiple processes (opt-in multi-process cache sharding)." />{/if}
 				<FormToggle fieldPath="caching.cpu_staged_checkpoint_loading" checked={caching.cpu_staged_checkpoint_loading ?? false} onchange={(e) => updateCaching('cpu_staged_checkpoint_loading', e.target.checked)} tooltip="Stage checkpoint tensors through CPU before moving them to the selected device." />
+				{#if caching.model_type === 'minimax_h3'}
+					<FormField type="number" label="Cache shards" fieldPath="caching.h3_num_shards" value={caching.h3_num_shards ?? 1} oninput={(e) => updateCaching('h3_num_shards', Number(e.target.value))} min={1} tooltip="Total number of deterministic H3 cache shards. Run each shard index separately for both latent and text caches." />
+					<FormField type="number" label="Shard index" fieldPath="caching.h3_shard_index" value={caching.h3_shard_index ?? 0} oninput={(e) => updateCaching('h3_shard_index', Number(e.target.value))} min={0} max={Math.max(0, (caching.h3_num_shards ?? 1) - 1)} disabled={(caching.h3_num_shards ?? 1) <= 1} tooltip="Zero-based H3 cache shard index." />
+				{/if}
 			</div>
 			{#if $advancedMode}
 				<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
