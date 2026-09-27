@@ -1057,6 +1057,9 @@ Every objective here is off unless its flag is given; a run that names none of t
 | `--h3_guidance_null_anchor_weight 0.0` | Penalizes movement of the EMPTY-prompt prediction away from the frozen base's, weighted by this value, and leaves the prompted prediction free; unlike `--h3_base_preservation_loss_weight` it does not pull the prompted branch and so does not fight the data term directly. Details below. |
 | `--h3_guidance_null_anchor_probability 1.0` | Evaluate the null anchor on a synchronized random fraction of prompted steps and divide the active term by it, so the expected gradient is the dense anchor's at a fraction of its two forwards a step. Reported as `h3/null_anchor_active`. |
 | `--h3_guidance_null_anchor_sigma_min 0.0` | Evaluate the null anchor only on prompted steps whose shifted video sigma (batch mean, and the mean over frames under `--h3_frame_sigma_jitter`) is at least this value; below it the anchor forwards are skipped. Not rescaled. Reported as `h3/null_anchor_active`. Needs the anchor weight above `0`. |
+| `--h3_soar_weight 0.0` | Experimental SOAR correction loss; `0` disables it. Uses one detached step of the current model and extra trainable forwards at re-noised states. See [SOAR correction training](#soar-correction-training). |
+| `--h3_soar_aux_points 1` | Number of re-noised correction states per data step. Each adds a trainable forward. |
+| `--h3_soar_rollout_steps 20` | One detached Euler step descends by `1 / N` in the shared unshifted sigma coordinate. |
 | `--h3_rollout_supervision` | Supervise the adapter at states reached by its own sampler, against a privileged frozen teacher. Requires `--h3_rollout_teacher_config`. See [Rollout supervision](#rollout-supervision). |
 | `--h3_rollout_teacher_config teacher.toml` | Dataset config for the teacher: the same clips and captions as the training set, with extra information about each clip in its cache. Its privilege channel is validated before the model loads. |
 | `--h3_rollout_steps 2` | No-gradient Euler steps taken from pure noise to reach the supervised state. Default `2`. |
@@ -1633,6 +1636,17 @@ one.
   `--h3_guidance_null_anchor_probability`, `--h3_guidance_loss_schedule constant`,
   `--h3_caption_dropout_rate 0` (dropout trains the branch the anchor holds), `--h3_fuse_frozen_teachers` (only with
   `--h3_base_preservation_loss_weight` above 0, whose teacher it batches into the same forward; rejected otherwise).
+
+#### SOAR correction training
+
+Set `--h3_soar_weight 1.0` to add a correction loss to H3 LoRA or full training; `0` (default) disables it.
+Each example adds one detached denoising step and one trainable correction pass per `--h3_soar_aux_points`
+(default `1`). `--h3_soar_rollout_steps` (default `20`) sets the denoising step size. The correction uses the
+original noise and clean video/audio targets; `loss/soar_auxiliary` reports its training loss.
+
+SOAR currently supports the plain data objective. The trainer rejects combinations with guidance distillation,
+teacher or rollout objectives, observed-modality training, frame sigma jitter, target conditioning, and CREPA.
+Use `--h3_validation_field_probe` when training the released guidance-distilled checkpoint.
 
 #### Rollout supervision
 

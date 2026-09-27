@@ -135,6 +135,7 @@ from musubi_tuner.minimax_h3.training import (
     joint_prediction_loss,
     joint_velocity_loss,
     prepare_joint_noisy_inputs,
+    prepare_soar_auxiliary_inputs,
     shift_sigma,
     target_slot_losses,
     unshift_sigma,
@@ -3325,6 +3326,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError(f"--{name} must be in [0.01, 100.0], got {value}")
         if args.h3_image_flow_shift is not None and args.h3_image_flow_shift <= 0:
             raise ValueError("MiniMax H3 --h3_image_flow_shift must be positive when specified")
+        self._validate_soar_args(args)
         modality_loss_weights = {
             "h3_video_loss_weight": float(args.h3_video_loss_weight),
             "h3_audio_loss_weight": float(args.h3_audio_loss_weight),
@@ -5186,6 +5188,58 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             weight = measured if weight is None else weight * measured
         return weight
 
+    def _validate_soar_args(self, args: argparse.Namespace) -> None:
+        weight = float(getattr(args, "h3_soar_weight", 0.0) or 0.0)
+        points = int(getattr(args, "h3_soar_aux_points", 1))
+        steps = int(getattr(args, "h3_soar_rollout_steps", 20))
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("--h3_soar_weight must be finite and non-negative; 0 disables SOAR")
+        if points < 1:
+            raise ValueError("--h3_soar_aux_points must be at least 1")
+        if steps < 1:
+            raise ValueError("--h3_soar_rollout_steps must be at least 1")
+        if weight == 0:
+            return
+        incompatible = []
+        if args.h3_guidance_distillation_scale is not None:
+            incompatible.append("guidance distillation")
+        if getattr(args, "h3_guidance_scale_range", None) is not None:
+            incompatible.append("guidance scale range")
+        if bool(getattr(args, "h3_teacher_matching", False)):
+            incompatible.append("teacher matching")
+        if bool(getattr(args, "h3_rollout_supervision", False)):
+            incompatible.append("rollout supervision")
+        if float(getattr(args, "h3_base_preservation_loss_weight", 0.0) or 0.0) > 0:
+            incompatible.append("base preservation")
+        if float(getattr(args, "h3_dop_loss_weight", 0.0) or 0.0) > 0:
+            incompatible.append("DOP")
+        if float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0:
+            incompatible.append("two-teacher training")
+        if float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0:
+            incompatible.append("null anchoring")
+        if args.h3_observed_modality is not None:
+            incompatible.append("observed-modality training")
+        if args.h3_frame_sigma_jitter > 0:
+            incompatible.append("frame sigma jitter")
+        if args.h3_caption_dropout_rate > 0:
+            incompatible.append("caption dropout")
+        if float(getattr(args, "h3_qwen_control_dropout_rate", 0.0) or 0.0) > 0:
+            incompatible.append("Qwen control dropout")
+        if args.crepa is not None:
+            incompatible.append("CREPA")
+        if args.h3_mask_mode != "off" or args.h3_mask_audio:
+            incompatible.append("mask conditioning")
+        if args.h3_extension_video_frames or args.h3_extension_audio_latents:
+            incompatible.append("extension conditioning")
+        if args.h3_keyframe_anchors or args.h3_keyframe_random_count:
+            incompatible.append("keyframe conditioning")
+        if getattr(args, "h3_guide_specs", ""):
+            incompatible.append("guide conditioning")
+        if incompatible:
+            raise ValueError(
+                "--h3_soar_weight currently supports the plain data objective only; incompatible with " + ", ".join(incompatible)
+            )
+
     def _validate_rollout_args(self, args: argparse.Namespace) -> None:
         """Reject every incoherent rollout-supervision configuration before loading.
 
@@ -6236,6 +6290,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             or float(args.h3_dop_loss_weight) > 0
             or float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
             or bool(getattr(args, "h3_rollout_supervision", False))
+            or float(getattr(args, "h3_soar_weight", 0.0) or 0.0) > 0
             or bool(getattr(args, "h3_teacher_matching", False))
             or float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0
             or self._crepa is not None
@@ -6842,6 +6897,66 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if float(torch.rand((), device="cpu")) < args.h3_caption_dropout_rate:
                 conditioning = "empty"
 
+        soar_auxiliary_loss = None
+        soar_weight = float(getattr(args, "h3_soar_weight", 0.0) or 0.0)
+        soar_points = int(getattr(args, "h3_soar_aux_points", 1))
+        soar_normalizer = 1.0 + soar_weight * soar_points
+        if soar_weight > 0:
+            # SOAR deliberately uses the raw prompted adapted field.  It corrects
+            # toward the original clean data and does not preserve a distilled
+            # guidance field, hence the plain-objective compatibility gate.
+            auxiliary_block_swap = bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False)
+            int8_context = getattr(transformer, "int8_attention_context", None)
+            with (
+                self._auxiliary_block_swap(transformer, auxiliary_block_swap),
+                torch.no_grad(),
+                int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+            ):
+                rollout_prediction = self._predict(accelerator, transformer, batch, inputs, conditioning="prompt", role="rollout")
+            next_base_sigma = (base_sigma.float() - 1.0 / int(args.h3_soar_rollout_steps)).clamp_min(0.0)
+            auxiliary_losses = []
+            for _ in range(soar_points):
+                auxiliary_draw = torch.rand_like(next_base_sigma).clamp_min(torch.finfo(next_base_sigma.dtype).eps)
+                auxiliary_base_sigma = next_base_sigma + (1.0 - next_base_sigma) * auxiliary_draw
+                auxiliary_inputs = prepare_soar_auxiliary_inputs(
+                    inputs,
+                    video_latents,
+                    audio_latents,
+                    video_noise,
+                    audio_noise,
+                    rollout_prediction,
+                    next_base_sigma,
+                    auxiliary_base_sigma,
+                    video_shift=1.0 if is_image else args.h3_shift_video,
+                    audio_shift=1.0 if is_image else args.h3_shift_audio,
+                )
+                auxiliary_prediction = self._predict(accelerator, transformer, batch, auxiliary_inputs, conditioning="prompt")
+                auxiliary_video_mask = self._mask_to_loss(
+                    batch.get("video_loss_mask"), auxiliary_inputs.video_target, None, axis=-3
+                )
+                auxiliary_audio_mask = self._mask_to_loss(
+                    batch.get("audio_loss_mask"), auxiliary_inputs.audio_target, None, axis=-1
+                )
+                auxiliary_result = joint_velocity_loss(
+                    auxiliary_prediction,
+                    auxiliary_inputs,
+                    video_mask=auxiliary_video_mask,
+                    audio_mask=auxiliary_audio_mask,
+                    video_sample_weight=self._sample_weight(args, auxiliary_inputs.video_sigma) if has_video else None,
+                    audio_sample_weight=(
+                        self._sample_weight(args, auxiliary_inputs.audio_sigma, modality="audio") if has_audio else None
+                    ),
+                    balance=args.h3_loss_balance,
+                    mask_normalization=args.h3_loss_mask_normalization,
+                    video_weight=0.0 if spatial_tokens else args.h3_video_loss_weight,
+                    audio_weight=args.h3_audio_loss_weight,
+                )
+                auxiliary_term = (soar_weight / soar_normalizer) * auxiliary_result.loss
+                accelerator.backward(auxiliary_term * auxiliary_backward_scale)
+                auxiliary_losses.append(auxiliary_result.loss.detach())
+                del auxiliary_prediction
+            soar_auxiliary_loss = torch.stack(auxiliary_losses).sum()
+
         # A dropped step is already unconditional, so there is no guided field to
         # invert and both branches would evaluate the same empty prompt.
         # After the curriculum's snapshot the concept is supplied by the frozen
@@ -7386,11 +7501,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 metrics["h3/recipe_mask_active"] = float(self._step_recipe == "mask")
             if extension_configured:
                 metrics["h3/recipe_extension_active"] = float(self._step_recipe == "extension")
-        loss = result.loss
+        loss = result.loss / soar_normalizer if soar_weight > 0 else result.loss
         # Dense-equivalent objective, free of inverse-probability scaling and of
         # auxiliary terms. Reported as the averaged loss whenever the optimized
         # loss differs from it.
         dense_loss = result.loss
+        if soar_weight > 0:
+            loss = loss + (soar_weight / soar_normalizer) * soar_auxiliary_loss
+            metrics["loss/soar_auxiliary"] = soar_auxiliary_loss / soar_points
+            metrics["h3/soar_normalizer"] = soar_normalizer
         if matching_teacher_prediction is not None:
             magnitude = args.h3_teacher_loss_mag_weight if teacher_conditioned else 1.0
             loss, video_teacher_loss, audio_teacher_loss = _teacher_joint_loss(
@@ -7800,6 +7919,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             or rollout_replaced
             or null_anchor is not None
             or two_teacher_trigger_loss is not None
+            or soar_weight > 0
         ):
             average_loss = loss
             if base_preservation_term is not None:
@@ -7840,6 +7960,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # same forward already produced, which is what a run without the
                 # flag would have logged.
                 average_loss = average_loss - rescaled_rollout_loss + dense_loss
+            if soar_weight > 0:
+                # The running average stays in the ordinary data-loss units; the
+                # separately backpropagated correction is visible in its own metric.
+                average_loss = dense_loss
             metrics[LOSS_FOR_AVERAGE_KEY] = average_loss.detach()
         # Keep capture active until backward has completed. Non-reentrant
         # gradient checkpointing recomputes hooked blocks during backward and
@@ -8067,6 +8191,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_null_anchor_reuse_empty": str(bool(getattr(args, "h3_null_anchor_reuse_empty", False))),
             "ss_h3_null_anchor_shared_draws": str(bool(getattr(args, "h3_null_anchor_shared_draws", False))),
             "ss_h3_rollout_supervision": str(bool(getattr(args, "h3_rollout_supervision", False))),
+            **(
+                {
+                    "ss_h3_soar_weight": str(float(args.h3_soar_weight)),
+                    "ss_h3_soar_aux_points": str(int(args.h3_soar_aux_points)),
+                    "ss_h3_soar_rollout_steps": str(int(args.h3_soar_rollout_steps)),
+                }
+                if float(getattr(args, "h3_soar_weight", 0.0) or 0.0) > 0
+                else {}
+            ),
             "ss_h3_rollout_probability": str(args.h3_rollout_probability),
             "ss_h3_rollout_steps": str(args.h3_rollout_steps),
             "ss_h3_rollout_window": str(args.h3_rollout_window),
@@ -8680,6 +8813,28 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "streams overlap. The run must be at least 3 + N optimizer steps long. Profiling stops afterwards and "
             "training continues. Diagnostic only. 0 disables"
         ),
+    )
+    parser.add_argument(
+        "--h3_soar_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "EXPERIMENTAL SOAR auxiliary correction weight. Each enabled step takes one detached adapted Euler step "
+            "from the ordinary data state, re-noises toward the same noise, and regresses to the original clean data. "
+            "The base and auxiliary losses are normalized by 1 + weight * auxiliary_points. 0 disables"
+        ),
+    )
+    parser.add_argument(
+        "--h3_soar_aux_points",
+        type=int,
+        default=1,
+        help="number of independently re-noised SOAR correction points per data step",
+    )
+    parser.add_argument(
+        "--h3_soar_rollout_steps",
+        type=int,
+        default=20,
+        help="base-sigma schedule resolution; the detached Euler endpoint is one 1/N interval below the data state",
     )
     parser.add_argument(
         "--h3_rollout_supervision",

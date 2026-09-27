@@ -209,6 +209,90 @@ def prepare_joint_noisy_inputs(
     )
 
 
+def prepare_soar_auxiliary_inputs(
+    inputs: H3JointNoisyInputs,
+    video_latents: torch.Tensor | None,
+    audio_latents: torch.Tensor | None,
+    video_noise: torch.Tensor | None,
+    audio_noise: torch.Tensor | None,
+    rollout_prediction: H3ModelPrediction,
+    next_base_sigma: torch.Tensor,
+    auxiliary_base_sigma: torch.Tensor,
+    *,
+    video_shift: float = VIDEO_FLOW_SHIFT,
+    audio_shift: float = AUDIO_FLOW_SHIFT,
+) -> H3JointNoisyInputs:
+    """Build one detached SOAR correction point from an on-path data state.
+
+    The adapted field takes one Euler step to ``next_base_sigma``.  That state is
+    then re-noised toward the *same* data noise at ``auxiliary_base_sigma``.  The
+    target points from the resulting auxiliary state to the original clean data,
+    so ``x_aux + sigma_aux * target == x0`` (up to arithmetic precision).
+    """
+    if next_base_sigma.shape != inputs.video_sigma.shape or auxiliary_base_sigma.shape != inputs.video_sigma.shape:
+        raise ValueError("H3 SOAR sigma tensors must have one value per batch item")
+    if (
+        bool((auxiliary_base_sigma <= 0).any())
+        or bool((auxiliary_base_sigma < next_base_sigma).any())
+        or bool((auxiliary_base_sigma > 1).any())
+    ):
+        raise ValueError("H3 SOAR auxiliary base sigma must be positive and lie between the rollout endpoint and 1")
+
+    next_video_sigma = shift_sigma(next_base_sigma.float(), video_shift)
+    next_audio_sigma = shift_sigma(next_base_sigma.float(), audio_shift)
+    auxiliary_video_sigma = shift_sigma(auxiliary_base_sigma.float(), video_shift)
+    auxiliary_audio_sigma = shift_sigma(auxiliary_base_sigma.float(), audio_shift)
+
+    def build(clean, noise, state, velocity, current_sigma, next_sigma, auxiliary_sigma):
+        if clean is None:
+            if any(value is not None for value in (noise, state, velocity)):
+                raise ValueError("H3 SOAR modality tensors must be present together")
+            return None, None
+        if noise is None or state is None or velocity is None:
+            raise ValueError("H3 SOAR modality tensors must be present together")
+        shape = (clean.shape[0],) + (1,) * (clean.ndim - 1)
+        current = current_sigma.to(device=state.device, dtype=torch.float32).view(shape)
+        following = next_sigma.to(device=state.device, dtype=torch.float32).view(shape)
+        auxiliary = auxiliary_sigma.to(device=state.device, dtype=torch.float32).view(shape)
+        with torch.no_grad():
+            rolled = state.float() + (current - following) * velocity.detach().float()
+            # Continue along the ray from the rolled state toward the original
+            # noise.  This is re-noising, not a fresh stochastic draw.
+            denominator = (1.0 - following).clamp_min(torch.finfo(torch.float32).eps)
+            auxiliary_state = ((1.0 - auxiliary) / denominator) * rolled + ((auxiliary - following) / denominator) * noise.float()
+            correction = (clean.float() - auxiliary_state) / auxiliary.clamp_min(torch.finfo(torch.float32).eps)
+        return auxiliary_state.to(dtype=state.dtype), correction.to(dtype=state.dtype)
+
+    video, video_target = build(
+        video_latents,
+        video_noise,
+        inputs.video,
+        rollout_prediction.video,
+        inputs.video_sigma,
+        next_video_sigma,
+        auxiliary_video_sigma,
+    )
+    audio, audio_target = build(
+        audio_latents,
+        audio_noise,
+        inputs.audio,
+        rollout_prediction.audio,
+        inputs.audio_sigma,
+        next_audio_sigma,
+        auxiliary_audio_sigma,
+    )
+    return H3JointNoisyInputs(
+        video=video,
+        audio=audio,
+        video_target=video_target,
+        audio_target=audio_target,
+        video_sigma=auxiliary_video_sigma,
+        audio_sigma=auxiliary_audio_sigma,
+        video_timestep=1.0 - auxiliary_video_sigma,
+        audio_timestep=1.0 - auxiliary_audio_sigma,
+    )
+
+
 def guidance_consistent_prediction(
     guided: H3ModelPrediction,
     empty: H3ModelPrediction,
