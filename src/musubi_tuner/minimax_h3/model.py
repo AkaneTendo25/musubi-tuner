@@ -416,6 +416,10 @@ class MiniMaxH3Attention(nn.Module):
         self.int8_attention = False
         self.block_sparse_config: BlockSparseConfig | None = None
         self.block_sparse_plan: SequencePlan | None = None
+        self.miowtion_bundle = None
+        self.miowtion_plan = None
+        self.miowtion_layer_index = None
+        self.miowtion_keep_fraction = None
         self.fused_qk_norm_rope = False
         # Set by ``MiniMaxH3Transformer.set_checkpoint_keep("qkv")``; gates the
         # region ``install_projection_region`` wraps around the base projection.
@@ -508,7 +512,23 @@ class MiniMaxH3Attention(nn.Module):
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor | None
     ) -> torch.Tensor:
         """``[B, S, heads, head_dim]`` Q/K/V to the ``[B, S, heads * head_dim]`` attention output."""
-        if self.block_sparse_config is not None and attention_mask is None:
+        if self.miowtion_bundle is not None and attention_mask is None:
+            from musubi_tuner.minimax_h3.block_sparse_attention import miowtion_block_sparse_attention
+
+            hidden_states = (
+                miowtion_block_sparse_attention(
+                    query.transpose(1, 2),
+                    key.transpose(1, 2),
+                    value.transpose(1, 2),
+                    bundle=self.miowtion_bundle,
+                    plan=self.miowtion_plan,
+                    layer_index=self.miowtion_layer_index,
+                    keep_fraction=self.miowtion_keep_fraction,
+                )
+                .transpose(1, 2)
+                .flatten(2, 3)
+            )
+        elif self.block_sparse_config is not None and attention_mask is None:
             # A padding mask is a pairwise condition block selection cannot
             # express, so masked calls fall through to the dense path.
             hidden_states = block_sparse_attention(
@@ -1149,8 +1169,50 @@ class MiniMaxH3Transformer(nn.Module):
                     if index >= start_block:
                         self.block_sparse_modules.append(module)
 
+    def set_miowtion_sparse_attention(self, bundle, *, start_block: int = 0, keep_fraction: float | None = None) -> None:
+        """Use a frozen Miowtion predictor bundle for sparse H3 attention."""
+        from musubi_tuner.minimax_h3.block_sparse_attention import prepare_flex_attention
+
+        prepare_flex_attention()
+        if getattr(self, "block_sparse_config", None) is not None:
+            raise ValueError("Miowtion predictor and mean-scored block sparse attention are mutually exclusive")
+        if keep_fraction is not None and not 0 < keep_fraction <= 1:
+            raise ValueError("Miowtion keep fraction must be in (0, 1]")
+        if bundle.num_layers != len(self.blocks):
+            raise ValueError(f"Miowtion bundle has {bundle.num_layers} layers; H3 has {len(self.blocks)}")
+        first_attention = next(module for module in self.blocks[0].modules() if isinstance(module, MiniMaxH3Attention))
+        if bundle.num_heads != first_attention.heads or bundle.head_dim != first_attention.head_dim:
+            raise ValueError(
+                f"Miowtion bundle has {bundle.num_heads} heads of width {bundle.head_dim}; "
+                f"H3 has {first_attention.heads} heads of width {first_attention.head_dim}"
+            )
+        self.miowtion_bundle = bundle
+        self.miowtion_modules = []
+        for index, block in enumerate(self.blocks):
+            for module in block.modules():
+                if isinstance(module, MiniMaxH3Attention):
+                    # The predictor is frozen and supplied as a separate bundle;
+                    # it must not enter the transformer or LoRA state dict.
+                    object.__setattr__(module, "miowtion_bundle", bundle if index >= start_block else None)
+                    module.miowtion_layer_index = index
+                    module.miowtion_keep_fraction = keep_fraction
+                    module.miowtion_plan = None
+                    if index >= start_block:
+                        self.miowtion_modules.append(module)
+
     def _refresh_block_sparse_plan(self, position_ids: torch.Tensor, token_tags: torch.Tensor) -> None:
         """Build the packed-sequence tile order once for each forward."""
+        bundle = getattr(self, "miowtion_bundle", None)
+        if bundle is not None:
+            from musubi_tuner.minimax_h3.miowtion_predictor import build_miowtion_plan
+
+            if token_tags.ndim != 1:
+                raise ValueError("Miowtion sparse attention requires one shared, unpadded token layout")
+            not_video = torch.nonzero(token_tags != int(MiniMaxH3TokenTag.VIDEO)).flatten()
+            target_start = int(not_video[-1]) + 1 if not_video.numel() else 0
+            plan = build_miowtion_plan(bundle, position_ids.to(device=token_tags.device), target_start)
+            for module in self.miowtion_modules:
+                module.miowtion_plan = plan
         config = getattr(self, "block_sparse_config", None)
         if config is None or config.block_shape is None or not self.block_sparse_modules:
             return

@@ -750,8 +750,10 @@ versions.
 | `--h3_int8_attention {off,aux,train}` | `off` | Experimental native INT8-QK forward with BF16/FP16 P×V and an optimized training backward. `aux` affects only the auxiliary forwards -- guidance, base-preservation, teacher-matching, and the rollout prefix plus fused teacher/floor/anchor arms -- while the trainable forward stays dense; `train` also affects the trainable forward. Requires CUDA, Triton, and head width 128; masked or padded batches use the selected regular backend. Incompatible with `--compile`. |
 | `--h3_block_sparse_kv_fraction F` | `0.0` | Experimental block-sparse attention over the packed sequence. Rows are grouped into 128-row blocks, and each query block attends to the top-scoring key blocks by the dot product of their means plus its own block. `0` disables it, `1.0` keeps every block and reproduces dense attention. Requires CUDA (`flex_attention`); the first steps pay a one-time compilation. Masked or padded batches fall back to the dense SDPA path. Selection is an approximation, so results differ from dense attention; validate before a long run. Incompatible with `--h3_int8_attention` and `--compile`. |
 | `--h3_block_sparse_threshold F` | `0.0` | Alternative selection rule: keep the highest scoring key blocks until they hold this share of the score mass, instead of a fixed count. Takes precedence over `--h3_block_sparse_kv_fraction`; `1.0` keeps every block. |
+| `--h3_miowtion_predictor PATH` | off | Use a frozen Miowtion predictor for learned sparse training attention. Requires positive `--h3_block_sparse_kv_fraction`; incompatible with threshold/manual tile selection. |
 | `--h3_block_sparse_start_block N` | `0` | Index of the first main block to run block-sparse; earlier blocks stay dense, keeping their full-sequence mixing exact. |
 | `--h3_block_sparse_block_shape T,H,W` | off | Reorder target-video rows into 3D lattice tiles before block-sparse selection, then restore their original order. `T*H*W` must equal the 128-row block size; text, audio, and reference context remains dense. Has no effect without `--h3_block_sparse_kv_fraction` or `--h3_block_sparse_threshold`. |
+
 | `--h3_null_anchor_reuse_empty` | off | Reuse the guidance step's frozen empty-prompt prediction for the null anchor, saving one transformer pass. Requires guidance distillation, `--h3_guidance_null_source frozen`, and positive null-anchor weight; inert otherwise. |
 | `--h3_null_anchor_shared_draws` | off | Replay the student's RNG for the frozen null-anchor reference so both use the same conditioning-noise draw. Requires positive null-anchor weight; unused with `--h3_null_anchor_reuse_empty`. |
 | `--h3_lora_token_refiner` | off | Also place LoRA adapters on the two text token-refiner blocks. This experimental target adds eight adapter modules. |
@@ -782,6 +784,27 @@ versions.
 | `--num_timestep_buckets` | off | Stratifies base timesteps across an epoch to reduce sampling imbalance. Incompatible with `--timestep_sampling sigma`. |
 | `--h3_video_loss_weight` / `--h3_audio_loss_weight` | `1.0` | Modality weights. `--h3_loss_balance token` switches from equal modality means to element weighting. |
 | `--async_checkpoint_save` | off | Hash and write periodic checkpoints on a background thread. The step pauses only for the CPU snapshot, so the `.safetensors` file lands shortly after the step instead of stalling training for the write. Saves stay ordered and never overlap; the final checkpoint and `--save_state` remain synchronous. |
+
+**Miowtion.** Download the released
+[T2VA predictor bundle](https://huggingface.co/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview), then add the three training flags:
+
+```bash
+hf download Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview \
+  minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors \
+  --local-dir weights/veda
+```
+
+```bash
+--sdpa \
+  --h3_block_sparse_kv_fraction 0.10 \
+  --h3_miowtion_predictor weights/veda/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
+```
+
+The released bundle accepts exact 16:9, 9:16, 4:3, and 1:1 grids at latent
+lengths 37, 72, or 102. At 10% keep, expect roughly 1.5-2x faster steady training
+steps, with larger gains at larger token counts. Peak VRAM can increase, and the
+first run compiles sparse kernels. The predictor stays frozen and is not saved
+in or required by the trained LoRA. Its weights remain on CPU and are staged one layer at a time.
 
 **`--h3_fused_elementwise`.** The product stays in the fp32 accumulator and is rounded once, so results can differ from the default operation order by BF16 rounding; validate before a long run. Precedence with `--h3_fused_indexed_adaln`: when that Triton kernel accepts the layout it handles the norm+modulation itself and the `addcmul` AdaLN path is bypassed for that call; the gated residual and LoRA fusions of this option remain active.
 

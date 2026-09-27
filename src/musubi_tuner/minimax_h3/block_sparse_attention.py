@@ -19,30 +19,50 @@ Two properties of the packed sequence shape the layout:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
-_COMPILED: dict[str, object] = {}
+from musubi_tuner.minimax_h3.miowtion_predictor import (
+    TILE_SIZE,
+    MiowtionBundle,
+    MiowtionHeadGroup,
+    MiowtionPlan,
+    pool_miowtion_tiles,
+)
+
+_COMPILED: dict[tuple[object, ...], object] = {}
 
 #: Block edge in rows.
 DEFAULT_BLOCK = 128
 
 
-def _compiled_flex():
+def _compiled_flex(cache_key: tuple[object, ...] = ("generic",)):
     """Compiled kernel, built once per process.
 
     Uncompiled ``flex_attention`` materializes the full score matrix; the
     compiled path fuses the mask and skips excluded blocks.
     """
-    if "fn" not in _COMPILED:
+    if cache_key not in _COMPILED:
         # Dynamic shapes on purpose: sequence length varies per sample, and a
         # static compile would rebuild the kernel for every new length until
         # the recompile limit is hit and the call silently falls back to the
         # dense math path.
-        _COMPILED["fn"] = torch.compile(flex_attention, dynamic=True)
-    return _COMPILED["fn"]
+        _COMPILED[cache_key] = torch.compile(flex_attention, dynamic=True)
+    return _COMPILED[cache_key]
+
+
+def prepare_flex_attention() -> None:
+    """Create the compiled FlexAttention wrapper before entering disabled model code."""
+    # Released Miowtion plans use up to 37 distinct head-group extents in one
+    # forward. FlexAttention specializes on that extent even with dynamic
+    # shapes, so Dynamo's default limit of eight would drop later groups to
+    # eager dense attention. This is process-wide because Dynamo counts
+    # recompiles per Python code object across compiled wrappers.
+    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+    _compiled_flex()
 
 
 @dataclass(frozen=True)
@@ -242,3 +262,112 @@ def block_sparse_attention(
     if pad:
         out = out[..., :rows, :]
     return out.index_select(-2, plan.inverse) if plan is not None else out
+
+
+def _miowtion_keep(
+    scores: torch.Tensor, n_video: int, video_tokens: int, valid_tiles: torch.Tensor, keep_fraction: float
+) -> torch.Tensor:
+    """Miowtion top-k with equal-cost budgeting and Bresenham rounding."""
+    if not 0.0 < keep_fraction <= 1.0 or not math.isfinite(keep_fraction):
+        raise ValueError(f"keep_fraction must lie in (0, 1], got {keep_fraction}")
+    batch, heads, _, n_tiles = scores.shape
+    keep = torch.zeros((batch, heads, n_tiles, n_tiles), dtype=torch.bool, device=scores.device)
+    keep[..., :, n_video:] = valid_tiles[n_video:]
+    keep[..., n_video:, :] = valid_tiles
+    video_valid = valid_tiles[:n_video]
+    if keep_fraction == 1.0:
+        keep[..., :n_video, :n_video] = video_valid
+        return keep
+    ideal = math.ceil(video_tokens / TILE_SIZE)
+    per_row = keep_fraction * ideal * ideal / n_video
+    low = max(1, min(n_video, math.floor(per_row)))
+    high = max(1, min(n_video, math.ceil(per_row)))
+    fraction = round(per_row - math.floor(per_row), 12)
+    ranked_scores = scores[..., :n_video, :n_video].float().masked_fill(~video_valid, -torch.inf)
+    diagonal = torch.arange(n_video, device=scores.device)
+    ranked_scores[..., diagonal, diagonal] = torch.inf
+    chosen = ranked_scores.topk(high, dim=-1).indices
+    row = torch.arange(n_video, device=scores.device)
+    extra = torch.floor((row + 1) * fraction) > torch.floor(row * fraction)
+    allowed = low + extra.to(torch.long)
+    take = torch.arange(high, device=scores.device).view(1, 1, 1, -1) < allowed.view(1, 1, -1, 1)
+    keep[..., :n_video, :n_video].scatter_(-1, chosen, take.expand(batch, heads, -1, -1))
+    return keep
+
+
+def _valid_key_mask(valid_rows: torch.Tensor):
+    def mask_mod(batch_index, head_index, query_row, key_row):
+        return valid_rows[key_row]
+
+    return mask_mod
+
+
+def miowtion_block_sparse_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    bundle: MiowtionBundle,
+    plan: MiowtionPlan,
+    layer_index: int,
+    keep_fraction: float | None = None,
+) -> torch.Tensor:
+    """Learned Miowtion block sparse attention over ``(B,H,S,D)`` Q/K/V."""
+    if query.shape != key.shape or query.shape != value.shape or query.ndim != 4:
+        raise ValueError("Miowtion query, key, and value must have the same (B,H,S,D) shape")
+    _, heads, rows, dim = query.shape
+    if rows != plan.rows or heads != bundle.num_heads or dim != bundle.head_dim:
+        raise ValueError(
+            f"Miowtion QKV geometry {(heads, rows, dim)} disagrees with bundle/plan "
+            f"{(bundle.num_heads, plan.rows, bundle.head_dim)}"
+        )
+    if len(plan.head_shape) != bundle.num_layers or not 0 <= layer_index < bundle.num_layers:
+        raise ValueError(f"invalid Miowtion layer_index {layer_index}")
+    fraction = bundle.keep_fraction if keep_fraction is None else keep_fraction
+    head_outputs: list[torch.Tensor | None] = [None] * heads
+    groups = plan.head_groups(layer_index, query.device)
+    gather_budget = 128 << 20
+    bytes_per_head = rows * dim * query.element_size()
+    max_group_heads = max(1, gather_budget // bytes_per_head)
+    groups = tuple(MiowtionHeadGroup(group.shape, heads) for group in groups for heads in group.heads.split(max_group_heads))
+    for group in groups:
+        layout = plan.layout(group.shape, query.device)
+        group_q, group_k, group_v = (
+            tensor.index_select(1, group.heads).index_select(2, layout.gather_index) for tensor in (query, key, value)
+        )
+        invalid = ~layout.slot_valid
+        if invalid.any():
+            padding = invalid.view(1, 1, -1, 1)
+            group_q.masked_fill_(padding, 0)
+            group_k.masked_fill_(padding, 0)
+            group_v.masked_fill_(padding, 0)
+        with torch.no_grad():
+            q_features = pool_miowtion_tiles(group_q, layout)
+            k_features = pool_miowtion_tiles(group_k, layout)
+            scores = bundle.predictor.layers[layer_index](q_features, k_features, group.heads)
+            keep = _miowtion_keep(scores, layout.n_video_tiles, rows - plan.target_start, layout.valid_count > 0, fraction)
+        whole = keep & layout.full_tile.view(1, 1, 1, -1)
+        partial = keep & ~whole
+        partial_counts, partial_indices = _counts_and_indices(partial)
+        whole_counts, whole_indices = _counts_and_indices(whole)
+        block_mask = BlockMask.from_kv_blocks(
+            partial_counts,
+            partial_indices,
+            whole_counts,
+            whole_indices,
+            BLOCK_SIZE=TILE_SIZE,
+            mask_mod=_valid_key_mask(layout.slot_valid),
+            seq_lengths=(layout.n_tiles * TILE_SIZE, layout.n_tiles * TILE_SIZE),
+        )
+        # Dynamo specializes FlexAttention on the head extent despite
+        # ``dynamic=True``. Keep one wrapper per extent so 50 layers with
+        # different head-group sizes do not exhaust its recompile limit and
+        # silently fall back to dense mathematical attention.
+        kernel_key = ("miowtion", group_q.shape[1], layout.n_tiles)
+        tiled_output = _compiled_flex(kernel_key)(group_q, group_k, group_v, block_mask=block_mask)
+        restored = tiled_output.index_select(2, layout.inverse_slots)
+        for local, global_head in enumerate(group.heads.tolist()):
+            head_outputs[global_head] = restored[:, local]
+    if any(output is None for output in head_outputs):
+        raise RuntimeError("Miowtion plan did not assign every attention head")
+    return torch.stack(head_outputs, dim=1)  # type: ignore[arg-type]

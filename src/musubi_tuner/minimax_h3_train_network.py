@@ -3854,6 +3854,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_compile_attention opaque is one graph break per block, which --compile_fullgraph forbids")
         block_sparse_kv_fraction = getattr(args, "h3_block_sparse_kv_fraction", 0.0)
         block_sparse_threshold = getattr(args, "h3_block_sparse_threshold", 0.0)
+        miowtion_predictor = getattr(args, "h3_miowtion_predictor", None)
         # The runtime config rejects the same bounds, but only on the first
         # forward, after model loading and caching have already been paid for.
         if not 0.0 <= block_sparse_kv_fraction <= 1.0:
@@ -3861,6 +3862,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if not 0.0 <= block_sparse_threshold <= 1.0:
             raise ValueError("--h3_block_sparse_threshold must be in [0, 1]")
         _parse_block_sparse_block_shape(getattr(args, "h3_block_sparse_block_shape", None))
+        if miowtion_predictor:
+            if block_sparse_kv_fraction <= 0:
+                raise ValueError("--h3_miowtion_predictor requires --h3_block_sparse_kv_fraction above 0")
+            if block_sparse_threshold > 0:
+                raise ValueError("--h3_miowtion_predictor cannot be combined with --h3_block_sparse_threshold")
+            if getattr(args, "h3_block_sparse_block_shape", None):
+                raise ValueError(
+                    "--h3_miowtion_predictor cannot be combined with --h3_block_sparse_block_shape; "
+                    "the predictor bundle supplies its geometry-specific tile plans"
+                )
         if block_sparse_kv_fraction > 0 or block_sparse_threshold > 0:
             if getattr(args, "h3_int8_attention", "off") != "off":
                 # Block-sparse attention takes every unmasked call and masked
@@ -4110,8 +4121,31 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             transformer.set_checkpoint_keep(checkpoint_keep)
         fraction = getattr(args, "h3_block_sparse_kv_fraction", 0.0)
         threshold = getattr(args, "h3_block_sparse_threshold", 0.0)
+        miowtion_predictor = getattr(args, "h3_miowtion_predictor", None)
+        if miowtion_predictor:
+            from musubi_tuner.minimax_h3.miowtion_predictor import load_miowtion_bundle
+
+            # Predictor weights are frozen and only one layer is used at a
+            # time. Keep the bundle on CPU; each score call stages its current
+            # layer projections to avoid about 600 MiB of persistent CUDA use.
+            bundle = load_miowtion_bundle(miowtion_predictor, device="cpu")
+            set_miowtion = getattr(transformer, "set_miowtion_sparse_attention", None)
+            if not callable(set_miowtion):
+                raise RuntimeError("this MiniMax H3 transformer does not support Miowtion sparse attention")
+            set_miowtion(
+                bundle,
+                start_block=getattr(args, "h3_block_sparse_start_block", 0),
+                keep_fraction=fraction,
+            )
+            logger.info(
+                "loaded frozen Miowtion predictor %s with %d geometry plan(s); keep fraction %.4f, start block %d",
+                miowtion_predictor,
+                len(bundle.plans),
+                fraction,
+                getattr(args, "h3_block_sparse_start_block", 0),
+            )
         set_block_sparse = getattr(transformer, "set_block_sparse_attention", None)
-        if (fraction > 0 or threshold > 0) and callable(set_block_sparse):
+        if not miowtion_predictor and (fraction > 0 or threshold > 0) and callable(set_block_sparse):
             from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig
 
             set_block_sparse(
@@ -9606,6 +9640,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "keep the highest scoring key blocks until they hold this share of the score mass, "
             "instead of a fixed count; takes precedence over --h3_block_sparse_kv_fraction"
+        ),
+    )
+    parser.add_argument(
+        "--h3_miowtion_predictor",
+        type=str,
+        default=None,
+        help=(
+            "Miowtion Veda predictor bundle (.safetensors) for learned block selection; requires "
+            "--h3_block_sparse_kv_fraction above 0 and uses the geometry-specific tile plans embedded in the bundle"
         ),
     )
     parser.add_argument(
