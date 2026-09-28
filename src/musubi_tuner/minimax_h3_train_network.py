@@ -6588,6 +6588,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         reset_backward_arms = getattr(getattr(transformer, "offloader", None), "reset_backward_arms", None)
         if callable(reset_backward_arms):
             reset_backward_arms()
+        # A backward that stopped above the first swapped blocks (nothing upstream
+        # trainable, e.g. frozen leading blocks) left them on the CPU; finish its
+        # moves before this forward.
+        finish_truncated_backward = getattr(getattr(transformer, "offloader", None), "finish_truncated_backward", None)
+        if callable(finish_truncated_backward):
+            finish_truncated_backward(transformer.blocks)
         batch_size = int(latents.shape[0])
         if batch_size < 1:
             raise ValueError("MiniMax H3 training received an empty batch")

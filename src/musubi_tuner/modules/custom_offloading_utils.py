@@ -857,6 +857,10 @@ class ModelOffloader(Offloader, FusedArmBackwardGate):
 
         self.supports_backward = supports_backward
         self.forward_only = not supports_backward  # forward only offloading: can be changed to True for inference
+        # Backward-hook moves, kept so a backward that stops early can be completed (finish_truncated_backward).
+        self._backward_actions: dict[int, tuple[bool, int, int, bool, int]] = {}
+        self._backward_fired: set[int] = set()
+        self._training_pass = False
 
         if self.supports_backward:
             # register backward hooks
@@ -900,6 +904,7 @@ class ModelOffloader(Offloader, FusedArmBackwardGate):
         block_idx_to_cpu = self.num_blocks - num_blocks_propagated
         block_idx_to_cuda = self.blocks_to_swap - num_blocks_propagated
         block_idx_to_wait = block_index - 1
+        self._backward_actions[block_index] = (swapping, block_idx_to_cpu, block_idx_to_cuda, waiting, block_idx_to_wait)
 
         def backward_hook(module, grad_input, grad_output):
             # A fused pass invokes this block once per arm, so the hook fires once
@@ -909,6 +914,7 @@ class ModelOffloader(Offloader, FusedArmBackwardGate):
                 return
             if self.debug:
                 print(f"Backward hook for block {block_index}")
+            self._backward_fired.add(block_index)
 
             if swapping:
                 self._submit_move_blocks(blocks, block_idx_to_cpu, block_idx_to_cuda)
@@ -917,8 +923,36 @@ class ModelOffloader(Offloader, FusedArmBackwardGate):
 
         return backward_hook
 
+    def finish_truncated_backward(self, blocks: list[nn.Module]) -> None:
+        """Make the block moves that a backward ending early never triggered.
+
+        The swapped blocks return to the GPU from backward hooks, deepest block
+        first. When nothing upstream of block k needs a gradient (frozen leading
+        blocks and embeddings in a full fine-tune), autograd never reaches blocks
+        below k, their hooks never fire, and the next forward finds the leading
+        blocks on the CPU (``mat2 is on cpu``). Call this once per training step,
+        after the previous backward has finished: it replays the missing hooks in
+        the order backward would have fired them. A complete backward leaves
+        nothing to replay, so the call is then a no-op.
+        """
+        if not self._training_pass:
+            return
+        lowest_fired = min(self._backward_fired, default=self.num_blocks)
+        for block_index in sorted(self._backward_actions, reverse=True):
+            if block_index >= lowest_fired:
+                continue
+            swapping, block_idx_to_cpu, block_idx_to_cuda, waiting, block_idx_to_wait = self._backward_actions[block_index]
+            if swapping:
+                self._submit_move_blocks(blocks, block_idx_to_cpu, block_idx_to_cuda)
+            if waiting:
+                self._wait_blocks_move(block_idx_to_wait)
+        self._backward_fired.clear()
+        self._training_pass = False
+
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]):
         self.reset_backward_arms()
+        self._backward_fired.clear()
+        self._training_pass = False
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
 
@@ -966,6 +1000,7 @@ class ModelOffloader(Offloader, FusedArmBackwardGate):
             # if backward is enabled, we do not swap blocks in forward pass more than blocks_to_swap, because it should be on GPU
             if block_idx >= self.blocks_to_swap:
                 return
+            self._training_pass = True
             block_idx_to_cpu = block_idx
             block_idx_to_cuda = self.num_blocks - self.blocks_to_swap + block_idx
             block_idx_to_cuda = block_idx_to_cuda % self.num_blocks  # this does nothing for backward offloading
