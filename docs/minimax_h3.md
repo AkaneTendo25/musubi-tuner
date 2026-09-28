@@ -1469,12 +1469,18 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTORCH_ALLOC_CONF=expandable_s
   --h3_training_mode fl2va \
   --sdpa \
   --blocks_to_swap 8 \
+  --block_swap_trainable_ring \
+  --use_pinned_memory_for_block_swap \
+  --block_swap_ring_size 2 \
   --adafactor_triton \
   --learning_rate 1e-6 \
   --max_train_steps 1000 \
   --save_every_n_steps 250 --save_state --autoresume \
   --output_dir output/full --output_name h3_full
 ```
+
+With block swap, use the trainable ring: at `--blocks_to_swap 48` the ordinary backward-capable swap took about 3.5x the
+ring's step time (table below). Fall back to the ordinary swap only when the host cannot pin the swapped blocks.
 
 The dense entry point defaults to BF16 weights, gradient checkpointing, manual-learning-rate Adafactor
 (`scale_parameter=False relative_step=False warmup_init=False`), per-parameter optimizer steps during backward, stochastic
@@ -1488,6 +1494,8 @@ manual-learning-rate Adafactor arguments; if you replace `--optimizer_args`, inc
 | `--block_swap_trainable_ring` | Use coalesced bidirectional block transfers and write updated weights back to pinned CPU masters. Requires block swap, gradient checkpointing, fused backward, and `--use_pinned_memory_for_block_swap`. |
 | `--block_swap_ring_size N` | Number of reusable GPU block buffers for the trainable ring; `2` enables double buffering. |
 | `--h3_adaln_rank 16` | Train the rank-reduced AdaLN projections instead of the full 13.0B AdaLN weights; the saved checkpoint carries `adaln_t_table` and the reduced weights (metadata `ss_h3_adaln_layout=pruned`). Rejected on already-pruned and INT8 ConvRot sources. |
+| `--h3_freeze_blocks 0-19,45` | Keep these transformer blocks frozen: they get no gradient, no optimizer state, and are saved unchanged. Indices outside the model are an error. |
+| `--h3_freeze_params REGEX ...` | Keep every transformer parameter whose name matches one of the regexes (`re.search`) frozen, e.g. `adaln_proj` for all AdaLN projections or `mlp\.` for the feed-forward layers. A pattern that matches nothing is an error. Both freeze options are recorded in the checkpoint metadata. |
 | `--gradient_checkpointing_cpu_offload` | Offload checkpoint activations when long packed sequences still exceed VRAM. |
 | `--mem_eff_save` | Stream native transformer tensors during `.safetensors` output; enabled by default. |
 | `--no_mem_eff_save` | Write checkpoints with the ordinary safetensors writer instead of the streaming one; needs the whole checkpoint contiguous in host memory. |
@@ -1497,7 +1505,7 @@ full-parameter training, but its host-memory and transfer requirements are high.
 and conditioning rows. `--gradient_checkpointing_cpu_offload` further reduces activation residency at the cost of additional
 host memory and transfers.
 
-For the trainable ring, add:
+The example above enables the ring with these three flags; drop them for the ordinary swap:
 
 ```shell
   --block_swap_trainable_ring \

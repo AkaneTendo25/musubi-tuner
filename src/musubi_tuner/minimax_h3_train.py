@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -18,6 +19,73 @@ from musubi_tuner.minimax_h3_train_network import setup_parser as setup_h3_parse
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 
 logger = logging.getLogger(__name__)
+
+
+def parse_block_spec(spec: str) -> set[int]:
+    """Parse ``"0-19,45"`` into block indices; bounds are checked against the model later."""
+    indices: set[int] = set()
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError(f"empty entry in block list {spec!r}")
+        start, separator, end = item.partition("-")
+        try:
+            first = int(start)
+            last = int(end) if separator else first
+        except ValueError:
+            raise ValueError(f"invalid block list entry {item!r}; expected N or N-M") from None
+        if first < 0 or last < first:
+            raise ValueError(f"invalid block range {item!r}")
+        indices.update(range(first, last + 1))
+    return indices
+
+
+def compile_freeze_patterns(patterns: Sequence[str] | None) -> list[re.Pattern]:
+    compiled = []
+    for pattern in patterns or []:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as error:
+            raise ValueError(f"invalid --h3_freeze_params pattern {pattern!r}: {error}") from None
+    return compiled
+
+
+def freeze_transformer_parameters(
+    transformer: torch.nn.Module, freeze_blocks: str | None, freeze_params: Sequence[str] | None
+) -> tuple[int, int]:
+    """Turn off gradients for the selected blocks and parameter-name patterns.
+
+    Names are those of ``transformer.named_parameters()`` (``blocks.12.attn.qkv_proj.weight``);
+    patterns use ``re.search``. A block index outside the model, or a pattern that matches
+    nothing, is an error: a typo would otherwise train the whole model silently.
+    Returns (frozen tensors, frozen elements).
+    """
+    blocks: set[int] = set()
+    if freeze_blocks:
+        blocks = parse_block_spec(freeze_blocks)
+        num_blocks = len(transformer.blocks)
+        outside = sorted(index for index in blocks if index >= num_blocks)
+        if outside:
+            raise ValueError(f"--h3_freeze_blocks names blocks {outside}, but the model has {num_blocks} (0-{num_blocks - 1})")
+    patterns = compile_freeze_patterns(freeze_params)
+    matched = [False] * len(patterns)
+    block_name = re.compile(r"^blocks\.(\d+)\.")
+    frozen_tensors = frozen_elements = 0
+    for name, parameter in transformer.named_parameters():
+        match = block_name.match(name)
+        freeze = match is not None and int(match.group(1)) in blocks
+        for index, pattern in enumerate(patterns):
+            if pattern.search(name):
+                matched[index] = True
+                freeze = True
+        if freeze and parameter.requires_grad:
+            parameter.requires_grad_(False)
+            frozen_tensors += 1
+            frozen_elements += parameter.numel()
+    unmatched = [pattern.pattern for pattern, hit in zip(patterns, matched) if not hit]
+    if unmatched:
+        raise ValueError(f"--h3_freeze_params patterns match no transformer parameter: {unmatched}")
+    return frozen_tensors, frozen_elements
 
 
 class MiniMaxH3FullFinetuneModule(torch.nn.Module):
@@ -156,6 +224,10 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
                 )
         if args.block_swap_trainable_ring and not (args.blocks_to_swap or 0):
             raise ValueError("--block_swap_trainable_ring requires --blocks_to_swap")
+        # Syntax only; block bounds and pattern matches need the loaded model.
+        if args.h3_freeze_blocks:
+            parse_block_spec(args.h3_freeze_blocks)
+        compile_freeze_patterns(args.h3_freeze_params)
 
     @staticmethod
     def _validate_adaln_rank_source(args: argparse.Namespace) -> None:
@@ -200,6 +272,19 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
         # frozen; the basis itself is never stored, only its coefficients.
         transformer.requires_grad_(True)
         transformer.train()
+        if args.h3_freeze_blocks or args.h3_freeze_params:
+            frozen_tensors, frozen_elements = freeze_transformer_parameters(
+                transformer, args.h3_freeze_blocks, args.h3_freeze_params
+            )
+            trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+            if trainable == 0:
+                raise ValueError("--h3_freeze_blocks/--h3_freeze_params freeze every MiniMax H3 transformer parameter")
+            logger.info(
+                "MiniMax H3 dense training freezes %d tensors (%.3fB parameters); %.3fB parameters train",
+                frozen_tensors,
+                frozen_elements / 1e9,
+                trainable / 1e9,
+            )
         self._adaln_reduced = getattr(transformer, TABLE_KEY, None) is not None
         if self._adaln_reduced:
             reduced = [p for n, p in transformer.named_parameters() if ADALN_INFIX in n and p.requires_grad]
@@ -338,6 +423,10 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
                 "ss_block_swap_trainable_ring": str(args.block_swap_trainable_ring),
             }
         )
+        if args.h3_freeze_blocks:
+            metadata["ss_h3_freeze_blocks"] = args.h3_freeze_blocks
+        if args.h3_freeze_params:
+            metadata["ss_h3_freeze_params"] = " ".join(args.h3_freeze_params)
         if getattr(self, "_adaln_reduced", args.h3_adaln_rank is not None):
             # The saved checkpoint carries ``adaln_t_table`` plus rank-reduced
             # projections in float32, loaded like the released pruned checkpoints
@@ -357,6 +446,19 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--block_swap_trainable_ring",
         action="store_true",
         help="stream trainable blocks through a coalesced pinned-memory GPU ring; requires fused backward",
+    )
+    parser.add_argument(
+        "--h3_freeze_blocks",
+        type=str,
+        default=None,
+        help="transformer blocks kept frozen, e.g. 0-19,45; they are saved unchanged",
+    )
+    parser.add_argument(
+        "--h3_freeze_params",
+        type=str,
+        nargs="+",
+        default=None,
+        help="regexes (re.search) over transformer parameter names to keep frozen, e.g. adaln_proj",
     )
     parser.add_argument(
         "--mem_eff_save",
