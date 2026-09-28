@@ -824,7 +824,9 @@ The sparse auxiliary objectives (rollout selection and stop sigma, sparse preser
 from private streams that are not saved; on resume they are reseeded from the restored global stream, so a resumed run
 selects a different subset of steps than an uninterrupted one.
 `--network_weights output/h3_style-step00001000.safetensors` only initializes LoRA weights for a new run; its optimizer,
-scheduler, and step start at zero. Use `--save_state_on_train_end` if only the final state is needed. An incomplete state is
+scheduler, and step start at zero. ComfyUI and Diffusers key formats are converted, and a file with modules the run does
+not target (for example the token refiner without `--h3_lora_token_refiner`) is rejected. `--dim_from_weights` takes the
+ranks from that file. Use `--save_state_on_train_end` if only the final state is needed. An incomplete state is
 rejected instead of silently restarting at step zero. Add `--autoresume` to select the highest-step complete state matching
 `--output_name` in `--output_dir`; an explicit `--resume` path takes priority.
 

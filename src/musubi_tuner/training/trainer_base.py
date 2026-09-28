@@ -1190,6 +1190,10 @@ class NetworkTrainer:
         # Default: assume the saved LoRA is already in this project's native format.
         return weights_sd
 
+    def load_trained_network_weights(self, network, path: str, network_module: lora_module):
+        # Default: the file is in this project's key format; keys that match no module are ignored.
+        return network.load_weights(path)
+
     def process_sample_prompts(
         self,
         args: argparse.Namespace,
@@ -1780,9 +1784,11 @@ class NetworkTrainer:
                 net_kwargs[key] = value
 
         if args.dim_from_weights:
-            logger.info(f"Loading network from weights: {args.dim_from_weights}")
-            weights_sd = load_file(args.dim_from_weights)
-            network, _ = network_module.create_arch_network_from_weights(1, weights_sd, unet=transformer)
+            if args.network_weights is None:
+                raise ValueError("--dim_from_weights reads the ranks from --network_weights, which is not set")
+            logger.info(f"Loading network from weights: {args.network_weights}")
+            weights_sd = self.convert_weight_keys(load_file(args.network_weights), network_module)
+            network = network_module.create_arch_network_from_weights(1, weights_sd, unet=transformer)
         else:
             # We use the name create_arch_network for compatibility with LyCORIS
             if hasattr(network_module, "create_arch_network"):
@@ -1818,7 +1824,7 @@ class NetworkTrainer:
 
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
-            info = network.load_weights(args.network_weights)
+            info = self.load_trained_network_weights(network, args.network_weights, network_module)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
             accelerator.print("--network_weights loads LoRA weights only; optimizer, scheduler, and global step start at 0")
 

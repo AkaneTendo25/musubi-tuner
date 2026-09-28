@@ -1737,6 +1737,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def load_network_weights(self, path: str, network_module_name: str) -> dict[str, torch.Tensor]:
         return self.convert_weight_keys(load_file(path), network_module_name)
 
+    def load_trained_network_weights(self, network, path: str, network_module):
+        """Load ``--network_weights`` in any supported key format, refusing tensors that match no module."""
+        if not str(path).endswith(".safetensors"):
+            return super().load_trained_network_weights(network, path, network_module)
+        info = network.load_state_dict(self.load_network_weights(path, network_module), False)
+        check_nora = getattr(network, "_check_loaded_nora_columns", None)
+        if callable(check_nora):
+            check_nora(path)
+        unmatched = sorted({key.split(".")[0] for key in info.unexpected_keys})
+        if unmatched:
+            raise ValueError(
+                f"--network_weights {path}: {len(unmatched)} module(s) in the file match no module of this network and "
+                f"would be dropped, e.g. {', '.join(unmatched[:3])}. Train the same targets as the file "
+                "(for example --h3_lora_token_refiner, --network_args exclude_patterns) or load a training adapter "
+                "with --h3_overlay_weights"
+            )
+        return info
+
     def _build_dataset(self, args):
         if args.num_timestep_buckets is not None:
             logger.info("Using timestep bucketing. Number of buckets: %s", args.num_timestep_buckets)
