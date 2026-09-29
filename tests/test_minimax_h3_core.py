@@ -3567,6 +3567,7 @@ def test_h3_bundled_text_encoder_assets_are_complete():
                 "attention_mode": "torch",
                 "split_attention": False,
                 "fp8_scaled": False,
+                "fp8_scaled_mm": False,
                 "quantization_device": None,
                 "int8_convrot": False,
                 "adaln_rank": None,

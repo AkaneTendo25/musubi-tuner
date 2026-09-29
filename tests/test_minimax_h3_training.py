@@ -4596,6 +4596,7 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         "attention_mode": "torch",
         "split_attention": False,
         "fp8_scaled": False,
+        "fp8_scaled_mm": False,
         "quantization_device": "cuda:0",
         "int8_convrot": False,
         "adaln_rank": None,
