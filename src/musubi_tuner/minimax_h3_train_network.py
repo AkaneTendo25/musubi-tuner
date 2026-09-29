@@ -3782,6 +3782,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             args.fp8_scaled = True
         if args.int8_convrot_base and args.fp8_base:
             raise ValueError("MiniMax H3 --int8_convrot_base cannot be combined with --fp8_base")
+        if getattr(args, "h3_fp8_scaled_mm", False):
+            if not args.fp8_base:
+                raise ValueError("--h3_fp8_scaled_mm requires --fp8_base")
+            if args.h3_fp8_quantization_mode != "tensor":
+                raise ValueError(
+                    "--h3_fp8_scaled_mm computes on FP8 tensor cores via torch._scaled_mm, which carries "
+                    "per-tensor scales only; pass --h3_fp8_quantization_mode tensor (block/channel modes "
+                    "dequantize to bf16 instead and gain no compute speed)"
+                )
         if args.blocks_to_swap is not None and args.blocks_to_swap < 0:
             raise ValueError("MiniMax H3 --blocks_to_swap must be non-negative")
         if getattr(args, "h3_gradient_checkpointing_swapped", False):
@@ -4815,6 +4824,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             attention_mode=attn_mode,
             split_attention=split_attn,
             fp8_scaled=bool(args.fp8_base),
+            fp8_scaled_mm=bool(getattr(args, "h3_fp8_scaled_mm", False)),
             adaln_rank=args.h3_adaln_rank,
             fp8_quantization_mode=args.h3_fp8_quantization_mode,
             convrot_int8=bool(args.h3_convrot_int8),
@@ -9473,6 +9483,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "fuse the LoRA-up projection into the ConvRot INT8 dequantization epilogue; requires online or "
             "pre-quantized ConvRot INT8 weights with INT8 forward and backward, and automatically falls back for "
             "LoRA dropout or split dimensions"
+        ),
+    )
+    parser.add_argument(
+        "--h3_fp8_scaled_mm",
+        action="store_true",
+        help=(
+            "compute FP8-base Linear forwards on the FP8 tensor cores via torch._scaled_mm with per-tensor "
+            "scales and dynamic input quantization, instead of dequantizing weights to bf16. Requires "
+            "--fp8_base and --h3_fp8_quantization_mode tensor"
         ),
     )
     parser.add_argument(

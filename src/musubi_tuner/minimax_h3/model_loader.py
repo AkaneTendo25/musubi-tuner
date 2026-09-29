@@ -370,6 +370,7 @@ def load_transformer(
     mode: H3TrainingMode,
     loading_device: str | torch.device,
     fp8_scaled: bool = False,
+    fp8_scaled_mm: bool = False,
     quantization_device: str | torch.device | None = None,
     int8_convrot: bool = False,
     adaln_rank: int | None = None,
@@ -502,7 +503,7 @@ def load_transformer(
             placement_fn=placement_fn,
         )
         if fp8_scaled:
-            apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
+            apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=fp8_scaled_mm, fp8_input_max=448.0 if fp8_scaled_mm else None)
         elif convrot_int8:
             apply_convrot_int8_monkey_patch(model, state_dict, bwd_mode=convrot_int8_bwd, fwd_mode=convrot_int8_fwd)
             # int8 tensors cannot carry requires_grad, and load_state_dict(assign=True)
