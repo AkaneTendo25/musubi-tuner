@@ -591,7 +591,7 @@ async def start_extract_lora(req: ExtractLoRARequest, request: Request):
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     target_preset = (req.target_preset or "full").strip()
-    valid_presets = ({"custom"} if lora_ltx2 is None else set(lora_ltx2.LTX2_LORA_TARGET_PRESETS.keys()) | {"custom"})
+    valid_presets = {"custom"} if lora_ltx2 is None else set(lora_ltx2.LTX2_LORA_TARGET_PRESETS.keys()) | {"custom"}
     if target_preset not in valid_presets:
         raise HTTPException(status_code=400, detail=f"Unknown target preset: {target_preset}")
     extract_mode = (req.extract_mode or "lora").strip()

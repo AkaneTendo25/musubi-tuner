@@ -31,17 +31,15 @@ jobs:
       - name: Install the project
         run: uv sync --dev
 
+      # Run through uv so the ruff version is exactly the one pinned in
+      # pyproject/uv.lock. astral-sh/ruff-action defaults to the LATEST ruff,
+      # which ignores the <0.16 pin and floods CI with the ~2000 findings from
+      # rules the pin exists to exclude.
       - name: "Run Ruff check"
-        uses: astral-sh/ruff-action@v3
-        with:
-          args: >
-            check --fix
+        run: uv run ruff check --fix .
 
       - name: "Run Ruff format check"
-        uses: astral-sh/ruff-action@v3
-        with:
-          args: >
-            format --check
+        run: uv run ruff format --check .
           # will exit with a non-zero code if there are formatting changes
 
       # - name: Minimize uv cache
