@@ -52,3 +52,32 @@ def test_large_row_quantization_matches_row_split():
         expected, expected_scales = kernels.triton_quantize_rowwise(x[start:stop])
         torch.testing.assert_close(actual[start:stop], expected, rtol=0, atol=0)
         torch.testing.assert_close(scales[start:stop], expected_scales, rtol=0, atol=0)
+
+
+def test_lora_fused_backward_handles_batched_input():
+    """3D [B, S, K] inputs (batched micro-batches) must match per-item passes."""
+    from musubi_tuner.modules import convrot_int8_utils as utils
+
+    torch.manual_seed(0)
+    B, S, K, N, RANK, GROUP = 2, 37, 128, 96, 16, 64
+    x = torch.randn(B, S, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    wq = torch.randint(-127, 127, (N, K), device="cuda", dtype=torch.int8)
+    w_scale = torch.rand(N, device="cuda", dtype=torch.float32) * 0.02 + 0.01
+    bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+    down = torch.randn(RANK, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    up = torch.randn(N, RANK, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    out = utils.ConvRotInt8LoRAFn.apply(x, wq, w_scale, bias, GROUP, down, up, 1.0)
+    assert out.shape == (B, S, N)
+    out.square().mean().backward()
+
+    x2 = x.detach().clone().requires_grad_(True)
+    down2 = down.detach().clone().requires_grad_(True)
+    up2 = up.detach().clone().requires_grad_(True)
+    per_item = [utils.ConvRotInt8LoRAFn.apply(x2[i : i + 1], wq, w_scale, bias, GROUP, down2, up2, 1.0) for i in range(B)]
+    torch.cat(per_item).square().mean().backward()
+
+    torch.testing.assert_close(out, torch.cat(per_item), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(x.grad, x2.grad, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(down.grad, down2.grad, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(up.grad, up2.grad, rtol=2e-2, atol=2e-2)

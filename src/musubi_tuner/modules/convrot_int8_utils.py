@@ -303,7 +303,11 @@ class ConvRotInt8LoRAFn(torch.autograd.Function):
         grad_x = _rotate_activation(combined_rotated, h, ctx.groupsize).reshape_as(x)
         x2d = x.reshape(-1, x.shape[-1]).to(grad_down_output.dtype)
         grad_down = (grad_down_output.t() @ x2d).to(down.dtype)
-        grad_up = ((grad2d.t() @ down_output.to(grad2d.dtype)) * scale).to(up.dtype)
+        # down_output is saved with the forward's batch shape [B, S, rank];
+        # flatten it to match the 2D grad2d, or the matmul misreads the batch
+        # dimension whenever the input carries more than one batch item.
+        down_output2d = down_output.reshape(-1, down_output.shape[-1])
+        grad_up = ((grad2d.t() @ down_output2d.to(grad2d.dtype)) * scale).to(up.dtype)
         grad_bias = grad2d.sum(0) if ctx.needs_input_grad[3] else None
         return grad_x, None, None, grad_bias, None, grad_down, grad_up, None, None
 

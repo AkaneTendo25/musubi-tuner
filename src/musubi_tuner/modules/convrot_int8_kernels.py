@@ -261,7 +261,7 @@ if HAS_TRITON:
             triton.Config({"block_m": 64, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
             triton.Config({"block_m": 128, "block_n": 32, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
         ],
-        key=["m", "n", "k"],
+        key=["n", "k"],
     )
     @triton.jit
     def _int8_matmul_dequant_kernel(
@@ -357,7 +357,7 @@ if HAS_TRITON:
             triton.Config({"block_m": 64, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
             triton.Config({"block_m": 128, "block_n": 32, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
         ],
-        key=["m", "n", "k"],
+        key=["n", "k"],
     )
     @triton.jit
     def _int8_matmul_dequant_per_row_kernel(
@@ -545,7 +545,7 @@ if HAS_TRITON:
             triton.Config({"block_m": 64, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
             triton.Config({"block_m": 128, "block_n": 32, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
         ],
-        key=["m", "n", "k", "rank"],
+        key=["n", "k", "rank"],
     )
     @triton.jit
     def _int8_matmul_dequant_lora_kernel(
