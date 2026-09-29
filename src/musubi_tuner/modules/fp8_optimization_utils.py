@@ -396,6 +396,43 @@ def load_safetensors_with_fp8_optimization(
     return state_dict
 
 
+class _ScaledMMLinearFn(torch.autograd.Function):
+    """torch._scaled_mm has no autograd derivative, so carry the input gradient by hand.
+
+    Forward computes on the FP8 tensor cores: ``out = (x/s_a) @ Wq^T * s_a * s_b + bias``.
+    The weight is frozen in every consumer of this patch, so backward only needs
+    ``dL/dx``; with the straight-through view ``xq ~= x / s_a`` the Jacobian is the
+    dequantized weight, and the input gradient is an ordinary bf16 GEMM against
+    the cached dequantized weight (same artifact the non-scaled_mm path builds).
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, scale_weight, bias, scale_x):
+        original_shape = x.shape
+        x2d = x.reshape(-1, x.shape[-1])
+        out = torch._scaled_mm(
+            x2d,
+            weight,
+            out_dtype=torch.bfloat16 if bias is None else bias.dtype,
+            bias=bias,
+            scale_a=scale_x,
+            scale_b=scale_weight,
+        )
+        ctx.save_for_backward(weight, scale_weight)
+        ctx.original_shape = original_shape
+        return out.reshape(original_shape[:-1] + (weight.shape[1],))
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight, scale_weight = ctx.saved_tensors
+        dequantized = _dequant_cache_lookup((weight, scale_weight), torch.bfloat16, grad_output.device)
+        if dequantized is None:
+            dequantized = weight.to(torch.bfloat16) * scale_weight.to(torch.bfloat16).reshape(-1, *([1] * (weight.ndim - 1)))
+            _dequant_cache_store((weight, scale_weight), torch.bfloat16, grad_output.device, dequantized)
+        grad_x = grad_output.reshape(-1, grad_output.shape[-1]) @ dequantized.t()
+        return grad_x.reshape(ctx.original_shape), None, None, None, None
+
+
 def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=None):
     """
     Patched forward method for Linear layers with FP8 weights.
@@ -410,15 +447,13 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         torch.Tensor: Result of linear transformation
     """
     if use_scaled_mm:
-        # **not tested**
-        # _scaled_mm only works for per-tensor scale for now (per-channel scale does not work in certain cases)
-        if self.scale_weight.ndim != 1:
+        # _scaled_mm supports scalar (per-tensor) scales only; per-channel
+        # [out, 1] and block [out, blocks, 1] scale tensors must dequantize.
+        if self.scale_weight.ndim > 1:
             raise ValueError("scaled_mm only supports per-tensor scale_weight for now.")
 
         input_dtype = x.dtype
-        original_weight_dtype = self.scale_weight.dtype
         target_dtype = self.weight.dtype
-        # assert x.ndim == 3, "Input tensor must be 3D (batch_size, seq_len, hidden_dim)"
 
         if max_value is None:
             # no input quantization
@@ -432,20 +467,11 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
             fp8_min_value = torch.finfo(target_dtype).min
             x = quantize_fp8(x, scale_x, target_dtype, fp8_max_value, fp8_min_value)
 
-        original_shape = x.shape
-        x = x.reshape(-1, x.shape[-1]).to(target_dtype)
-
         weight = self.weight.to(x.device).t()
         scale_weight = self.scale_weight.to(device=x.device, dtype=torch.float32)
         bias = self.bias.to(x.device) if self.bias is not None else None
 
-        if bias is not None:
-            # float32 is not supported with bias in scaled_mm
-            o = torch._scaled_mm(x, weight, out_dtype=original_weight_dtype, bias=bias, scale_a=scale_x, scale_b=scale_weight)
-        else:
-            o = torch._scaled_mm(x, weight, out_dtype=input_dtype, scale_a=scale_x, scale_b=scale_weight)
-
-        o = o.reshape(original_shape[0], original_shape[1], -1) if len(original_shape) == 3 else o.reshape(original_shape[0], -1)
+        o = _ScaledMMLinearFn.apply(x, weight, scale_weight, bias, scale_x)
         return o.to(input_dtype)
 
     else:
@@ -476,7 +502,7 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         return output
 
 
-def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
+def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False, fp8_input_max=None):
     """
     Apply monkey patching to a model using FP8 optimized state dict.
 
@@ -484,13 +510,13 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
         model (nn.Module): Model instance to patch
         optimized_state_dict (dict): FP8 optimized state dict
         use_scaled_mm (bool): Use scaled_mm for FP8 Linear layers, requires SM 8.9+ (RTX 40 series)
+        fp8_input_max (float | None): e4m3 target maximum for dynamic per-tensor input
+            quantization under scaled_mm; None leaves the input unquantized (raw cast)
 
     Returns:
         nn.Module: The patched model (same instance, modified in-place)
     """
-    # # Calculate FP8 float8_e5m2 max value
-    # max_value = calculate_fp8_maxval(5, 2)
-    max_value = None  # do not quantize input tensor
+    max_value = fp8_input_max  # dynamic per-tensor input scaling under scaled_mm
 
     # Find all scale keys to identify FP8-optimized layers
     scale_keys = [k for k in optimized_state_dict.keys() if k.endswith(".scale_weight")]
