@@ -5200,7 +5200,7 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.h3_shift_video == 12.0
     assert args.h3_shift_audio == 3.0
     assert args.h3_sigma_sqrt_max_weight == 10.0
-    assert args.h3_loss_balance == "modality"
+    assert args.h3_loss_balance == "token"
     assert args.h3_guidance_distillation_scale is None
     assert args.h3_guidance_loss_form == "normalized"
     assert args.h3_guidance_loss_schedule == "sigma"

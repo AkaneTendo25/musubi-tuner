@@ -8423,8 +8423,8 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--h3_loss_balance",
         choices=("token", "modality"),
-        default="modality",
-        help="combine joint AV loss over all valid latent elements or equally by modality means",
+        default="token",
+        help="combine joint AV loss over all valid latent elements or equally by modality means; token matches the validation accumulators and keeps the per-modality gradient scale stable regardless of packed token counts",
     )
     parser.add_argument(
         "--h3_loss_mask_normalization",
