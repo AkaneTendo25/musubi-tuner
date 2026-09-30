@@ -200,8 +200,8 @@ def prepare_joint_noisy_inputs(
         audio=(1.0 - audio_sigma_expanded) * audio_latents + audio_sigma_expanded * audio_noise
         if audio_latents is not None
         else None,
-        video_target=video_latents - video_noise if video_latents is not None else None,
-        audio_target=audio_latents - audio_noise if audio_latents is not None else None,
+        video_target=video_latents.float() - video_noise.float() if video_latents is not None else None,
+        audio_target=audio_latents.float() - audio_noise.float() if audio_latents is not None else None,
         video_sigma=video_sigma,
         audio_sigma=audio_sigma,
         video_timestep=1.0 - video_sigma,
