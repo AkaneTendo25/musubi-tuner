@@ -538,6 +538,10 @@ if HAS_TRITON:
 
     @triton.autotune(
         configs=[
+            # Measured on H100 at training batch sizes (M ~ 12k, K = 5376):
+            # (256, 128, 128) reaches ~1076 TOPS vs ~831 for the previous best,
+            # 1.23-1.44x across the qkv/mlp shapes the step spends its time in.
+            triton.Config({"block_m": 256, "block_n": 128, "block_k": 128, "group_size_m": 8}, num_stages=3, num_warps=8),
             triton.Config({"block_m": 128, "block_n": 256, "block_k": 64, "group_size_m": 8}, num_stages=3, num_warps=8),
             triton.Config({"block_m": 64, "block_n": 256, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
             triton.Config({"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
