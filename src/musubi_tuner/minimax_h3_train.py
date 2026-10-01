@@ -388,16 +388,28 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
             return
         if accelerator.num_processes != 1:
             raise ValueError("--fused_backward_pass requires a single process; hooks step before distributed gradient reduction")
+        # ``accelerator.prepare`` wraps the optimizer. Patching that wrapper's
+        # ``step`` bypasses AcceleratedOptimizer's gradient-accumulation guard:
+        # trainer_base calls optimizer.step() on every microstep, and the fused
+        # replacement would update early. Patch only the underlying optimizer so
+        # the wrapper retains its step/zero_grad semantics.
+        raw_optimizer = getattr(optimizer, "optimizer", optimizer)
         if args.adafactor_triton:
             from musubi_tuner.modules.adafactor_triton import patch_adafactor_triton
 
-            patch_adafactor_triton(optimizer)
+            patch_adafactor_triton(raw_optimizer)
             logger.info("MiniMax H3 dense Adafactor uses the Triton 2D BF16 fast path")
         else:
             from musubi_tuner.modules.adafactor_fused import patch_adafactor_fused
 
-            patch_adafactor_fused(optimizer)
+            patch_adafactor_fused(raw_optimizer)
             logger.info("MiniMax H3 dense Adafactor uses fused per-parameter backward updates")
+
+        # Keep a dynamic proxy on the prepared wrapper. Besides making the hook
+        # agnostic to wrapping, this is the supported observation point used by
+        # diagnose_gradients.py; replacing it after installation must affect the
+        # already-registered hooks.
+        optimizer.step_param = raw_optimizer.step_param
 
         def make_hook(parameter: torch.nn.Parameter, param_group: dict):
             def grad_hook(_tensor: torch.Tensor) -> None:
