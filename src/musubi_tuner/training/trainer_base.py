@@ -2559,8 +2559,10 @@ class NetworkTrainer:
                                 train_utils.consume_checkpoint_request_file(save_request_file)
                         optimizer_train_fn()
 
-                current_loss = loss.detach().item()
-                loss_for_average = loss_metrics.pop(LOSS_FOR_AVERAGE_KEY, current_loss)
+                loss_for_average = loss_metrics.pop(LOSS_FOR_AVERAGE_KEY, None)
+                # With LOSS_FOR_AVERAGE_KEY already materialized as a float the
+                # extra .item() sync disappears; the fallback keeps old behaviour.
+                current_loss = float(loss_for_average) if loss_for_average is not None else loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=float(loss_for_average))
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}

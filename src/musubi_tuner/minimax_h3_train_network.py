@@ -6566,9 +6566,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if multi_group:
             # The backwards already ran; report the detached batch mean.
             self._batch_backward_performed = True
-            return torch.stack([term.detach() for term in losses]).mean(), metrics
+            metrics[LOSS_FOR_AVERAGE_KEY] = torch.stack([term.detach() for term in losses]).mean()
+            return torch.stack([term.detach() for term in losses]).mean(), self._materialize_metrics(metrics)
         # A single group returns the live loss for backward_loss to run.
-        return torch.stack(losses).sum(), metrics
+        metrics[LOSS_FOR_AVERAGE_KEY] = torch.stack(losses).sum().detach()
+        return torch.stack(losses).sum(), self._materialize_metrics(metrics)
 
     def process_batch(
         self,
@@ -6718,7 +6720,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if self._crepa._similarity_ema is not None:
                 averaged_metrics["crepa/alignment_ema"] = self._crepa._similarity_ema
         self._batch_backward_performed = True
-        return torch.stack(losses).mean(), averaged_metrics
+        return torch.stack(losses).mean(), self._materialize_metrics(averaged_metrics)
 
     def backward_loss(self, accelerator: Accelerator, loss: torch.Tensor) -> None:
         try:
@@ -6746,12 +6748,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     @classmethod
     def _average_batch_metrics(cls, item_metrics: list[dict[str, float]]) -> dict[str, float]:
-        item_metrics = [cls._materialize_metrics(metrics) for metrics in item_metrics]
+        # Average deferred tensor metrics on the device and keep them deferred:
+        # callers resolve everything in ONE host sync instead of one per item.
         metric_keys = set().union(*(metrics.keys() for metrics in item_metrics))
-        return {
-            key: sum(metrics[key] for metrics in item_metrics if key in metrics) / sum(key in metrics for metrics in item_metrics)
-            for key in metric_keys
-        }
+        averaged: dict[str, float] = {}
+        for key in metric_keys:
+            values = [metrics[key] for metrics in item_metrics if key in metrics]
+            if any(torch.is_tensor(value) for value in values):
+                first = next(value for value in values if torch.is_tensor(value))
+                device = first.device
+                stacked = [
+                    value.detach().reshape(()).float()
+                    if torch.is_tensor(value)
+                    else torch.tensor(value, device=device, dtype=torch.float32)
+                    for value in values
+                ]
+                averaged[key] = torch.stack(stacked).mean()
+            else:
+                averaged[key] = sum(values) / len(values)
+        return averaged
 
     @staticmethod
     def _slice_batch_item(batch: dict, index: int, batch_size: int) -> dict:
