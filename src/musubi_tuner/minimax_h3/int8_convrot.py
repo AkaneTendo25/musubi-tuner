@@ -10,6 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from musubi_tuner.modules import convrot_int8_kernels
+from musubi_tuner.modules.convrot_int8_native import transpose_int8_contiguous_or_fallback
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
 logger = logging.getLogger(__name__)
@@ -183,7 +184,7 @@ class _Int8ConvRotFunction(torch.autograd.Function):
             unit_scale = torch.ones(1, device=folded.device, dtype=torch.float32)
             grad_input = convrot_int8_kernels.int8_linear(
                 scaled,
-                weight.t().contiguous(),
+                transpose_int8_contiguous_or_fallback(weight),
                 unit_scale,
                 None,
                 folded.dtype,

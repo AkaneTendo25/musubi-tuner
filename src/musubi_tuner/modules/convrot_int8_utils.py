@@ -34,6 +34,10 @@ from musubi_tuner.modules.convrot_int8_kernels import (
     int8_lora_linear,
     quantize_int8_convrot_weight,
 )
+from musubi_tuner.modules.convrot_int8_native import (
+    scaled_int8_lora_linear_or_fallback,
+    transpose_int8_contiguous_or_fallback,
+)
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, TensorWeightAdapter, WeightTransformHooks
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
@@ -242,7 +246,7 @@ class ConvRotInt8LinearFn(torch.autograd.Function):
                     # transient int8 transpose of wq: [K, N], ~1 byte/param, freed after mm
                     g_scaled = g2d * w_scale.reshape(1, -1).to(g2d.dtype)
                     one = torch.ones(1, device=g2d.device, dtype=torch.float32)
-                    gx_rot = int8_linear(g_scaled, wq.t().contiguous(), one, None, grad_out.dtype, False, gs)
+                    gx_rot = int8_linear(g_scaled, transpose_int8_contiguous_or_fallback(wq), one, None, grad_out.dtype, False, gs)
                 else:
                     # transient bf16 dequant of the rotated weight (stays in rotated basis)
                     w_rot = wq.to(grad_out.dtype) * w_scale.reshape(-1, 1).to(grad_out.dtype)
@@ -291,10 +295,10 @@ class ConvRotInt8LoRAFn(torch.autograd.Function):
         grad_down_output = F.linear(grad2d, up.to(grad2d.dtype).t()) * scale
         h = _build_hadamard(ctx.groupsize, device=grad_output.device, dtype=grad_output.dtype)
         rotated_down = _rotate_activation(down.to(grad_output.dtype), h, ctx.groupsize)
-        base_input = grad2d * w_scale.reshape(1, -1).to(grad2d.dtype)
-        combined_rotated = int8_lora_linear(
-            base_input,
-            wq.t().contiguous(),
+        combined_rotated = scaled_int8_lora_linear_or_fallback(
+            grad2d,
+            w_scale.reshape(-1),
+            transpose_int8_contiguous_or_fallback(wq),
             torch.ones(wq.shape[1], device=wq.device, dtype=torch.float32),
             grad_down_output,
             rotated_down,

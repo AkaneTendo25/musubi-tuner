@@ -39,6 +39,7 @@ from torch.utils.checkpoint import checkpoint
 from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffloader
 from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig, SequencePlan, block_sparse_attention, build_plan
 from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
+from musubi_tuner.minimax_h3.residual_norm_native import try_residual_norm_adaln_gated
 from musubi_tuner.minimax_h3.selective_checkpoint import (
     SavedActivations,
     adaln_projection_region,
@@ -65,6 +66,10 @@ _CUDNN_AUTO_MIN_SEQUENCE = 1024
 
 
 _H3_NULL_PROFILE_SCOPE = nullcontext()
+
+
+def _use_native_residual_boundary(fused_elementwise: bool, fused_indexed_adaln: bool, adaln_indices: torch.Tensor) -> bool:
+    return fused_elementwise and not (fused_indexed_adaln and adaln_indices.ndim == 1)
 
 
 def h3_profile_scope(name: str) -> AbstractContextManager:
@@ -839,10 +844,26 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 else:
                     attention = attn(norm_hidden_states, rotary_emb, attention_mask)
             with h3_profile_scope("h3.gate"):
-                hidden_states = self._gated_residual(hidden_states, gate_attn[adaln_indices], attention)
+                fused_residual_norm = None
+                if _use_native_residual_boundary(self.fused_elementwise, self.fused_indexed_adaln, adaln_indices):
+                    fused_residual_norm = try_residual_norm_adaln_gated(
+                        hidden_states,
+                        attention,
+                        gate_attn,
+                        self.norm2.weight,
+                        shift_mlp,
+                        scale_mlp,
+                        adaln_indices,
+                        self.norm2.eps,
+                    )
+                if fused_residual_norm is None:
+                    hidden_states = self._gated_residual(hidden_states, gate_attn[adaln_indices], attention)
 
             with h3_profile_scope("h3.norm"):
-                norm_hidden_states = self._norm_and_modulate(self.norm2, hidden_states, shift_mlp, scale_mlp, adaln_indices)
+                if fused_residual_norm is None:
+                    norm_hidden_states = self._norm_and_modulate(self.norm2, hidden_states, shift_mlp, scale_mlp, adaln_indices)
+                else:
+                    hidden_states, norm_hidden_states = fused_residual_norm
             with h3_profile_scope("h3.mlp"):
                 feed_forward = self.mlp(norm_hidden_states)
             with h3_profile_scope("h3.gate"):
