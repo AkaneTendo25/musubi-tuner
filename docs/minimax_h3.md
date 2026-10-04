@@ -863,9 +863,9 @@ mutually exclusive.
 | `--fp8_base` | Scaled FP8. `--h3_fp8_quantization_mode` selects `block` (default, finest), `channel`, or `tensor`. |
 | `--int8_convrot_base` | Load the released pre-quantized checkpoint instead of quantizing at load (see below). |
 | `--h3_adaln_rank 16` | Replace full AdaLN projections with rank-16 factors. Incompatible with a pre-quantized `--int8_convrot_base`. |
-| `--h3_checkpoint_keep {none,attention,qkv,adaln,mlp}` | Trade activation memory for recompute under `--gradient_checkpointing`. `attention` retains the fused attention output; `qkv` also retains the base QKV output; `adaln` additionally retains the AdaLN modulation output; `mlp` additionally retains the SwiGLU input projection, the block's largest single activation. Details below. |
+| `--h3_checkpoint_keep {none,attention,qkv,adaln,mlp}` | Trade activation memory for recompute under `--gradient_checkpointing`. The default `none` uses plain checkpointing. The supported speed recipe is `--sdpa --h3_checkpoint_keep attention`, which retains fused SDPA outputs. `qkv`, `adaln`, and `mlp` retain additional projections and are experimental. Details below. |
 
-**`--h3_checkpoint_keep`.** Higher modes retain the outputs named in the option table and include the lower modes. It requires a fused attention backend and is incompatible with checkpoint CPU offload, compile, training INT8 or block-sparse attention, layer-granularity swap, and fused ConvRot LoRA for `qkv`, `adaln`, or `mlp`.
+**`--h3_checkpoint_keep`.** Use `--sdpa --gradient_checkpointing --h3_checkpoint_keep attention` for attention-only selective activation checkpointing. It retains more activation memory than plain checkpointing. Higher modes retain the outputs named in the option table and include the lower modes. Selective checkpointing requires a visible fused attention kernel and is incompatible with checkpoint CPU offload, `--compile`, `--h3_int8_attention train`, block-sparse attention, layer-granularity swap, and fused ConvRot LoRA for `qkv`, `adaln`, or `mlp`.
 
 To train against the released pre-quantized transformer instead, pass it with `--int8_convrot_base`:
 
