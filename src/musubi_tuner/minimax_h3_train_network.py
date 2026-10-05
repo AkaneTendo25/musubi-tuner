@@ -8133,6 +8133,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         contributed = 0
         with torch.no_grad():
             for module in modules:
+                delta_norm_sq = getattr(module, "delta_norm_sq", None)
+                if callable(delta_norm_sq):
+                    total += float(delta_norm_sq())
+                    contributed += 1
+                    continue
                 # Unsplit Linear adapters only: the delta is up @ down (NoRA's
                 # normalised down weight when the module has one). Split and
                 # convolutional adapters are skipped, so the norm covers what it

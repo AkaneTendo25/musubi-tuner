@@ -2,6 +2,7 @@ __pycache__/
 .venv
 venv/
 logs/
+tmp/
 uv.lock
 main.exp
 main.lib
@@ -11,6 +12,7 @@ GEMINI.md
 .claude/
 .gemini/
 AGENTS.md
+.agents/
 .vscode/settings.json
 .mcp.json
 references/

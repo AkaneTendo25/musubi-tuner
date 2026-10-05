@@ -1748,6 +1748,21 @@ class NetworkTrainer:
             transformer.move_to_device_except_swap_blocks(accelerator.device)
         return transformer
 
+    @staticmethod
+    def _validate_sds_training_options(args):
+        incompatible = (
+            ("network_weights", "use --save_state and --resume to continue SDS-LoRA"),
+            ("dim_from_weights", "SDS-LoRA needs its training rank, not an exported adapter rank"),
+            ("scale_weight_norms", "weight-norm regularization assumes the ordinary BA parameterization"),
+            ("fused_backward_pass", "SDS-LoRA requires complete optimizer updates before refreshing its bases"),
+            ("h3_adapter_ema_decay", "parameter EMA does not preserve SDS-LoRA's changing bases"),
+            ("h3_lora_fused_bf16", "the fused LoRA path supports the ordinary BA parameterization"),
+            ("h3_convrot_int8_lora_fused", "the fused LoRA path supports the ordinary BA parameterization"),
+        )
+        for option, reason in incompatible:
+            if getattr(args, option, None):
+                raise ValueError(f"SDS-LoRA cannot be combined with --{option}: {reason}")
+
     def _build_network(self, args, accelerator, transformer, vae, weight_dtype):
         # load network module for differential training
         # Allow short paths like `--network_module networks.lora` by putting the musubi_tuner
@@ -1783,6 +1798,13 @@ class NetworkTrainer:
                 key, value = net_arg.split("=")
                 net_kwargs[key] = value
 
+        sds_arg = str(net_kwargs.get("sds", "False")).lower()
+        if sds_arg not in ("true", "false", "1", "0"):
+            raise ValueError(f"network_args sds must be True, False, 1, or 0; got {net_kwargs.get('sds')!r}")
+        sds_requested = sds_arg in ("true", "1")
+        if sds_requested:
+            self._validate_sds_training_options(args)
+
         if args.dim_from_weights:
             if args.network_weights is None:
                 raise ValueError("--dim_from_weights reads the ranks from --network_weights, which is not set")
@@ -1815,6 +1837,8 @@ class NetworkTrainer:
                 )
         if network is None:
             return None
+        if sds_requested and not getattr(network, "sds_enabled", False):
+            raise ValueError("The selected --network_module does not support network_args sds=True")
 
         if hasattr(network_module, "prepare_network"):
             network.prepare_network(args)
@@ -1871,6 +1895,10 @@ class NetworkTrainer:
             accelerator.print(
                 f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
             )
+
+        configure_sds = getattr(network, "configure_sds_training", None)
+        if callable(configure_sds):
+            configure_sds(args.max_train_steps)
 
         # send max_train_steps to train_dataset_group
         train_dataset_group.set_max_train_steps(args.max_train_steps)
@@ -2024,6 +2052,14 @@ class NetworkTrainer:
     ):
         is_main_process = accelerator.is_main_process
 
+        unwrapped_network = accelerator.unwrap_model(network)
+        configure_sds = getattr(unwrapped_network, "configure_sds_training", None)
+        if callable(configure_sds):
+            # The restored schedule must match the final epoch/step budget.
+            configure_sds(args.max_train_steps)
+        sds_optimizer_step = (
+            getattr(unwrapped_network, "on_sds_optimizer_step", None) if getattr(unwrapped_network, "sds_enabled", False) else None
+        )
         self.on_train_start(args, accelerator, network, transformer, optimizer)
 
         # epoch数を計算する
@@ -2242,7 +2278,14 @@ class NetworkTrainer:
             metadata["ss_steps"] = str(steps)
             metadata["ss_epoch"] = str(epoch_no)
 
-            metadata_to_save = minimum_metadata if args.no_metadata else metadata
+            metadata_to_save = dict(minimum_metadata if args.no_metadata else metadata)
+            sds_export_metadata = getattr(unwrapped_nw, "sds_export_metadata", None)
+            if callable(sds_export_metadata) and getattr(unwrapped_nw, "sds_enabled", False):
+                metadata_to_save.update(sds_export_metadata())
+                export_args = dict(net_kwargs)
+                for key in ("sds", "sds_warmup_steps", "sds_update_phases"):
+                    export_args.pop(key, None)
+                metadata_to_save[SS_METADATA_KEY_NETWORK_ARGS] = json.dumps(export_args)
 
             title = args.metadata_title if args.metadata_title is not None else args.output_name
             if args.min_timestep is not None or args.max_timestep is not None:
@@ -2459,6 +2502,9 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    if sds_optimizer_step is not None and accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
+                        sds_optimizer_step(optimizer)
 
                     self.on_post_optimizer_step(args, accelerator, network, transformer, accelerator.sync_gradients, global_step)
 

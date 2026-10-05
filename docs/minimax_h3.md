@@ -735,6 +735,29 @@ ordinary LoRA and needs no NoRA code to merge or infer), `nora=init` normalises 
 `lora_down` a block-identity start; set `--network_alpha` equal to `--network_dim`. Default `nora=off` is bit-identical to a
 run without the argument.
 
+### SDS-LoRA
+
+Enable [SDS-LoRA](https://arxiv.org/abs/2606.16454v2) through `--network_args`:
+
+```bash
+--network_dim 16 --network_alpha 4 \
+    --network_args "sds=True" "sds_warmup_steps=10" "sds_update_phases=5"
+```
+
+| Argument | Default | Effect |
+| --- | --- | --- |
+| `sds` | `False` | Enable SDS-LoRA. |
+| `sds_warmup_steps` | `10` | Ordinary LoRA updates before switching to SDS. |
+| `sds_update_phases` | `5` | Basis-refresh phases; intervals increase from 1 to this value. |
+
+Uses scale `alpha / sqrt(rank)`. `--max_train_steps` includes warmup and must exceed it.
+
+**Choose rank for the exported size:** lossless standard-LoRA export doubles the training rank after warmup: 16 -> 32, 32 -> 64. No compression or inference-code changes; larger adapters cost more to store and apply. Save dtype rounding still applies.
+
+Resume with `--save_state` and `--resume`, retaining rank, alpha, SDS arguments and total steps. Exported `--network_weights` cannot resume SDS training.
+
+Linear adapters only. Incompatible with NoRA, `init=bimi`, split adapters, dropout options, `--dim_from_weights`, `--scale_weight_norms`, `--fused_backward_pass`, H3 adapter EMA, `--h3_lora_fused_bf16` and `--h3_convrot_int8_lora_fused`.
+
 LoHa/LoKr are unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally
 `--compile_auto_cache_size_limit`, `--compile_fallback_to_eager`, or `--inductor_config KEY=VALUE ...`. GPU compilation requires
 a working Triton installation; on Windows, install a `triton-windows` build compatible with the installed PyTorch and Python

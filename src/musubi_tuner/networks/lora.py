@@ -703,7 +703,19 @@ def create_network(
     if include_patterns is not None and isinstance(include_patterns, str):
         include_patterns = ast.literal_eval(include_patterns)
 
-    if module_class is None:
+    sds_arg = str(kwargs.get("sds", "False")).lower()
+    if sds_arg not in ("true", "false", "1", "0"):
+        raise ValueError(f"network_args sds must be True, False, 1, or 0; got {kwargs.get('sds')!r}")
+    sds = sds_arg in ("true", "1")
+    if sds:
+        if int(network_dim) < 1:
+            raise ValueError("SDS-LoRA network_dim (rank) must be positive")
+        if module_class is not None and module_class is not LoRAModule:
+            raise ValueError("SDS-LoRA cannot be combined with a custom LoRA module class")
+        from musubi_tuner.networks.sds_lora import SDSLoRAModule
+
+        module_class = SDSLoRAModule
+    elif module_class is None:
         module_class = LoRAModule
 
     # NoRA column normalisation and bimi initialisation. Only forwarded to the module when
@@ -723,6 +735,25 @@ def create_network(
             f"NoRA is intended for network_alpha == network_dim (scaling 1); got alpha={network_alpha}, dim={network_dim}. "
             "With unit-norm lora_down columns the alpha/dim factor only rescales lora_up's learning signal."
         )
+    if sds:
+        incompatible = []
+        if nora != "off":
+            incompatible.append("nora")
+        if init != "default":
+            incompatible.append("init=bimi")
+        if neuron_dropout is not None:
+            incompatible.append("neuron dropout")
+        if rank_dropout is not None:
+            incompatible.append("rank_dropout")
+        if module_dropout is not None:
+            incompatible.append("module_dropout")
+        if incompatible:
+            raise ValueError("SDS-LoRA is incompatible with " + ", ".join(incompatible))
+        warmup = int(kwargs.get("sds_warmup_steps", 10))
+        phases = int(kwargs.get("sds_update_phases", 5))
+        module_kwargs = dict(module_kwargs or {})
+        module_kwargs.update(sds_warmup_steps=warmup, sds_update_phases=phases)
+        logger.info(f"SDS-LoRA: warmup_steps={warmup}, update_phases={phases}")
 
     # too many arguments ( ^ω^)･･･
     network = LoRANetwork(
@@ -744,6 +775,16 @@ def create_network(
         include_patterns=include_patterns,
         verbose=verbose,
     )
+    network.sds_enabled = sds
+    if sds:
+        network.sds_warmup_steps = warmup
+        network.sds_update_phases = phases
+        network.register_buffer("sds_optimizer_step", torch.tensor(0, dtype=torch.long), persistent=True)
+        network.register_buffer("sds_total_steps", torch.tensor(0, dtype=torch.long), persistent=True)
+        network.register_buffer("sds_warmup_config", torch.tensor(warmup, dtype=torch.long), persistent=True)
+        network.register_buffer("sds_update_phases_config", torch.tensor(phases, dtype=torch.long), persistent=True)
+        network.sds_completed_steps = 0
+        network._sds_total_steps_cached = 0
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
     # loraplus_unet_lr_ratio = kwargs.get("loraplus_unet_lr_ratio", None)
@@ -966,6 +1007,83 @@ class LoRANetwork(torch.nn.Module):
         """
         pass
 
+    def configure_sds_training(self, total_steps: int):
+        if not getattr(self, "sds_enabled", False):
+            return
+        total_steps = int(total_steps)
+        if total_steps <= self.sds_warmup_steps:
+            raise ValueError(f"SDS-LoRA total_steps ({total_steps}) must exceed sds_warmup_steps ({self.sds_warmup_steps})")
+        saved_total = self._sds_total_steps_cached
+        saved_step = self.sds_completed_steps
+        saved_warmup = int(self.sds_warmup_config.item())
+        saved_phases = int(self.sds_update_phases_config.item())
+        if saved_step and (saved_warmup != self.sds_warmup_steps or saved_phases != self.sds_update_phases):
+            raise ValueError(
+                "SDS-LoRA resume configuration mismatch: checkpoint has "
+                f"warmup={saved_warmup}, phases={saved_phases}; current run has "
+                f"warmup={self.sds_warmup_steps}, phases={self.sds_update_phases}"
+            )
+        if saved_step and saved_total and saved_total != total_steps:
+            raise ValueError(f"SDS-LoRA resume total_steps mismatch: checkpoint has {saved_total}, current run has {total_steps}")
+        self.sds_total_steps.fill_(total_steps)
+        self.sds_warmup_config.fill_(self.sds_warmup_steps)
+        self.sds_update_phases_config.fill_(self.sds_update_phases)
+        self._sds_total_steps_cached = total_steps
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        if getattr(self, "sds_enabled", False):
+            self.sds_completed_steps = int(self.sds_optimizer_step.item())
+            self._sds_total_steps_cached = int(self.sds_total_steps.item())
+
+    @staticmethod
+    def _clear_sds_optimizer_state(optimizer, modules):
+        from musubi_tuner.networks.sds_lora import clear_sds_optimizer_state
+
+        clear_sds_optimizer_state(optimizer, modules)
+
+    @torch.no_grad()
+    def on_sds_optimizer_step(self, optimizer):
+        if not getattr(self, "sds_enabled", False):
+            return
+        total_steps = self._sds_total_steps_cached
+        if total_steps <= 0:
+            raise RuntimeError("configure_sds_training(total_steps) must be called before SDS-LoRA training")
+        self.sds_optimizer_step.add_(1)
+        self.sds_completed_steps += 1
+        step = self.sds_completed_steps
+        modules = self.text_encoder_loras + self.unet_loras
+        if step == self.sds_warmup_steps:
+            for module in modules:
+                module.activate_sds()
+            self._clear_sds_optimizer_state(optimizer, modules)
+            return
+        if step <= self.sds_warmup_steps:
+            return
+        main_step = step - self.sds_warmup_steps
+        main_total = total_steps - self.sds_warmup_steps
+        interval = max(1, math.ceil(self.sds_update_phases * main_step / main_total))
+        if main_step % interval == 0:
+            for module in modules:
+                module.refresh_sds_bases()
+
+    def sds_export_metadata(self):
+        if not getattr(self, "sds_enabled", False):
+            return {}
+        modules = self.text_encoder_loras + self.unet_loras
+        active = bool(modules) and all(module._sds_active_cached for module in modules)
+        export_rank = self.lora_dim * (2 if active else 1)
+        export_alpha = export_rank * modules[0].sds_scale if modules else 0.0
+        return {
+            "ss_network_dim": str(export_rank),
+            "ss_network_alpha": str(export_alpha),
+            "ss_sds_training_rank": str(self.lora_dim),
+            "ss_sds_training_alpha": str(self.alpha),
+            "ss_sds_stage": "main" if active else "warmup",
+            "ss_sds_completed_steps": str(self.sds_completed_steps),
+            "ss_sds_export": "lossless",
+        }
+
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
         for lora in self.text_encoder_loras + self.unet_loras:
@@ -1013,6 +1131,11 @@ class LoRANetwork(torch.nn.Module):
 
     def export_state_dict(self):
         """The adapter-file state dict: ``state_dict()`` with NoRA modules' normalised ``lora_down``."""
+        if getattr(self, "sds_enabled", False):
+            sd = {}
+            for lora in self.text_encoder_loras + self.unet_loras:
+                sd.update(lora.export_state_dict(prefix=lora.lora_name + "."))
+            return sd
         sd = self.state_dict()
         for lora in self.text_encoder_loras + self.unet_loras:
             if getattr(lora, "nora", "off") == "forward":
@@ -1200,6 +1323,8 @@ class LoRANetwork(torch.nn.Module):
             lora.enabled = False
 
     def apply_max_norm_regularization(self, max_norm_value, device):
+        if getattr(self, "sds_enabled", False):
+            raise ValueError("SDS-LoRA is incompatible with max-norm regularization")
         downkeys = []
         upkeys = []
         alphakeys = []
