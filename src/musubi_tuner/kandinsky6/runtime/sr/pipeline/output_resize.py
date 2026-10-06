@@ -99,9 +99,7 @@ def resolve_target_hw(
         parts = key.split("x")
         expected_parts = 2
         if len(parts) != expected_parts or not all(part.strip().isdigit() for part in parts):
-            msg = (
-                f"--target-resolution must be a tier {sorted(TARGET_RESOLUTIONS)} or WxH (e.g. 1280x720), got {spec!r}"
-            )
+            msg = f"--target-resolution must be a tier {sorted(TARGET_RESOLUTIONS)} or WxH (e.g. 1280x720), got {spec!r}"
             raise ValueError(msg)
         width, height = (int(part) for part in parts)
         bucket = (height, width)

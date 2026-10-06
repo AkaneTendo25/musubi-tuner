@@ -61,9 +61,7 @@ def bind_checkpoint_paths(cfg: PipelineConfig) -> PipelineConfig:
         )
     }
     if cfg.audio_vae is not None:
-        update["audio_vae"] = cfg.audio_vae.model_copy(
-            update={"tod_vae_ckpt": _under_snapshot(root, cfg.audio_vae.tod_vae_ckpt)}
-        )
+        update["audio_vae"] = cfg.audio_vae.model_copy(update={"tod_vae_ckpt": _under_snapshot(root, cfg.audio_vae.tod_vae_ckpt)})
     if cfg.vocoder is not None:
         update["vocoder"] = cfg.vocoder.model_copy(update={"ckpt": _under_snapshot(root, cfg.vocoder.ckpt)})
     return cfg.model_copy(update=update)

@@ -31,8 +31,7 @@ from .reconfigure import reconfigure as _reconfigure
 logger = logging.getLogger("kandinsky")
 
 _DEFAULT_NEG = (
-    "Static, 2D cartoon, cartoon, 2d animation, paintings, images, "
-    "worst quality, low quality, ugly, deformed, walking backwards"
+    "Static, 2D cartoon, cartoon, 2d animation, paintings, images, worst quality, low quality, ugly, deformed, walking backwards"
 )
 
 
@@ -372,9 +371,7 @@ class Kandinsky6Pipeline:
             # Keep cache step counters aligned with this generation's schedule.
             if self.dit.mode == "magcache" and self.dit._mag is not None:
                 mag_steps_changed = bool(self.dit._mag["num_steps"] != num_steps * 2)
-                mag_gen_mode_changed = bool(
-                    self.dit._mag["gen_mode"] is not None and generation_mode != self.dit._mag["gen_mode"]
-                )
+                mag_gen_mode_changed = bool(self.dit._mag["gen_mode"] is not None and generation_mode != self.dit._mag["gen_mode"])
                 if mag_gen_mode_changed:
                     logger.warning(
                         "MagCache uses different ratios per mode for this model. Generation mode changed: %s",

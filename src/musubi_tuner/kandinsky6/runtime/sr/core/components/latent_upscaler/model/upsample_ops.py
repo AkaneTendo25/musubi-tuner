@@ -9,7 +9,11 @@ from einops import rearrange
 from torch import nn
 from torch.nn import functional
 
-from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.conv_ops import TemporalPadding, UpsamplePaddingMode, make_conv
+from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.conv_ops import (
+    TemporalPadding,
+    UpsamplePaddingMode,
+    make_conv,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable

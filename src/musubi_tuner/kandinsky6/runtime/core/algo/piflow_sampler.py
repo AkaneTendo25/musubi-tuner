@@ -27,14 +27,10 @@ def _normalize_grid_prediction(prediction: torch.Tensor, state: torch.Tensor, na
         return prediction
 
     # Accept the legacy grid-last layout emitted by older distilled wrappers.
-    if (
-        prediction.shape[-1] == state.shape[-1]
-        and tuple(prediction.shape[1:-2]) == tuple(state.shape[1:-1])
-    ):
+    if prediction.shape[-1] == state.shape[-1] and tuple(prediction.shape[1:-2]) == tuple(state.shape[1:-1]):
         return prediction.movedim(-2, 1)
     raise ValueError(
-        f"{name} π-Flow prediction has incompatible grid layout: "
-        f"prediction={tuple(prediction.shape)}, state={tuple(state.shape)}"
+        f"{name} π-Flow prediction has incompatible grid layout: prediction={tuple(prediction.shape)}, state={tuple(state.shape)}"
     )
 
 
@@ -132,12 +128,10 @@ def piflow_denoise_loop(  # noqa: PLR0913, PLR0915
             audio_tau_src = tau_src.repeat_interleave(audio_lengths)
             audio_tau_dst = tau_dst.repeat_interleave(audio_lengths)
         video_segment = torch.full(
-            (batch_size if video.ndim == 5 else video.shape[0],),
-            float(segment_size), device=device, dtype=sigma_t_src.dtype
+            (batch_size if video.ndim == 5 else video.shape[0],), float(segment_size), device=device, dtype=sigma_t_src.dtype
         ).reshape(video.shape[0], *((video.dim() - 1) * [1]))
         audio_segment = torch.full(
-            (batch_size if audio.ndim == 3 else audio.shape[0],),
-            float(segment_size), device=device, dtype=sigma_t_src.dtype
+            (batch_size if audio.ndim == 3 else audio.shape[0],), float(segment_size), device=device, dtype=sigma_t_src.dtype
         ).reshape(audio.shape[0] if audio.ndim == 2 else batch_size, *((audio.dim() - 1) * [1]))
 
         policy = MultimodalDXPolicy(
@@ -175,19 +169,10 @@ def piflow_denoise_loop(  # noqa: PLR0913, PLR0915
         if progress_callback is not None:
             progress_callback()
 
-    if (
-        visual_cond_scheme in ("i2v", "tail_cond_first_frame")
-        and first_frames is not None
-    ):
-        reference_positions = (
-            video_cu_seqlens[:-1]
-            if visual_cond_scheme == "i2v"
-            else video_cu_seqlens[1:] - 1
-        )
+    if visual_cond_scheme in ("i2v", "tail_cond_first_frame") and first_frames is not None:
+        reference_positions = video_cu_seqlens[:-1] if visual_cond_scheme == "i2v" else video_cu_seqlens[1:] - 1
         if video.ndim == 5:
-            video[:, 0 if visual_cond_scheme == "i2v" else -1] = first_frames.to(
-                device=device, dtype=video.dtype
-            )
+            video[:, 0 if visual_cond_scheme == "i2v" else -1] = first_frames.to(device=device, dtype=video.dtype)
         else:
             video[reference_positions] = first_frames.to(device=device, dtype=video.dtype)
     return LatentBundle(

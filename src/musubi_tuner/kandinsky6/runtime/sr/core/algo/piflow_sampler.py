@@ -140,9 +140,7 @@ def piflow_generate(  # noqa: PLR0913
 
             raw_src_tok = torch.full((total_tokens,), raw_src, device=device)
             raw_dst_tok = torch.full((total_tokens,), raw_dst, device=device)
-            x_pred, _, _ = policy_rollout_fm(
-                x[..., :out_dim], sigma_tok, raw_src_tok, raw_dst_tok, num_policy_substeps, policy
-            )
+            x_pred, _, _ = policy_rollout_fm(x[..., :out_dim], sigma_tok, raw_src_tok, raw_dst_tok, num_policy_substeps, policy)
         x = torch.cat([x_pred, x[..., out_dim:]], dim=-1)
         if progress_callback is not None:
             progress_callback()

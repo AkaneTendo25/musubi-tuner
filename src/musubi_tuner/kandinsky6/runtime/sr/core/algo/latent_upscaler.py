@@ -98,9 +98,7 @@ def load_latent_upscaler(
     return bank
 
 
-def resolve_lu_state_dict(
-    checkpoint_path: str, *, use_ema: bool, state_prefix: str | None = None
-) -> dict[str, torch.Tensor]:
+def resolve_lu_state_dict(checkpoint_path: str, *, use_ema: bool, state_prefix: str | None = None) -> dict[str, torch.Tensor]:
     """Load the LU state dict from a training ``.pt`` or a release ``.safetensors``.
 
     A training checkpoint is a pickled dict with ``"ema"`` and ``"model"``

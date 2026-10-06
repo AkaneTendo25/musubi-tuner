@@ -37,7 +37,7 @@ def _build_video_input(
         batched = video.ndim == 5
         starts = torch.arange(video.shape[0], device=video.device) if batched else video_cu_seqlens[:-1]
         tail_cond = visual_cond_scheme == "tail_cond_first_frame"
-        inject = (torch.full_like(starts, video.shape[1] - 1) if batched and tail_cond else starts)
+        inject = torch.full_like(starts, video.shape[1] - 1) if batched and tail_cond else starts
         if not batched and tail_cond:
             inject = video_cu_seqlens[1:] - 1
 
@@ -154,38 +154,20 @@ def denoise_loop(
     device = video.device if video is not None else audio.device
     timesteps = flow_match_timesteps(num_steps, scheduler_scale, device)
 
-    video_cu_seqlens = (
-        bundle.video_cu_seqlens.to(device=device)
-        if bundle.video_cu_seqlens is not None
-        else None
-    )
-    audio_cu_seqlens = (
-        bundle.audio_cu_seqlens.to(device=device)
-        if bundle.audio_cu_seqlens is not None
-        else None
-    )
-    bs = (
-        video_cu_seqlens.shape[0] - 1
-        if video_cu_seqlens is not None
-        else audio_cu_seqlens.shape[0] - 1
-    )
+    video_cu_seqlens = bundle.video_cu_seqlens.to(device=device) if bundle.video_cu_seqlens is not None else None
+    audio_cu_seqlens = bundle.audio_cu_seqlens.to(device=device) if bundle.audio_cu_seqlens is not None else None
+    bs = video_cu_seqlens.shape[0] - 1 if video_cu_seqlens is not None else audio_cu_seqlens.shape[0] - 1
 
     null_te, null_pe, null_rope = _resolve_null_embeds(null_text_embeds, null_text_rope)
 
     out_c: int | None = None  # determined after first step, used to strip instruct channels
     raw = _raw_dit(dit)
     vis_shape = (
-        (int(visual_rope.shape[0]), int(visual_rope.shape[1]), int(visual_rope.shape[2]))
-        if visual_rope is not None
-        else None
+        (int(visual_rope.shape[0]), int(visual_rope.shape[1]), int(visual_rope.shape[2])) if visual_rope is not None else None
     )
     scale = (float(scale_factor[0]), float(scale_factor[1]), float(scale_factor[2]))
     tail_cond = visual_cond_scheme == "tail_cond_first_frame"
-    ref_positions = (
-        video_cu_seqlens[1:] - 1
-        if tail_cond and video_cu_seqlens is not None
-        else None
-    )
+    ref_positions = video_cu_seqlens[1:] - 1 if tail_cond and video_cu_seqlens is not None else None
     batched_video = video is not None and video.ndim == 5
 
     for t, dt in zip(timesteps[:-1], torch.diff(timesteps)):
@@ -193,10 +175,14 @@ def denoise_loop(
 
         model_input_v = (
             _build_video_input(
-                video, dit.visual_cond, first_frames,
-                video_cu_seqlens, visual_cond_scheme,
+                video,
+                dit.visual_cond,
+                first_frames,
+                video_cu_seqlens,
+                visual_cond_scheme,
             )
-            if video is not None else None
+            if video is not None
+            else None
         )
 
         # Freeze one modality at t=0 for partial sampling (T2VA only)
@@ -229,13 +215,12 @@ def denoise_loop(
             )
 
         vel_cond = _forward(
-            text_embeds["text_embeds"], text_embeds["pooled_embed"], text_rope, attention_mask,
+            text_embeds["text_embeds"],
+            text_embeds["pooled_embed"],
+            text_rope,
+            attention_mask,
         )
-        vel_uncond = (
-            _forward(null_te, null_pe, null_rope, null_attention_mask)
-            if abs(guidance_weight - 1.0) > 1e-6
-            else vel_cond
-        )
+        vel_uncond = _forward(null_te, null_pe, null_rope, null_attention_mask) if abs(guidance_weight - 1.0) > 1e-6 else vel_cond
 
         # Euler update per modality
         if isinstance(vel_cond, tuple):

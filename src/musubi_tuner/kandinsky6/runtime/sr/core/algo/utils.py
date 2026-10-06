@@ -6,7 +6,11 @@ from typing import Any, Literal, Callable
 
 import torch
 
-from musubi_tuner.kandinsky6.runtime.sr.core.components.model.vae_io import cast_to_module_dtype, decode_latent_to_uint8, encode_pixels_to_latent
+from musubi_tuner.kandinsky6.runtime.sr.core.components.model.vae_io import (
+    cast_to_module_dtype,
+    decode_latent_to_uint8,
+    encode_pixels_to_latent,
+)
 from musubi_tuner.kandinsky6.runtime.sr.core.algo.cached_text_embs_utils import replicate_cached_embeds
 from musubi_tuner.kandinsky6.runtime.sr.core.algo.train_utils import degrade_lq_latent, get_sparse_params
 

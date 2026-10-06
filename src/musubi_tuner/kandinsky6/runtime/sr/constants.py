@@ -1,6 +1,5 @@
 """Constants for the Kandinsky 5 Super Resolution dataset."""
 
-
 # Compression factors are a property of the encoding VAE, keyed by the
 # ``vae.name`` config value accepted by the VAE builders.
 VAE_FACTORS: dict[str, tuple[int, int]] = {

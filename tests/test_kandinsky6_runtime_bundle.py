@@ -108,9 +108,11 @@ def test_convrot_factory_uses_resolved_checkpoint_and_attaches_lora(monkeypatch)
         return dit
 
     monkeypatch.setattr("musubi_tuner.kandinsky6.load_dit_convrot_int8", fake_loader)
-    monkeypatch.setattr(generate, "apply_lora_weights", lambda model, paths, multipliers, *, merge: captured.update(
-        model=model, paths=paths, multipliers=multipliers, merge=merge
-    ))
+    monkeypatch.setattr(
+        generate,
+        "apply_lora_weights",
+        lambda model, paths, multipliers, *, merge: captured.update(model=model, paths=paths, multipliers=multipliers, merge=merge),
+    )
     cfg = SimpleNamespace(paths=SimpleNamespace(dit="snapshot/transformer"))
     loader = generate._convrot_dit_loader(
         enabled=True,

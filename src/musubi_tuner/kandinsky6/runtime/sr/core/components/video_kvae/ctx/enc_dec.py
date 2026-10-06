@@ -1,7 +1,6 @@
 import functools
 
 import numpy as np
-import torch
 import torch.nn as nn
 
 from ..utils import nonlinearity
@@ -36,7 +35,7 @@ class Encoder3D(nn.Module):
         fix_pxs=False,
         freeze=False,
         checkpoint_list=None,
-        norm_type='group_norm',
+        norm_type="group_norm",
         downsample_version=1,
         temporal_compress_start_level=0,
         skip_last_resolution=False,
@@ -54,21 +53,20 @@ class Encoder3D(nn.Module):
         if checkpoint_list is None:
             checkpoint_list = [True] * (self.num_resolutions + 1)
 
-        assert len(checkpoint_list) == (self.num_resolutions + 1), f'Checkpoint list filled wrong, expected length {self.num_resolutions + 1}, found {len(checkpoint_list)}'
+        assert len(checkpoint_list) == (self.num_resolutions + 1), (
+            f"Checkpoint list filled wrong, expected length {self.num_resolutions + 1}, found {len(checkpoint_list)}"
+        )
 
         # log2 of temporal_compress_times
         temporal_compress_level = int(np.log2(temporal_compress_times)) + temporal_compress_start_level
 
         in_ch_mult = (ch_mult[0],) + tuple(ch_mult)
 
-        self.conv_in = ContextParallelCausalConv3d( # CausalConv3d
-            chan_in=in_channels,
-            chan_out=int(in_ch_mult[0] * self.ch),
-            kernel_size=3,
-            padding_mode=padding_mode
+        self.conv_in = ContextParallelCausalConv3d(  # CausalConv3d
+            chan_in=in_channels, chan_out=int(in_ch_mult[0] * self.ch), kernel_size=3, padding_mode=padding_mode
         )
 
-        normalization = Normalize if norm_type == 'group_norm' else RMSNorm
+        normalization = Normalize if norm_type == "group_norm" else RMSNorm
 
         curr_res = resolution
         self.down = nn.ModuleList()
@@ -84,7 +82,7 @@ class Encoder3D(nn.Module):
 
             for i_block in range(self.num_res_blocks):
                 block.append(
-                    ContextParallelResnetBlock3D( #CheckpointedCausalResnetBlock3D(
+                    ContextParallelResnetBlock3D(  # CheckpointedCausalResnetBlock3D(
                         in_channels=block_in,
                         out_channels=block_out,
                         dropout=dropout,
@@ -93,7 +91,7 @@ class Encoder3D(nn.Module):
                         norm_chunks_num=norm_chunks_num,
                         modulated_norm=normalization,
                         checkpoint=checkpoint_list[i_level],
-                        padding_mode=padding_mode
+                        padding_mode=padding_mode,
                     )
                 )
                 if attn_resolutions and i_level in attn_resolutions:
@@ -104,16 +102,20 @@ class Encoder3D(nn.Module):
             down.attn = attn
             if i_level != self.num_resolutions - 1:
                 if temporal_compress_start_level <= i_level < temporal_compress_level:
-                    down.downsample = PXSDownsample(block_in, compress_time=True, fix_stride=fix_pxs, version=downsample_version, padding_mode=padding_mode) # DownSample3D(block_in, resamp_with_conv, compress_time=True)
+                    down.downsample = PXSDownsample(
+                        block_in, compress_time=True, fix_stride=fix_pxs, version=downsample_version, padding_mode=padding_mode
+                    )  # DownSample3D(block_in, resamp_with_conv, compress_time=True)
                 else:
-                    down.downsample = PXSDownsample(block_in, compress_time=False, version=downsample_version, padding_mode=padding_mode) # DownSample3D(block_in, resamp_with_conv, compress_time=False)
+                    down.downsample = PXSDownsample(
+                        block_in, compress_time=False, version=downsample_version, padding_mode=padding_mode
+                    )  # DownSample3D(block_in, resamp_with_conv, compress_time=False)
                 curr_res = curr_res // 2
             if not skip_last_resolution or i_level != self.num_resolutions - 1:
                 self.down.append(down)
 
         # middle
         self.mid = nn.Module()
-        self.mid.block_1 = ContextParallelResnetBlock3D( #CheckpointedCausalResnetBlock3D(
+        self.mid.block_1 = ContextParallelResnetBlock3D(  # CheckpointedCausalResnetBlock3D(
             in_channels=block_in,
             out_channels=block_in,
             temb_channels=self.temb_ch,
@@ -122,7 +124,7 @@ class Encoder3D(nn.Module):
             norm_chunks_num=norm_chunks_num,
             modulated_norm=normalization,
             checkpoint=checkpoint_list[-1],
-            padding_mode=padding_mode
+            padding_mode=padding_mode,
         )
 
         if attn_mid:
@@ -130,7 +132,7 @@ class Encoder3D(nn.Module):
         else:
             self.mid.attn = None
 
-        self.mid.block_2 = ContextParallelResnetBlock3D( #CheckpointedCausalResnetBlock3D(
+        self.mid.block_2 = ContextParallelResnetBlock3D(  # CheckpointedCausalResnetBlock3D(
             in_channels=block_in,
             out_channels=block_in,
             temb_channels=self.temb_ch,
@@ -139,17 +141,14 @@ class Encoder3D(nn.Module):
             norm_chunks_num=norm_chunks_num,
             modulated_norm=normalization,
             checkpoint=checkpoint_list[-1],
-            padding_mode=padding_mode
+            padding_mode=padding_mode,
         )
 
         # end
         self.norm_out = normalization(block_in, gather=gather_norm)
 
-        self.conv_out = ContextParallelCausalConv3d( # CausalConv3d(
-            chan_in=block_in,
-            chan_out=2 * z_channels if double_z else z_channels,
-            kernel_size=3,
-            padding_mode=padding_mode
+        self.conv_out = ContextParallelCausalConv3d(  # CausalConv3d(
+            chan_in=block_in, chan_out=2 * z_channels if double_z else z_channels, kernel_size=3, padding_mode=padding_mode
         )
 
     def forward(self, x, return_features=False):
@@ -209,7 +208,7 @@ class Decoder3D(nn.Module):
         gather_norm=False,
         norm_chunks_num=1,
         checkpoint_list=None,
-        norm_type='group_norm',
+        norm_type="group_norm",
         temporal_compress_start_level=0,
         upsample_version=1,
         skip_last_resolution=False,
@@ -228,7 +227,9 @@ class Decoder3D(nn.Module):
         if checkpoint_list is None:
             checkpoint_list = [True] * (self.num_resolutions + 1)
 
-        assert len(checkpoint_list) == (self.num_resolutions + 1), f'Checkpoint list filled wrong, expected length {self.num_resolutions + 1}, found {len(checkpoint_list)}'
+        assert len(checkpoint_list) == (self.num_resolutions + 1), (
+            f"Checkpoint list filled wrong, expected length {self.num_resolutions + 1}, found {len(checkpoint_list)}"
+        )
         checkpoint_list.reverse()
 
         # log2 of temporal_compress_times
@@ -242,19 +243,16 @@ class Decoder3D(nn.Module):
         curr_res = resolution // 2 ** (self.num_resolutions - 1)
         self.z_shape = (1, z_channels, curr_res, curr_res)
 
-        self.conv_in = ContextParallelCausalConv3d( #CausalConv3d(
-            chan_in=z_channels,
-            chan_out=block_in,
-            kernel_size=3,
-            padding_mode=padding_mode
+        self.conv_in = ContextParallelCausalConv3d(  # CausalConv3d(
+            chan_in=z_channels, chan_out=block_in, kernel_size=3, padding_mode=padding_mode
         )
 
-        normalization = Normalize if norm_type == 'group_norm' else RMSNorm
+        normalization = Normalize if norm_type == "group_norm" else RMSNorm
         modulated_norm = functools.partial(Normalize3D, normalization=normalization)
 
         # middle
         self.mid = nn.Module()
-        self.mid.block_1 = ContextParallelResnetBlock3D( #CheckpointedCausalResnetBlock3D(
+        self.mid.block_1 = ContextParallelResnetBlock3D(  # CheckpointedCausalResnetBlock3D(
             in_channels=block_in,
             out_channels=block_in,
             temb_channels=self.temb_ch,
@@ -265,7 +263,7 @@ class Decoder3D(nn.Module):
             gather_norm=gather_norm,
             norm_chunks_num=norm_chunks_num,
             checkpoint=checkpoint_list[-1],
-            padding_mode=padding_mode
+            padding_mode=padding_mode,
         )
 
         if attn_mid:
@@ -273,7 +271,7 @@ class Decoder3D(nn.Module):
         else:
             self.mid.attn = None
 
-        self.mid.block_2 = ContextParallelResnetBlock3D( #CheckpointedCausalResnetBlock3D(
+        self.mid.block_2 = ContextParallelResnetBlock3D(  # CheckpointedCausalResnetBlock3D(
             in_channels=block_in,
             out_channels=block_in,
             temb_channels=self.temb_ch,
@@ -284,7 +282,7 @@ class Decoder3D(nn.Module):
             gather_norm=gather_norm,
             norm_chunks_num=norm_chunks_num,
             checkpoint=checkpoint_list[-1],
-            padding_mode=padding_mode
+            padding_mode=padding_mode,
         )
 
         # upsampling
@@ -299,7 +297,7 @@ class Decoder3D(nn.Module):
 
             for i_block in range(self.num_res_blocks + 1):
                 block.append(
-                    ContextParallelResnetBlock3D( #CheckpointedCausalResnetBlock3D(
+                    ContextParallelResnetBlock3D(  # CheckpointedCausalResnetBlock3D(
                         in_channels=block_in,
                         out_channels=block_out,
                         temb_channels=self.temb_ch,
@@ -310,7 +308,7 @@ class Decoder3D(nn.Module):
                         gather_norm=gather_norm,
                         norm_chunks_num=norm_chunks_num,
                         checkpoint=checkpoint_list[i_level],
-                        padding_mode=padding_mode
+                        padding_mode=padding_mode,
                     )
                 )
                 if attn_resolutions and i_level in attn_resolutions:
@@ -321,18 +319,19 @@ class Decoder3D(nn.Module):
             up.attn = attn
             if i_level != 0:
                 if self.num_resolutions - temporal_compress_start_level > i_level >= self.num_resolutions - temporal_compress_level:
-                    up.upsample = PXSUpsample(block_in, compress_time=True, version=upsample_version, padding_mode=padding_mode) # Upsample3D(block_in, with_conv=resamp_with_conv, compress_time=True)
+                    up.upsample = PXSUpsample(
+                        block_in, compress_time=True, version=upsample_version, padding_mode=padding_mode
+                    )  # Upsample3D(block_in, with_conv=resamp_with_conv, compress_time=True)
                 else:
-                    up.upsample = PXSUpsample(block_in, compress_time=False, version=upsample_version, padding_mode=padding_mode) # Upsample3D(block_in, with_conv=resamp_with_conv, compress_time=False)
+                    up.upsample = PXSUpsample(
+                        block_in, compress_time=False, version=upsample_version, padding_mode=padding_mode
+                    )  # Upsample3D(block_in, with_conv=resamp_with_conv, compress_time=False)
             self.up.insert(0, up)
 
-        self.norm_out = modulated_norm(block_in, zq_ch, add_conv=add_conv) #, gather=gather_norm)
+        self.norm_out = modulated_norm(block_in, zq_ch, add_conv=add_conv)  # , gather=gather_norm)
 
-        self.conv_out = ContextParallelCausalConv3d( # CausalConv3d(
-            chan_in=block_in,
-            chan_out=out_ch,
-            kernel_size=3,
-            padding_mode=padding_mode
+        self.conv_out = ContextParallelCausalConv3d(  # CausalConv3d(
+            chan_in=block_in, chan_out=out_ch, kernel_size=3, padding_mode=padding_mode
         )
 
     def forward(self, z, up_time=None):
@@ -370,7 +369,7 @@ class Decoder3D(nn.Module):
         if self.give_pre_end:
             return h
 
-        h = self.norm_out(h, zq) #, fake_cp=use_cp)
+        h = self.norm_out(h, zq)  # , fake_cp=use_cp)
         h = nonlinearity(h)
         h = self.conv_out(h)
 

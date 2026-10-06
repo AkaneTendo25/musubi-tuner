@@ -240,9 +240,7 @@ class MultiScaleModelConfig(_BaseModelConfig):
                 f"x2_adapter_blocks ({self.x2_adapter_blocks})"
             )
             raise ValueError(msg)
-        if self.x2_adapter_sources is not None and any(
-            not 0 <= index < self.num_pre_blocks for index in self.x2_adapter_sources
-        ):
+        if self.x2_adapter_sources is not None and any(not 0 <= index < self.num_pre_blocks for index in self.x2_adapter_sources):
             msg = f"x2_adapter_sources indices must be within [0, num_pre_blocks={self.num_pre_blocks})"
             raise ValueError(msg)
         if self.x2_finisher != "none" and self.upsample_mode != "pxs_v2":

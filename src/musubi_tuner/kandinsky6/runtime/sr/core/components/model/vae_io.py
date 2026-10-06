@@ -67,6 +67,7 @@ def encode_pixels_to_latent(vae: torch.nn.Module, pixels: torch.Tensor, *, sampl
     result = vae.encode(x)
     return result[0]
 
+
 def decode_latent_to_uint8(vae: torch.nn.Module, latent: torch.Tensor) -> torch.Tensor:
     """Decode a ``(B, C, T, H, W)`` latent to ``uint8`` pixels in ``[0, 255]``.
 

@@ -20,7 +20,10 @@ from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.up
 
 if TYPE_CHECKING:
     from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.config import UpsampleMode, UpsamplePosition
-    from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.conv_ops import TemporalPadding, UpsamplePaddingMode
+    from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.conv_ops import (
+        TemporalPadding,
+        UpsamplePaddingMode,
+    )
 
 
 class ConvLatentUpsampler(nn.Module):

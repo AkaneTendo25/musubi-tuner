@@ -145,6 +145,12 @@ Musubi Tuner 開発へのご支援、ご協力に感謝いたします。コミ�
    accelerate config
    ```
 
+4. **リポジトリの pre-commit フックをインストール**：
+   ```shell
+   python tools/install_git_hooks.py
+   ```
+   このフックはステージ済みスナップショットを `ruff check` と `ruff format --check` で検査します。ファイルや Git のグローバルフック設定は変更しません。
+
 ## コードスタイルとガイドライン
 
 ### Python コードスタイル

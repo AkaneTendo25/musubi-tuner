@@ -62,6 +62,4 @@ def create_arch_network_from_weights(
     for_inference: bool = False,
     **kwargs,
 ) -> lora.LoRANetwork:
-    return lora.create_network_from_weights(
-        None, multiplier, weights_sd, text_encoders, unet, for_inference, **kwargs
-    )
+    return lora.create_network_from_weights(None, multiplier, weights_sd, text_encoders, unet, for_inference, **kwargs)

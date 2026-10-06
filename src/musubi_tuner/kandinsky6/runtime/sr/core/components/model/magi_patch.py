@@ -1,5 +1,6 @@
 """Runtime patch for MagiCompiler static-shape marking (shared by the magi builders)."""
 
+
 def patch_magi_mark_static_shapes(*, mark_owner: bool = False):
     """
     Runtime patch for magi_compiler._api._mark_static_shapes.
@@ -9,7 +10,7 @@ def patch_magi_mark_static_shapes(*, mark_owner: bool = False):
 
     mark_owner=False is intentional and recommended.
     """
-    print(f"USING MAGI PATCH")
+    print("USING MAGI PATCH")
     import torch
     import magi_compiler._api as magi_api
 

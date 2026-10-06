@@ -1,8 +1,6 @@
 import functools
-import time
 
 import numpy as np
-import torch
 import torch.nn as nn
 
 from .cached_layers import CachedPXSDownsample, CachedPXSUpsample
@@ -49,10 +47,7 @@ class CachedEncoder3D(nn.Module):
 
         in_ch_mult = (ch_mult[0],) + tuple(ch_mult)
         self.conv_in = CachedCausalConv3d(
-            chan_in=in_channels,
-            chan_out=round(in_ch_mult[0] * self.ch),
-            kernel_size=3,
-            padding_mode=padding_mode
+            chan_in=in_channels, chan_out=round(in_ch_mult[0] * self.ch), kernel_size=3, padding_mode=padding_mode
         )
 
         normalization = Normalize if norm_type == "group_norm" else RMSNorm
@@ -78,7 +73,7 @@ class CachedEncoder3D(nn.Module):
                         temb_channels=self.temb_ch,
                         gather_norm=gather_norm,
                         normalization=normalization,
-                        padding_mode=padding_mode
+                        padding_mode=padding_mode,
                     )
                 )
                 block_in = block_out
@@ -87,9 +82,13 @@ class CachedEncoder3D(nn.Module):
             down.attn = attn
             if i_level != self.num_resolutions - 1:
                 if temporal_compress_start_level <= i_level < temporal_compress_level:
-                    down.downsample = CachedPXSDownsample(block_in, compress_time=True, version=downsample_version, fixed_stride=fix_pxs, padding_mode=padding_mode)
+                    down.downsample = CachedPXSDownsample(
+                        block_in, compress_time=True, version=downsample_version, fixed_stride=fix_pxs, padding_mode=padding_mode
+                    )
                 else:
-                    down.downsample = CachedPXSDownsample(block_in, compress_time=False, version=downsample_version, fixed_stride=fix_pxs, padding_mode=padding_mode)
+                    down.downsample = CachedPXSDownsample(
+                        block_in, compress_time=False, version=downsample_version, fixed_stride=fix_pxs, padding_mode=padding_mode
+                    )
                 curr_res = curr_res // 2
             if not skip_last_resolution or i_level != self.num_resolutions - 1:
                 self.down.append(down)
@@ -103,7 +102,7 @@ class CachedEncoder3D(nn.Module):
             dropout=dropout,
             gather_norm=gather_norm,
             normalization=normalization,
-            padding_mode=padding_mode
+            padding_mode=padding_mode,
         )
 
         self.mid.block_2 = CachedCausalResnetBlock3D(
@@ -113,17 +112,14 @@ class CachedEncoder3D(nn.Module):
             dropout=dropout,
             gather_norm=gather_norm,
             normalization=normalization,
-            padding_mode=padding_mode
+            padding_mode=padding_mode,
         )
 
         # end
         self.norm_out = normalization(block_in, gather=gather_norm)
 
         self.conv_out = CachedCausalConv3d(
-            chan_in=block_in,
-            chan_out=2 * z_channels if double_z else z_channels,
-            kernel_size=3,
-            padding_mode=padding_mode
+            chan_in=block_in, chan_out=2 * z_channels if double_z else z_channels, kernel_size=3, padding_mode=padding_mode
         )
 
     def forward(self, x, cache_dict, use_cp=True):
@@ -131,7 +127,7 @@ class CachedEncoder3D(nn.Module):
         temb = None
 
         # downsampling
-        h = self.conv_in(x, cache=cache_dict['conv_in'])
+        h = self.conv_in(x, cache=cache_dict["conv_in"])
         for i_level in range(self.num_resolutions):
             if not self.skip_last_resolution or i_level != self.num_resolutions - 1:
                 for i_block in range(self.num_res_blocks):
@@ -139,16 +135,16 @@ class CachedEncoder3D(nn.Module):
                     if len(self.down[i_level].attn) > 0:
                         h = self.down[i_level].attn[i_block](h)
             if i_level != self.num_resolutions - 1:
-                h = self.down[i_level].downsample(h, cache=cache_dict[i_level]['down'])
+                h = self.down[i_level].downsample(h, cache=cache_dict[i_level]["down"])
 
         # middle
-        h = self.mid.block_1(h, temb, layer_cache=cache_dict['mid_1'])
-        h = self.mid.block_2(h, temb, layer_cache=cache_dict['mid_2'])
+        h = self.mid.block_1(h, temb, layer_cache=cache_dict["mid_1"])
+        h = self.mid.block_2(h, temb, layer_cache=cache_dict["mid_2"])
 
         # end
-        h = self.norm_out(h, cache=cache_dict['norm_out'])
+        h = self.norm_out(h, cache=cache_dict["norm_out"])
         h = nonlinearity(h)
-        h = self.conv_out(h, cache=cache_dict['conv_out'])
+        h = self.conv_out(h, cache=cache_dict["conv_out"])
 
         return h
 
@@ -196,12 +192,7 @@ class CachedDecoder3D(nn.Module):
         curr_res = resolution // 2 ** (self.num_resolutions - 1)
         self.z_shape = (1, z_channels, curr_res, curr_res)
 
-        self.conv_in = CachedCausalConv3d(
-            chan_in=z_channels,
-            chan_out=block_in,
-            kernel_size=3,
-            padding_mode=padding_mode
-        )
+        self.conv_in = CachedCausalConv3d(chan_in=z_channels, chan_out=block_in, kernel_size=3, padding_mode=padding_mode)
 
         modulated_norm = functools.partial(Normalize3D, normalization=Normalize if norm_type == "group_norm" else RMSNorm)
 
@@ -216,7 +207,7 @@ class CachedDecoder3D(nn.Module):
             add_conv=add_conv,
             normalization=modulated_norm,
             gather_norm=gather_norm,
-            padding_mode=padding_mode
+            padding_mode=padding_mode,
         )
 
         self.mid.block_2 = CachedCausalResnetBlock3D(
@@ -228,7 +219,7 @@ class CachedDecoder3D(nn.Module):
             add_conv=add_conv,
             normalization=modulated_norm,
             gather_norm=gather_norm,
-            padding_mode=padding_mode
+            padding_mode=padding_mode,
         )
 
         # upsampling
@@ -248,7 +239,7 @@ class CachedDecoder3D(nn.Module):
                         add_conv=add_conv,
                         normalization=modulated_norm,
                         gather_norm=gather_norm,
-                        padding_mode=padding_mode
+                        padding_mode=padding_mode,
                     )
                 )
                 block_in = block_out
@@ -262,14 +253,9 @@ class CachedDecoder3D(nn.Module):
                     up.upsample = CachedPXSUpsample(block_in, compress_time=False, padding_mode=padding_mode)
             self.up.insert(0, up)
 
-        self.norm_out = modulated_norm(block_in, zq_ch, add_conv=add_conv) #, gather=gather_norm)
+        self.norm_out = modulated_norm(block_in, zq_ch, add_conv=add_conv)  # , gather=gather_norm)
 
-        self.conv_out = CachedCausalConv3d(
-            chan_in=block_in,
-            chan_out=out_ch,
-            kernel_size=3,
-            padding_mode=padding_mode
-        )
+        self.conv_out = CachedCausalConv3d(chan_in=block_in, chan_out=out_ch, kernel_size=3, padding_mode=padding_mode)
 
     def forward(self, z, cache_dict):
         self.last_z_shape = z.shape
@@ -280,11 +266,11 @@ class CachedDecoder3D(nn.Module):
         t = z.shape[2]
 
         zq = z
-        h = self.conv_in(z, cache_dict['conv_in'])
+        h = self.conv_in(z, cache_dict["conv_in"])
 
         # middle
-        h = self.mid.block_1(h, temb, layer_cache=cache_dict['mid_1'], zq=zq)
-        h = self.mid.block_2(h, temb, layer_cache=cache_dict['mid_2'], zq=zq)
+        h = self.mid.block_1(h, temb, layer_cache=cache_dict["mid_1"], zq=zq)
+        h = self.mid.block_2(h, temb, layer_cache=cache_dict["mid_2"], zq=zq)
 
         # upsampling
         for i_level in reversed(range(self.num_resolutions)):
@@ -294,15 +280,15 @@ class CachedDecoder3D(nn.Module):
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h, zq)
             if i_level != 0:
-                h = self.up[i_level].upsample(h, cache_dict[i_level]['up'])
+                h = self.up[i_level].upsample(h, cache_dict[i_level]["up"])
 
         # end
         if self.give_pre_end:
             return h
 
-        h = self.norm_out(h, zq, cache_dict['norm_out'])
+        h = self.norm_out(h, zq, cache_dict["norm_out"])
         h = nonlinearity(h)
-        h = self.conv_out(h, cache_dict['conv_out'])
+        h = self.conv_out(h, cache_dict["conv_out"])
 
         return h
 

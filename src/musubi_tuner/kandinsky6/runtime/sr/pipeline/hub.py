@@ -224,9 +224,7 @@ def sidecar_from_hf_kvae(directory: Path) -> str | None:
     scaling_factor = config.get("scaling_factor", model.get("scaling_factor"))
     if scaling_factor is None:
         scaling_factor = KVAE_T4S16_SCALING_FACTOR
-        logger.warning(
-            "{} carries no scaling_factor; using the KVAE-3D-2.0-t4s16 value {}", config_file, scaling_factor
-        )
+        logger.warning("{} carries no scaling_factor; using the KVAE-3D-2.0-t4s16 value {}", config_file, scaling_factor)
     architecture = KvaeArchitecture(
         scaling_factor=float(scaling_factor),
         encoder_params=model["encoder_params"],
@@ -244,9 +242,7 @@ def find_kvae_sidecar_prefix(directory: Path, label: str) -> str:
     Raises:
         ValueError: If the directory holds no (or more than one) sidecar pair.
     """
-    prefixes = sorted(
-        str(yaml_file.with_suffix("")) for yaml_file in directory.rglob("*.yaml") if has_sidecar_weights(yaml_file)
-    )
+    prefixes = sorted(str(yaml_file.with_suffix("")) for yaml_file in directory.rglob("*.yaml") if has_sidecar_weights(yaml_file))
     if not prefixes:
         converted = sidecar_from_hf_kvae(directory)
         if converted is not None:

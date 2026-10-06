@@ -36,7 +36,10 @@ def test_export_roundtrip_uses_loader_policy_and_preserves_float_values(tmp_path
         assert handle.get_tensor("visual_transformer_blocks.0.proj.weight").dtype is torch.int8
         assert handle.get_tensor("visual_transformer_blocks.0.proj.weight_scale").dtype is torch.float32
         assert handle.get_tensor("audio_text_transformer_blocks.0.proj.weight").dtype is torch.int8
-        assert torch.equal(handle.get_tensor("visual_transformer_blocks.0.norm.weight"), original["visual_transformer_blocks.0.norm.weight"].bfloat16())
+        assert torch.equal(
+            handle.get_tensor("visual_transformer_blocks.0.norm.weight"),
+            original["visual_transformer_blocks.0.norm.weight"].bfloat16(),
+        )
         assert metadata["kandinsky6.variant"] == "pro"
         assert metadata["kandinsky6.checkpoint_format"] == "regular"
     assert "visual_transformer_blocks.0.proj.comfy_quant" in keys
@@ -51,22 +54,32 @@ def test_export_roundtrip_uses_loader_policy_and_preserves_float_values(tmp_path
         "visual_transformer_blocks.0.proj": 256,
     }
     with safe_open(output, framework="pt", device="cpu") as handle:
-        assert torch.equal(reloaded["visual_transformer_blocks.0.proj.weight"], handle.get_tensor("visual_transformer_blocks.0.proj.weight"))
-        assert torch.equal(reloaded["visual_transformer_blocks.0.proj.scale_weight"], handle.get_tensor("visual_transformer_blocks.0.proj.weight_scale"))
+        assert torch.equal(
+            reloaded["visual_transformer_blocks.0.proj.weight"], handle.get_tensor("visual_transformer_blocks.0.proj.weight")
+        )
+        assert torch.equal(
+            reloaded["visual_transformer_blocks.0.proj.scale_weight"],
+            handle.get_tensor("visual_transformer_blocks.0.proj.weight_scale"),
+        )
 
 
 def test_export_does_not_requantize_existing_comfy_triple(tmp_path, monkeypatch):
     source = tmp_path / "existing.safetensors"
     weight = torch.arange(512, dtype=torch.int16).reshape(2, 256).to(torch.int8)
     scale = torch.tensor([[1.25], [2.5]], dtype=torch.float32)
-    payload = torch.tensor(list(json.dumps({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}).encode()), dtype=torch.uint8)
-    save_file({
-        "visual_embeddings.in_layer.weight": torch.zeros(2, 16, dtype=torch.bfloat16),
-        "out_layer.out_layer.weight": torch.zeros(64, 1, dtype=torch.bfloat16),
-        "visual_transformer_blocks.0.proj.weight": weight,
-        "visual_transformer_blocks.0.proj.weight_scale": scale,
-        "visual_transformer_blocks.0.proj.comfy_quant": payload,
-    }, str(source))
+    payload = torch.tensor(
+        list(json.dumps({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}).encode()), dtype=torch.uint8
+    )
+    save_file(
+        {
+            "visual_embeddings.in_layer.weight": torch.zeros(2, 16, dtype=torch.bfloat16),
+            "out_layer.out_layer.weight": torch.zeros(64, 1, dtype=torch.bfloat16),
+            "visual_transformer_blocks.0.proj.weight": weight,
+            "visual_transformer_blocks.0.proj.weight_scale": scale,
+            "visual_transformer_blocks.0.proj.comfy_quant": payload,
+        },
+        str(source),
+    )
     output = tmp_path / "copy.safetensors"
     monkeypatch.setattr(kandinsky6_prequantize, "inspect_checkpoint", lambda _path: ("pro", None))
 

@@ -63,9 +63,7 @@ def build_example_kwargs(  # noqa: PLR0913
     x_video = torch.randn(duration, h_lat, w_lat, in_ch, device=device, dtype=dtype)
 
     scale = (float(scale_factor[0]), float(scale_factor[1]), float(scale_factor[2]))
-    visual_rope = compute_visual_rope(
-        dit.visual_rope, (t_rope, h_patches, w_patches), scale, device=device
-    )
+    visual_rope = compute_visual_rope(dit.visual_rope, (t_rope, h_patches, w_patches), scale, device=device)
 
     text_len = text_max_length
     text_embed = torch.randn(text_len, in_text_dim, device=device, dtype=dtype)
@@ -161,12 +159,8 @@ def materialize_block_example_args(
             t_v, t_a = time[0], time[1]
             video_te, video_tm = dit._encode_text("video", te_v, pe_v, t_v, rope_v)
             audio_te, audio_tm = dit._encode_text("audio", te_a, pe_a, t_a, rope_a)
-            vis_embed, _, vis_rope = dit._embed_visual(
-                dit_kwargs["x_video"], dit_kwargs["visual_rope"]
-            )
-            aud_embed, aud_rope = dit._embed_audio(
-                dit_kwargs["x_audio"], dit_kwargs["audio_rope"]
-            )
+            vis_embed, _, vis_rope = dit._embed_visual(dit_kwargs["x_video"], dit_kwargs["visual_rope"])
+            aud_embed, aud_rope = dit._embed_audio(dit_kwargs["x_audio"], dit_kwargs["audio_rope"])
             args: tuple[Any, ...] = (
                 vis_embed,
                 aud_embed,
@@ -178,9 +172,7 @@ def materialize_block_example_args(
             )
             if pad:
                 # Static key-padding mask (True=valid); shape matches runtime pad-to-max.
-                attn_mask = torch.ones(
-                    1, int(video_te.shape[0]), dtype=torch.bool, device=video_te.device
-                )
+                attn_mask = torch.ones(1, int(video_te.shape[0]), dtype=torch.bool, device=video_te.device)
                 args = (*args, attn_mask)
             return args
 
@@ -189,9 +181,7 @@ def materialize_block_example_args(
         rope_in = dit_kwargs["text_rope"]
         t_in = dit_kwargs["time"]
         te, tm = dit._encode_t2v(te_in, pe_in, t_in, rope_in)
-        vis_embed, _, vis_rope = dit._embed_visual(
-            dit_kwargs["x_video"], dit_kwargs["visual_rope"]
-        )
+        vis_embed, _, vis_rope = dit._embed_visual(dit_kwargs["x_video"], dit_kwargs["visual_rope"])
         args = (vis_embed, te, tm, vis_rope)
         if pad:
             attn_mask = torch.ones(1, int(te.shape[0]), dtype=torch.bool, device=te.device)
@@ -249,13 +239,9 @@ def export_visual_block(
     if len(dit.visual_transformer_blocks) < 1:
         raise ValueError("DiT has no visual_transformer_blocks to export")
     block = dit.visual_transformer_blocks[0]
-    expected = (
-        FusedTransformerDecoderBlock if dit.is_multimodal else TransformerDecoderBlock
-    )
+    expected = FusedTransformerDecoderBlock if dit.is_multimodal else TransformerDecoderBlock
     if not isinstance(block, expected):
-        raise TypeError(
-            f"expected visual_transformer_blocks[0] to be {expected.__name__}, got {type(block)}"
-        )
+        raise TypeError(f"expected visual_transformer_blocks[0] to be {expected.__name__}, got {type(block)}")
 
     args = materialize_block_example_args(dit, dit_kwargs)
     if device is not None:
@@ -276,11 +262,7 @@ def _configure_aoti_compile_parallelism() -> int:
     """
     import os
 
-    affinity = (
-        len(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity")
-        else (os.cpu_count() or 1)
-    )
+    affinity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     reported = os.cpu_count() or affinity
     ncpu = max(1, min(affinity, reported))
     if ncpu >= 64:
@@ -343,17 +325,10 @@ def compile_aoti(
     configs = dict(inductor_configs) if inductor_configs is not None else _default_aoti_inductor_configs()
     if configs.get("triton.cudagraphs"):
         logger.warning(
-            "triton.cudagraphs=true is fragile with MagCache skip and FA3 custom ops; "
-            "prefer compile.aoti.cudagraphs=false"
+            "triton.cudagraphs=true is fragile with MagCache skip and FA3 custom ops; prefer compile.aoti.cudagraphs=false"
         )
     max_at = bool(configs.get("max_autotune", False))
-    mode = (
-        "max-autotune"
-        if max_at and configs.get("triton.cudagraphs")
-        else "max-autotune-no-cudagraphs"
-        if max_at
-        else "default"
-    )
+    mode = "max-autotune" if max_at and configs.get("triton.cudagraphs") else "max-autotune-no-cudagraphs" if max_at else "default"
     logger.info(
         "AOTI compile_threads=%s mode=%s cache=%s",
         workers,
@@ -407,7 +382,11 @@ def bind_aoti_to_visual_blocks(
 
     if device is not None:
         dev = torch.device(device)
-        device_index = (torch.cuda.current_device() if dev.index is None else dev.index) if dev.type == "cuda" else _aoti_device_index(blocks[0])
+        device_index = (
+            (torch.cuda.current_device() if dev.index is None else dev.index)
+            if dev.type == "cuda"
+            else _aoti_device_index(blocks[0])
+        )
     else:
         device_index = _aoti_device_index(blocks[0])
 

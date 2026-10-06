@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    pass
 
 
 class DXPolicy:

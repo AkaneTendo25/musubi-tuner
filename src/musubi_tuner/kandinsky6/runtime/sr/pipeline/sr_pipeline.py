@@ -157,16 +157,12 @@ def latent_path_padding(components: Any, run_config: RunConfig, source_hw: tuple
     spatial_factor = _spatial_factor(components)
 
     def tile_hw_for(height: int, width: int) -> tuple[int, int]:
-        return _tile_geometry(
-            height, width, visual_size, run_config.resolution_scale, run_config.overlap, spatial_factor
-        )[1]
+        return _tile_geometry(height, width, visual_size, run_config.resolution_scale, run_config.overlap, spatial_factor)[1]
 
     return source_padding(source_hw[0], source_hw[1], spatial_factor, tile_hw_for)
 
 
-def denoise_progress_total(
-    components: SRComponents, run_config: RunConfig, source_hw: tuple[int, int]
-) -> tuple[int, int]:
+def denoise_progress_total(components: SRComponents, run_config: RunConfig, source_hw: tuple[int, int]) -> tuple[int, int]:
     """Return ``(total_tiles, steps_per_tile)`` of a run: the work a progress reporter counts.
 
     Args:
@@ -429,9 +425,7 @@ def upscale_lr_latent_tile(
 
 def _upsample_tiles_to_base(raw_tiles: list[torch.Tensor], base_h: int, base_w: int) -> list[torch.Tensor]:
     return [
-        functional.interpolate(tile.float(), size=(base_h, base_w), mode="bilinear", align_corners=False).permute(
-            0, 2, 3, 1
-        )
+        functional.interpolate(tile.float(), size=(base_h, base_w), mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
         for tile in raw_tiles
     ]
 
@@ -744,22 +738,16 @@ class Kandinsky6SRPipeline:
         if latent_input:
             if bridge:
                 if self.source_vae is None:
-                    raise ValueError(
-                        "KVAE bridge latent SR requires the source VAE; pass pixel video or configure source_vae"
-                    )
+                    raise ValueError("KVAE bridge latent SR requires the source VAE; pass pixel video or configure source_vae")
                 # The bridge converts the source VAE latent to pixels first;
                 # the regular pixel-input branch then encodes it with the
                 # SR VAE when a matching latent upscaler is available.
                 samples = [_decode_source_latent_video(sample, self.source_vae, self.device) for sample in samples]
                 latent_input = False
             elif pre_upscale != 1.0:
-                raise ValueError(
-                    "2.25x latent SR requires the KVAE bridge source VAE; pass pixel video or configure source_vae"
-                )
+                raise ValueError("2.25x latent SR requires the KVAE bridge source VAE; pass pixel video or configure source_vae")
         if not latent_input and pre_upscale != 1.0:
-            samples = [
-                pre_upscale_video(sample, pre_upscale, _spatial_factor(self._components())) for sample in samples
-            ]
+            samples = [pre_upscale_video(sample, pre_upscale, _spatial_factor(self._components())) for sample in samples]
             _validate_equal_shapes(samples, "video")
         return samples, latent_input
 
@@ -785,8 +773,7 @@ def _pad_for_latent_path(
         samples = [padding.apply_to_video(sample) for sample in samples]
     if padding.any:
         logger.info(
-            "Source {}x{} padded to {}x{} (bottom={}, right={}) for the latent path; "
-            "the SR result is cropped back to source x{}",
+            "Source {}x{} padded to {}x{} (bottom={}, right={}) for the latent path; the SR result is cropped back to source x{}",
             source_hw[0],
             source_hw[1],
             *padding.padded_hw(source_hw),
@@ -815,14 +802,7 @@ def _decode_source_latent_video(
             if "alternative_fwd" not in str(exc):
                 raise
             decoded = source_vae.decode(latent_5d).sample
-    return (
-        ((decoded.squeeze(0).float().clamp(-1, 1) + 1.0) * 127.5)
-        .round()
-        .clamp(0, 255)
-        .to(torch.uint8)
-        .permute(1, 0, 2, 3)
-        .cpu()
-    )
+    return ((decoded.squeeze(0).float().clamp(-1, 1) + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).cpu()
 
 
 __all__ = [

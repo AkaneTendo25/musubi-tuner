@@ -73,8 +73,8 @@ class RoPE3D(nn.Module):
         )
         cos, sin = torch.cos(args), torch.sin(args)
         rope = torch.stack([cos, -sin, sin, cos], dim=-1)  # (T, H, W, total_dim, 4)
-        rope = rope.view(*rope.shape[:-1], 2, 2)           # (T, H, W, total_dim, 2, 2)
-        return rope.unsqueeze(-4)                           # (T, H, W, 1, total_dim, 2, 2)
+        rope = rope.view(*rope.shape[:-1], 2, 2)  # (T, H, W, total_dim, 2, 2)
+        return rope.unsqueeze(-4)  # (T, H, W, 1, total_dim, 2, 2)
 
     def reset_parameters(self) -> None:
         for i, (d, mp) in enumerate(zip(self.axes_dims, self.max_pos)):

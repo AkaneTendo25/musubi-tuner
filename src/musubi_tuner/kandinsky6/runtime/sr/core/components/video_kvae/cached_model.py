@@ -17,8 +17,7 @@ class DecoderOutput:
 class CausalVAE(torch.nn.Module):
     def __init__(self, encoder_conf, decoder_conf, scaling_factor=None, mean=None, ckpt_path=None):
         super().__init__()
-        self.conf = {'enc': encoder_conf,
-                     'dec': decoder_conf}
+        self.conf = {"enc": encoder_conf, "dec": decoder_conf}
         self.encoder = Encoder3D(**encoder_conf)
         self.decoder = Decoder3D(**decoder_conf)
         self.regularizer = DiagonalGaussianRegularizer(sample=False)
@@ -33,7 +32,7 @@ class CausalVAE(torch.nn.Module):
         replace_keys = dict()
         delete_keys = list()
         for k in sd:
-            if k.startswith('loss.'):
+            if k.startswith("loss."):
                 delete_keys.append(k)
                 continue
 
@@ -81,8 +80,7 @@ class CausalVAE(torch.nn.Module):
 class CachedCausalVAE(CausalVAE):
     def __init__(self, encoder_conf, decoder_conf, scaling_factor=None, mean=None, ckpt_path=None):
         super(CausalVAE, self).__init__()
-        self.conf = {'enc' : encoder_conf,
-                     'dec' : decoder_conf}
+        self.conf = {"enc": encoder_conf, "dec": decoder_conf}
         self.encoder = CachedEncoder3D(**encoder_conf)
         self.decoder = CachedDecoder3D(**decoder_conf)
         self.regularizer = DiagonalGaussianRegularizer(sample=False)
@@ -92,7 +90,7 @@ class CachedCausalVAE(CausalVAE):
 
     def init_from_ckpt(self, path):
         """Load a KVAE checkpoint in safetensors or training-checkpoint format."""
-        if str(path).endswith('.safetensors'):
+        if str(path).endswith(".safetensors"):
             # Release checkpoints are flat safetensors state dicts already in
             # the new-style key naming.
             self.load_state_dict(safetensors_load_file(str(path)), strict=True)
@@ -103,24 +101,24 @@ class CachedCausalVAE(CausalVAE):
         replace_keys = dict()
         delete_keys = list()
         for k in sd:
-            if k.startswith('loss.'):
+            if k.startswith("loss."):
                 delete_keys.append(k)
                 continue
-            if 'encoder.down' in k and 'downsample.temporal_conv.conv' in k:
+            if "encoder.down" in k and "downsample.temporal_conv.conv" in k:
                 continue
 
-            if k.startswith('decoder'):
-                if 'upsample' in k:
+            if k.startswith("decoder"):
+                if "upsample" in k:
                     continue
-                elif '.conv_b.conv' in k:
-                    replace_keys[k] = k.replace('.conv_b.conv', '.conv_b')
+                elif ".conv_b.conv" in k:
+                    replace_keys[k] = k.replace(".conv_b.conv", ".conv_b")
                     continue
-                elif '.conv_y.conv' in k:
-                    replace_keys[k] = k.replace('.conv_y.conv', '.conv_y')
+                elif ".conv_y.conv" in k:
+                    replace_keys[k] = k.replace(".conv_y.conv", ".conv_y")
                     continue
 
-            if k.endswith('sample.temporal_conv.conv.weight') or k.endswith('sample.temporal_conv.conv.bias'):
-                replace_keys[k] = k.replace(".temporal_conv.conv.", '.temporal_conv.')
+            if k.endswith("sample.temporal_conv.conv.weight") or k.endswith("sample.temporal_conv.conv.bias"):
+                replace_keys[k] = k.replace(".temporal_conv.conv.", ".temporal_conv.")
         for old_k, new_k in replace_keys.items():
             sd[new_k] = sd[old_k]
             del sd[old_k]
@@ -131,39 +129,41 @@ class CachedCausalVAE(CausalVAE):
 
     def make_empty_cache(self, block: str):
         """Create empty causal-convolution and normalization caches."""
-        def make_dict(name, p=None):
-            if name == 'conv':
-                return {'padding' : None}
 
-            layer, module = name.split('_')
-            if layer == 'norm':
-                if module == 'enc':
-                    return {'mean' : None,
-                            'var' : None}
+        def make_dict(name, p=None):
+            if name == "conv":
+                return {"padding": None}
+
+            layer, module = name.split("_")
+            if layer == "norm":
+                if module == "enc":
+                    return {"mean": None, "var": None}
                 else:
-                    return {'norm' : make_dict('norm_enc'),
-                            'add_conv' : make_dict('conv')}
-            elif layer == 'resblock':
-                return {'norm1' : make_dict(f'norm_{module}'),
-                        'norm2' : make_dict(f'norm_{module}'),
-                        'conv1' : make_dict('conv'),
-                        'conv2' : make_dict('conv'),
-                        'conv_shortcut' : make_dict('conv')}
+                    return {"norm": make_dict("norm_enc"), "add_conv": make_dict("conv")}
+            elif layer == "resblock":
+                return {
+                    "norm1": make_dict(f"norm_{module}"),
+                    "norm2": make_dict(f"norm_{module}"),
+                    "conv1": make_dict("conv"),
+                    "conv2": make_dict("conv"),
+                    "conv_shortcut": make_dict("conv"),
+                }
             elif layer.isdigit():
-                out_dict = {'down' : [make_dict('conv'), make_dict('conv')],
-                            'up' : make_dict('conv')}
+                out_dict = {"down": [make_dict("conv"), make_dict("conv")], "up": make_dict("conv")}
                 for i in range(p):
-                    out_dict[i] = make_dict(f'resblock_{module}')
+                    out_dict[i] = make_dict(f"resblock_{module}")
 
                 return out_dict
 
-        cache = {'conv_in' : make_dict('conv'),
-                 'mid_1' : make_dict(f'resblock_{block}'),
-                 'mid_2' : make_dict(f'resblock_{block}'),
-                 'norm_out' : make_dict(f'norm_{block}'),
-                 'conv_out' : make_dict('conv')}
+        cache = {
+            "conv_in": make_dict("conv"),
+            "mid_1": make_dict(f"resblock_{block}"),
+            "mid_2": make_dict(f"resblock_{block}"),
+            "norm_out": make_dict(f"norm_{block}"),
+            "conv_out": make_dict("conv"),
+        }
         for i in range(len(self.conf[block].get("ch_mult", [1, 2, 4, 8]))):
-            cache[i] = make_dict(f'{i}_block', p=self.conf[block]["num_res_blocks"] + 1)
+            cache[i] = make_dict(f"{i}_block", p=self.conf[block]["num_res_blocks"] + 1)
         return cache
 
     def encode(self, x, seg_len=16):
@@ -178,7 +178,7 @@ class CachedCausalVAE(CausalVAE):
             `tuple[torch.Tensor, list[int]]`: Encoded latents and the pixel-space
             segment sizes needed by :meth:`decode`.
         """
-        cache = self.make_empty_cache('enc')
+        cache = self.make_empty_cache("enc")
 
         # Compute segment sizes.
         split_list = [seg_len + 1]
@@ -210,7 +210,7 @@ class CachedCausalVAE(CausalVAE):
         Returns:
             `DecoderOutput`: Decoded video in ``sample``.
         """
-        cache = self.make_empty_cache('dec')
+        cache = self.make_empty_cache("dec")
 
         # Compute latent segment sizes.
         if split_list is None:
@@ -226,10 +226,7 @@ class CachedCausalVAE(CausalVAE):
                     split_list.append((time_dim - 1) % default_split_size)
                 split_list[0] += 1
         else:
-            split_list = [
-                math.ceil(size / self.conf["enc"]["temporal_compress_times"])
-                for size in split_list
-            ]
+            split_list = [math.ceil(size / self.conf["enc"]["temporal_compress_times"]) for size in split_list]
 
         # Decode each segment.
         recs = []
@@ -240,7 +237,7 @@ class CachedCausalVAE(CausalVAE):
         recs = torch.cat(recs, dim=2)
         return DecoderOutput(sample=recs)
 
-    def forward(self, x, seg_len: int=16):
+    def forward(self, x, seg_len: int = 16):
         """Encode and decode a video in one call.
 
         Args:

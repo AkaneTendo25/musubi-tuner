@@ -33,8 +33,7 @@ def _stream_assign_safetensors(
             expected_tensor = expected[key]
             if tensor.shape != expected_tensor.shape:
                 raise RuntimeError(
-                    f"State dict shape mismatch for {key}: checkpoint={tuple(tensor.shape)}, "
-                    f"model={tuple(expected_tensor.shape)}"
+                    f"State dict shape mismatch for {key}: checkpoint={tuple(tensor.shape)}, model={tuple(expected_tensor.shape)}"
                 )
             target_dtype = dtype if dtype is not None and tensor.is_floating_point() else tensor.dtype
             tensor = tensor.to(device=device, dtype=target_dtype)
@@ -161,10 +160,15 @@ def load_dit_convrot_int8(
         allowed_groupsizes=(256, 64),
     )
     state = load_safetensors_with_lora_and_fp8(
-        model_files=[str(path)], lora_weights_list=None, lora_multipliers=None,
-        fp8_optimization=False, calc_device=torch.device(quant_device),
-        move_to_device=torch.device(device) == torch.device(quant_device), dit_weight_dtype=None,
-        disable_numpy_memmap=disable_numpy_memmap, quantizer=quantizer,
+        model_files=[str(path)],
+        lora_weights_list=None,
+        lora_multipliers=None,
+        fp8_optimization=False,
+        calc_device=torch.device(quant_device),
+        move_to_device=torch.device(device) == torch.device(quant_device),
+        dit_weight_dtype=None,
+        disable_numpy_memmap=disable_numpy_memmap,
+        quantizer=quantizer,
     )
     apply_convrot_int8_monkey_patch(model, state, bwd_mode=bwd_mode, groupsize_map=quantizer.module_groupsizes)
     model.requires_grad_(False)
@@ -214,9 +218,13 @@ def load_dit_fp8(
                 n_grid=n_grid, out_visual_dim=config.pop("out_visual_dim"), out_audio_dim=config.pop("out_audio_dim"), **config
             )
     state = load_safetensors_with_lora_and_fp8(
-        model_files=[str(path)], lora_weights_list=None, lora_multipliers=None,
-        fp8_optimization=True, calc_device=torch.device(quant_device),
-        move_to_device=torch.device(device) == torch.device(quant_device), dit_weight_dtype=None,
+        model_files=[str(path)],
+        lora_weights_list=None,
+        lora_multipliers=None,
+        fp8_optimization=True,
+        calc_device=torch.device(quant_device),
+        move_to_device=torch.device(device) == torch.device(quant_device),
+        dit_weight_dtype=None,
         target_keys=["visual_transformer_blocks.", "video_text_transformer_blocks.", "audio_text_transformer_blocks."],
         exclude_keys=["modulation", "norm"],
         disable_numpy_memmap=disable_numpy_memmap,

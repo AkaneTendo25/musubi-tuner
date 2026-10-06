@@ -1,11 +1,10 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .ctx_parallel_causal_conv import ContextParallelCausalConv3d
 from .utils_distributed import _conv_gather, _conv_split
-from .utils_cp_internals import get_context_parallel_rank, get_context_parallel_world_size, get_context_parallel_group
+from .utils_cp_internals import get_context_parallel_rank, get_context_parallel_world_size
 
 
 def conv_gather_from_context_parallel_region(input_, dim, kernel_size):
@@ -43,17 +42,16 @@ class _ConvolutionGatherFromContextParallelRegion(torch.autograd.Function):
 
 
 class ContextParallelGroupNorm(nn.GroupNorm):
-
     def __init__(self, *args, **kwargs) -> None:
-        self.chunks_num = kwargs.pop('chunks_num', 1)
-        self.gather_flag = kwargs.pop('gather_flag', False)
+        self.chunks_num = kwargs.pop("chunks_num", 1)
+        self.gather_flag = kwargs.pop("gather_flag", False)
         super().__init__(*args, **kwargs)
 
     def forward(self, input_):
 
         cp_rank = get_context_parallel_rank()
 
-        if self.gather_flag :
+        if self.gather_flag:
             input_ = conv_gather_from_context_parallel_region(input_, dim=2, kernel_size=1)
             output = super().forward(input_)
             output = conv_scatter_to_context_parallel_region(output, dim=2, kernel_size=1)
@@ -119,8 +117,12 @@ class ContextParallelGroupNorm(nn.GroupNorm):
 
         return output
 
+
 def Normalize(in_channels, gather=False, chunks_num=1, **kwargs):
-    return ContextParallelGroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True, gather_flag=gather, chunks_num=chunks_num)
+    return ContextParallelGroupNorm(
+        num_groups=32, num_channels=in_channels, eps=1e-6, affine=True, gather_flag=gather, chunks_num=chunks_num
+    )
+
 
 class SpatialNorm3D(nn.Module):
     def __init__(
@@ -146,23 +148,14 @@ class SpatialNorm3D(nn.Module):
         self.add_conv = add_conv
         if add_conv:
             self.conv = ContextParallelCausalConv3d(
-                chan_in=zq_channels,
-                chan_out=zq_channels,
-                kernel_size=3,
-                padding_mode=padding_mode
+                chan_in=zq_channels, chan_out=zq_channels, kernel_size=3, padding_mode=padding_mode
             )
 
         self.conv_y = ContextParallelCausalConv3d(
-            chan_in=zq_channels,
-            chan_out=f_channels,
-            kernel_size=1,
-            padding_mode=padding_mode
+            chan_in=zq_channels, chan_out=f_channels, kernel_size=1, padding_mode=padding_mode
         )
         self.conv_b = ContextParallelCausalConv3d(
-            chan_in=zq_channels,
-            chan_out=f_channels,
-            kernel_size=1,
-            padding_mode=padding_mode
+            chan_in=zq_channels, chan_out=f_channels, kernel_size=1, padding_mode=padding_mode
         )
 
     def forward(self, f, zq, clear_fake_cp_cache=True):
@@ -187,15 +180,7 @@ class SpatialNorm3D(nn.Module):
         return new_f
 
 
-def Normalize3D(
-    in_channels,
-    zq_ch,
-    add_conv,
-    gather=False,
-    chunks_num=1,
-    normalization=Normalize,
-    padding_mode=None
-):
+def Normalize3D(in_channels, zq_ch, add_conv, gather=False, chunks_num=1, normalization=Normalize, padding_mode=None):
     return SpatialNorm3D(
         in_channels,
         zq_ch,
@@ -207,5 +192,5 @@ def Normalize3D(
         eps=1e-6,
         affine=True,
         normalization=normalization,
-        padding_mode=padding_mode
+        padding_mode=padding_mode,
     )

@@ -8,8 +8,15 @@ from pydantic import BaseModel
 from torch import Tensor, nn
 
 from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.blocks import ModulatedRMSNorm, ResidualBlock, RMSNorm
-from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.conv_ops import TemporalPadding, UpsamplePaddingMode, make_conv
-from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.motion_correspondence import MotionCorrespondenceBlock, MotionCorrespondenceSpec
+from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.conv_ops import (
+    TemporalPadding,
+    UpsamplePaddingMode,
+    make_conv,
+)
+from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.motion_correspondence import (
+    MotionCorrespondenceBlock,
+    MotionCorrespondenceSpec,
+)
 from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.runtime import forward_with_checkpointing
 from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.upsample_ops import (
     BilinearUpsampleND,

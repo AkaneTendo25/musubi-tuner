@@ -158,9 +158,7 @@ def resize_image(
     try:
         import torchvision.transforms.functional as TF
     except (ImportError, OSError) as exc:
-        raise RuntimeError(
-            "I2VA image processing requires torchvision. Install it with `pip install torchvision`."
-        ) from exc
+        raise RuntimeError("I2VA image processing requires torchvision. Install it with `pip install torchvision`.") from exc
 
     return TF.resize(image, (new_h, new_w)), k
 
@@ -206,17 +204,13 @@ def encode_i2va_first_frame(
     try:
         import torchvision.transforms.functional as TF
     except (ImportError, OSError) as exc:
-        raise RuntimeError(
-            "I2VA image processing requires torchvision. Install it with `pip install torchvision`."
-        ) from exc
+        raise RuntimeError("I2VA image processing requires torchvision. Install it with `pip install torchvision`.") from exc
 
     pil_image = _load_pil_rgb(image)
     tensor = TF.pil_to_tensor(pil_image).unsqueeze(0)
 
     if max_area is not None and (height is None or width is None):
-        tensor, _ = resize_image(
-            tensor, max_area=max_area, divisibility=divisibility, world_size=world_size
-        )
+        tensor, _ = resize_image(tensor, max_area=max_area, divisibility=divisibility, world_size=world_size)
         height, width = int(tensor.shape[-2]), int(tensor.shape[-1])
     else:
         if height is None or width is None:
@@ -225,9 +219,7 @@ def encode_i2va_first_frame(
         scale = min(src_h / height, src_w / width)
         tensor = TF.resize(tensor, (int(src_h / scale), int(src_w / scale)))
         cur_h, cur_w = tensor.shape[-2:]
-        tensor = TF.crop(
-            tensor, (cur_h - height) // 2, (cur_w - width) // 2, height, width
-        )
+        tensor = TF.crop(tensor, (cur_h - height) // 2, (cur_w - width) // 2, height, width)
 
     tensor = tensor / 127.5 - 1.0
     vae_dtype = next(vae.parameters()).dtype
@@ -254,10 +246,7 @@ def _append_i2va_tail_condition_batch(
     first_frames = first_frames.to(device=latent_visual.device, dtype=latent_visual.dtype)
     expected = (batch_size, height, width, dim)
     if tuple(first_frames.shape) != expected:
-        raise ValueError(
-            f"first-frame latent shape mismatch: expected {expected}, "
-            f"got {tuple(first_frames.shape)}"
-        )
+        raise ValueError(f"first-frame latent shape mismatch: expected {expected}, got {tuple(first_frames.shape)}")
 
     latent_visual = torch.cat([latent_visual, first_frames[:, None]], dim=1)
     token_types = torch.cat(
@@ -282,21 +271,16 @@ def append_i2va_tail_condition(
     0=generated / 1=reference and ``generated_mask`` selects frames to decode.
     """
     if latent_visual.ndim == 5:
-        return _append_i2va_tail_condition_batch(
-            latent_visual, first_frames, batch_size, video_duration
-        )
+        return _append_i2va_tail_condition_batch(latent_visual, first_frames, batch_size, video_duration)
 
     _, height, width, dim = latent_visual.shape
     first_frames = first_frames.to(device=latent_visual.device, dtype=latent_visual.dtype)
     expected = (batch_size, height, width, dim)
     if tuple(first_frames.shape) != expected:
-        raise ValueError(
-            f"first-frame latent shape mismatch: expected {expected}, got {tuple(first_frames.shape)}"
-        )
+        raise ValueError(f"first-frame latent shape mismatch: expected {expected}, got {tuple(first_frames.shape)}")
     if latent_visual.shape[0] != batch_size * video_duration:
         raise ValueError(
-            "generated visual latent length mismatch: expected "
-            f"{batch_size * video_duration}, got {latent_visual.shape[0]}"
+            f"generated visual latent length mismatch: expected {batch_size * video_duration}, got {latent_visual.shape[0]}"
         )
 
     latent_visual = torch.cat(
@@ -307,8 +291,10 @@ def append_i2va_tail_condition(
         dim=1,
     ).reshape(batch_size * (video_duration + 1), height, width, dim)
 
-    token_types = torch.cat([
-        torch.zeros(video_duration, dtype=torch.long, device=latent_visual.device),
-        torch.ones(1, dtype=torch.long, device=latent_visual.device),
-    ]).repeat(batch_size)
+    token_types = torch.cat(
+        [
+            torch.zeros(video_duration, dtype=torch.long, device=latent_visual.device),
+            torch.ones(1, dtype=torch.long, device=latent_visual.device),
+        ]
+    ).repeat(batch_size)
     return latent_visual, token_types, token_types == 0

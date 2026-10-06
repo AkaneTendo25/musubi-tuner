@@ -12,9 +12,7 @@ def _require_av():
     try:
         import av
     except (ImportError, OSError) as exc:
-        raise RuntimeError(
-            "SR video/audio output requires PyAV and FFmpeg. Install with `pip install av`."
-        ) from exc
+        raise RuntimeError("SR video/audio output requires PyAV and FFmpeg. Install with `pip install av`.") from exc
     return av
 
 

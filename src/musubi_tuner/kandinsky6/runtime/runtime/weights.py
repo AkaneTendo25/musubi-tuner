@@ -202,9 +202,7 @@ def materialize_meta_buffers(module: nn.Module, device: torch.device) -> None:
 def load_bf16_checkpoint(dit: nn.Module, path: str) -> None:
     """Read a local safetensors file and assign it into ``dit``."""
     state_dict = load_file(path, device="cpu")
-    state_dict = {
-        key: value.to(torch.bfloat16) if value.dtype == torch.float32 else value for key, value in state_dict.items()
-    }
+    state_dict = {key: value.to(torch.bfloat16) if value.dtype == torch.float32 else value for key, value in state_dict.items()}
     missing, unexpected = dit.load_state_dict(state_dict, strict=True, assign=True)
     if missing:
         logger.warning("missing keys (%d): %s", len(missing), missing[:5])

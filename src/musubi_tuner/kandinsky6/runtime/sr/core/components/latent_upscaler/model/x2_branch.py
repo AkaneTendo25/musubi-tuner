@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 from einops import rearrange
 from torch import Tensor, nn
 
-from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.multi_scale_components import OutputHead, apply_output_head
+from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.multi_scale_components import (
+    OutputHead,
+    apply_output_head,
+)
 from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.runtime import forward_with_checkpointing
 from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.upsample_ops import PXSv2UpsampleND
 
@@ -191,9 +194,7 @@ class X2Branch(nn.Module):
         x = stage.output_proj.act(x)
         return stage.output_proj.conv(x)
 
-    def apply_block_stack(
-        self, blocks: nn.Sequential, x: Tensor, zq: Tensor | None, *, use_checkpointing: bool
-    ) -> Tensor:
+    def apply_block_stack(self, blocks: nn.Sequential, x: Tensor, zq: Tensor | None, *, use_checkpointing: bool) -> Tensor:
         """Run a residual stack with the branch's zq-threading convention."""
         for block in blocks:
             if zq is None:

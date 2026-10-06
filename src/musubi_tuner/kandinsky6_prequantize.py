@@ -143,17 +143,22 @@ def main(argv: list[str] | None = None) -> None:
         overwrite=args.overwrite,
         disable_numpy_memmap=args.disable_numpy_memmap,
     )
-    print(json.dumps({
-        "source": str(report.source),
-        "output": str(report.output),
-        "variant": report.variant,
-        "checkpoint_format": report.checkpoint_format,
-        "tensor_count": report.tensor_count,
-        "quantized_layer_count": report.quantized_layer_count,
-        "groupsize_counts": report.groupsize_counts,
-        "estimated_tensor_bytes": report.estimated_tensor_bytes,
-        "output_bytes": report.output_bytes,
-    }, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "source": str(report.source),
+                "output": str(report.output),
+                "variant": report.variant,
+                "checkpoint_format": report.checkpoint_format,
+                "tensor_count": report.tensor_count,
+                "quantized_layer_count": report.quantized_layer_count,
+                "groupsize_counts": report.groupsize_counts,
+                "estimated_tensor_bytes": report.estimated_tensor_bytes,
+                "output_bytes": report.output_bytes,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

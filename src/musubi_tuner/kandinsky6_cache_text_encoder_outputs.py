@@ -72,8 +72,7 @@ def main() -> None:
         from musubi_tuner.kandinsky6.runtime.core.components.text_embedder import Kandinsky6TextEmbedder
     except ImportError as exc:
         raise RuntimeError(
-            "Kandinsky6 text caching requires the optional Kandinsky6 dependencies; "
-            "install `musubi-tuner[kandinsky6]`."
+            "Kandinsky6 text caching requires the optional Kandinsky6 dependencies; install `musubi-tuner[kandinsky6]`."
         ) from exc
     from musubi_tuner.dataset.architectures import ARCHITECTURE_KANDINSKY6
 

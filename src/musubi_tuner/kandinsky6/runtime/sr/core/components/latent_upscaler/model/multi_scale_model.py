@@ -34,7 +34,10 @@ from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.x2
 
 if TYPE_CHECKING:
     from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.config import UpsampleMode
-    from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.conv_ops import TemporalPadding, UpsamplePaddingMode
+    from musubi_tuner.kandinsky6.runtime.sr.core.components.latent_upscaler.model.conv_ops import (
+        TemporalPadding,
+        UpsamplePaddingMode,
+    )
 
 # The two projections back to latent space. They are scale-specific, so a warm
 # start from another network cannot supply them and a warm-started run may want
@@ -211,9 +214,7 @@ class MultiScaleUpsampler(nn.Module):
         self.mid_input_proj: nn.Sequential | None = None
         self.x2_branch: X2Branch | None = None
         if enable_x2_entry:
-            self.mid_input_proj = build_stem(
-                in_channels, hidden_channels, dims, bare=bare_stem, temporal_padding=temporal_padding
-            )
+            self.mid_input_proj = build_stem(in_channels, hidden_channels, dims, bare=bare_stem, temporal_padding=temporal_padding)
             adapter_spec = stage_spec(w1, None).model_copy(
                 update={
                     "total_blocks": max(x2_adapter_blocks, 1),

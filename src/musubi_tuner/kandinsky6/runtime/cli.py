@@ -227,6 +227,7 @@ def _super_resolve_if_enabled(  # noqa: PLR0913
         return
     from musubi_tuner.kandinsky6.runtime.sr.pipeline.components import scale_factor_for
     from musubi_tuner.kandinsky6.runtime.sr.pipeline.warmup import clip_base_resolution, compile_vae_decode, warmup
+
     out_path = Path(out)
     sr_path = out_path.with_name(f"{out_path.stem}_sr{out_path.suffix}")
     frames_tchw = result.frames[0].permute(1, 0, 2, 3).contiguous().cpu()  # (3,T,H,W) -> (T,3,H,W)
@@ -390,8 +391,7 @@ def configure_logging() -> None:
         stream.setFormatter(formatter)
         kandinsky_logger.addHandler(stream)
     has_file = any(
-        isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path
-        for handler in kandinsky_logger.handlers
+        isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path for handler in kandinsky_logger.handlers
     )
     if not has_file:
         file_handler = logging.FileHandler(log_path)

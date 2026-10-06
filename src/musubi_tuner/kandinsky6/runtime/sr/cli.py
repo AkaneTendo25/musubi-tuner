@@ -110,9 +110,7 @@ class CommonOptions:
         cyclopts.Parameter(
             name="--vae-backend",
             show_default=True,
-            help=(
-                "VAE compilation backend: 'torch' = per-block/leaf torch.compile; 'magi' = MagiCompiler static graphs."
-            ),
+            help=("VAE compilation backend: 'torch' = per-block/leaf torch.compile; 'magi' = MagiCompiler static graphs."),
         ),
     ] = None
     dit_overrides_spec: Annotated[
@@ -355,9 +353,7 @@ def _run_sr(  # noqa: PLR0913 - CLI knobs stay explicit
         logger.info("Pre-upscale x{} in pixel space, then tiling at x{}", pre_upscale, tiling_scale)
     _warn_without_latent_upscaler(sr_pipe.latent_upscaler, tiling_scale)
     if warm_target_shape:
-        warm_video = (
-            video if pre_upscale == 1.0 else pre_upscale_video(video, pre_upscale, constants.VAE_SPATIAL_FACTOR)
-        )
+        warm_video = video if pre_upscale == 1.0 else pre_upscale_video(video, pre_upscale, constants.VAE_SPATIAL_FACTOR)
         _warm_target_shape(sr, sr_pipe, tiling_scale, warm_video)
     return sr_pipe(video=video, seed=sr.seed, show_progress=True).frames[0]
 

@@ -302,9 +302,7 @@ class VideoAdapter(nn.Module):
         self.gamma = gamma
         patch_vol = math.prod(patch_size)
         self.lq_proj = nn.Linear(patch_vol * in_visual_dim, model_dim)
-        self.blocks = nn.ModuleList(
-            [TransformerDecoderBlock(model_dim, time_dim, ff_dim, head_dim) for _ in range(num_blocks)]
-        )
+        self.blocks = nn.ModuleList([TransformerDecoderBlock(model_dim, time_dim, ff_dim, head_dim) for _ in range(num_blocks)])
 
     def _patchify(self, x: Tensor, visual_cu_seqlens: Tensor) -> tuple[Tensor, Tensor]:
         """Patchify LQ latent with the same logic as VisualEmbeddings._patchify."""
@@ -455,9 +453,7 @@ class DiffusionTransformer3D(nn.Module):
         self.use_adapter = use_adapter
 
         visual_embed_dim = (
-            2 * in_visual_dim + 1
-            if visual_cond or instruct_type in ("channel", "hybrid", "hybrid_anchor")
-            else in_visual_dim
+            2 * in_visual_dim + 1 if visual_cond or instruct_type in ("channel", "hybrid", "hybrid_anchor") else in_visual_dim
         )
         self.time_embeddings = TimeEmbeddings(model_dim, time_dim)
         if use_motion_score:
@@ -598,9 +594,7 @@ class DiffusionTransformer3D(nn.Module):
             text_rope = self.text_rope_embeddings(text_rope_pos)
             text_time_embed_idx = time_embed_idx.repeat_interleave(torch.diff(text_cu_seqlens), dim=0)
             for text_transformer_block in self.text_transformer_blocks:
-                text_embed = text_transformer_block(
-                    text_embed, time_embed, text_rope, text_cu_seqlens, text_time_embed_idx
-                )
+                text_embed = text_transformer_block(text_embed, time_embed, text_rope, text_cu_seqlens, text_time_embed_idx)
 
         visual_shape = visual_embed.shape[:-1]
         visual_rope = self.visual_rope_embeddings(visual_shape, visual_rope_pos, scale_factor)
@@ -656,9 +650,7 @@ class DiffusionTransformer3D(nn.Module):
                 sparse_params,
                 lq_tokens,
             )
-        visual_embed, visual_cu_seqlens = fractal_unflatten(
-            visual_embed, visual_cu_seqlens, visual_shape, fractal=to_fractal
-        )
+        visual_embed, visual_cu_seqlens = fractal_unflatten(visual_embed, visual_cu_seqlens, visual_shape, fractal=to_fractal)
 
         visual_time_embed_idx = time_embed_idx.repeat_interleave(torch.diff(visual_cu_seqlens), dim=0)
         return self.out_layer(visual_embed, text_embed, time_embed, visual_cu_seqlens, visual_time_embed_idx)

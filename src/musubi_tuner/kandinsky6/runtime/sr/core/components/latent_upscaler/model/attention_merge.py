@@ -85,9 +85,7 @@ class MergeWithNullBranch(Function):
         grad = grad_out.float()
         null_weight = torch.exp(null_logits.float() - total_lse)
         d_null_value = torch.einsum("bsh,bshd->hd", null_weight, grad)
-        d_null_logits = null_weight * (
-            torch.einsum("bshd,hd->bsh", grad, null_value.float()) - (grad * merged).sum(dim=-1)
-        )
+        d_null_logits = null_weight * (torch.einsum("bshd,hd->bsh", grad, null_value.float()) - (grad * merged).sum(dim=-1))
         for output, lse in zip(outputs, lses, strict=True):
             output.data.copy_(merged.to(output.dtype))
             lse.data.copy_(total_lse.to(lse.dtype))

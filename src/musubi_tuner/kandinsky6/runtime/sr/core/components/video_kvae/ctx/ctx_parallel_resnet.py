@@ -23,7 +23,7 @@ class ContextParallelResnetBlock3D(nn.Module):
         norm_chunks_num=1,
         modulated_norm=Normalize,
         checkpoint=True,
-        padding_mode=None
+        padding_mode=None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -32,44 +32,25 @@ class ContextParallelResnetBlock3D(nn.Module):
         self.use_conv_shortcut = conv_shortcut
 
         self.norm1 = modulated_norm(
-            in_channels,
-            zq_ch=zq_ch,
-            add_conv=add_conv,
-            gather=gather_norm,
-            chunks_num=norm_chunks_num,
-            padding_mode=padding_mode
+            in_channels, zq_ch=zq_ch, add_conv=add_conv, gather=gather_norm, chunks_num=norm_chunks_num, padding_mode=padding_mode
         )
 
         self.conv1 = ContextParallelCausalConv3d(
-            chan_in=in_channels,
-            chan_out=out_channels,
-            kernel_size=3,
-            padding_mode=padding_mode
+            chan_in=in_channels, chan_out=out_channels, kernel_size=3, padding_mode=padding_mode
         )
         if temb_channels > 0:
             self.temb_proj = torch.nn.Linear(temb_channels, out_channels)
         self.norm2 = modulated_norm(
-            out_channels,
-            zq_ch=zq_ch,
-            add_conv=add_conv,
-            gather=gather_norm,
-            chunks_num=norm_chunks_num,
-            padding_mode=padding_mode
+            out_channels, zq_ch=zq_ch, add_conv=add_conv, gather=gather_norm, chunks_num=norm_chunks_num, padding_mode=padding_mode
         )
-        #self.dropout = torch.nn.Dropout(dropout)
+        # self.dropout = torch.nn.Dropout(dropout)
         self.conv2 = ContextParallelCausalConv3d(
-            chan_in=out_channels,
-            chan_out=out_channels,
-            kernel_size=3,
-            padding_mode=padding_mode
+            chan_in=out_channels, chan_out=out_channels, kernel_size=3, padding_mode=padding_mode
         )
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = ContextParallelCausalConv3d(
-                    chan_in=in_channels,
-                    chan_out=out_channels,
-                    kernel_size=3,
-                    padding_mode=padding_mode
+                    chan_in=in_channels, chan_out=out_channels, kernel_size=3, padding_mode=padding_mode
                 )
             else:
                 self.nin_shortcut = Conv3d(

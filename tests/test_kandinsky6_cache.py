@@ -141,9 +141,7 @@ def test_encode_batch_scales_audio_and_encodes_condition_separately(monkeypatch,
     saved = {}
     monkeypatch.setattr("musubi_tuner.dataset.cache_io.save_latent_cache_kandinsky6", lambda item, **kw: saved.update(kw))
     item = ItemInfo("x", "caption", (8, 8), frame_count=1, content=np.zeros((2, 8, 8, 3), dtype=np.uint8))
-    item.control_content = np.stack(
-        [np.full((8, 8, 3), 255, dtype=np.uint8), np.zeros((8, 8, 3), dtype=np.uint8)]
-    )
+    item.control_content = np.stack([np.full((8, 8, 3), 255, dtype=np.uint8), np.zeros((8, 8, 3), dtype=np.uint8)])
     item.audio_content = torch.zeros(1, 2048)
     item.audio_present = True
     item.latent_cache_path = str(tmp_path / "x.safetensors")

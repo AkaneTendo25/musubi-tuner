@@ -79,9 +79,7 @@ def load_bigvgan_v2(
     weight_file = _resolve_weight_file(root, "bigvgan_generator.pt")
     config_file = root / "config.json"
     if weight_file is None or not config_file.is_file():
-        raise FileNotFoundError(
-            f"Expected config.json and {_DIFFUSERS_WEIGHTS} or bigvgan_generator.pt under {vocoder_ckpt_path}"
-        )
+        raise FileNotFoundError(f"Expected config.json and {_DIFFUSERS_WEIGHTS} or bigvgan_generator.pt under {vocoder_ckpt_path}")
     hparams = AttrDict(vocoder_config) if vocoder_config is not None else vocoder_hparams(config_file)
     model = BigVGANv2(hparams)
     state = _load_weight_file(weight_file)

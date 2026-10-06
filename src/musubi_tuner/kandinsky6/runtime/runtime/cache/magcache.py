@@ -81,11 +81,7 @@ class MagCache:
             st["accumulated_steps"][lane] += 1
             st["accumulated_err"][lane] += abs(1 - st["accumulated_ratio"][lane])
             residual = st["residual_cache"][lane]
-            if (
-                residual is not None
-                and st["accumulated_err"][lane] < st["thresh"]
-                and st["accumulated_steps"][lane] <= st["K"]
-            ):
+            if residual is not None and st["accumulated_err"][lane] < st["thresh"] and st["accumulated_steps"][lane] <= st["K"]:
                 skip = True
             else:
                 st["accumulated_err"][lane] = 0.0
@@ -187,12 +183,8 @@ class MagCache:
         assert st is not None
         attn_mask = dit._normalize_attn_mask(attention_mask) if hasattr(dit, "_normalize_attn_mask") else attention_mask
 
-        te_v, pe_v = (
-            (text_embed[0], pooled_text_embed[0]) if isinstance(text_embed, list) else (text_embed, pooled_text_embed)
-        )
-        te_a, pe_a = (
-            (text_embed[1], pooled_text_embed[1]) if isinstance(text_embed, list) else (text_embed, pooled_text_embed)
-        )
+        te_v, pe_v = (text_embed[0], pooled_text_embed[0]) if isinstance(text_embed, list) else (text_embed, pooled_text_embed)
+        te_a, pe_a = (text_embed[1], pooled_text_embed[1]) if isinstance(text_embed, list) else (text_embed, pooled_text_embed)
         if isinstance(text_rope, list):
             rope_v, rope_a = text_rope[0], text_rope[1]
         else:

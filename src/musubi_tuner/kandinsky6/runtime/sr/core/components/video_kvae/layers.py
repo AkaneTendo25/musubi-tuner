@@ -1,4 +1,3 @@
-import itertools
 from typing import Union, Tuple
 
 from einops import rearrange
@@ -11,7 +10,16 @@ from .utils import cast_tuple
 
 
 class CausalConv3d(nn.Module):
-    def __init__(self, chan_in, chan_out, kernel_size: Union[int, Tuple[int, int, int]], stride=(1,1,1), dilation=(1,1,1), padding_mode=None, **kwargs):
+    def __init__(
+        self,
+        chan_in,
+        chan_out,
+        kernel_size: Union[int, Tuple[int, int, int]],
+        stride=(1, 1, 1),
+        dilation=(1, 1, 1),
+        padding_mode=None,
+        **kwargs,
+    ):
         super().__init__()
         kernel_size = cast_tuple(kernel_size, 3)
 
@@ -43,6 +51,7 @@ class CausalConv3d(nn.Module):
 def RMSNorm(in_channels, *args, **kwargs):
     return WanRMS_norm(n_ch=in_channels, bias=False)
 
+
 class WanRMS_norm(nn.Module):
     r"""
     A custom RMS normalization layer.
@@ -56,7 +65,7 @@ class WanRMS_norm(nn.Module):
         super().__init__()
         shape = (n_ch, 1, 1, 1)
 
-        self.scale = n_ch ** 0.5
+        self.scale = n_ch**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
@@ -88,7 +97,7 @@ class AttentionBlock(nn.Module):
         b, c, t, h, w = x.size()
         x = rearrange(x, "b c t h w -> (b t) c h w")
         # compute query, key, value
-        q, k, v = (self.to_qkv(x).reshape(b * t, 1, c * 3, -1).permute(0, 1, 3, 2).contiguous().chunk(3, dim=-1))
+        q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3, -1).permute(0, 1, 3, 2).contiguous().chunk(3, dim=-1)
 
         # apply attention
         x = F.scaled_dot_product_attention(q, k, v)

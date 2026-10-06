@@ -223,9 +223,7 @@ class ResidualBlock(nn.Module):
             )
         self.shortcut = nn.Identity() if in_channels == out_channels else conv(in_channels, out_channels, kernel_size=1)
         self.layer_scale: nn.Module = (
-            LayerScale(out_channels, init_value=layer_scale_init, dims=dims)
-            if layer_scale_init is not None
-            else nn.Identity()
+            LayerScale(out_channels, init_value=layer_scale_init, dims=dims) if layer_scale_init is not None else nn.Identity()
         )
         self.stochastic_depth: nn.Module = (
             StochasticDepth(stochastic_depth_prob, mode="row") if stochastic_depth_prob > 0 else nn.Identity()

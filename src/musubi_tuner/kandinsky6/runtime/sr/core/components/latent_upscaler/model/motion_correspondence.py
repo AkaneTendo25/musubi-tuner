@@ -124,8 +124,7 @@ class AxialRoPE3D(nn.Module):
         axes = (1, 2, 3)
         frequencies = (self.time_frequencies, self.height_frequencies, self.width_frequencies)
         rotated = [
-            self.rotate_axis(chunk, axis, frequency)
-            for chunk, axis, frequency in zip(chunks, axes, frequencies, strict=True)
+            self.rotate_axis(chunk, axis, frequency) for chunk, axis, frequency in zip(chunks, axes, frequencies, strict=True)
         ]
         return torch.cat(rotated, dim=-1).to(working_dtype)
 
@@ -192,9 +191,7 @@ class MotionCorrespondenceBlock(nn.Module):
         features = rearrange(x, "b c t h w -> b t h w c")
         # fp32 norm inputs keep fused rms_norm kernels under bf16 autocast (same as DiT QK-norm).
         qkv = self.to_qkv(self.norm(features.float()).type_as(features))
-        q, k, v = [
-            rearrange(part, "b t h w (nh d) -> b t h w nh d", nh=self.num_heads) for part in qkv.chunk(3, dim=-1)
-        ]
+        q, k, v = [rearrange(part, "b t h w (nh d) -> b t h w nh d", nh=self.num_heads) for part in qkv.chunk(3, dim=-1)]
         q_unrotated = self.q_norm(q.float()).type_as(q)
         q = self.rope(q_unrotated)
         k = self.rope(self.k_norm(k.float()).type_as(k))

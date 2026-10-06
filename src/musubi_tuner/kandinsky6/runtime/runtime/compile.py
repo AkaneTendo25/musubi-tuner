@@ -3,6 +3,7 @@
 Baseline ``torch`` strategy mirrors kandinsky-5-inference
 ``dit_compile_wrapper(..., compile_type="torch")``.
 """
+
 from __future__ import annotations
 
 import logging
@@ -129,10 +130,7 @@ class DiTCompiler:
 
     def __init__(self, strategy: CompileStrategyName | str = "torch"):
         if strategy not in _STRATEGIES:
-            raise ValueError(
-                f"Unknown compile strategy: {strategy!r}. "
-                f"Available: {sorted(_STRATEGIES)}"
-            )
+            raise ValueError(f"Unknown compile strategy: {strategy!r}. Available: {sorted(_STRATEGIES)}")
         self.strategy_name = strategy
         self._strategy = _STRATEGIES[strategy]()
 

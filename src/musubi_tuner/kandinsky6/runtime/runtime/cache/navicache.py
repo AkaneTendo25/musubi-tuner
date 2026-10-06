@@ -85,9 +85,7 @@ class NaviCache:
                 st["accumulated_error"] = 0.0
             elif st["previous_raw_cond_input"] is not None and st["previous_raw_cond_output"] is not None:
                 raw_input_change = (
-                    torch.cat(
-                        [(u - v).flatten() for u, v in zip(raw_input, st["previous_raw_cond_input"], strict=True)]
-                    )
+                    torch.cat([(u - v).flatten() for u, v in zip(raw_input, st["previous_raw_cond_input"], strict=True)])
                     .abs()
                     .mean()
                 )
@@ -149,9 +147,7 @@ class NaviCache:
         if is_cond:
             if st["previous_raw_cond_output"] is not None:
                 output_change = (
-                    torch.cat(
-                        [(u - v).flatten() for u, v in zip(out_list, st["previous_raw_cond_output"], strict=True)]
-                    )
+                    torch.cat([(u - v).flatten() for u, v in zip(out_list, st["previous_raw_cond_output"], strict=True)])
                     .abs()
                     .mean()
                 )

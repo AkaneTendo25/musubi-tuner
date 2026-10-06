@@ -1,4 +1,5 @@
 """Audio VAE and BigVGAN vocoder as separate modules."""
+
 from __future__ import annotations
 
 import torch

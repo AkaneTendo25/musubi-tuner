@@ -679,9 +679,7 @@ def load_latent_upscaler_bank(
         return None
     lu_conf, lu_lazy_specs = split_lu_bank_by_scales(lu_bank_conf, lu_load_scales)
     latent_upscaler = (
-        load_latent_upscaler(lu_conf, device=device, vae_scaling_factor=vae_scaling_factor)
-        if lu_conf is not None
-        else None
+        load_latent_upscaler(lu_conf, device=device, vae_scaling_factor=vae_scaling_factor) if lu_conf is not None else None
     )
     if lu_lazy_specs:
         # Wrap eager modules and cold specs into one bank: cold scales load on
@@ -769,9 +767,7 @@ def load_sr_components(  # noqa: PLR0913
     if device.startswith("cuda"):
         torch.cuda.set_device(resolve_cuda_device(device))
 
-    checkpoint_path, vae_path, latent_upscaler_config = resolve_model_references(
-        checkpoint_path, vae_path, latent_upscaler_config
-    )
+    checkpoint_path, vae_path, latent_upscaler_config = resolve_model_references(checkpoint_path, vae_path, latent_upscaler_config)
     conf, vae_name = load_training_config(checkpoint_path, vae_backend)
     logger.info("Paths -> DiT: {} | VAE ({}): {} | LU: {}", checkpoint_path, vae_name, vae_path, latent_upscaler_config)
     sr_params = _extract_sr_params(conf)
@@ -785,9 +781,7 @@ def load_sr_components(  # noqa: PLR0913
         instruct_type_override=instruct_type_override,
     )
     vae = load_kvae(conf, vae_name, vae_path, vae_backend, device)
-    latent_upscaler = load_latent_upscaler_bank(
-        latent_upscaler_config, lu_load_scales, device, vae.config.scaling_factor
-    )
+    latent_upscaler = load_latent_upscaler_bank(latent_upscaler_config, lu_load_scales, device, vae.config.scaling_factor)
     return SRComponents(
         dit=dit,
         vae=vae,

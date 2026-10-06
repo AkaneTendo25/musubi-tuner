@@ -235,10 +235,7 @@ def denoise(  # noqa: PLR0913
                 scheduler=scheduler,
             )
     else:
-        start_t = (
-            lq_noise_scale if cap_noise_timestep and dit.instruct_type in ("noise", "hybrid", "hybrid_anchor") else
-            1.0
-        )
+        start_t = lq_noise_scale if cap_noise_timestep and dit.instruct_type in ("noise", "hybrid", "hybrid_anchor") else 1.0
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             latent_visual = generate(
                 latent_state.image,
@@ -266,9 +263,7 @@ def denoise(  # noqa: PLR0913
             )
 
     if tp_mesh:
-        tensor_list = [
-            torch.zeros_like(latent_visual, device=latent_visual.device) for _ in range(tp_mesh["tp"].size())
-        ]
+        tensor_list = [torch.zeros_like(latent_visual, device=latent_visual.device) for _ in range(tp_mesh["tp"].size())]
         all_gather(
             tensor_list,
             latent_visual.contiguous(),
@@ -306,8 +301,7 @@ def vae_decode(  # noqa: PLR0913
     width: int,
     vae_decode_batch: bool = False,
 ) -> torch.Tensor:
-    """ Decode denoised SR latents into ``[batch, 3, T, H, W]`` uint8 frames
-    """
+    """Decode denoised SR latents into ``[batch, 3, T, H, W]`` uint8 frames"""
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         all_latents = latent_visual.reshape(batch_size, duration, height, width, -1)
         all_latents = (all_latents / vae.config.scaling_factor).permute(0, 4, 1, 2, 3)  # type: ignore[attr-defined]
@@ -494,10 +488,7 @@ def _run_tile_batches(  # noqa: PLR0913
     sampler = getattr(sr_components, "sampler", None)
     params = _component_params(sr_components)
     piflow_params = _scheduler_piflow_params(scheduler) or getattr(sr_components.dit, "piflow_params", None)
-    progress_steps = int(
-        piflow_params["nfe"] if piflow_params is not None else
-        run_config.num_steps - 1
-    )
+    progress_steps = int(piflow_params["nfe"] if piflow_params is not None else run_config.num_steps - 1)
     with offload.use("dit", "vae"):
         for start in range(0, len(tile_inputs), run_config.tiles_batch_size):
             raw_chunk = tile_inputs[start : start + run_config.tiles_batch_size]
@@ -519,11 +510,7 @@ def _run_tile_batches(  # noqa: PLR0913
             # the seed once per tile, not once per flattened sample batch, so
             # batched and independent runs use the same tile seeds.
             kwargs["seed"] = run_config.seed + start // sample_batch_size
-            chunk_progress = (
-                _scale_progress_callback(progress_callback, len(raw_chunk))
-                if progress_callback is not None
-                else None
-            )
+            chunk_progress = _scale_progress_callback(progress_callback, len(raw_chunk)) if progress_callback is not None else None
 
             if sampler is None:
                 outputs.extend(
@@ -591,16 +578,12 @@ def run_tiled_sr(  # noqa: PLR0913
         offload=offload,
         progress_callback=progress_callback,
         scheduler=scheduler,
-        prepare_chunk=lambda chunk: [
-            upscale_lr_latent_tile(tile, lu, sr_components.vae, run_config.device) for tile in chunk
-        ],
+        prepare_chunk=lambda chunk: [upscale_lr_latent_tile(tile, lu, sr_components.vae, run_config.device) for tile in chunk],
     )
 
     h = lr_latent.shape[-2] * _spatial_factor(sr_components)
     w = lr_latent.shape[-1] * _spatial_factor(sr_components)
-    return (
-        stitch_tiles_hanning(outputs, pixel_grid, h, w, scale=run_config.resolution_scale).clamp(0, 255).to(torch.uint8)
-    )
+    return stitch_tiles_hanning(outputs, pixel_grid, h, w, scale=run_config.resolution_scale).clamp(0, 255).to(torch.uint8)
 
 
 @torch.no_grad()

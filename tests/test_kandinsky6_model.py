@@ -33,9 +33,20 @@ def _tiny_model():
 def _tiny_four_block_model():
     model = _tiny_model()
     config = dict(LITE_CONFIG)
-    config.update(model_dim=64, model_dim_a=64, ff_dim=128, ff_dim_a=64, time_dim=32, time_dim_a=32,
-                  num_text_blocks=1, num_visual_blocks=4, axes_dims=(16, 24, 24), axes_dims_a=(16, 24, 24),
-                  in_text_dim=48, in_text_dim2=16)
+    config.update(
+        model_dim=64,
+        model_dim_a=64,
+        ff_dim=128,
+        ff_dim_a=64,
+        time_dim=32,
+        time_dim_a=32,
+        num_text_blocks=1,
+        num_visual_blocks=4,
+        axes_dims=(16, 24, 24),
+        axes_dims_a=(16, 24, 24),
+        in_text_dim=48,
+        in_text_dim2=16,
+    )
     return DiffusionTransformer3D(**config)
 
 
@@ -86,10 +97,13 @@ def test_inspect_checkpoint_detects_architecture_and_piflow(tmp_path, hidden_siz
     from safetensors.torch import save_file
 
     path = tmp_path / "model.safetensors"
-    save_file({
-        "visual_embeddings.in_layer.weight": torch.empty(hidden_size, 132),
-        "out_layer.out_layer.weight": torch.empty(head_width, hidden_size),
-    }, path)
+    save_file(
+        {
+            "visual_embeddings.in_layer.weight": torch.empty(hidden_size, 132),
+            "out_layer.out_layer.weight": torch.empty(head_width, hidden_size),
+        },
+        path,
+    )
     assert inspect_checkpoint(path) == expected
 
 
@@ -97,10 +111,13 @@ def test_inspect_checkpoint_rejects_unknown_architecture(tmp_path):
     from safetensors.torch import save_file
 
     path = tmp_path / "unknown.safetensors"
-    save_file({
-        "visual_embeddings.in_layer.weight": torch.empty(2048, 132),
-        "out_layer.out_layer.weight": torch.empty(64, 2048),
-    }, path)
+    save_file(
+        {
+            "visual_embeddings.in_layer.weight": torch.empty(2048, 132),
+            "out_layer.out_layer.weight": torch.empty(64, 2048),
+        },
+        path,
+    )
     with pytest.raises(ValueError, match="Unknown Kandinsky 6 hidden size"):
         inspect_checkpoint(path)
 
@@ -110,15 +127,15 @@ def test_quantization_scope_only_selects_safe_transformer_linears():
 
     quantizer = ConvRotInt8Quantizer(
         target_layer_keys=["visual_transformer_blocks.", "video_text_transformer_blocks.", "audio_text_transformer_blocks."],
-        exclude_layer_keys=["modulation", "norm"], allowed_groupsizes=(256, 64),
+        exclude_layer_keys=["modulation", "norm"],
+        allowed_groupsizes=(256, 64),
     )
     model = _tiny_model()
     selected = [key for key, value in model.state_dict().items() if value.ndim == 2 and quantizer.is_target_key(key)]
     assert selected
     assert all("transformer_blocks." in key for key in selected)
     assert not any(
-        "modulation" in key or key.startswith(("visual_embeddings.", "out_layer.", "audio_out_layer."))
-        for key in selected
+        "modulation" in key or key.startswith(("visual_embeddings.", "out_layer.", "audio_out_layer.")) for key in selected
     )
 
 
@@ -137,9 +154,7 @@ def test_bf16_streaming_assignment_roundtrip(tmp_path):
     save_file(source.state_dict(), path)
     with torch.device("meta"):
         loaded = Tiny()
-    missing, unexpected = _stream_assign_safetensors(
-        loaded, path, dtype=torch.bfloat16, device="cpu", strict=True
-    )
+    missing, unexpected = _stream_assign_safetensors(loaded, path, dtype=torch.bfloat16, device="cpu", strict=True)
     assert missing == unexpected == []
     assert loaded.linear.weight.dtype == torch.bfloat16
     assert loaded.counter.dtype == torch.int64
@@ -213,7 +228,8 @@ def test_vendored_model_matches_upstream_reference():
         pytest.skip("set K6_UPSTREAM to an authentic Kandinsky 6 checkout for numerical parity")
     prefix = "_k6_reference"
     for package, path in (
-        (prefix, upstream.parent), (f"{prefix}.core", upstream),
+        (prefix, upstream.parent),
+        (f"{prefix}.core", upstream),
         (f"{prefix}.core.components", upstream / "components"),
         (f"{prefix}.core.components.attention", upstream / "components" / "attention"),
     ):
@@ -222,6 +238,7 @@ def test_vendored_model_matches_upstream_reference():
         sys.modules[package] = module
     dispatch = types.ModuleType(f"{prefix}.core.components.attention.dispatch")
     from musubi_tuner.kandinsky6.attention import SelfAttentionEngine, _sdpa
+
     dispatch.SelfAttentionEngine, dispatch._sdpa = SelfAttentionEngine, _sdpa
     sys.modules[dispatch.__name__] = dispatch
     spec = importlib.util.spec_from_file_location(f"{prefix}.core.components.dit", upstream / "components" / "dit.py")
@@ -231,9 +248,20 @@ def test_vendored_model_matches_upstream_reference():
 
     ours = _tiny_model().eval()
     config = dict(LITE_CONFIG)
-    config.update(model_dim=64, model_dim_a=64, ff_dim=128, ff_dim_a=64, time_dim=32, time_dim_a=32,
-                  num_text_blocks=1, num_visual_blocks=1, axes_dims=(16, 24, 24), axes_dims_a=(16, 24, 24),
-                  in_text_dim=48, in_text_dim2=16)
+    config.update(
+        model_dim=64,
+        model_dim_a=64,
+        ff_dim=128,
+        ff_dim_a=64,
+        time_dim=32,
+        time_dim_a=32,
+        num_text_blocks=1,
+        num_visual_blocks=1,
+        axes_dims=(16, 24, 24),
+        axes_dims_a=(16, 24, 24),
+        in_text_dim=48,
+        in_text_dim2=16,
+    )
     reference = module.DiffusionTransformer3D(**config).eval()
     reference.load_state_dict(ours.state_dict(), strict=True)
     inputs = _inputs(ours)
@@ -275,9 +303,15 @@ def test_cuda_block_swap_checkpoint_gradient_parity(base_dtype, h2d_only):
             model.load_state_dict(quantized, strict=True, assign=True)
         elif base_dtype == "fp8":
             quantized = optimize_state_dict_with_fp8(
-                dict(state), torch.device("cpu"),
-                target_layer_keys=["visual_transformer_blocks.", "video_text_transformer_blocks.", "audio_text_transformer_blocks."],
-                exclude_layer_keys=["modulation", "norm"], move_to_device=False,
+                dict(state),
+                torch.device("cpu"),
+                target_layer_keys=[
+                    "visual_transformer_blocks.",
+                    "video_text_transformer_blocks.",
+                    "audio_text_transformer_blocks.",
+                ],
+                exclude_layer_keys=["modulation", "norm"],
+                move_to_device=False,
             )
             apply_fp8_monkey_patch(model, quantized, use_scaled_mm=False)
             model.requires_grad_(False)
@@ -300,9 +334,7 @@ def test_cuda_block_swap_checkpoint_gradient_parity(base_dtype, h2d_only):
     swapped_network.to("cuda")
     swapped.enable_block_swap(
         2,
-        BlockSwapConfig(
-            torch.device("cuda"), supports_backward=True, h2d_only=h2d_only, ring_size=2
-        ),
+        BlockSwapConfig(torch.device("cuda"), supports_backward=True, h2d_only=h2d_only, ring_size=2),
     )
     swapped.move_to_device_except_swap_blocks(torch.device("cuda"))
     swapped.prepare_block_swap_before_forward()

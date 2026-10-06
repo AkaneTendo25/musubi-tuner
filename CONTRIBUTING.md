@@ -145,6 +145,12 @@ For significant features, consider posting in [GitHub Discussions](https://githu
    accelerate config
    ```
 
+4. **Install the repository pre-commit hook**:
+   ```shell
+   python tools/install_git_hooks.py
+   ```
+   The hook checks the exact staged snapshot with `ruff check` and `ruff format --check`. It does not modify files or change your global Git hook configuration.
+
 ## Code Style and Guidelines
 
 ### Python Code Style

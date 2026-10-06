@@ -60,7 +60,6 @@ def flash_attn_funcs() -> tuple[Any, Any]:
     return flash_attn_varlen_func, flash_attn_varlen_qkvpacked_func
 
 
-
 def _ensure_nabla_compatible_flex_bwd_configs() -> None:
     """Guarantee flex_attention's backward keeps a 64-block-compatible config.
 
@@ -751,9 +750,7 @@ class MultiheadSelfAttention(nn.Module):
         else:
             _, flash_attn_varlen_qkvpacked_func = flash_attn_funcs()
             query_key_value = torch.stack([query, key, value], dim=-3)
-            out, softmax_lse, _ = flash_attn_varlen_qkvpacked_func(
-                query_key_value, cu_seqlens, max_seqlen, return_attn_probs=True
-            )
+            out, softmax_lse, _ = flash_attn_varlen_qkvpacked_func(query_key_value, cu_seqlens, max_seqlen, return_attn_probs=True)
         out = out.flatten(-2, -1)
 
         if return_attn_probs:

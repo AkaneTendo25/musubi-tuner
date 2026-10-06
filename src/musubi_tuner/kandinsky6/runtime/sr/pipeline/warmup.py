@@ -99,12 +99,8 @@ def warmup_flex_attention(dit: torch.nn.Module, scale_factor: tuple[float, ...],
     )
     if dit.use_text:
         text_len = 5
-        text_embed = torch.randn(
-            text_len, dit.text_embeddings.in_layer.in_features, device=device, dtype=torch.bfloat16
-        )
-        pooled_text_embed = torch.randn(
-            1, dit.pooled_text_embeddings.in_layer.in_features, device=device, dtype=torch.bfloat16
-        )
+        text_embed = torch.randn(text_len, dit.text_embeddings.in_layer.in_features, device=device, dtype=torch.bfloat16)
+        pooled_text_embed = torch.randn(1, dit.pooled_text_embeddings.in_layer.in_features, device=device, dtype=torch.bfloat16)
         text_cu_seqlens = torch.tensor([0, text_len], dtype=torch.int32, device=device)
         text_rope_pos = torch.arange(text_len, device=device)
     else:
@@ -245,9 +241,7 @@ def warmup_target_pass(  # noqa: PLR0913
         }
     else:
         lq_kwargs = {"lq_videos": [torch.rand(num_pixel_frames, base_h, base_w, 3) * 255.0]}
-    logger.info(
-        "Warmup: one throwaway tile at base {}x{} ({} path)", base_h, base_w, "LU" if lu is not None else "pixel"
-    )
+    logger.info("Warmup: one throwaway tile at base {}x{} ({} path)", base_h, base_w, "LU" if lu is not None else "pixel")
     with torch.no_grad():
         generate_sample_sr(
             **lq_kwargs,

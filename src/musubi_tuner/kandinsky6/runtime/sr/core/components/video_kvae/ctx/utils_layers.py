@@ -1,15 +1,15 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import interpolate
-from einops import rearrange
 
 
 def cast_tuple(t, length=1):
     return t if isinstance(t, tuple) else ((t,) * length)
 
+
 def nonlinearity(x):
     # swish
     return x * torch.sigmoid(x)
+
 
 class SafeConv3d(nn.Conv3d):
     def forward(self, input):
@@ -20,8 +20,7 @@ class SafeConv3d(nn.Conv3d):
             input_chunks = torch.chunk(input, part_num, dim=2)  # NCTHW
             if kernel_size > 1:
                 input_chunks = [input_chunks[0]] + [
-                    torch.cat((prev[:, :, -kernel_size + 1 :], cur), dim=2)
-                    for prev, cur in zip(input_chunks, input_chunks[1:])
+                    torch.cat((prev[:, :, -kernel_size + 1 :], cur), dim=2) for prev, cur in zip(input_chunks, input_chunks[1:])
                 ]
 
             output_chunks = []

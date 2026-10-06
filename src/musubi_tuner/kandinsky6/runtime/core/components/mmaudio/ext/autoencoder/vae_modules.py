@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .edm2_utils import (MPConv1D, mp_silu, mp_sum, normalize)
+from .edm2_utils import MPConv1D, mp_silu, mp_sum, normalize
 
 
 def nonlinearity(x):
@@ -11,7 +11,6 @@ def nonlinearity(x):
 
 
 class ResnetBlock1D(nn.Module):
-
     def __init__(self, *, in_dim, out_dim=None, conv_shortcut=False, kernel_size=3, use_norm=True):
         super().__init__()
         self.in_dim = in_dim
@@ -51,7 +50,6 @@ class ResnetBlock1D(nn.Module):
 
 
 class AttnBlock1D(nn.Module):
-
     def __init__(self, in_channels, num_heads=1):
         super().__init__()
         self.in_channels = in_channels
@@ -79,7 +77,6 @@ class AttnBlock1D(nn.Module):
 
 
 class Upsample1D(nn.Module):
-
     def __init__(self, in_channels, with_conv):
         super().__init__()
         self.with_conv = with_conv
@@ -87,14 +84,13 @@ class Upsample1D(nn.Module):
             self.conv = MPConv1D(in_channels, in_channels, kernel_size=3)
 
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=2.0, mode='nearest-exact')  # support 3D tensor(B,C,T)
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest-exact")  # support 3D tensor(B,C,T)
         if self.with_conv:
             x = self.conv(x)
         return x
 
 
 class Downsample1D(nn.Module):
-
     def __init__(self, in_channels, with_conv):
         super().__init__()
         self.with_conv = with_conv

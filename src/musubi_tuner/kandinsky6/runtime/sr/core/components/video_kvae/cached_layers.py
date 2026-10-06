@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .layers import CausalConv3d
-from .utils import cast_tuple, nonlinearity, SafeConv3d as Conv3d
+from .utils import nonlinearity, SafeConv3d as Conv3d
 
 
 class CachedGroupNorm(nn.GroupNorm):
@@ -37,9 +37,9 @@ class CachedGroupNorm(nn.GroupNorm):
 
     def forward(self, x, cache: dict):
         out = super().forward(x)
-        if cache.get('mean') is None and cache.get('var') is None:
-            cache['mean'] = 1
-            cache['var'] = 1
+        if cache.get("mean") is None and cache.get("var") is None:
+            cache["mean"] = 1
+            cache["var"] = 1
         return out
 
 
@@ -51,17 +51,20 @@ class CachedCausalConv3d(CausalConv3d):
     def forward(self, input_, cache: dict, fixed_stride=False):
         t_stride = self.stride[0]
         padding_3d = (self.height_pad, self.height_pad, self.width_pad, self.width_pad, 0, 0)
-        input_parallel = F.pad(input_, padding_3d,
-            mode="constant" if self.padding_mode == 'zeros' else (self.padding_mode or 'replicate'),
-            value=0 if self.padding_mode in ['constant', 'zeros'] else None)
+        input_parallel = F.pad(
+            input_,
+            padding_3d,
+            mode="constant" if self.padding_mode == "zeros" else (self.padding_mode or "replicate"),
+            value=0 if self.padding_mode in ["constant", "zeros"] else None,
+        )
 
-        if cache['padding'] is None:
+        if cache["padding"] is None:
             first_frame = input_parallel[:, :, :1]
             time_pad_shape = [i for i in first_frame.shape]
             time_pad_shape[2] = self.time_pad
             padding = first_frame.expand(time_pad_shape)
         else:
-            padding = cache['padding']
+            padding = cache["padding"]
 
         out_size = [i for i in input_.shape]
         out_size[1] = self.conv.out_channels
@@ -70,31 +73,35 @@ class CachedCausalConv3d(CausalConv3d):
         output = torch.empty(tuple(out_size), dtype=input_.dtype, device=input_.device)
 
         offset_out = math.ceil(padding.size(2) / t_stride)  # forward on `padding_poisoned` should take exactly this range
-        offset_in = offset_out * t_stride - padding.size(2) # to make forward on `input_parallel` take slice starting with this index
+        offset_in = offset_out * t_stride - padding.size(
+            2
+        )  # to make forward on `input_parallel` take slice starting with this index
 
         if offset_out > 0:
-            padding_poisoned = torch.cat([padding, input_parallel[:, :, :offset_in + self.time_kernel_size - t_stride]], dim=2)
+            padding_poisoned = torch.cat([padding, input_parallel[:, :, : offset_in + self.time_kernel_size - t_stride]], dim=2)
             output[:, :, :offset_out] = self.conv(padding_poisoned)
 
         if offset_out < output.size(2):
             output[:, :, offset_out:] = self.conv(input_parallel[:, :, offset_in:])
 
-        if t_stride == 2 and not fixed_stride and cache['padding'] is not None:
+        if t_stride == 2 and not fixed_stride and cache["padding"] is not None:
             expected_pad_size = padding.size(2) - 1
             offset_out = math.ceil(expected_pad_size / t_stride)
             offset_in = offset_out * t_stride - expected_pad_size
 
         # exact formula, doesn't depend on size of segments
-        pad_offset = offset_in + t_stride * math.trunc((input_parallel.size(2) - offset_in - self.time_kernel_size) / t_stride) + t_stride
+        pad_offset = (
+            offset_in + t_stride * math.trunc((input_parallel.size(2) - offset_in - self.time_kernel_size) / t_stride) + t_stride
+        )
 
         # this condition will be executed ONLY for old models
         if t_stride == 2 and not fixed_stride:
             pad_offset -= 1
 
-        if pad_offset < 0: # specific to small chunks (for inference on high resolution videos)
-            cache['padding'] = torch.cat([padding[:, :, pad_offset:], input_parallel], dim=2)
+        if pad_offset < 0:  # specific to small chunks (for inference on high resolution videos)
+            cache["padding"] = torch.cat([padding[:, :, pad_offset:], input_parallel], dim=2)
         else:
-            cache['padding'] = torch.clone(input_parallel[:, :, pad_offset:])
+            cache["padding"] = torch.clone(input_parallel[:, :, pad_offset:])
 
         return output
 
@@ -112,7 +119,7 @@ class CachedCausalResnetBlock3D(nn.Module):
         add_conv=False,
         gather_norm=False,
         normalization=Normalize,
-        padding_mode=None
+        padding_mode=None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -120,39 +127,18 @@ class CachedCausalResnetBlock3D(nn.Module):
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        self.norm1 = normalization(
-            in_channels,
-            zq_ch=zq_ch,
-            add_conv=add_conv
-        )
+        self.norm1 = normalization(in_channels, zq_ch=zq_ch, add_conv=add_conv)
 
-        self.conv1 = CachedCausalConv3d(
-            chan_in=in_channels,
-            chan_out=out_channels,
-            kernel_size=3,
-            padding_mode=padding_mode
-        )
+        self.conv1 = CachedCausalConv3d(chan_in=in_channels, chan_out=out_channels, kernel_size=3, padding_mode=padding_mode)
         if temb_channels > 0:
             self.temb_proj = torch.nn.Linear(temb_channels, out_channels)
-        self.norm2 = normalization(
-            out_channels,
-            zq_ch=zq_ch,
-            add_conv=add_conv
-        )
+        self.norm2 = normalization(out_channels, zq_ch=zq_ch, add_conv=add_conv)
         # self.dropout = torch.nn.Dropout(dropout)
-        self.conv2 = CachedCausalConv3d(
-            chan_in=out_channels,
-            chan_out=out_channels,
-            kernel_size=3,
-            padding_mode=padding_mode
-        )
+        self.conv2 = CachedCausalConv3d(chan_in=out_channels, chan_out=out_channels, kernel_size=3, padding_mode=padding_mode)
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = CachedCausalConv3d(
-                    chan_in=in_channels,
-                    chan_out=out_channels,
-                    kernel_size=3,
-                    padding_mode=padding_mode
+                    chan_in=in_channels, chan_out=out_channels, kernel_size=3, padding_mode=padding_mode
                 )
             else:
                 self.nin_shortcut = Conv3d(
@@ -169,9 +155,9 @@ class CachedCausalResnetBlock3D(nn.Module):
         h = x
 
         if zq is None:
-            h = self.norm1(h, cache=layer_cache['norm1'])
+            h = self.norm1(h, cache=layer_cache["norm1"])
         else:
-            h = self.norm1(h, zq, cache=layer_cache['norm1'])
+            h = self.norm1(h, zq, cache=layer_cache["norm1"])
 
         if x.size(2) == 17 and x.size(3) == 1080 and zq is not None:
             torch.cuda.empty_cache()
@@ -181,7 +167,7 @@ class CachedCausalResnetBlock3D(nn.Module):
         if x.size(2) == 17 and x.size(3) == 1080 and zq is not None:
             torch.cuda.empty_cache()
 
-        h = self.conv1(h, cache=layer_cache['conv1'])
+        h = self.conv1(h, cache=layer_cache["conv1"])
         if x.size(2) == 17 and x.size(3) == 1080 and zq is not None:
             torch.cuda.empty_cache()
 
@@ -189,18 +175,18 @@ class CachedCausalResnetBlock3D(nn.Module):
             h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None, None]
 
         if zq is None:
-            h = self.norm2(h, cache=layer_cache['norm2'])
+            h = self.norm2(h, cache=layer_cache["norm2"])
         else:
-            h = self.norm2(h, zq, cache=layer_cache['norm2'])
+            h = self.norm2(h, zq, cache=layer_cache["norm2"])
 
         # h = nonlinearity(h)
         h = F.silu(h, inplace=True)
         # h = self.dropout(h)
-        h = self.conv2(h, cache=layer_cache['conv2'])
+        h = self.conv2(h, cache=layer_cache["conv2"])
 
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
-                x = self.conv_shortcut(x, cache=layer_cache['conv_shortcut'])
+                x = self.conv_shortcut(x, cache=layer_cache["conv_shortcut"])
             else:
                 x = self.nin_shortcut(x)
 
@@ -208,7 +194,7 @@ class CachedCausalResnetBlock3D(nn.Module):
 
 
 class CachedPXSDownsample(nn.Module):
-    def __init__(self, in_channels: int, compress_time: bool, factor: int=2, version=1, fixed_stride=False, padding_mode=None):
+    def __init__(self, in_channels: int, compress_time: bool, factor: int = 2, version=1, fixed_stride=False, padding_mode=None):
         super().__init__()
         self.temporal_compress = compress_time
         self.fixed_stride = fixed_stride
@@ -219,46 +205,58 @@ class CachedPXSDownsample(nn.Module):
         self.version = version
         out_channels = in_channels * 2 if version > 1 else in_channels
 
-        self.spatial_conv = Conv3d(in_channels, out_channels,
-                                      kernel_size=(1, 3, 3),
-                                      stride=(1, 2, 2),
-                                      padding=(0, 1, 1),
-                                      padding_mode=padding_mode or 'reflect')
+        self.spatial_conv = Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size=(1, 3, 3),
+            stride=(1, 2, 2),
+            padding=(0, 1, 1),
+            padding_mode=padding_mode or "reflect",
+        )
 
         if self.temporal_compress:
             if version == 2:
-                self.temporal_conv = nn.Sequential(CachedCausalConv3d(out_channels, out_channels,
-                                                                      kernel_size=(2, 1, 1),
-                                                                      stride=(1, 1, 1),
-                                                                      dilation=(1, 1, 1),
-                                                                      padding_mode=padding_mode),
-                                                   CachedCausalConv3d(out_channels, out_channels,
-                                                                      kernel_size=(2, 1, 1),
-                                                                      stride=(2, 1, 1),
-                                                                      dilation=(1, 1, 1),
-                                                                      padding_mode=padding_mode))
-            else: # 1 or 3
-                self.temporal_conv = CachedCausalConv3d(out_channels, out_channels,
-                                        kernel_size=(3, 1, 1),
-                                        stride=(2, 1, 1),
-                                        dilation=(1, 1, 1),
-                                        padding_mode=padding_mode)
+                self.temporal_conv = nn.Sequential(
+                    CachedCausalConv3d(
+                        out_channels,
+                        out_channels,
+                        kernel_size=(2, 1, 1),
+                        stride=(1, 1, 1),
+                        dilation=(1, 1, 1),
+                        padding_mode=padding_mode,
+                    ),
+                    CachedCausalConv3d(
+                        out_channels,
+                        out_channels,
+                        kernel_size=(2, 1, 1),
+                        stride=(2, 1, 1),
+                        dilation=(1, 1, 1),
+                        padding_mode=padding_mode,
+                    ),
+                )
+            else:  # 1 or 3
+                self.temporal_conv = CachedCausalConv3d(
+                    out_channels,
+                    out_channels,
+                    kernel_size=(3, 1, 1),
+                    stride=(2, 1, 1),
+                    dilation=(1, 1, 1),
+                    padding_mode=padding_mode,
+                )
 
-        self.linear = nn.Conv3d(out_channels, out_channels,
-                                kernel_size=1,
-                                stride=1)
+        self.linear = nn.Conv3d(out_channels, out_channels, kernel_size=1, stride=1)
 
     def spatial_downsample(self, input_):
         # PixelShuffle part
-        pxs_input = rearrange(input_, 'b c t h w -> (b t) c h w')
+        pxs_input = rearrange(input_, "b c t h w -> (b t) c h w")
         pxs_interm = self.unshuffle(pxs_input)
         b, c, h, w = pxs_interm.shape
         if self.version > 1:
             pxs_interm_view = pxs_interm.view(b, c // self.factor, self.factor, h, w)
-        else: #
-            pxs_interm_view = pxs_interm.view(b, c // self.factor ** 2, self.factor ** 2, h, w)
+        else:  #
+            pxs_interm_view = pxs_interm.view(b, c // self.factor**2, self.factor**2, h, w)
         pxs_out = torch.mean(pxs_interm_view, dim=2)
-        pxs_out = rearrange(pxs_out, '(b t) c h w -> b c t h w', t=input_.size(2))
+        pxs_out = rearrange(pxs_out, "(b t) c h w -> b c t h w", t=input_.size(2))
 
         # Downsampling by 3D-convolution
         conv_out = self.spatial_conv(input_)
@@ -269,7 +267,7 @@ class CachedPXSDownsample(nn.Module):
     def temporal_downsample(self, input_, cache):
         # Interpolation part
         permuted = rearrange(input_, "b c t h w -> (b h w) c t")
-        if cache[0]['padding'] is None:
+        if cache[0]["padding"] is None:
             first, rest = permuted[..., :1], permuted[..., 1:]
 
             if rest.size(-1) > 0:
@@ -306,9 +304,10 @@ class CachedPXSDownsample(nn.Module):
 
 class CachedSpatialNorm3D(nn.Module):
     """
-      Looking at `forward`, it seems this class should be renamed to `DecoderSpatialNorm` or something similar,
-      because it's not usual forward, but a conditional one.
+    Looking at `forward`, it seems this class should be renamed to `DecoderSpatialNorm` or something similar,
+    because it's not usual forward, but a conditional one.
     """
+
     def __init__(
         self,
         f_channels,
@@ -324,12 +323,7 @@ class CachedSpatialNorm3D(nn.Module):
 
         self.add_conv = add_conv
         if add_conv:
-            self.conv = CachedCausalConv3d(
-                chan_in=zq_channels,
-                chan_out=zq_channels,
-                kernel_size=3,
-                padding_mode=padding_mode
-            )
+            self.conv = CachedCausalConv3d(chan_in=zq_channels, chan_out=zq_channels, kernel_size=3, padding_mode=padding_mode)
 
         self.conv_y = Conv3d(
             zq_channels,
@@ -345,7 +339,7 @@ class CachedSpatialNorm3D(nn.Module):
     def forward(self, f, zq, cache):
         f_shape = [s for s in f.shape]
 
-        if cache['norm']['mean'] is None and cache['norm']['var'] is None:
+        if cache["norm"]["mean"] is None and cache["norm"]["var"] is None:
             f_first, f_rest = f[:, :, :1], f[:, :, 1:]
             f_first_size, f_rest_size = f_first.shape[-3:], f_rest.shape[-3:]
             zq_first, zq_rest = zq[:, :, :1], zq[:, :, 1:]
@@ -354,9 +348,7 @@ class CachedSpatialNorm3D(nn.Module):
 
             if zq.size(2) > 1:
                 zq_rest_splits = torch.split(zq_rest, 32, dim=1)
-                interpolated_splits = [
-                    F.interpolate(split, size=f_rest_size, mode="nearest") for split in zq_rest_splits
-                ]
+                interpolated_splits = [F.interpolate(split, size=f_rest_size, mode="nearest") for split in zq_rest_splits]
 
                 zq_rest = torch.cat(interpolated_splits, dim=1)
                 zq = torch.cat([zq_first, zq_rest], dim=2)
@@ -365,32 +357,24 @@ class CachedSpatialNorm3D(nn.Module):
         else:
             f_size = f.shape[-3:]
             zq_splits = torch.split(zq, 32, dim=1)
-            interpolated_splits = [
-                F.interpolate(split, size=f_size, mode="nearest") for split in zq_splits
-            ]
+            interpolated_splits = [F.interpolate(split, size=f_size, mode="nearest") for split in zq_splits]
             zq = torch.cat(interpolated_splits, dim=1)
 
-
         if self.add_conv:
-            zq = self.conv(zq, cache['add_conv'])
+            zq = self.conv(zq, cache["add_conv"])
 
-        norm_f = self.norm_layer(f, cache['norm'])
+        norm_f = self.norm_layer(f, cache["norm"])
         norm_f.mul_(self.conv_y(zq))
         norm_f.add_(self.conv_b(zq))
 
-        if cache['norm']['mean'] is None and cache['norm']['var'] is None:
-            cache['norm']['mean'] = 1
-            cache['norm']['var'] = 1
+        if cache["norm"]["mean"] is None and cache["norm"]["var"] is None:
+            cache["norm"]["mean"] = 1
+            cache["norm"]["var"] = 1
 
         return norm_f
 
 
-def Normalize3D(
-    in_channels,
-    zq_ch,
-    add_conv,
-    normalization=Normalize
-):
+def Normalize3D(in_channels, zq_ch, add_conv, normalization=Normalize):
     return CachedSpatialNorm3D(
         in_channels,
         zq_ch,
@@ -399,32 +383,31 @@ def Normalize3D(
         num_groups=32,
         eps=1e-6,
         affine=True,
-        normalization=normalization
+        normalization=normalization,
     )
 
 
 class CachedPXSUpsample(nn.Module):
-    def __init__(self, in_channels: int, compress_time: bool, factor: int=2, padding_mode=None):
+    def __init__(self, in_channels: int, compress_time: bool, factor: int = 2, padding_mode=None):
         super().__init__()
         self.temporal_compress = compress_time
         self.factor = factor
         self.shuffle = nn.PixelShuffle(self.factor)
-        self.spatial_conv = Conv3d(in_channels, in_channels,
-                                      kernel_size=(1, 3, 3),
-                                      stride=(1, 1, 1),
-                                      padding=(0, 1, 1),
-                                      padding_mode=padding_mode or 'reflect')
+        self.spatial_conv = Conv3d(
+            in_channels,
+            in_channels,
+            kernel_size=(1, 3, 3),
+            stride=(1, 1, 1),
+            padding=(0, 1, 1),
+            padding_mode=padding_mode or "reflect",
+        )
 
         if self.temporal_compress:
-            self.temporal_conv = CachedCausalConv3d(in_channels, in_channels,
-                                                    kernel_size=(3, 1, 1),
-                                                    stride=(1, 1, 1),
-                                                    dilation=(1, 1, 1),
-                                                    padding_mode=padding_mode)
+            self.temporal_conv = CachedCausalConv3d(
+                in_channels, in_channels, kernel_size=(3, 1, 1), stride=(1, 1, 1), dilation=(1, 1, 1), padding_mode=padding_mode
+            )
 
-        self.linear = Conv3d(in_channels, in_channels,
-                                kernel_size=1,
-                                stride=1)
+        self.linear = Conv3d(in_channels, in_channels, kernel_size=1, stride=1)
 
     def spatial_upsample_NEW(self, input_):
         def conv_part(x):
@@ -434,7 +417,7 @@ class CachedPXSUpsample(nn.Module):
 
         # 5D interpolate keeps channels_last_3d layout intact; merging dims
         # via view() is impossible for channels_last strides (dim 1 is innermost)
-        input_interp = F.interpolate(input_, scale_factor=(1, 2, 2), mode='nearest')
+        input_interp = F.interpolate(input_, scale_factor=(1, 2, 2), mode="nearest")
         input_interp.add_(conv_part(input_interp))
         return input_interp
 
@@ -444,8 +427,8 @@ class CachedPXSUpsample(nn.Module):
         repeated = input_.repeat_interleave(2, dim=2)
         # repeated: (2T + 2) x H x W
 
-        if cache['padding'] is None:
-            tail = repeated[..., 1:, :, :] # tail: (2T + 1) x H x W
+        if cache["padding"] is None:
+            tail = repeated[..., 1:, :, :]  # tail: (2T + 1) x H x W
         else:
             tail = repeated
 

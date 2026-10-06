@@ -10,9 +10,7 @@ from safetensors.torch import load_file
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-_BUNDLED_CONFIG_NAMES = frozenset(
-    {"lite", "lite-distill", "lite-pretrain", "pro", "pro-distill", "pro-pretrain"}
-)
+_BUNDLED_CONFIG_NAMES = frozenset({"lite", "lite-distill", "lite-pretrain", "pro", "pro-distill", "pro-pretrain"})
 
 
 def resolve_config(value: str | Path) -> Path:
@@ -20,14 +18,7 @@ def resolve_config(value: str | Path) -> Path:
     value = Path(value)
     if str(value) not in _BUNDLED_CONFIG_NAMES:
         return value
-    path = (
-        Path(__file__).resolve().parent
-        / "kandinsky6"
-        / "runtime"
-        / "configs"
-        / "checkpoints"
-        / f"{value}.yaml"
-    )
+    path = Path(__file__).resolve().parent / "kandinsky6" / "runtime" / "configs" / "checkpoints" / f"{value}.yaml"
     if not path.is_file():
         raise FileNotFoundError(f"Bundled Kandinsky6 config is missing: {path}")
     return path
@@ -38,8 +29,7 @@ def _load_pipeline_factory():
         from musubi_tuner.kandinsky6.runtime.pipeline.factory import get_pipeline
     except ImportError as exc:
         raise RuntimeError(
-            "Kandinsky6 generation requires the optional Kandinsky6 dependencies; "
-            "install `musubi-tuner[kandinsky6]`."
+            "Kandinsky6 generation requires the optional Kandinsky6 dependencies; install `musubi-tuner[kandinsky6]`."
         ) from exc
     return get_pipeline
 
@@ -60,9 +50,7 @@ def apply_lora_weights(
     for index, path in enumerate(paths):
         multiplier = multipliers[index] if index < len(multipliers) else 1.0
         state = load_file(path)
-        network = lora_kandinsky6.create_arch_network_from_weights(
-            multiplier, state, unet=dit, for_inference=True
-        )
+        network = lora_kandinsky6.create_arch_network_from_weights(multiplier, state, unet=dit, for_inference=True)
         device = next(dit.parameters()).device
         if merge:
             network.merge_to(None, dit, state, device=device, non_blocking=True)
@@ -89,7 +77,7 @@ def _convrot_dit_loader(
     compute_device: str | torch.device,
     lora_paths: list[str],
     lora_multipliers: list[float] | None,
-) :
+):
     """Return a pipeline DiT callback backed by the authentic ConvRot loader."""
     if not enabled:
         return None
@@ -109,9 +97,7 @@ def _convrot_dit_loader(
         # Bind the runtime engine selected by the pipeline onto every slot.
         for module in dit.modules():
             if isinstance(getattr(module, "attn", None), ModelSelfAttentionEngine):
-                module.attn = SelfAttentionEngine(
-                    "sdpa" if getattr(module, "force_sdpa", False) else attention_engine
-                )
+                module.attn = SelfAttentionEngine("sdpa" if getattr(module, "force_sdpa", False) else attention_engine)
         apply_lora_weights(dit, lora_paths, lora_multipliers, merge=False)
         return dit
 

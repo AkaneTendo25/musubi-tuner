@@ -148,9 +148,7 @@ def local_patching(x: Tensor, shape: tuple[int, int, int], group_size: tuple[int
     duration, height, width = shape
     g1, g2, g3 = group_size
     x = x.reshape(*x.shape[:dim], duration // g1, g1, height // g2, g2, width // g3, g3, *x.shape[dim + 3 :])
-    x = x.permute(
-        *range(len(x.shape[:dim])), dim, dim + 2, dim + 4, dim + 1, dim + 3, dim + 5, *range(dim + 6, len(x.shape))
-    )
+    x = x.permute(*range(len(x.shape[:dim])), dim, dim + 2, dim + 4, dim + 1, dim + 3, dim + 5, *range(dim + 6, len(x.shape)))
     return x.flatten(dim, dim + 2).flatten(dim + 1, dim + 3)
 
 
@@ -169,9 +167,7 @@ def local_merge(x: Tensor, shape: tuple[int, int, int], group_size: tuple[int, i
     duration, height, width = shape
     g1, g2, g3 = group_size
     x = x.reshape(*x.shape[:dim], duration // g1, height // g2, width // g3, g1, g2, g3, *x.shape[dim + 2 :])
-    x = x.permute(
-        *range(len(x.shape[:dim])), dim, dim + 3, dim + 1, dim + 4, dim + 2, dim + 5, *range(dim + 6, len(x.shape))
-    )
+    x = x.permute(*range(len(x.shape[:dim])), dim, dim + 3, dim + 1, dim + 4, dim + 2, dim + 5, *range(dim + 6, len(x.shape)))
     return x.flatten(dim, dim + 1).flatten(dim + 1, dim + 2).flatten(dim + 2, dim + 3)
 
 
@@ -379,17 +375,10 @@ def build_framewise_causal_block_doc(
     """
     device = seq.device
     d = torch.diff(seq)
-    doc1 = (
-        torch.eye(d.numel(), dtype=torch.bool, device=device)
-        .repeat_interleave(d, dim=0)
-        .repeat_interleave(d, dim=1)
-        .tril()
-    )
+    doc1 = torch.eye(d.numel(), dtype=torch.bool, device=device).repeat_interleave(d, dim=0).repeat_interleave(d, dim=1).tril()
     group_sizes = [[c.sum().item() for c in torch.ones((dd,)).split(mf)] for dd in d]
     cl = torch.tensor([x for xs in group_sizes for x in xs], dtype=torch.int32, device=device)
-    doc2 = (
-        torch.eye(cl.numel(), dtype=torch.bool, device=device).repeat_interleave(cl, dim=0).repeat_interleave(cl, dim=1)
-    )
+    doc2 = torch.eye(cl.numel(), dtype=torch.bool, device=device).repeat_interleave(cl, dim=0).repeat_interleave(cl, dim=1)
     return torch.logical_or(doc1, doc2).repeat_interleave(H * W, dim=0).repeat_interleave(H * W, dim=1)
 
 

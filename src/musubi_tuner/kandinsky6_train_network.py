@@ -13,8 +13,13 @@ from accelerate import Accelerator
 from musubi_tuner.dataset.architectures import ARCHITECTURE_KANDINSKY6, ARCHITECTURE_KANDINSKY6_FULL
 from musubi_tuner.dataset.audio_utils import AudioSpec
 from musubi_tuner.hv_train_network import (
-    DiTOutput, NetworkTrainer, clean_memory_on_device, load_prompts, read_config_from_file,
-    setup_parser_common, should_sample_images,
+    DiTOutput,
+    NetworkTrainer,
+    clean_memory_on_device,
+    load_prompts,
+    read_config_from_file,
+    setup_parser_common,
+    should_sample_images,
 )
 from musubi_tuner.kandinsky6 import PiFlowDiffusionTransformer3D, load_dit, load_dit_convrot_int8, load_dit_fp8
 from musubi_tuner.training.audio_loss import add_audio_train_args, effective_audio_loss_weights
@@ -122,13 +127,13 @@ def build_ti2av_video_input(noisy_video: torch.Tensor, image_latent: torch.Tenso
     token_types = None
     if image_latent is not None:
         if image_latent.shape != (batch, 1, height, width, channels):
-            raise ValueError(
-                f"TI2AV image latent must be {(batch, 1, height, width, channels)}, got {tuple(image_latent.shape)}"
-            )
+            raise ValueError(f"TI2AV image latent must be {(batch, 1, height, width, channels)}, got {tuple(image_latent.shape)}")
         noisy_video = torch.cat([noisy_video, image_latent], dim=1)
         token_types = torch.cat(
-            [torch.zeros((batch, frames), device=noisy_video.device, dtype=torch.long),
-             torch.ones((batch, 1), device=noisy_video.device, dtype=torch.long)],
+            [
+                torch.zeros((batch, frames), device=noisy_video.device, dtype=torch.long),
+                torch.ones((batch, 1), device=noisy_video.device, dtype=torch.long),
+            ],
             dim=1,
         )
     if not visual_cond:
@@ -234,8 +239,11 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         return model_utils.compile_transformer(
             args,
             transformer,
-            [transformer.video_text_transformer_blocks, transformer.audio_text_transformer_blocks,
-             transformer.visual_transformer_blocks],
+            [
+                transformer.video_text_transformer_blocks,
+                transformer.audio_text_transformer_blocks,
+                transformer.visual_transformer_blocks,
+            ],
             disable_linear=bool(self.blocks_to_swap) or bool(args.convrot_int8) or bool(args.fp8_base),
         )
 
@@ -271,22 +279,28 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
             from musubi_tuner.kandinsky6.runtime.core.components.vae_audio import build_audio_vae, build_vocoder
             from musubi_tuner.kandinsky6.runtime.core.components.vae_video import build_vae
         except ImportError as exc:
-            raise RuntimeError(
-                "Kandinsky 6 sampling dependencies are missing. Install Musubi with the kandinsky6 extra."
-            ) from exc
+            raise RuntimeError("Kandinsky 6 sampling dependencies are missing. Install Musubi with the kandinsky6 extra.") from exc
         # Keep sampling resources on CPU between samples. Each encoder is staged briefly;
         # decoding stays on CPU so the training DiT and its optimizer can remain resident.
         device = torch.device("cpu")
         resources = _SamplingResources(
             video_vae=build_vae(args.vae, device=device),
             audio_vae=build_audio_vae(
-                tod_vae_ckpt=args.audio_vae, mode="44k", need_vae_encoder=True, need_vae_decoder=True,
-                scaling_factor=args.audio_vae_scaling_factor, device=device,
+                tod_vae_ckpt=args.audio_vae,
+                mode="44k",
+                need_vae_encoder=True,
+                need_vae_decoder=True,
+                scaling_factor=args.audio_vae_scaling_factor,
+                device=device,
             ),
             vocoder=build_vocoder(ckpt=args.vocoder, device=device),
             text_embedder=Kandinsky6TextEmbedder(
-                args.text_encoder_qwen, args.text_encoder_clip, max_length=args.max_length,
-                device=device, quantized_qwen=args.quantized_qwen, text_token_padding=False,
+                args.text_encoder_qwen,
+                args.text_encoder_clip,
+                max_length=args.max_length,
+                device=device,
+                quantized_qwen=args.quantized_qwen,
+                text_token_padding=False,
             ),
         )
         for module in (resources.video_vae, resources.audio_vae, resources.vocoder, resources.text_embedder):
@@ -306,8 +320,11 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         from musubi_tuner.kandinsky6.runtime.core.algo.postprocess_audio import postprocess_audio
         from musubi_tuner.kandinsky6.runtime.core.algo.postprocess_video import postprocess_video
         from musubi_tuner.kandinsky6.runtime.core.algo.prepare_latents import (
-            append_i2va_tail_condition, audio_latent_duration, encode_i2va_first_frame,
-            prepare_audio_latents, prepare_video_latents,
+            append_i2va_tail_condition,
+            audio_latent_duration,
+            encode_i2va_first_frame,
+            prepare_audio_latents,
+            prepare_video_latents,
         )
         from musubi_tuner.kandinsky6.runtime.core.algo.prepare_ropes import compute_rope1d, compute_visual_rope
         from musubi_tuner.kandinsky6.runtime.core.types import LatentBundle
@@ -355,11 +372,14 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                 clean_memory_on_device(accelerator.device)
 
                 latent_h, latent_w = height // 8, width // 8
-                bundle = prepare_video_latents(1, video_frames, latent_h, latent_w, transformer.in_visual_dim,
-                                               seed, accelerator.device)
+                bundle = prepare_video_latents(
+                    1, video_frames, latent_h, latent_w, transformer.in_visual_dim, seed, accelerator.device
+                )
                 bundle = LatentBundle(
                     video=bundle.video.reshape(1, video_frames, latent_h, latent_w, transformer.in_visual_dim),
-                    audio=None, video_cu_seqlens=bundle.video_cu_seqlens, audio_cu_seqlens=None,
+                    audio=None,
+                    video_cu_seqlens=bundle.video_cu_seqlens,
+                    audio_cu_seqlens=None,
                 )
                 first_frames = None
                 token_types = None
@@ -376,7 +396,8 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                         bundle.video, first_frames, batch_size=1, video_duration=video_frames
                     )
                     bundle = LatentBundle(
-                        video=video, audio=None,
+                        video=video,
+                        audio=None,
                         video_cu_seqlens=torch.tensor([0, video_frames + 1], device=accelerator.device, dtype=torch.int32),
                         audio_cu_seqlens=None,
                     )
@@ -391,27 +412,47 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
                 restore_dit()
                 visual_rope = compute_visual_rope(
                     transformer.visual_rope,
-                    (video_frames // transformer.patch_size[0], latent_h // transformer.patch_size[1],
-                     latent_w // transformer.patch_size[2]),
+                    (
+                        video_frames // transformer.patch_size[0],
+                        latent_h // transformer.patch_size[1],
+                        latent_w // transformer.patch_size[2],
+                    ),
                     self._visual_rope_scale,
                 )
                 if image_path:
                     visual_rope = torch.cat([visual_rope, visual_rope[:1]], dim=0)
                 audio_rope = compute_rope1d(transformer.audio_rope, audio_frames)
-                text_rope = [compute_rope1d(transformer.video_text_rope, text_length),
-                             compute_rope1d(transformer.audio_text_rope, text_length)]
-                null_rope = [compute_rope1d(transformer.video_text_rope, null_length),
-                             compute_rope1d(transformer.audio_text_rope, null_length)]
+                text_rope = [
+                    compute_rope1d(transformer.video_text_rope, text_length),
+                    compute_rope1d(transformer.audio_text_rope, text_length),
+                ]
+                null_rope = [
+                    compute_rope1d(transformer.video_text_rope, null_length),
+                    compute_rope1d(transformer.audio_text_rope, null_length),
+                ]
                 result = denoise_loop(
-                    bundle, transformer, text, null, visual_rope, audio_rope, text_rope, null_rope,
-                    sample_steps, guidance, self._scheduler_scale,
-                    first_frames=first_frames, visual_cond_scheme="tail_cond_first_frame" if image_path else "pretrain",
-                    attention_mask=attention_mask, null_attention_mask=null_attention_mask,
-                    visual_token_type_ids=token_types, scale_factor=self._visual_rope_scale,
+                    bundle,
+                    transformer,
+                    text,
+                    null,
+                    visual_rope,
+                    audio_rope,
+                    text_rope,
+                    null_rope,
+                    sample_steps,
+                    guidance,
+                    self._scheduler_scale,
+                    first_frames=first_frames,
+                    visual_cond_scheme="tail_cond_first_frame" if image_path else "pretrain",
+                    attention_mask=attention_mask,
+                    null_attention_mask=null_attention_mask,
+                    visual_token_type_ids=token_types,
+                    scale_factor=self._visual_rope_scale,
                 )
                 if generated_mask is not None:
                     result = LatentBundle(
-                        video=result.video[:, generated_mask[0]], audio=result.audio,
+                        video=result.video[:, generated_mask[0]],
+                        audio=result.audio,
                         video_cu_seqlens=torch.tensor([0, video_frames], device=accelerator.device, dtype=torch.int32),
                         audio_cu_seqlens=result.audio_cu_seqlens,
                     )
@@ -445,7 +486,9 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
 
     def get_noisy_model_input_and_timesteps(self, args, noise, latents, timesteps, noise_scheduler, device, dtype):
         del args, noise_scheduler, dtype
-        uniform = torch.as_tensor(timesteps, device=device) if timesteps is not None else torch.rand(latents.shape[0], device=device)
+        uniform = (
+            torch.as_tensor(timesteps, device=device) if timesteps is not None else torch.rand(latents.shape[0], device=device)
+        )
         sigma = shifted_flow_sigma(uniform, self._scheduler_scale)
         sigma_view = sigma.view(-1, 1, 1, 1, 1)
         noisy = ((1.0 - sigma_view) * latents.float() + sigma_view * noise.float()).to(latents.dtype)
@@ -478,9 +521,7 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
             raise TypeError(f"Unexpected Kandinsky 6 call_dit arguments: {sorted(kwargs)}")
 
         generated_video = noisy_model_input.to(accelerator.device)
-        model_video, token_types = build_ti2av_video_input(
-            generated_video, image_latent, transformer.visual_cond
-        )
+        model_video, token_types = build_ti2av_video_input(generated_video, image_latent, transformer.visual_cond)
         visual_rope, audio_rope, text_rope = self._ropes(transformer, generated_video, noisy_audio, text_embeds.shape[1])
         if image_latent is not None:
             # The upstream tail reference reuses generated frame zero's temporal
@@ -507,13 +548,23 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         return DiTOutput(
             pred=video_pred,
             target=noise - latents,
-            extra={"audio_pred": audio_pred, "audio_target": audio_noise - audio_latents,
-                   "audio_loss_weights": audio_loss_weights},
+            extra={"audio_pred": audio_pred, "audio_target": audio_noise - audio_latents, "audio_loss_weights": audio_loss_weights},
         )
 
     def process_batch(
-        self, args, accelerator, transformer, network, batch, latents, noise, noise_scheduler,
-        dit_dtype, network_dtype, sample_resources, global_step,
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        sample_resources,
+        global_step,
     ):
         del network, sample_resources
         # Cache layout [B,C,T,H,W]/[B,C,A] -> upstream [B,T,H,W,C]/[B,A,C].
@@ -537,9 +588,23 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
             raise ValueError("T2AV cache unexpectedly contains TI2AV image conditioning")
         audio_weights = effective_audio_loss_weights(batch["audio_present"], args).to(video.device)
         output = self.call_dit(
-            args, accelerator, transformer, video, batch, video_noise, noisy_video, timesteps, network_dtype,
-            audio_latents=audio, audio_noise=audio_noise, noisy_audio=noisy_audio, text_embeds=text,
-            pooled_embed=pooled, attention_mask=text_mask, image_latent=image, audio_loss_weights=audio_weights,
+            args,
+            accelerator,
+            transformer,
+            video,
+            batch,
+            video_noise,
+            noisy_video,
+            timesteps,
+            network_dtype,
+            audio_latents=audio,
+            audio_noise=audio_noise,
+            noisy_audio=noisy_audio,
+            text_embeds=text,
+            pooled_embed=pooled,
+            attention_mask=text_mask,
+            image_latent=image,
+            audio_loss_weights=audio_weights,
         )
         return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
 
@@ -557,8 +622,13 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
 
 def kandinsky6_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.set_defaults(
-        timestep_sampling="uniform", weighting_scheme="none", discrete_flow_shift=1.0,
-        network_module="networks.lora_kandinsky6", sdpa=True, mixed_precision="bf16", guidance_scale=4.0,
+        timestep_sampling="uniform",
+        weighting_scheme="none",
+        discrete_flow_shift=1.0,
+        network_module="networks.lora_kandinsky6",
+        sdpa=True,
+        mixed_precision="bf16",
+        guidance_scale=4.0,
     )
     parser.add_argument("--task", choices=("t2av", "ti2av"), default="t2av")
     parser.add_argument("--model_variant", choices=("auto", "lite", "pro"), default="auto")

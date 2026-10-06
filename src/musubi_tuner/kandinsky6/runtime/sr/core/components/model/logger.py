@@ -391,9 +391,7 @@ class ModelLogger:
         if ModelLogger.USE_EXTENDED_LOGS:
             log_dict.update(
                 {
-                    f"utility/weights_norm_{n}": get_full_tensor(nn.utils.get_total_norm(p), emergency=emergency)
-                    .cpu()
-                    .item()
+                    f"utility/weights_norm_{n}": get_full_tensor(nn.utils.get_total_norm(p), emergency=emergency).cpu().item()
                     for n, p in model.named_parameters()
                     if p.requires_grad
                 }

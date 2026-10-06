@@ -179,9 +179,7 @@ class MagiCachedCausalVAE(CachedCausalVAE):
     def flatten_segment_cache(self, cache: dict) -> tuple[torch.Tensor, ...]:
         """Extract the tensor cache slots in ``cache_spec`` order."""
         flat = tuple(cache_leaf_parent(cache, path)[path[-1]] for path in self.cache_spec)
-        missing = [
-            path for path, value in zip(self.cache_spec, flat, strict=True) if not isinstance(value, torch.Tensor)
-        ]
+        missing = [path for path, value in zip(self.cache_spec, flat, strict=True) if not isinstance(value, torch.Tensor)]
         if missing:
             msg = f"decoder cache slots not written this segment: {missing}"
             raise RuntimeError(msg)
@@ -190,9 +188,7 @@ class MagiCachedCausalVAE(CachedCausalVAE):
     def make_segment_fn(self, *, first: bool) -> SegmentFn:
         """Build the pure per-segment decode function (the magi compile target)."""
 
-        def kvae_segment(
-            z: torch.Tensor, cache_flat: tuple[torch.Tensor, ...]
-        ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        def kvae_segment(z: torch.Tensor, cache_flat: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
             cache = self.build_segment_cache(None if first else cache_flat)
             out = self.decoder(z, cache)
             return out, self.flatten_segment_cache(cache)

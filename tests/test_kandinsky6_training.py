@@ -238,8 +238,18 @@ def test_process_batch_converts_cache_layout_and_shares_sigma(monkeypatch):
     latents = torch.zeros(1, 16, 3, 4, 5)
     noise = torch.ones_like(latents)
     loss, _ = trainer.process_batch(
-        args, accelerator, object(), None, batch, latents, noise, None,
-        torch.float32, torch.float32, None, 0,
+        args,
+        accelerator,
+        object(),
+        None,
+        batch,
+        latents,
+        noise,
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
     assert seen["video"].shape == (1, 3, 4, 5, 16)
     assert seen["audio"].shape == (1, 6, 40)
@@ -254,7 +264,7 @@ def test_kandinsky6_cache_rejects_wrong_layout_before_writing(tmp_path):
         save_latent_cache_kandinsky6(item, torch.zeros(1, 2, 3), torch.zeros(40, 4), True)
 
 
-@pytest.mark.parametrize('with_reference', [False, True])
+@pytest.mark.parametrize("with_reference", [False, True])
 def test_training_tail_reference_reuses_upstream_frame_zero_rope(with_reference):
     seen = {}
 
@@ -275,23 +285,32 @@ def test_training_tail_reference_reuses_upstream_frame_zero_rope(with_reference)
 
         def __call__(self, **kwargs):
             seen.update(kwargs)
-            return kwargs['x_video'][..., :16], kwargs['x_audio']
+            return kwargs["x_video"][..., :16], kwargs["x_audio"]
 
     video = torch.zeros(1, 3, 4, 4, 16)
     audio = torch.zeros(1, 6, 40)
     image = torch.ones(1, 1, 4, 4, 16) if with_reference else None
     output = Kandinsky6NetworkTrainer().call_dit(
         SimpleNamespace(gradient_checkpointing=False),
-        SimpleNamespace(device=torch.device('cpu'), autocast=nullcontext),
-        RecordingDiT(), video, {}, torch.ones_like(video), video,
-        torch.tensor([250.0]), torch.float32,
-        audio_latents=audio, audio_noise=audio, noisy_audio=audio,
-        text_embeds=torch.zeros(1, 2, 48), pooled_embed=torch.zeros(1, 16),
-        attention_mask=torch.ones(1, 2, dtype=torch.bool), image_latent=image,
+        SimpleNamespace(device=torch.device("cpu"), autocast=nullcontext),
+        RecordingDiT(),
+        video,
+        {},
+        torch.ones_like(video),
+        video,
+        torch.tensor([250.0]),
+        torch.float32,
+        audio_latents=audio,
+        audio_noise=audio,
+        noisy_audio=audio,
+        text_embeds=torch.zeros(1, 2, 48),
+        pooled_embed=torch.zeros(1, 16),
+        attention_mask=torch.ones(1, 2, dtype=torch.bool),
+        image_latent=image,
         audio_loss_weights=torch.ones(1),
     )
-    assert seen['visual_rope'][:, 0, 0, 0].tolist() == ([0, 1, 2, 0] if with_reference else [0, 1, 2])
+    assert seen["visual_rope"][:, 0, 0, 0].tolist() == ([0, 1, 2, 0] if with_reference else [0, 1, 2])
     assert output.pred.shape == video.shape
     if with_reference:
-        assert seen['visual_token_type_ids'].tolist() == [[0, 0, 0, 1]]
-        assert torch.equal(seen['x_video'][:, -1, ..., :16], image[:, 0])
+        assert seen["visual_token_type_ids"].tolist() == [[0, 0, 0, 1]]
+        assert torch.equal(seen["x_video"][:, -1, ..., :16], image[:, 0])

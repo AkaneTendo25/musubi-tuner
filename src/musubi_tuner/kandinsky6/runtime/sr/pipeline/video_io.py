@@ -117,8 +117,7 @@ def resample_to_target_fps(
         )
         return video[indices], target_fps
     logger.warning(
-        "Source fps {:.2f} < target {}fps: keeping native frames (no minterpolate upsample); "
-        "output is mildly out of distribution.",
+        "Source fps {:.2f} < target {}fps: keeping native frames (no minterpolate upsample); output is mildly out of distribution.",
         src_fps,
         target_fps,
     )
@@ -173,9 +172,7 @@ def read_video_tchw_uint8(path: Path) -> tuple[torch.Tensor, float]:
     with _require_av().open(str(path), mode="r") as container:
         stream = container.streams.video[0]
         src_fps = float(stream.average_rate or stream.base_rate or 0.0)
-        frames = [
-            torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1) for frame in container.decode(stream)
-        ]
+        frames = [torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1) for frame in container.decode(stream)]
 
     if not frames:
         msg = f"Video {path.name} has no readable frames."
