@@ -1474,6 +1474,58 @@ Observed-modality, masking, extension, caption-dropout, and CREPA objectives rem
 normal H3 LoRA targeting, quantization, checkpointing, block-swap, optimizer, validation-sampling, and save options. Sampling during
 training evaluates every value in `sample_slider_range`.
 
+### VA-Judger LoRA post-training
+
+Use [VA-Judger](https://huggingface.co/ShareLab-SII/VA-Judger) rewards to post-train an H3 LoRA for prompt adherence,
+audio/video alignment, and perceptual quality. Each round generates candidates, scores them, then trains from saved
+latents and rewards. The next round uses the updated LoRA to generate fresh candidates.
+
+Generate and score a round:
+
+```bash
+common=(
+  --model /models/minimax_h3_fl2va_bf16.safetensors
+  --text_encoder /models/qwen3vl_32b_minimax_h3_bf16.safetensors
+  --vae /models/minimax_h3_video_vae_fp16.safetensors
+  --audio_vae /models/minimax_h3_audio_vae_fp32.safetensors
+  --prompts examples/minimax_h3/va_judger_prompts.jsonl
+  --output_dir output/h3_va_judger
+  --round_dir output/h3_va_judger/rounds/round_000000
+  --group_size 4 --max_steps 100
+  --blocks_to_swap 48 --block_swap_h2d_only
+)
+python minimax_h3_generate_va_judger.py "${common[@]}" \
+  --reward_model /models/VA-Judger --round_groups 4
+```
+
+Review the saved clips, then train from the completed round:
+
+```bash
+python minimax_h3_train_va_judger.py "${common[@]}"
+```
+
+Prompts are text lines or JSONL objects with a `prompt` field. `--round_groups` sets groups per round;
+`--group_size` sets candidates per prompt. Every pair is judged in both presentation orders, then averaged per candidate;
+a group of K candidates requires K*(K-1) judge comparisons. Keep shared settings identical in both commands. Use `--duration`,
+`--height`, `--width`, and `--inference_steps` for rollout size; `--network_dim`, `--network_alpha`, and
+`--learning_rate` for LoRA training.
+
+For the next round, choose a new `--round_dir` and generate with `--resume /path/to/final.resume.pt`.
+Use `--initial_lora` to start from an existing LoRA. Training verifies artifact hashes and rejects completed rounds.
+Exports are ordinary H3 LoRAs; inference needs no judge. Judge scores can depend on
+clip presentation order and do not establish a quality gain. Compare exports against the base model on held-out prompts.
+Cached rewards must match the scorer version and sampling settings. To rescore an existing round, archive its
+`rewards.json` and rerun the generation command with the same round directory.
+
+H3 rollout generation and training require CUDA, use BF16 computation, and support prompt-only FL2VA rollouts. `--fp8_base`
+quantizes a BF16 transformer while loading; `--int8_convrot_base` instead requires the released pre-quantized FL2VA
+checkpoint. These two transformer modes cannot be combined. Block swap accepts 0-48 blocks;
+`--block_swap_h2d_only` and `--use_pinned_memory_for_block_swap` require a nonzero `--blocks_to_swap`.
+BF16 transformer training with an INT8 text encoder and unpinned H2D block swap is GPU-verified;
+transformer quantization and pinned-memory swapping remain experimental.
+Native scoring loads the full BF16 VA-Judger checkpoint onto one device. H3 block swapping does not offload the judge.
+
+
 ### Full-parameter BF16 training
 
 `minimax_h3_train.py` updates the entire transformer and writes a native MiniMax H3 BF16 checkpoint. It is separate from the
