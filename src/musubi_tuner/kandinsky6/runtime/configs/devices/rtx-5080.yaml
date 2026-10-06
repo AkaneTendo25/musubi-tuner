@@ -1,0 +1,26 @@
+# RTX 5080, 16 GB, Blackwell sm_120.
+
+checkpoint: pro-distill
+
+cache:
+  # none | magcache | navicache
+  mode: none
+
+offload:
+  # none | module | block
+  strategy: block
+
+compile:
+  # none | torch
+  strategy: none
+
+attention:
+  # flash_attention_3 | flash_attention_2 | sage | sdpa | auto
+  engine: sage
+
+text_embedder:
+  quantized_qwen: true
+
+beautifier:
+  # none | qwen25
+  name: qwen25

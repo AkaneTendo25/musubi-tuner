@@ -17,6 +17,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_KANDINSKY5_FULL,
     ARCHITECTURE_KREA2_FULL,
     ARCHITECTURE_MINIMAX_H3_FULL,
+    ARCHITECTURE_KANDINSKY6_FULL,
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_WAN_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
@@ -613,6 +614,58 @@ def save_latent_cache_minimax_h3(
     if one_frame_control_indices is not None:
         append_one_frame_control_indices_entry(sd, list(one_frame_control_indices))
     save_latent_cache_common(item_info, sd, ARCHITECTURE_MINIMAX_H3_FULL, metadata)
+
+
+def save_latent_cache_kandinsky6(
+    item_info: ItemInfo,
+    video_latent: torch.Tensor,
+    audio_latent: torch.Tensor,
+    audio_present: bool,
+    image_latent: Optional[torch.Tensor] = None,
+    metadata: Optional[dict[str, str]] = None,
+):
+    """Save a Kandinsky 6 joint AV target in channel-first cache layout."""
+    if video_latent.ndim != 4:
+        raise ValueError(f"Kandinsky 6 video latent must be [C,T,H,W], got {tuple(video_latent.shape)}")
+    if audio_latent.ndim != 2:
+        raise ValueError(f"Kandinsky 6 audio latent must be [C,A], got {tuple(audio_latent.shape)}")
+    c, frames, height, width = video_latent.shape
+    audio_channels, audio_frames = audio_latent.shape
+    sd = {
+        f"latents_{frames}x{height}x{width}_{dtype_to_str(video_latent.dtype)}": video_latent,
+        f"latents_audio_{audio_frames}_{dtype_to_str(audio_latent.dtype)}": audio_latent,
+    }
+    if image_latent is not None:
+        if image_latent.ndim != 4 or image_latent.shape[0] != c or image_latent.shape[1] != 1:
+            raise ValueError("Kandinsky 6 image latent must be [C,1,H,W] and match the video channels")
+        sd[f"latents_image_1x{height}x{width}_{dtype_to_str(image_latent.dtype)}"] = image_latent
+    sd = {key: value.detach().cpu().contiguous() for key, value in sd.items()}
+    append_audio_present_entry(sd, audio_present)
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_KANDINSKY6_FULL, metadata)
+
+
+def save_text_encoder_output_cache_kandinsky6(
+    item_info: ItemInfo,
+    text_embeds: torch.Tensor,
+    pooled_embed: torch.Tensor,
+    attention_mask: torch.Tensor,
+    metadata: Optional[dict[str, str]] = None,
+):
+    """Save unpadded Kandinsky 6 text rows; the bucket collator keeps them as lists."""
+    if text_embeds.ndim != 2 or text_embeds.shape[1] != 3584:
+        raise ValueError(f"Kandinsky 6 text embeds must be [L,3584], got {tuple(text_embeds.shape)}")
+    if pooled_embed.shape != (768,):
+        raise ValueError(f"Kandinsky 6 pooled embed must be [768], got {tuple(pooled_embed.shape)}")
+    if attention_mask.dtype != torch.bool or attention_mask.shape != (text_embeds.shape[0],):
+        raise ValueError("Kandinsky 6 attention mask must be bool [L]")
+    sd = {
+        f"varlen_text_embeds_{dtype_to_str(text_embeds.dtype)}": text_embeds.detach().cpu().contiguous(),
+        "pooled_embed_" + dtype_to_str(pooled_embed.dtype): pooled_embed.detach().cpu().contiguous(),
+        "varlen_attention_mask_bool": attention_mask.detach().cpu().contiguous(),
+    }
+    save_text_encoder_output_cache_common(
+        item_info, sd, ARCHITECTURE_KANDINSKY6_FULL, merge_existing=False, additional_metadata=metadata
+    )
 
 
 # key stem of the teacher text rows a MiniMax-H3 text cache may carry next to the student rows,

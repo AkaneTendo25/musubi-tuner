@@ -35,6 +35,7 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
     ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_KANDINSKY6,
     ARCHITECTURE_MINIMAX_H3,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_WAN,
@@ -747,6 +748,9 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_FLUX_KONTEXT
         elif self.architecture == ARCHITECTURE_KANDINSKY5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
+        elif self.architecture == ARCHITECTURE_KANDINSKY6:
+            self.target_fps = 24.0
+            self.strict_target_fps = True
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
         elif self.architecture == ARCHITECTURE_MINIMAX_H3:

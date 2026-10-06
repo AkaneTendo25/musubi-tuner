@@ -1,0 +1,15 @@
+# Standalone SR inference config for `kandy-sr` — pass via --config or set
+# KANDY_SR_CONFIG to this file's path. Same schema as the `sr:` section of the
+# k6 pipeline YAMLs; explicit CLI options override these values, and all
+# tunables not listed here keep the SRConfig defaults
+# (src/kandinsky_sr/pipeline/config.py).
+# checkpoint_path names the released Diffusers bundle (a Hugging Face repo id
+# or a local copy): the SR DiT, the KVAE and the x2 / x4 latent upscalers all
+# load from it. The flow-matching teacher is kandinskylab/Kandinsky-6.0-VSR-5s-Diffusers.
+# Set vae_path / latent_upscaler_config only to take those models from
+# somewhere else (another bundle, "<repo>/vae", or native checkpoints).
+sr:
+  checkpoint_path: kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers
+  resolution_scale: 2
+  # CUDA device to run on ("cuda:0", "cuda:1", ...); --device overrides.
+  device: cuda:0

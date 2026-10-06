@@ -9,7 +9,7 @@ dependencies = [
     "av==17.1.0",
     "bitsandbytes",
     "diffusers==0.40.0",
-    "einops==0.7.0",
+    "einops>=0.7.0",
     "huggingface-hub==1.32.0",
     # opencv-python has no wheel for Windows on ARM64 (e.g. NVIDIA RTX Spark PCs); a Pillow/NumPy
     # fallback (musubi_tuner.utils.cv2_compat) is used automatically when it is missing.
@@ -29,6 +29,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+kandinsky6 = [
+    "cyclopts>=4.22.0",
+    "einops>=0.8.2",
+    "librosa>=0.11.0",
+    "pydantic>=2.11.0",
+    "pyyaml>=6.0.2",
+    "loguru>=0.7.3",
+    "omegaconf>=2.3.0",
+]
 cu124 = [
     "torch>=2.6.0",
     "torchvision>=0.21.0",

@@ -1,0 +1,26 @@
+# RTX PRO 6000, 96 GB, Blackwell sm_120.
+
+checkpoint: pro-distill
+
+cache:
+  # none | magcache | navicache
+  mode: none
+
+offload:
+  # none | module | block
+  strategy: module
+
+compile:
+  # none | torch
+  strategy: none
+
+attention:
+  # flash_attention_3 | flash_attention_2 | sage | sdpa | auto
+  engine: sage
+
+text_embedder:
+  quantized_qwen: false
+
+beautifier:
+  # none | qwen25
+  name: qwen25

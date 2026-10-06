@@ -164,6 +164,7 @@ For detailed information on specific architectures, configurations, and advanced
 - [HiDream-O1-Image](./docs/hidream_o1.md)
 - [HunyuanVideo 1.5](./docs/hunyuan_video_1_5.md)
 - [Kandinsky 5](./docs/kandinsky5.md)
+- [Kandinsky 6](./docs/kandinsky6.md)
 - [FLUX.2](./docs/flux_2.md)
 - [MiniMax-H3](./docs/minimax_h3.md)
 - [MiniMax-H3 (Single Frame)](./docs/minimax_h3_1f.md)
