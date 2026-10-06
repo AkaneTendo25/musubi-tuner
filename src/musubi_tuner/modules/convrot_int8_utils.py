@@ -95,23 +95,27 @@ def quantize_weight_convrot(key: str, tensor: torch.Tensor, allowed_groupsizes: 
     return quantized_weight, scale_tensor, groupsize
 
 
-def parse_comfy_quant_spec(key: str, tensor: torch.Tensor) -> dict:
+def parse_comfy_quant_spec(key: str, tensor: torch.Tensor, *, allow_unrotated: bool = False) -> dict:
     """Decode and validate a ``.comfy_quant`` JSON spec tensor (uint8 bytes).
 
-    Only ConvRot INT8 (``int8_tensorwise`` + ``convrot``) is supported; other formats
-    (e.g. nvfp4) raise with a clear message.
+    Plain tensorwise INT8 is accepted only when ``allow_unrotated`` is true, keeping
+    the existing ConvRot-only contract for other model loaders.
     """
     spec = decode_comfy_quant_spec(key, tensor)
     quant_format = spec.get("format")
-    if quant_format != COMFY_QUANT_FORMAT_INT8 or not spec.get("convrot"):
+    convrot = spec.get("convrot", False)
+    if not isinstance(convrot, bool):
+        raise ValueError(f"Invalid convrot value for {key}: {convrot!r} (must be true or false)")
+    is_convrot = convrot
+    if quant_format != COMFY_QUANT_FORMAT_INT8 or (not is_convrot and not allow_unrotated):
+        supported = "ConvRot or plain INT8" if allow_unrotated else "ConvRot INT8"
         raise ValueError(
-            f"Unsupported comfy_quant format for {key}: {spec}. Only ConvRot INT8"
-            f' ("{COMFY_QUANT_FORMAT_INT8}" with "convrot": true) is supported.'
-            f" / {key} の comfy_quant 形式はサポートされていません。ConvRot INT8 のみ対応しています。"
+            f'Unsupported comfy_quant format for {key}: {spec}. Only {supported} (format "{COMFY_QUANT_FORMAT_INT8}") is supported.'
         )
-    groupsize = spec.get("convrot_groupsize")
-    if not isinstance(groupsize, int) or not _is_power_of_4(groupsize):
-        raise ValueError(f"Invalid convrot_groupsize for {key}: {groupsize!r} (must be a power of 4, e.g. 64 or 256)")
+    if is_convrot:
+        groupsize = spec.get("convrot_groupsize")
+        if not isinstance(groupsize, int) or not _is_power_of_4(groupsize):
+            raise ValueError(f"Invalid convrot_groupsize for {key}: {groupsize!r} (must be a power of 4, e.g. 64 or 256)")
     return spec
 
 
@@ -159,6 +163,7 @@ class ConvRotInt8Quantizer:
         target_layer_keys: Optional[List[str]] = None,
         exclude_layer_keys: Optional[List[str]] = None,
         allowed_groupsizes: Sequence[int] = (CONVROT_GROUPSIZE,),
+        allow_unrotated: bool = False,
     ):
         for groupsize in allowed_groupsizes:
             if not _is_power_of_4(groupsize):
@@ -166,6 +171,7 @@ class ConvRotInt8Quantizer:
         self.target_layer_keys = target_layer_keys
         self.exclude_layer_keys = exclude_layer_keys
         self.allowed_groupsizes = tuple(allowed_groupsizes)
+        self.allow_unrotated = allow_unrotated
         self.module_groupsizes: Dict[str, int] = {}
 
     def is_target_key(self, key: str) -> bool:
@@ -206,8 +212,8 @@ class ConvRotInt8Quantizer:
                 for key in keys:
                     if key.endswith(COMFY_QUANT_SUFFIX):
                         module_path = key[: -len(COMFY_QUANT_SUFFIX)]
-                        spec = parse_comfy_quant_spec(key, f.get_tensor(key))
-                        prequantized_groupsizes[module_path] = spec["convrot_groupsize"]
+                        spec = parse_comfy_quant_spec(key, f.get_tensor(key), allow_unrotated=self.allow_unrotated)
+                        prequantized_groupsizes[module_path] = spec["convrot_groupsize"] if spec.get("convrot") is True else 0
                 if prequantized_groupsizes and weight_hook is not None:
                     raise ValueError(
                         f"Cannot merge LoRA weights into pre-quantized ConvRot INT8 checkpoint {model_file}."
@@ -239,7 +245,7 @@ class ConvRotInt8Quantizer:
                         if value.dtype != torch.int8:
                             raise ValueError(f"Pre-quantized ConvRot layer {key} must be int8, got {value.dtype}")
                         groupsize = prequantized_groupsizes[module_path]
-                        if value.shape[1] % groupsize != 0:
+                        if groupsize and value.shape[1] % groupsize != 0:
                             raise ValueError(
                                 f"Pre-quantized ConvRot layer {key}: in_features {value.shape[1]} not divisible by"
                                 f" group size {groupsize}"
@@ -328,14 +334,16 @@ class ConvRotInt8LinearFn(torch.autograd.Function):
             x = x.to(cast_dtype)
             if bias is not None:
                 bias = bias.to(cast_dtype)
+        is_convrot = groupsize > 0
         if HAS_TRITON and x.is_cuda:
-            out = int8_linear(x, wq, w_scale.reshape(-1), bias, x.dtype, True, groupsize)
+            out = int8_linear(x, wq, w_scale.reshape(-1), bias, x.dtype, is_convrot, groupsize)
         else:
-            # eager fallback: rotation + transient dequantized matmul, no activation quantization
-            h = _build_hadamard(groupsize, device=x.device, dtype=x.dtype)
-            x_rot = _rotate_activation(x, h, groupsize)
+            # eager fallback: transient dequantized matmul, no activation quantization
+            if is_convrot:
+                h = _build_hadamard(groupsize, device=x.device, dtype=x.dtype)
+                x = _rotate_activation(x, h, groupsize)
             w_rot = wq.to(x.dtype) * w_scale.reshape(-1, 1).to(x.dtype)
-            out = F.linear(x_rot, w_rot, bias)
+            out = F.linear(x, w_rot, bias)
         # wq/w_scale are live buffers, so saving them adds no activation memory; x is not
         # saved (base is frozen, no grad_weight needed)
         ctx.save_for_backward(wq, w_scale)
@@ -367,8 +375,10 @@ class ConvRotInt8LinearFn(torch.autograd.Function):
                 # transient bf16 dequant of the rotated weight (stays in rotated basis)
                 w_rot = wq.to(grad_out.dtype) * w_scale.reshape(-1, 1).to(grad_out.dtype)
                 gx_rot = g2d @ w_rot  # [M, K]
-            h = _build_hadamard(gs, device=gx_rot.device, dtype=gx_rot.dtype)
-            grad_x = _rotate_activation(gx_rot, h, gs).reshape(*grad_out.shape[:-1], wq.shape[1])
+            if gs > 0:
+                h = _build_hadamard(gs, device=gx_rot.device, dtype=gx_rot.dtype)
+                gx_rot = _rotate_activation(gx_rot, h, gs)
+            grad_x = gx_rot.reshape(*grad_out.shape[:-1], wq.shape[1])
 
         grad_bias = g2d.sum(dim=0) if ctx.bias_needs_grad else None
         return grad_x, None, None, grad_bias, None, None

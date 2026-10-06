@@ -201,7 +201,7 @@ python kandinsky6_prequantize.py \
   --quant-device cuda
 ```
 
-Reuse it for training with both options:
+Use the exported file as `--dit`. The trainer automatically detects ComfyUI INT8 metadata; `--convrot_int8` may also be supplied explicitly:
 
 ```bash
 --dit /models/k6-lite/transformer/k6-lite-convrot-int8.safetensors --convrot_int8
@@ -209,9 +209,23 @@ Reuse it for training with both options:
 
 Only regular Lite/Pro weights are accepted. Existing output is protected unless `--overwrite` is passed.
 
+Prequantized Lite or Pro DiTs in the ComfyUI `int8_tensorwise` format are supported. Each quantized Linear layer must provide an INT8 `.weight`, an FP32 `.weight_scale`, and a `.comfy_quant` metadata tensor. Checkpoints can contain both rotated ConvRot and plain per-channel INT8 layers. Their supplied weights and scales are preserved; plain layers do not apply Hadamard rotation. LoRA weights remain floating point.
+
+Pass the checkpoint file to `--dit` in the training command:
+
+```bash
+--dit /models/k6/transformer-convrot-int8.safetensors
+```
+
+Use the matching original Lite or Pro snapshot for VAEs, text encoders, and vocoder if these components are not included with the quantized DiT. `--fp8_base` and `--base_weights` cannot be combined with a prequantized INT8 base.
+
 <details><summary>日本語</summary>
 
-`--convrot_int8` は読み込み時に対応Linear weightを量子化します。backward精度は `--convrot_int8_bwd bf16` または `int8` で選択します。上のexportを一度実行し、学習では出力ファイルを `--dit` に指定して `--convrot_int8` も付けます。通常版Lite／Pro専用で、既存出力の置換には `--overwrite` が必要です。
+`--convrot_int8` は読み込み時に対応Linear weightを量子化します。backward精度は `--convrot_int8_bwd bf16` または `int8` で選択します。上のexportを一度実行し、学習では出力ファイルを `--dit` に指定します。ComfyUIのINT8メタデータは自動検出され、`--convrot_int8` を明示することもできます。通常版Lite／Pro専用で、既存出力の置換には `--overwrite` が必要です。
+
+ComfyUIの `int8_tensorwise` 形式で事前量子化されたLite／ProのDiTに対応します。各量子化Linear層にはINT8の `.weight`、FP32の `.weight_scale`、および `.comfy_quant` メタデータが必要です。ConvRot回転済み層と通常のチャネル単位INT8層を混在させることができます。元の重みとスケールは保持され、通常のINT8層にはHadamard回転を適用しません。LoRAは浮動小数点のまま学習します。
+
+上の例のようにチェックポイントファイルを学習時の `--dit` に指定してください。VAE、テキストエンコーダー、vocoderが同梱されていない場合は、対応する通常版Lite／Proから取得します。事前量子化INT8モデルに `--fp8_base` や `--base_weights` は併用できません。
 </details>
 
 ## Standalone generation / 単体生成

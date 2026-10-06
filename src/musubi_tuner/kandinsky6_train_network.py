@@ -22,6 +22,8 @@ from musubi_tuner.hv_train_network import (
     should_sample_images,
 )
 from musubi_tuner.kandinsky6 import PiFlowDiffusionTransformer3D, load_dit, load_dit_convrot_int8, load_dit_fp8
+from musubi_tuner.kandinsky6.model import _resolve_weight_file
+from musubi_tuner.modules.convrot_int8_utils import has_comfy_quant_tensors
 from musubi_tuner.training.audio_loss import add_audio_train_args, effective_audio_loss_weights
 from musubi_tuner.utils import model_utils
 
@@ -163,6 +165,11 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         return ARCHITECTURE_KANDINSKY6_FULL
 
     def handle_model_specific_args(self, args: argparse.Namespace):
+        if not args.convrot_int8 and getattr(args, "dit", None):
+            checkpoint = _resolve_weight_file(args.dit)
+            if has_comfy_quant_tensors([checkpoint], disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False)):
+                logger.info("Detected a pre-quantized INT8 Kandinsky 6 checkpoint; enabling ConvRot INT8 loader")
+                args.convrot_int8 = True
         self._task = args.task
         self._scheduler_scale = float(args.scheduler_scale)
         self._visual_rope_scale = tuple(float(value) for value in args.visual_rope_scale)

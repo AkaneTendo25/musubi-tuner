@@ -158,6 +158,7 @@ def load_dit_convrot_int8(
         ],
         exclude_layer_keys=["modulation", "norm"],
         allowed_groupsizes=(256, 64),
+        allow_unrotated=True,
     )
     state = load_safetensors_with_lora_and_fp8(
         model_files=[str(path)],

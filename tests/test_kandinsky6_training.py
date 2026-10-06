@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import importlib
 from contextlib import nullcontext
+from pathlib import Path
 
 import pytest
 import torch
@@ -130,6 +131,20 @@ def test_quantized_training_rejects_base_weight_merge(quant_flag):
     setattr(args, quant_flag, True)
     with pytest.raises(ValueError, match="cannot be merged"):
         Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_prequantized_checkpoint_is_auto_detected_before_merge_validation(monkeypatch):
+    args = kandinsky6_setup_parser(setup_parser_common()).parse_args([])
+    args.dit_dtype = "bfloat16"
+    args.dit = "prequantized.safetensors"
+    args.base_weights = ["adapter.safetensors"]
+    monkeypatch.setattr("musubi_tuner.kandinsky6_train_network._resolve_weight_file", lambda path: Path(path))
+    monkeypatch.setattr("musubi_tuner.kandinsky6_train_network.has_comfy_quant_tensors", lambda *args, **kwargs: True)
+
+    with pytest.raises(ValueError, match="cannot be merged"):
+        Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.convrot_int8 is True
 
 
 def test_kandinsky6_rejects_irrelevant_input_offload_flag():

@@ -12,6 +12,7 @@ from musubi_tuner.modules.convrot_int8_utils import (
     canonicalize_convrot_int8_key,
     convrot_int8_linear_forward_patch,
     has_comfy_quant_tensors,
+    parse_comfy_quant_spec,
 )
 
 
@@ -21,6 +22,10 @@ def _payload(groupsize: int, *, whitespace: bool = False, **overrides) -> torch.
     separators = None if whitespace else (",", ":")
     raw = json.dumps(values, separators=separators).encode("utf-8")
     return torch.tensor(list(raw), dtype=torch.uint8)
+
+
+def _plain_payload() -> torch.Tensor:
+    return torch.tensor(list(b'{"format":"int8_tensorwise"}'), dtype=torch.uint8)
 
 
 def _triple(module: str = "linear", *, groupsize: int = 4, in_features: int = 16, out_features: int = 8):
@@ -79,6 +84,58 @@ def test_conversion_accepts_json_whitespace(tmp_path):
     state_dict, _quantizer = _load_prequantized(path)
 
     assert state_dict["linear.weight"].dtype is torch.int8
+
+
+def test_opt_in_conversion_preserves_mixed_rotated_and_plain_int8(tmp_path):
+    rotated = _triple("rotated", groupsize=4, in_features=16, out_features=8)
+    plain_weight = torch.arange(128, dtype=torch.int16).reshape(8, 16).to(torch.int8)
+    plain_scale = torch.linspace(0.001, 0.008, 8, dtype=torch.float32).reshape(8, 1)
+    path = _save(
+        tmp_path / "mixed.safetensors",
+        {
+            **rotated,
+            "plain.weight": plain_weight,
+            "plain.weight_scale": plain_scale,
+            "plain.comfy_quant": _plain_payload(),
+        },
+    )
+    quantizer = ConvRotInt8Quantizer(target_layer_keys=[], allow_unrotated=True)
+
+    state_dict = quantizer.load_and_quantize([str(path)], None)
+
+    assert quantizer.module_groupsizes == {"plain": 0, "rotated": 4}
+    assert torch.equal(state_dict["plain.weight"], plain_weight)
+    assert torch.equal(state_dict["plain.scale_weight"], plain_scale)
+
+
+@pytest.mark.parametrize("invalid", ["true", 1, None])
+def test_opt_in_plain_int8_rejects_non_boolean_convrot(invalid):
+    raw = json.dumps({"format": "int8_tensorwise", "convrot": invalid}).encode()
+    payload = torch.tensor(list(raw), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="convrot value"):
+        parse_comfy_quant_spec("linear.comfy_quant", payload, allow_unrotated=True)
+
+
+def test_plain_int8_forward_and_activation_gradient_match_dequantized_reference():
+    torch.manual_seed(7)
+    model = nn.Module()
+    model.linear = nn.Linear(16, 8, bias=False)
+    weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+    scale = torch.rand(8, 1, dtype=torch.float32) / 100
+    state_dict = {"linear.weight": weight, "linear.scale_weight": scale}
+    _patch_and_load(model, state_dict, {"linear": 0})
+    actual_input = torch.randn(3, 16, requires_grad=True)
+    reference_input = actual_input.detach().clone().requires_grad_(True)
+    grad = torch.randn(3, 8)
+
+    actual = model.linear(actual_input)
+    reference = torch.nn.functional.linear(reference_input, weight.float() * scale)
+    actual.backward(grad)
+    reference.backward(grad)
+
+    torch.testing.assert_close(actual, reference)
+    torch.testing.assert_close(actual_input.grad, reference_input.grad)
 
 
 @pytest.mark.parametrize(
