@@ -10,11 +10,11 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
+from musubi_tuner.hv_train_network import setup_parser_common
 from musubi_tuner.minimax_h3.adaln_lowrank import ADALN_INFIX, TABLE_KEY
 from musubi_tuner.minimax_h3.model_loader import infer_transformer_config, resolve_transformer_checkpoint
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError
-from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer
+from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, read_config_from_file
 from musubi_tuner.minimax_h3_train_network import setup_parser as setup_h3_parser
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 
@@ -508,7 +508,7 @@ def create_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = create_parser()
     args = parser.parse_args(argv)
-    args = read_config_from_file(args, parser)
+    args = read_config_from_file(args, parser, argv)
     args.dit_dtype = None
     MiniMaxH3Trainer().train(args)
 

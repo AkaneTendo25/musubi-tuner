@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
@@ -19,6 +20,7 @@ from multiprocessing import Value
 from pathlib import Path
 from types import SimpleNamespace
 
+import toml
 import torch
 from accelerate import Accelerator
 from PIL import Image
@@ -28,7 +30,7 @@ from musubi_tuner import convert_lora
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train import get_sigmas
-from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
+from musubi_tuner.hv_train_network import NetworkTrainer, setup_parser_common
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
     AUDIO_LATENT_FPS,
@@ -398,6 +400,81 @@ _DIRECT_SIGMA_SAMPLING = {
 }
 
 _H3_BASE_TIMESTEP_SAMPLING = {"sigma", "uniform", "sigmoid", "shift", "logsnr"}
+_H3_IMAGE_TIMESTEP_SAMPLING = (
+    "auto",
+    "inherit",
+    "sigma",
+    "uniform",
+    "sigmoid",
+    "shift",
+    "logsnr",
+    "krea2_shift",
+)
+
+
+def _effective_image_timestep_sampling(args: argparse.Namespace) -> str:
+    mode = getattr(args, "h3_image_timestep_sampling", "auto")
+    if mode == "auto":
+        explicit = getattr(args, "_h3_timestep_sampling_explicit", None)
+        if explicit is None:
+            explicit = args.timestep_sampling != "uniform"
+        return args.timestep_sampling if explicit else "krea2_shift"
+    return args.timestep_sampling if mode == "inherit" else mode
+
+
+def _image_scheduler_args(args: argparse.Namespace) -> argparse.Namespace:
+    scheduler_args = copy.copy(args)
+    mode = _effective_image_timestep_sampling(args)
+    # Preserve the historical fixed-shift route, including its ordering relative
+    # to common timestep bounds and distribution-shape validation.
+    if args.h3_image_flow_shift is not None and mode == "krea2_shift":
+        mode = "shift"
+        scheduler_args.discrete_flow_shift = args.h3_image_flow_shift
+    else:
+        scheduler_args.discrete_flow_shift = 1.0
+    scheduler_args.timestep_sampling = mode
+    return scheduler_args
+
+
+def _image_needs_post_sampling_shift(args: argparse.Namespace) -> bool:
+    return args.h3_image_flow_shift is not None and _effective_image_timestep_sampling(args) != "krea2_shift"
+
+
+def read_config_from_file(
+    args: argparse.Namespace, parser: argparse.ArgumentParser, argv: Sequence[str] | None = None
+) -> argparse.Namespace:
+    """Load common config while retaining whether H3's global sampler was explicitly selected."""
+    command_line = tuple(sys.argv[1:] if argv is None else argv)
+    explicit = any(
+        parsed is not None and parsed[0] is not None and parsed[0].dest == "timestep_sampling"
+        for value in command_line
+        if value.startswith("-")
+        for parsed in (parser._parse_optional(value),)
+    )
+    if not args.config_file:
+        args._h3_timestep_sampling_explicit = explicit
+        return args
+
+    config_path = args.config_file if args.config_file.endswith(".toml") else args.config_file + ".toml"
+    if not os.path.exists(config_path):
+        logger.info("%s not found.", config_path)
+        raise SystemExit(1)
+    logger.info("Loading settings from %s...", config_path)
+    with open(config_path, "r", encoding="utf-8") as file:
+        config = toml.load(file)
+    flattened = {}
+    for key, value in config.items():
+        if isinstance(value, dict):
+            flattened.update(value)
+        else:
+            flattened[key] = value
+    explicit = explicit or "timestep_sampling" in flattened
+    args = parser.parse_args(command_line, namespace=argparse.Namespace(**flattened))
+    args.config_file = os.path.splitext(args.config_file)[0]
+    logger.info(args.config_file)
+    args._h3_timestep_sampling_explicit = explicit
+    return args
+
 
 _H3_LORA_TARGETS = ("attention", "mlp", "audio", "video", "token_refiner")
 _H3_TRANSFORMER_BLOCKS = 50
@@ -2571,12 +2648,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
             base_sigma = torch.tensor([sigma_bin.base_sigma], device=accelerator.device, dtype=torch.float32)
             if is_image:
-                base_sigma = image_validation_sigma(
-                    base_sigma,
-                    latent_height=video_latents.shape[-2],
-                    latent_width=video_latents.shape[-1],
-                    flow_shift=args.h3_image_flow_shift,
-                )
+                image_sampling = _effective_image_timestep_sampling(args)
+                if image_sampling == "krea2_shift" or args.h3_image_flow_shift is not None:
+                    base_sigma = image_validation_sigma(
+                        base_sigma,
+                        latent_height=video_latents.shape[-2],
+                        latent_width=video_latents.shape[-1],
+                        flow_shift=args.h3_image_flow_shift,
+                    )
             for observed in batch_observed_modes:
                 for reference in batch_reference_modes:
                     task = (observed, reference)
@@ -3323,10 +3402,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "resolution-dependent shift before H3's own video/audio shifts. Use uniform (recommended), "
                 "sigmoid, shift, logsnr, or sigma."
             )
+        image_timestep_sampling = getattr(args, "h3_image_timestep_sampling", "auto")
+        if image_timestep_sampling not in _H3_IMAGE_TIMESTEP_SAMPLING:
+            raise ValueError(f"MiniMax H3 --h3_image_timestep_sampling {image_timestep_sampling!r} is unsupported")
         if args.num_timestep_buckets is not None and args.timestep_sampling == "sigma":
             raise ValueError(
                 "MiniMax H3 --num_timestep_buckets is not consumed by --timestep_sampling sigma; "
                 "use the recommended --timestep_sampling uniform or disable bucketing"
+            )
+        if args.num_timestep_buckets is not None and _effective_image_timestep_sampling(args) == "sigma":
+            raise ValueError(
+                "MiniMax H3 --num_timestep_buckets is not consumed by the image sigma sampler; "
+                "select another --h3_image_timestep_sampling mode or disable bucketing"
             )
         focus_probability = float(args.h3_timestep_focus_probability)
         if not 0.0 <= focus_probability <= 1.0:
@@ -3342,8 +3429,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             value = float(getattr(args, name))
             if not 0.01 <= value <= 100.0:
                 raise ValueError(f"--{name} must be in [0.01, 100.0], got {value}")
-        if args.h3_image_flow_shift is not None and args.h3_image_flow_shift <= 0:
-            raise ValueError("MiniMax H3 --h3_image_flow_shift must be positive when specified")
+        if args.h3_image_flow_shift is not None and (not math.isfinite(args.h3_image_flow_shift) or args.h3_image_flow_shift <= 0):
+            raise ValueError("MiniMax H3 --h3_image_flow_shift must be finite and positive when specified")
         self._validate_soar_args(args)
         modality_loss_weights = {
             "h3_video_loss_weight": float(args.h3_video_loss_weight),
@@ -6397,14 +6484,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         first_batch, first_video, first_audio, first_video_noise, first_audio_noise = items[0]
         _require_one_frame_opt_in(args, first_batch, first_video)
         is_image = first_video.shape[2] == 1 or _one_frame_target_slot_count(first_batch) > 0
-        scheduler_args = args
-        if is_image:
-            scheduler_args = copy.copy(args)
-            if args.h3_image_flow_shift is None:
-                scheduler_args.timestep_sampling = "krea2_shift"
-            else:
-                scheduler_args.timestep_sampling = "shift"
-                scheduler_args.discrete_flow_shift = args.h3_image_flow_shift
+        scheduler_args = _image_scheduler_args(args) if is_image else args
         _, scheduler_timesteps = super().get_noisy_model_input_and_timesteps(
             scheduler_args,
             first_video_noise,
@@ -6419,6 +6499,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # practice: the marginal distribution is unchanged, only correlated
         # within the batch -- which a shared modulation table requires anyway.
         base_sigma = self._base_sigma(scheduler_args, noise_scheduler, scheduler_timesteps, accelerator.device)
+        if is_image and _image_needs_post_sampling_shift(args):
+            base_sigma = shift_sigma(base_sigma, args.h3_image_flow_shift)
 
         inputs_items = []
         for item_batch, video_latents, audio_latents, video_noise, audio_noise in items:
@@ -6913,14 +6995,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             latent_height, latent_width = video_latents.shape[-2:]
             if latent_height % patch_h or latent_width % patch_w:
                 raise ValueError("MiniMax H3 image latent dimensions must be divisible by the spatial patch size")
-            scheduler_args = copy.copy(args)
-            if args.h3_image_flow_shift is None:
-                # Use the common logit-normal density with a
-                # resolution-aware shift for image batches.
-                scheduler_args.timestep_sampling = "krea2_shift"
-            else:
-                scheduler_args.timestep_sampling = "shift"
-                scheduler_args.discrete_flow_shift = args.h3_image_flow_shift
+            scheduler_args = _image_scheduler_args(args)
 
         _, scheduler_timesteps = super().get_noisy_model_input_and_timesteps(
             scheduler_args,
@@ -6933,6 +7008,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return_noisy=False,
         )
         base_sigma = self._base_sigma(scheduler_args, noise_scheduler, scheduler_timesteps, accelerator.device)
+        if is_image and _image_needs_post_sampling_shift(args):
+            base_sigma = shift_sigma(base_sigma, args.h3_image_flow_shift)
         if not is_image:
             base_sigma = _apply_timestep_focus(
                 base_sigma,
@@ -8213,7 +8290,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_swiglu_chunk_rows": str(args.h3_swiglu_chunk_rows),
             "ss_h3_int8_attention": args.h3_int8_attention,
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
-            "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
+            "ss_h3_image_flow_shift": str(
+                args.h3_image_flow_shift
+                if args.h3_image_flow_shift is not None
+                else ("resolution_aware" if _effective_image_timestep_sampling(args) == "krea2_shift" else "none")
+            ),
+            "ss_h3_image_timestep_sampling": _image_scheduler_args(args).timestep_sampling,
             **(
                 {
                     "ss_h3_teacher_matching": "True",
@@ -8509,12 +8591,23 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h3_image_timestep_sampling",
+        choices=_H3_IMAGE_TIMESTEP_SAMPLING,
+        default="auto",
+        help=(
+            "image-batch timestep distribution: auto preserves the resolution-aware historical default unless "
+            "--timestep_sampling was explicitly set, inherit always uses that global selection, or choose an "
+            "image-specific distribution"
+        ),
+    )
+    parser.add_argument(
         "--h3_image_flow_shift",
         type=float,
         default=None,
         help=(
-            "override the default logit-normal, resolution-aware flow shift for image batches; "
-            "video batches continue to use the released synchronized H3 schedule"
+            "apply one fixed exponential shift after the selected image timestep distribution; with the historical "
+            "auto image sampler this replaces its resolution-aware shift while preserving its sigmoid base. "
+            "Video batches continue to use the released synchronized H3 schedule"
         ),
     )
     parser.add_argument(
@@ -9778,7 +9871,7 @@ def create_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = create_parser()
     args = parser.parse_args(argv)
-    args = read_config_from_file(args, parser)
+    args = read_config_from_file(args, parser, argv)
     args.dit_dtype = None
     trainer = MiniMaxH3NetworkTrainer()
     trainer.train(args)
