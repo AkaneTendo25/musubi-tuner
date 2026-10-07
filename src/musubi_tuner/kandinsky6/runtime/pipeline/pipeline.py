@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 
+from musubi_tuner.kandinsky6.defaults import DEFAULT_NEGATIVE_PROMPT
+
 from ..core.algo.denoise_loop import denoise_loop
 from ..core.algo.mux import mux_video_audio
 from ..core.algo.piflow_sampler import piflow_denoise_loop
@@ -30,9 +32,7 @@ from .reconfigure import reconfigure as _reconfigure
 
 logger = logging.getLogger("kandinsky")
 
-_DEFAULT_NEG = (
-    "Static, 2D cartoon, cartoon, 2d animation, paintings, images, worst quality, low quality, ugly, deformed, walking backwards"
-)
+_DEFAULT_NEG = DEFAULT_NEGATIVE_PROMPT
 
 
 def write_expanded_prompt(video_path: str | Path, prompt: str) -> Path:

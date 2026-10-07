@@ -7,6 +7,8 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
+from musubi_tuner.kandinsky6.defaults import DEFAULT_NEGATIVE_PROMPT
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -112,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         help="bundled preset name (lite/pro and variants) or an explicit Kandinsky6 YAML path",
     )
     parser.add_argument("--prompt", required=True)
-    parser.add_argument("--negative_prompt", default="low quality, bad quality")
+    parser.add_argument("--negative_prompt", default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument("--output", required=True)
     parser.add_argument("--image", help="Optional TI2VA/I2VA first-frame image")
     parser.add_argument("--height", type=int)

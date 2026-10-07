@@ -22,6 +22,7 @@ from musubi_tuner.hv_train_network import (
     should_sample_images,
 )
 from musubi_tuner.kandinsky6 import PiFlowDiffusionTransformer3D, load_dit, load_dit_convrot_int8, load_dit_fp8
+from musubi_tuner.kandinsky6.defaults import DEFAULT_NEGATIVE_PROMPT
 from musubi_tuner.kandinsky6.model import _resolve_weight_file
 from musubi_tuner.modules.convrot_int8_utils import has_comfy_quant_tensors
 from musubi_tuner.training.audio_loss import add_audio_train_args, effective_audio_loss_weights
@@ -355,7 +356,7 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         try:
             for index, sample in enumerate(sample_parameters):
                 prompt = sample.get("prompt", "")
-                negative = sample.get("negative_prompt", "low quality, bad quality")
+                negative = sample.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
                 width, height = sample_canvas_size(sample.get("width", 512), sample.get("height", 512))
                 pixel_frames = int(sample.get("frame_count", 121))
                 pixel_frames, video_frames = sample_latent_frame_count(pixel_frames)

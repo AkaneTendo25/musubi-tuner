@@ -251,6 +251,8 @@ python kandinsky6_generate_video.py \
   --audio --seed 42 --output output/boat-lora.mp4
 ```
 
+Standalone generation and training previews share the official negative prompt by default. Override it with `--negative_prompt` for generation or the `negative_prompt` field in sample prompts; an explicit empty string disables the negative prompt.
+
 Use `--no-audio` for silence. For TI2AV add `--image starts/boat.png` and a compatible `--visual_cond_scheme`. Multiple LoRAs and matching multipliers may be listed.
 
 For fully local generation, copy the complete bundled `lite.yaml` or `pro.yaml` from `src/musubi_tuner/kandinsky6/runtime/configs/checkpoints/`. Keep every section and replace all six component locations with absolute paths:
@@ -281,6 +283,8 @@ python kandinsky6_generate_video.py \
 LoRAs remain floating adapters over INT8. ConvRot/LoRA generation rejects AOTI configs using `paths.dit_export`.
 
 <details><summary>日本語</summary>
+
+単体生成と学習中のプレビューは、デフォルトで同じ公式のネガティブプロンプトを使用します。生成時の `--negative_prompt`、またはサンプル設定の `negative_prompt` フィールドで上書きできます。空文字列を明示するとネガティブプロンプトを無効にします。
 
 generatorには `--dit` がありません。通常のbase／LoRA生成は上のコマンドを使います。無音は `--no-audio`、TI2AVは `--image` と対応する `--visual_cond_scheme` を追加します。
 
