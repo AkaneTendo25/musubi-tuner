@@ -149,7 +149,7 @@ accelerate launch --num_processes 1 --mixed_precision bf16 kandinsky6_train_netw
   --output_dir output --output_name k6-lora
 ```
 
-Use `--task ti2av` only with control-image caches. `--audio_loss_weight` scales audio loss; `--video_only` disables it. To save and resume complete state:
+Use `--task ti2av` only with control-image caches. Video and audio diffusion times are sampled independently by default, with the same `--scheduler_scale` shifted-uniform schedule applied to each modality. Use `--no-independent_time` for synchronous training with a shared diffusion time. When resuming an existing run, select the same timing mode used by that run. `--audio_loss_weight` scales audio loss; `--video_only` disables it. To save and resume complete state:
 
 ```bash
 # add to training
@@ -163,7 +163,7 @@ Use `--task ti2av` only with control-image caches. `--audio_loss_weight` scales 
 
 <details><summary>日本語</summary>
 
-上のコマンドで学習します。control画像cacheでのみ `--task ti2av` を使います。`--audio_loss_weight` は音声lossを調整し、`--video_only` は無効化します。完全なstateは `--save_state` で保存し、LoRA fileではなくstate directoryから再開します。
+上のコマンドで学習します。control画像cacheでのみ `--task ti2av` を使います。動画と音声の拡散時刻はデフォルトで独立にサンプリングされ、それぞれに同じ `--scheduler_scale` のshifted-uniform scheduleが適用されます。共通の拡散時刻で同期学習する場合は `--no-independent_time` を指定します。既存の学習を再開する際は、その学習と同じ時刻設定を選択してください。`--audio_loss_weight` は音声lossを調整し、`--video_only` は無効化します。完全なstateは `--save_state` で保存し、LoRA fileではなくstate directoryから再開します。
 
 再開時の `--max_train_steps` は**追加step数**で、表示counterは0から始まります。`--base_weights` はLoRAをBF16へmergeした新規runであり、optimizer状態は復元せず、INT8／FP8とは併用できません。
 </details>

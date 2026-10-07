@@ -8,6 +8,7 @@ import torch
 
 from musubi_tuner.dataset.cache_io import save_latent_cache_kandinsky6
 from musubi_tuner.dataset.bucket import BucketSelector
+from musubi_tuner.kandinsky6.dit import DiffusionTransformer3D
 from musubi_tuner.kandinsky6_train_network import (
     Kandinsky6NetworkTrainer,
     build_ti2av_video_input,
@@ -97,6 +98,13 @@ def test_kandinsky6_parser_supplies_complete_base_trainer_precision_and_attentio
     assert args.disable_numpy_memmap is False
     args.dit_dtype = "bfloat16"
     Kandinsky6NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_kandinsky6_parser_enables_independent_time_by_default_and_can_disable_it():
+    parser = kandinsky6_setup_parser(setup_parser_common())
+    assert parser.parse_args([]).independent_time is True
+    assert parser.parse_args(["--independent_time"]).independent_time is True
+    assert parser.parse_args(["--no-independent_time"]).independent_time is False
 
 
 def test_deprecated_checkout_flags_parse_without_affecting_bundled_runtime():
@@ -248,7 +256,7 @@ def test_process_batch_converts_cache_layout_and_shares_sigma(monkeypatch):
         "pooled_embed": torch.zeros(1, 768),
         "timesteps": torch.tensor([0.25]),
     }
-    args = SimpleNamespace(video_only=False, audio_loss_weight=1.0)
+    args = SimpleNamespace(video_only=False, audio_loss_weight=1.0, independent_time=False)
     accelerator = SimpleNamespace(device=torch.device("cpu"))
     latents = torch.zeros(1, 16, 3, 4, 5)
     noise = torch.ones_like(latents)
@@ -271,6 +279,143 @@ def test_process_batch_converts_cache_layout_and_shares_sigma(monkeypatch):
     assert seen["image"] is None
     assert seen["timesteps"].item() == pytest.approx(250.0)
     assert loss.item() == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_process_batch_routes_independent_shifted_times_and_noises_each_modality(monkeypatch, batch_size):
+    trainer = Kandinsky6NetworkTrainer()
+    trainer._scheduler_scale = 3.0
+    seen = {}
+
+    def fake_call(args, accelerator, transformer, video, batch, video_noise, noisy_video, timesteps, dtype, **kwargs):
+        seen.update(
+            video=video,
+            video_noise=video_noise,
+            noisy_video=noisy_video,
+            audio=kwargs["audio_latents"],
+            audio_noise=kwargs["audio_noise"],
+            noisy_audio=kwargs["noisy_audio"],
+            timesteps=timesteps,
+        )
+        return SimpleNamespace(
+            pred=video_noise,
+            target=video_noise - video,
+            extra={
+                "audio_pred": kwargs["audio_noise"],
+                "audio_target": kwargs["audio_noise"] - kwargs["audio_latents"],
+                "audio_loss_weights": kwargs["audio_loss_weights"],
+            },
+        )
+
+    monkeypatch.setattr(trainer, "call_dit", fake_call)
+    audio_uniform = torch.tensor([0.75, 0.5][:batch_size])
+    monkeypatch.setattr(torch, "rand", lambda *args, **kwargs: audio_uniform.to(kwargs.get("device")))
+    batch = {
+        "latents_audio": torch.zeros(batch_size, 40, 6),
+        "audio_present": torch.ones(batch_size),
+        "text_embeds": [torch.zeros(2, 3584) for _ in range(batch_size)],
+        "attention_mask": [torch.ones(2, dtype=torch.bool) for _ in range(batch_size)],
+        "pooled_embed": torch.zeros(batch_size, 768),
+        "timesteps": torch.tensor([0.25, 0.0][:batch_size]),
+    }
+    args = SimpleNamespace(video_only=False, audio_loss_weight=1.0, independent_time=True)
+    latents = torch.zeros(batch_size, 16, 3, 4, 5)
+    noise = torch.ones_like(latents)
+    trainer.process_batch(
+        args,
+        SimpleNamespace(device=torch.device("cpu")),
+        object(),
+        None,
+        batch,
+        latents,
+        noise,
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+
+    video_time, audio_time = seen["timesteps"]
+    assert torch.allclose(video_time, torch.tensor([500.0, 0.0][:batch_size]))
+    assert torch.allclose(audio_time, torch.tensor([900.0, 750.0][:batch_size]))
+    video_sigma = torch.tensor([0.5, 0.0][:batch_size]).view(-1, 1, 1, 1, 1)
+    audio_sigma = torch.tensor([0.9, 0.75][:batch_size]).view(-1, 1, 1)
+    assert seen["noisy_audio"].shape == seen["audio"].shape
+    assert torch.allclose(seen["noisy_video"], (1.0 - video_sigma) * seen["video"] + video_sigma * seen["video_noise"])
+    assert torch.allclose(seen["noisy_audio"], (1.0 - audio_sigma) * seen["audio"] + audio_sigma * seen["audio_noise"])
+
+
+def test_process_batch_independent_time_runs_real_dit_forward_and_backward(monkeypatch):
+    trainer = Kandinsky6NetworkTrainer()
+    trainer._scheduler_scale = 1.0
+    transformer = DiffusionTransformer3D(
+        in_visual_dim=16,
+        out_visual_dim=16,
+        in_text_dim=8,
+        in_text_dim2=6,
+        time_dim=8,
+        patch_size=(1, 1, 1),
+        model_dim=12,
+        ff_dim=20,
+        num_text_blocks=1,
+        num_visual_blocks=1,
+        axes_dims=(4, 4, 4),
+        visual_cond=False,
+        is_multimodal=True,
+        in_audio_dim=40,
+        out_audio_dim=40,
+        model_dim_a=12,
+        time_dim_a=8,
+        ff_dim_a=20,
+        axes_dims_a=(4, 4, 4),
+        attention_engine="sdpa",
+        text_token_padding=True,
+        ca_rope=True,
+        cross_gates=True,
+        fix_modulation=True,
+    )
+    seen = {}
+
+    def record_inputs(module, args, kwargs):
+        del module, args
+        seen.update(x_audio=kwargs["x_audio"], time=kwargs["time"])
+
+    hook = transformer.register_forward_pre_hook(record_inputs, with_kwargs=True)
+    monkeypatch.setattr(torch, "rand", lambda *args, **kwargs: torch.tensor([0.75], device=kwargs.get("device")))
+    batch = {
+        "latents_audio": torch.zeros(1, 40, 6),
+        "audio_present": torch.ones(1),
+        "text_embeds": [torch.zeros(2, 8)],
+        "attention_mask": [torch.ones(2, dtype=torch.bool)],
+        "pooled_embed": torch.zeros(1, 6),
+        "timesteps": torch.tensor([0.25]),
+    }
+    loss, _ = trainer.process_batch(
+        SimpleNamespace(video_only=False, audio_loss_weight=1.0, independent_time=True, gradient_checkpointing=False),
+        SimpleNamespace(device=torch.device("cpu"), autocast=nullcontext),
+        transformer,
+        None,
+        batch,
+        torch.zeros(1, 16, 2, 2, 2),
+        torch.ones(1, 16, 2, 2, 2),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+    hook.remove()
+
+    assert seen["x_audio"].shape == (1, 6, 40)
+    video_time, audio_time = seen["time"]
+    assert video_time.item() == pytest.approx(250.0)
+    assert audio_time.item() == pytest.approx(750.0)
+    gradients = [parameter.grad for parameter in transformer.parameters() if parameter.grad is not None]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(torch.count_nonzero(gradient) for gradient in gradients)
 
 
 def test_kandinsky6_cache_rejects_wrong_layout_before_writing(tmp_path):
@@ -326,6 +471,8 @@ def test_training_tail_reference_reuses_upstream_frame_zero_rope(with_reference)
     )
     assert seen["visual_rope"][:, 0, 0, 0].tolist() == ([0, 1, 2, 0] if with_reference else [0, 1, 2])
     assert output.pred.shape == video.shape
+    assert torch.equal(output.target, torch.ones_like(video))
+    assert torch.equal(output.extra["audio_target"], torch.zeros_like(audio))
     if with_reference:
         assert seen["visual_token_type_ids"].tolist() == [[0, 0, 0, 1]]
         assert torch.equal(seen["x_video"][:, -1, ..., :16], image[:, 0])

@@ -497,7 +497,7 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
             torch.as_tensor(timesteps, device=device) if timesteps is not None else torch.rand(latents.shape[0], device=device)
         )
         sigma = shifted_flow_sigma(uniform, self._scheduler_scale)
-        sigma_view = sigma.view(-1, 1, 1, 1, 1)
+        sigma_view = sigma.view(-1, *([1] * (latents.ndim - 1)))
         noisy = ((1.0 - sigma_view) * latents.float() + sigma_view * noise.float()).to(latents.dtype)
         return noisy, sigma * 1000.0
 
@@ -580,10 +580,17 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
         noisy_video, timesteps = self.get_noisy_model_input_and_timesteps(
             args, video_noise, video, batch.get("timesteps"), noise_scheduler, video.device, dit_dtype
         )
-        sigma = (timesteps / 1000.0).view(-1, 1, 1)
         audio = batch["latents_audio"].to(video.device).transpose(1, 2).contiguous()
         audio_noise = torch.randn_like(audio)
-        noisy_audio = ((1.0 - sigma) * audio.float() + sigma * audio_noise.float()).to(audio.dtype)
+        if args.independent_time:
+            noisy_audio, audio_timesteps = self.get_noisy_model_input_and_timesteps(
+                args, audio_noise, audio, None, noise_scheduler, audio.device, dit_dtype
+            )
+            model_timesteps = [timesteps, audio_timesteps]
+        else:
+            sigma = (timesteps / 1000.0).view(-1, 1, 1)
+            noisy_audio = ((1.0 - sigma) * audio.float() + sigma * audio_noise.float()).to(audio.dtype)
+            model_timesteps = timesteps
         text, text_mask = pad_text_batch(batch["text_embeds"], batch["attention_mask"], video.device, network_dtype)
         pooled = batch["pooled_embed"].to(device=video.device, dtype=network_dtype)
         image = batch.get("latents_image")
@@ -602,7 +609,7 @@ class Kandinsky6NetworkTrainer(NetworkTrainer):
             batch,
             video_noise,
             noisy_video,
-            timesteps,
+            model_timesteps,
             network_dtype,
             audio_latents=audio,
             audio_noise=audio_noise,
@@ -640,6 +647,12 @@ def kandinsky6_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--task", choices=("t2av", "ti2av"), default="t2av")
     parser.add_argument("--model_variant", choices=("auto", "lite", "pro"), default="auto")
     parser.add_argument("--scheduler_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--independent_time",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="sample independent video and audio diffusion times (disable to share the video time)",
+    )
     parser.add_argument("--visual_rope_scale", type=float, nargs=3, default=(1.0, 2.0, 2.0), metavar=("T", "H", "W"))
     parser.add_argument("--convrot_int8", action="store_true", help="stream and quantize frozen DiT Linear weights to ConvRot INT8")
     parser.add_argument("--convrot_int8_bwd", choices=("bf16", "int8"), default="bf16")
