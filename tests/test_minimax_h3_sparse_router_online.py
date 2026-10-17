@@ -375,6 +375,49 @@ def test_online_cache_loader_preserves_reference_contract_metadata(tmp_path: Pat
         assert key in batch
 
 
+@pytest.mark.parametrize(
+    ("latent_fingerprint", "text_fingerprint", "valid"),
+    [(None, None, True), ("same", "same", True), ("latent", None, False), (None, "text", False), ("one", "two", False)],
+)
+def test_online_cache_loader_requires_matching_sample_fingerprints(
+    tmp_path: Path,
+    latent_fingerprint: str | None,
+    text_fingerprint: str | None,
+    valid: bool,
+) -> None:
+    latent_path = tmp_path / "sample_mmh3.safetensors"
+    text_path = tmp_path / "sample_mmh3_te.safetensors"
+    save_file(
+        {
+            "latents_1x2x2_float32": torch.zeros(1, 2, 2),
+            H3_REFERENCE_KINDS_KEY: torch.tensor([0]),
+            H3_REFERENCE_VIDEO_SHAPES_KEY: torch.tensor([[1, 2, 2]]),
+            H3_REFERENCE_AUDIO_LENGTHS_KEY: torch.tensor([0]),
+            H3_REFERENCE_VIDEO_ROWS_KEY: torch.zeros(1, 8),
+            H3_REFERENCE_AUDIO_ROWS_KEY: torch.zeros(0, 2),
+        },
+        latent_path,
+        metadata={"sample_fingerprint": latent_fingerprint} if latent_fingerprint is not None else None,
+    )
+    save_file(
+        {
+            H3_TEXT_HIDDEN_KEY: torch.zeros(2, 8),
+            H3_TEXT_TOKEN_TAGS_KEY: torch.tensor([1, 1]),
+            H3_CONDITIONING_TASK_KEY: torch.tensor(4),
+        },
+        text_path,
+        metadata={"sample_fingerprint": text_fingerprint} if text_fingerprint is not None else None,
+    )
+
+    if valid:
+        batch, clean = _load_example(latent_path, text_path)
+        assert batch[H3_REFERENCE_KINDS_KEY].tolist() == [0]
+        assert clean.shape == (1, 1, 2, 2)
+    else:
+        with pytest.raises(ValueError, match="do not describe the same sample"):
+            _load_example(latent_path, text_path)
+
+
 def test_online_teacher_requires_each_layer_exactly_once() -> None:
     _validate_layer_sequence([0, 1, 2], 3)
 

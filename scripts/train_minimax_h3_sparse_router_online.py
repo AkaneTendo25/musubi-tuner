@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TypeVar
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from musubi_tuner.minimax_h3.cache import (
@@ -363,6 +364,14 @@ def _validate_options(args: argparse.Namespace) -> None:
 
 
 def _load_example(latent_path: Path, text_path: Path) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    with safe_open(latent_path, framework="pt", device="cpu") as handle:
+        latent_fingerprint = (handle.metadata() or {}).get("sample_fingerprint")
+    with safe_open(text_path, framework="pt", device="cpu") as handle:
+        text_fingerprint = (handle.metadata() or {}).get("sample_fingerprint")
+    if (latent_fingerprint or text_fingerprint) and latent_fingerprint != text_fingerprint:
+        raise ValueError(
+            f"MiniMax H3 latent/text caches do not describe the same sample; rebuild both caches: {latent_path} and {text_path}"
+        )
     latent = load_file(latent_path)
     text = load_file(text_path)
     latent_key = _visual_latent_key(list(latent), latent_path)
