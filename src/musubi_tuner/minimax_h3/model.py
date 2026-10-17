@@ -40,6 +40,12 @@ from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffload
 from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig, SequencePlan, block_sparse_attention, build_plan
 from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
 from musubi_tuner.minimax_h3.residual_norm_native import try_residual_norm_adaln_gated
+from musubi_tuner.minimax_h3.sparse_attention import (
+    H3ReferenceSparseConfig,
+    H3ReferenceSparseLayout,
+    H3UniversalSparseRouter,
+    reference_sparse_attention,
+)
 from musubi_tuner.minimax_h3.selective_checkpoint import (
     SavedActivations,
     adaln_projection_region,
@@ -321,6 +327,7 @@ class MiniMaxH3PackedState:
     timestep_indices: torch.Tensor
     video_indices: torch.Tensor
     audio_indices: torch.Tensor
+    reference_sparse_layout: H3ReferenceSparseLayout | None = None
 
 
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -426,6 +433,10 @@ class MiniMaxH3Attention(nn.Module):
         self.miowtion_layer_index = None
         self.miowtion_keep_fraction = None
         self.fused_qk_norm_rope = False
+        self.reference_sparse_config: H3ReferenceSparseConfig | None = None
+        self.reference_sparse_layout: H3ReferenceSparseLayout | None = None
+        self.reference_sparse_layer_index = -1
+        object.__setattr__(self, "_reference_sparse_router", None)
         # Set by ``MiniMaxH3Transformer.set_checkpoint_keep("qkv")``; gates the
         # region ``install_projection_region`` wraps around the base projection.
         self.checkpoint_keep_qkv = False
@@ -437,6 +448,42 @@ class MiniMaxH3Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(self.inner_dim, hidden_size, bias=False)
+
+    def configure_reference_sparse_attention(
+        self,
+        config: H3ReferenceSparseConfig | None,
+        router: H3UniversalSparseRouter | None,
+        layer_index: int,
+    ) -> None:
+        self.reference_sparse_config = config
+        self.reference_sparse_layer_index = layer_index
+        object.__setattr__(self, "_reference_sparse_router", router)
+
+    def _apply_reference_sparse_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        layout = self.reference_sparse_layout
+        config = self.reference_sparse_config
+        if layout is None or config is None:
+            raise RuntimeError("H3 sparse attention context requested before configuration")
+        inverse_permutation = layout.inverse_permutation
+        if layout.permutation is not None:
+            permutation = layout.permutation.to(query.device)
+            query = query.index_select(1, permutation)
+            key = key.index_select(1, permutation)
+            value = value.index_select(1, permutation)
+        router = self._reference_sparse_router
+        routing_scores = None
+        if router is not None:
+            start = layout.reference_start
+            stop = start + layout.reference_rows
+            routing_scores = router.score_summaries(
+                router.summarize(query[:, start:stop]),
+                router.summarize(key[:, start:stop]),
+                self.reference_sparse_layer_index,
+            )
+        output = reference_sparse_attention(query, key, value, layout, config, routing_scores=routing_scores)
+        if inverse_permutation is not None:
+            output = output.index_select(1, inverse_permutation.to(output.device))
+        return output
 
     def install_projection_region(self) -> None:
         """Wrap the base projection's own ``forward`` in the ``qkv`` checkpoint region, once.
@@ -517,7 +564,11 @@ class MiniMaxH3Attention(nn.Module):
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor | None
     ) -> torch.Tensor:
         """``[B, S, heads, head_dim]`` Q/K/V to the ``[B, S, heads * head_dim]`` attention output."""
-        if self.miowtion_bundle is not None and attention_mask is None:
+        if self.reference_sparse_config is not None and self.reference_sparse_layout is not None:
+            if attention_mask is not None:
+                raise ValueError("H3 sparse reference attention does not support a caller attention mask")
+            hidden_states = self._apply_reference_sparse_attention(query, key, value)
+        elif self.miowtion_bundle is not None and attention_mask is None:
             from musubi_tuner.minimax_h3.block_sparse_attention import miowtion_block_sparse_attention
 
             hidden_states = (
@@ -953,7 +1004,38 @@ class MiniMaxH3Transformer(nn.Module):
         self.offloader = None
         self.layer_streaming = False
         self.int8_attention_mode = "off"
+        self.reference_sparse_config: H3ReferenceSparseConfig | None = None
+        self.reference_sparse_router: H3UniversalSparseRouter | None = None
         self._refiner_cache: tuple[torch.Tensor, int, torch.dtype | None, torch.Tensor] | None = None
+
+    def enable_reference_sparse_attention(
+        self,
+        config: H3ReferenceSparseConfig,
+        router: H3UniversalSparseRouter | None = None,
+    ) -> None:
+        config.validate()
+        if self.int8_attention_mode != "off":
+            raise ValueError("H3 reference-sparse attention cannot be combined with INT8 attention")
+        if getattr(self, "block_sparse_config", None) is not None:
+            raise ValueError("H3 reference-sparse and mean-scored block-sparse attention are mutually exclusive")
+        if getattr(self, "miowtion_bundle", None) is not None:
+            raise ValueError("H3 reference-sparse attention and Miowtion are mutually exclusive")
+        if router is not None:
+            if router.num_layers != len(self.blocks):
+                raise ValueError(f"H3 sparse router has {router.num_layers} layers; model has {len(self.blocks)}")
+            first_attention = next(module for module in self.blocks[0].modules() if isinstance(module, MiniMaxH3Attention))
+            if (router.num_heads, router.head_dim, router.block_size) != (
+                first_attention.heads,
+                first_attention.head_dim,
+                config.router_block_size,
+            ):
+                raise ValueError("H3 sparse router checkpoint does not match the model attention geometry")
+            router.requires_grad_(False).eval()
+        self.reference_sparse_config = config
+        self.reference_sparse_router = router
+        for layer_index, block in enumerate(self.blocks):
+            layer_config = config if config.applies_to_layer(layer_index) else None
+            block.attn.configure_reference_sparse_attention(layer_config, router, layer_index)
 
     @property
     def device(self) -> torch.device:
@@ -1164,6 +1246,8 @@ class MiniMaxH3Transformer(nn.Module):
     def set_int8_attention_mode(self, mode: str) -> None:
         if mode not in {"off", "aux", "train"}:
             raise ValueError(f"unsupported H3 INT8 attention mode: {mode}")
+        if mode != "off" and self.reference_sparse_config is not None:
+            raise ValueError("H3 INT8 attention cannot be combined with reference-sparse attention")
         if mode != "off" and not HAS_TRITON:
             raise RuntimeError("H3 INT8 attention requires Triton")
         self.int8_attention_mode = mode
@@ -1180,6 +1264,8 @@ class MiniMaxH3Transformer(nn.Module):
         """
         if config is not None:
             config.validate()
+            if self.reference_sparse_config is not None:
+                raise ValueError("H3 mean-scored block-sparse and reference-sparse attention are mutually exclusive")
         self.block_sparse_config = config
         self.block_sparse_modules = []
         for index, block in enumerate(self.blocks):
@@ -1195,6 +1281,8 @@ class MiniMaxH3Transformer(nn.Module):
         from musubi_tuner.minimax_h3.block_sparse_attention import prepare_flex_attention
 
         prepare_flex_attention()
+        if self.reference_sparse_config is not None:
+            raise ValueError("H3 Miowtion and reference-sparse attention are mutually exclusive")
         if getattr(self, "block_sparse_config", None) is not None:
             raise ValueError("Miowtion predictor and mean-scored block sparse attention are mutually exclusive")
         if keep_fraction is not None and not 0 < keep_fraction <= 1:
@@ -1348,6 +1436,7 @@ class MiniMaxH3Transformer(nn.Module):
         adaln_indices: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
+        reference_sparse_layout: H3ReferenceSparseLayout | None,
     ) -> torch.Tensor:
         def forward(value: torch.Tensor) -> torch.Tensor:
             # The dense trainable ring advances from forward order to reverse
@@ -1355,6 +1444,7 @@ class MiniMaxH3Transformer(nn.Module):
             # module backward hooks and does not need this second wait.
             if self.blocks_to_swap and getattr(self.offloader, "recompute_requires_wait", False):
                 self.offloader.wait_for_block(block_index)
+            block.attn.reference_sparse_layout = reference_sparse_layout
             return block(value, timestep_embedding, adaln_indices, rotary_emb, attention_mask)
 
         if self.activation_cpu_offloading:
@@ -1413,7 +1503,9 @@ class MiniMaxH3Transformer(nn.Module):
                 state.adaln_indices,
                 state.rotary_emb,
                 state.attention_mask,
+                state.reference_sparse_layout,
             )
+        block.attn.reference_sparse_layout = state.reference_sparse_layout
         return block(
             state.hidden_states,
             state.timestep_embedding,
@@ -1529,6 +1621,7 @@ class MiniMaxH3Transformer(nn.Module):
         text_indices: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_tags_have_padding: bool | None = None,
+        reference_sparse_layout: H3ReferenceSparseLayout | None = None,
     ) -> MiniMaxH3TransformerOutput:
         state = self._prepare(
             video_hidden_states=video_hidden_states,
@@ -1543,6 +1636,7 @@ class MiniMaxH3Transformer(nn.Module):
             text_indices=text_indices,
             attention_mask=attention_mask,
             token_tags_have_padding=token_tags_have_padding,
+            reference_sparse_layout=reference_sparse_layout,
         )
         if self.reusable_activation_offloader is not None and torch.is_grad_enabled():
             self.reusable_activation_offloader.begin_forward()
@@ -1573,6 +1667,7 @@ class MiniMaxH3Transformer(nn.Module):
         text_indices: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_tags_have_padding: bool | None = None,
+        reference_sparse_layout: H3ReferenceSparseLayout | None = None,
     ) -> MiniMaxH3PackedState:
         """Embed one packed sequence into the state the block loop advances."""
         with h3_profile_scope("h3.pack"):
@@ -1589,6 +1684,7 @@ class MiniMaxH3Transformer(nn.Module):
                 text_indices,
                 attention_mask,
                 token_tags_have_padding,
+                reference_sparse_layout,
             )
 
     def _refined_text(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1632,6 +1728,7 @@ class MiniMaxH3Transformer(nn.Module):
         text_indices: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         token_tags_have_padding: bool | None = None,
+        reference_sparse_layout: H3ReferenceSparseLayout | None = None,
     ) -> MiniMaxH3PackedState:
         sequence_length = position_ids.shape[0]
         if position_ids.shape != (sequence_length, 3):
@@ -1644,6 +1741,12 @@ class MiniMaxH3Transformer(nn.Module):
             raise ValueError(f"H3 timestep_indices must have shape (sequence,), got {tuple(timestep_indices.shape)}")
         if token_tags.ndim not in (1, 2) or token_tags.shape[-1] != sequence_length:
             raise ValueError(f"H3 token_tags must have shape (sequence,) or (batch, sequence), got {tuple(token_tags.shape)}")
+        if reference_sparse_layout is not None:
+            if self.reference_sparse_config is None:
+                raise ValueError("H3 received a sparse reference layout without sparse attention being enabled")
+            if attention_mask is not None or token_tags.ndim != 1 or (token_tags_have_padding is True):
+                raise ValueError("H3 reference-sparse attention requires one unpadded, unmasked sequence")
+            reference_sparse_layout.validate(sequence_length)
 
         # A pairwise attention mask forces every block onto the dense path, so
         # the plan the refresh builds could never be consulted; skip its host
@@ -1716,4 +1819,5 @@ class MiniMaxH3Transformer(nn.Module):
             timestep_indices=timestep_indices,
             video_indices=video_indices,
             audio_indices=audio_indices,
+            reference_sparse_layout=reference_sparse_layout,
         )

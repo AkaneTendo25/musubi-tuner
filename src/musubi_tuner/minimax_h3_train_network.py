@@ -110,6 +110,7 @@ from musubi_tuner.minimax_h3.references import (
     validate_reference_video_fps,
     validate_reference_video_sizing,
 )
+from musubi_tuner.minimax_h3.sparse_attention import H3ReferenceSparseConfig, H3UniversalSparseRouter
 from musubi_tuner.minimax_h3.rollout import (
     MAX_ROLLOUT_WINDOW,
     TEACHER_PRIVILEGE_CHANNELS,
@@ -4077,6 +4078,26 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError(
                     "--h3_block_sparse_kv_fraction/--h3_block_sparse_threshold cannot currently be combined with --compile"
                 )
+        sparse_router = getattr(args, "h3_sparse_router", None)
+        if sparse_router is not None:
+            if args.h3_training_mode not in ("ref2va", "ref2va_omni"):
+                raise ValueError("--h3_sparse_router requires Ref2VA training")
+            if args.h3_sparse_exact_blocks <= 0 or args.h3_sparse_temporal_radius < 0:
+                raise ValueError("H3 sparse exact blocks must be positive and temporal radius non-negative")
+            if args.compile:
+                raise ValueError("H3 sparse reference attention cannot be combined with --compile")
+            if getattr(args, "train_batch_size", 1) != 1:
+                raise ValueError("H3 sparse reference attention requires --train_batch_size 1")
+            if getattr(args, "h3_int8_attention", "off") != "off":
+                raise ValueError("--h3_sparse_router cannot be combined with --h3_int8_attention")
+            if block_sparse_kv_fraction > 0 or block_sparse_threshold > 0 or miowtion_predictor:
+                raise ValueError("--h3_sparse_router cannot be combined with another sparse attention backend")
+            if checkpoint_keep != "none":
+                raise ValueError("--h3_sparse_router cannot be combined with --h3_checkpoint_keep")
+            if getattr(args, "h3_varlen_padding", False):
+                raise ValueError("--h3_sparse_router does not support padded/varlen attention")
+            if getattr(args, "h3_guide_specs", None) or getattr(args, "h3_keyframe_anchors", None):
+                raise ValueError("--h3_sparse_router does not support additional visual guides")
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
         target_noise_coupling = getattr(args, "h3_target_noise_coupling", "independent")
@@ -4311,6 +4332,55 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         checkpoint_keep = getattr(args, "h3_checkpoint_keep", "none")
         if checkpoint_keep != "none":
             transformer.set_checkpoint_keep(checkpoint_keep)
+        if getattr(args, "h3_sparse_router", None) is not None:
+            state = torch.load(args.h3_sparse_router, map_location="cpu", weights_only=True)
+            query_projection = state.get("query_layer_projection")
+            key_projection = state.get("key_layer_projection")
+            if query_projection is None or key_projection is None or query_projection.ndim != 3:
+                raise ValueError("H3 sparse router checkpoint lacks layer-specific query/key projections")
+            if key_projection.shape != query_projection.shape:
+                raise ValueError("H3 sparse router query/key projection shapes differ")
+            num_layers, summary_dim, index_dim = query_projection.shape
+            config = getattr(transformer, "config", None)
+            head_dim = getattr(config, "attention_head_dim", None)
+            if num_layers != len(transformer.blocks):
+                raise ValueError(f"H3 sparse router has {num_layers} layers; model has {len(transformer.blocks)}")
+            if head_dim is None or summary_dim % head_dim:
+                raise ValueError("H3 sparse router summary dimension is incompatible with the transformer")
+            with torch.random.fork_rng(devices=[]):
+                router = H3UniversalSparseRouter(
+                    num_layers=num_layers,
+                    num_heads=config.num_attention_heads,
+                    head_dim=head_dim,
+                    index_dim=index_dim,
+                    block_size=128,
+                    layer_specific_projections=True,
+                    summary_subblocks=summary_dim // head_dim,
+                )
+            missing, unexpected = router.load_state_dict(state, strict=False)
+            legacy_gate_keys = {
+                "reference_mass_feature_weight",
+                "reference_mass_feature_bias",
+                "reference_mass_feature_mean",
+                "reference_mass_feature_scale",
+            }
+            unexpected = [key for key in unexpected if key not in legacy_gate_keys]
+            if missing or unexpected:
+                raise ValueError(f"H3 sparse router checkpoint is incompatible: missing={missing}, unexpected={unexpected}")
+            sparse_config = H3ReferenceSparseConfig(
+                router_block_size=128,
+                topk_blocks=args.h3_sparse_exact_blocks,
+                temporal_radius=args.h3_sparse_temporal_radius,
+                layer_ranges=((0, len(transformer.blocks)),),
+                data_path=args.h3_sparse_data_path,
+            )
+            transformer.enable_reference_sparse_attention(sparse_config, router)
+            logger.info(
+                "Enabled H3 sparse reference attention: exact_blocks=%d radius=%d data_path=%s",
+                args.h3_sparse_exact_blocks,
+                args.h3_sparse_temporal_radius,
+                args.h3_sparse_data_path,
+            )
         fraction = getattr(args, "h3_block_sparse_kv_fraction", 0.0)
         threshold = getattr(args, "h3_block_sparse_threshold", 0.0)
         miowtion_predictor = getattr(args, "h3_miowtion_predictor", None)
@@ -8436,6 +8506,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_compile_attention": str(getattr(args, "h3_compile_attention", "inline")),
             "ss_h3_swiglu_chunk_rows": str(args.h3_swiglu_chunk_rows),
             "ss_h3_int8_attention": args.h3_int8_attention,
+            "ss_h3_sparse_reference_attention": str(getattr(args, "h3_sparse_router", None) is not None),
+            "ss_h3_sparse_exact_blocks": str(getattr(args, "h3_sparse_exact_blocks", 64)),
+            "ss_h3_sparse_temporal_radius": str(getattr(args, "h3_sparse_temporal_radius", 2)),
+            "ss_h3_sparse_data_path": getattr(args, "h3_sparse_data_path", "packed"),
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(
                 args.h3_image_flow_shift
@@ -9909,6 +9983,25 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "checkpoint only the last N of H3's 50 main blocks; default checkpoints all blocks. "
             "Lower values trade more VRAM for less recomputation and require resident eager blocks"
         ),
+    )
+    parser.add_argument(
+        "--h3_sparse_router",
+        type=Path,
+        default=None,
+        help="frozen learned reference-attention router checkpoint used only during Ref2VA concept training",
+    )
+    parser.add_argument(
+        "--h3_sparse_exact_blocks",
+        type=int,
+        default=64,
+        help="number of exact 128-row visual-reference blocks retained per query block and head",
+    )
+    parser.add_argument("--h3_sparse_temporal_radius", type=int, default=2)
+    parser.add_argument(
+        "--h3_sparse_data_path",
+        choices=("packed", "mapped_int64"),
+        default="packed",
+        help="sparse QKV data layout; packed uses contiguous head-major buffers and mapped_int64 maps logical rows",
     )
     parser.add_argument(
         "--h3_gradient_checkpointing_swapped",

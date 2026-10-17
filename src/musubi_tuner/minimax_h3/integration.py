@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import math
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -95,6 +96,7 @@ from musubi_tuner.minimax_h3.inference import (
 )
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
+from musubi_tuner.minimax_h3.sparse_attention import H3ReferenceSparseLayout
 from musubi_tuner.minimax_h3.one_frame import (
     H3_REFERENCE_ROUTE_IDS,
     route_keeps_dit_rows,
@@ -111,6 +113,7 @@ from musubi_tuner.minimax_h3.packing import (
     build_t2va_packed_sequence,
     pack_audio_latents,
     patchify_video_latents,
+    permute_packed_sequence,
     reference_time_span,
     unpack_audio_tokens,
     unpatchify_video_tokens,
@@ -1728,6 +1731,7 @@ class _NativeTrainingBackend:
             )
         qwen_images_presented = route_presents_qwen_images(reference_route)
         dit_rows_kept = route_keeps_dit_rows(reference_route)
+        reference_sparse_layout = None
         if self.mode in ("ref2va", "ref2va_omni"):
             cached_reference_size = batch.get(H3_REFERENCE_IMAGE_SHORT_EDGE_KEY)
             if cached_reference_size is None:
@@ -2106,6 +2110,48 @@ class _NativeTrainingBackend:
                 torch.ones(1, device=model_device),
                 per_row_timesteps=per_row,
             )
+            if getattr(transformer, "reference_sparse_config", None) is not None:
+                visual_references = tuple(reference for reference in references if reference.kind != int(H3ReferenceKind.AUDIO))
+                if not visual_references:
+                    raise ValueError("H3 sparse reference training requires at least one visual reference")
+                reference_rows = sum(reference.num_video_rows(patch_size) for reference in visual_references)
+                if reference_rows != layout.num_condition_video_rows:
+                    raise ValueError("H3 sparse reference training cannot combine reference routing with other visual guides")
+                sparse_config = transformer.reference_sparse_config
+                visual_indices = layout.video_indices[:reference_rows]
+                expected = torch.arange(
+                    int(visual_indices[0]), int(visual_indices[0]) + visual_indices.numel(), dtype=visual_indices.dtype
+                )
+                if not torch.equal(visual_indices, expected):
+                    is_visual_reference = torch.zeros(layout.sequence_length, dtype=torch.bool)
+                    is_visual_reference[visual_indices] = True
+                    permutation = torch.cat((visual_indices, torch.arange(layout.sequence_length)[~is_visual_reference]))
+                    layout = permute_packed_sequence(layout, permutation)
+                    timestep_indices = timestep_indices.index_select(0, permutation.to(timestep_indices.device))
+                    reference_start = 0
+                else:
+                    reference_start = int(visual_indices[0])
+
+                frame_ids = []
+                frame_cursor = 0
+                for reference in visual_references:
+                    rows_per_frame = (reference.latent_height // patch_size[1]) * (reference.latent_width // patch_size[2])
+                    frame_ids.append(torch.arange(reference.num_latent_frames).repeat_interleave(rows_per_frame) + frame_cursor)
+                    frame_cursor += reference.num_latent_frames + sparse_config.temporal_radius + 1
+                frame_ids = torch.cat(frame_ids)
+                router_blocks = math.ceil(frame_ids.numel() / sparse_config.router_block_size)
+                padded_frame_ids = F.pad(
+                    frame_ids,
+                    (0, router_blocks * sparse_config.router_block_size - frame_ids.numel()),
+                    value=int(frame_ids[-1]),
+                ).unflatten(0, (router_blocks, sparse_config.router_block_size))
+                reference_sparse_layout = H3ReferenceSparseLayout(
+                    reference_start=reference_start,
+                    reference_rows=reference_rows,
+                    rows_per_frame=1,
+                    block_first_frames=padded_frame_ids[:, 0].to(model_device),
+                    block_last_frames=padded_frame_ids[:, -1].to(model_device),
+                )
         elif task in ("i2va", "fl2va", "l2va"):
             anchors = {"i2va": ("first",), "fl2va": ("first", "last"), "l2va": ("last",)}[task]
             if one_frame_placed:
@@ -2379,6 +2425,7 @@ class _NativeTrainingBackend:
                 "video_indices": layout.video_indices.to(model_device),
                 "audio_indices": layout.audio_indices.to(model_device),
                 "text_indices": layout.text_indices.to(model_device),
+                "reference_sparse_layout": reference_sparse_layout,
             },
             decode=decode,
             text_source=padded_text_hidden,

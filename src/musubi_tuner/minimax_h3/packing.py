@@ -88,6 +88,26 @@ class MiniMaxH3GuideGeometry:
         return _AUDIO_CHANNELS * self.num_audio_latents
 
 
+def permute_packed_sequence(layout: MiniMaxH3PackedSequence, permutation: torch.Tensor) -> MiniMaxH3PackedSequence:
+    """Reorder packed rows while preserving each modality tensor's logical order."""
+    if permutation.dtype != torch.long or permutation.shape != (layout.sequence_length,):
+        raise ValueError("H3 packed permutation must be one int64 index per sequence row")
+    expected = torch.arange(layout.sequence_length, device=permutation.device)
+    if not torch.equal(torch.sort(permutation).values, expected):
+        raise ValueError("H3 packed permutation must contain every sequence row exactly once")
+    inverse = torch.argsort(permutation)
+    return MiniMaxH3PackedSequence(
+        sequence_length=layout.sequence_length,
+        position_ids=layout.position_ids.index_select(0, permutation),
+        token_tags=layout.token_tags.index_select(0, permutation),
+        video_indices=inverse.index_select(0, layout.video_indices),
+        audio_indices=inverse.index_select(0, layout.audio_indices),
+        text_indices=inverse.index_select(0, layout.text_indices),
+        num_condition_video_rows=layout.num_condition_video_rows,
+        num_condition_audio_rows=layout.num_condition_audio_rows,
+    )
+
+
 def patchify_video_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:
     """Convert ``[B, C, T, H, W]`` latents to frame-major H3 video rows."""
     if latents.ndim != 5:
