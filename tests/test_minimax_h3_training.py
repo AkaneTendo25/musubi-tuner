@@ -67,6 +67,7 @@ from musubi_tuner.minimax_h3.packing import (
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
+from musubi_tuner.minimax_h3.sparse_attention import H3ReferenceSparseConfig
 from musubi_tuner.minimax_h3.training import (
     OBSERVED_AUDIO_SIGMA,
     OBSERVED_VIDEO_SIGMA,
@@ -3118,6 +3119,26 @@ class _ToggleNetwork:
         self.events.append(enabled)
         self.transformer.adapter_enabled = enabled
 
+    def is_enabled(self):
+        return getattr(self.transformer, "adapter_enabled", True)
+
+    def parameters(self):
+        return self.transformer.parameters()
+
+
+class _SparseScaleTransformer(_ScaleTransformer):
+    def __init__(self):
+        super().__init__()
+        self.adapter_enabled = True
+        self.reference_sparse_config = H3ReferenceSparseConfig(topk_blocks=4)
+        self.reference_sparse_router = object()
+        self.sparse_topk_events = []
+
+    def enable_reference_sparse_attention(self, config, router):
+        assert router is self.reference_sparse_router
+        self.reference_sparse_config = config
+        self.sparse_topk_events.append(config.topk_blocks)
+
 
 class _StochasticPreservationBackend:
     def __init__(self):
@@ -3534,6 +3555,135 @@ def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
     assert transformer.adapter_enabled is True
     assert metrics["loss/base_preservation"] > 0
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
+
+
+def test_h3_sparse_teacher_matches_dense_frozen_prediction_and_restores_state():
+    args = create_parser().parse_args(
+        [
+            "--h3_sparse_router",
+            "router.pt",
+            "--h3_sparse_teacher_loss_weight",
+            "1",
+            "--h3_sparse_teacher_only",
+            "--h3_sparse_teacher_budgets",
+            "8,16,24",
+        ]
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer._sparse_teacher_budgets = (8, 16, 24)
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _SparseScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+
+    torch.manual_seed(0)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        {"timesteps": [0.5], H3_REFERENCE_KINDS_KEY: [torch.tensor([0, 1])]},
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        1,
+    )
+    loss.backward()
+
+    assert backend.calls == [("prompt", False), ("prompt", True)]
+    assert backend.random_draws[0] == backend.random_draws[1]
+    assert network.events == [False, True]
+    assert transformer.sparse_topk_events == [16, 1_000_000, 16]
+    assert transformer.reference_sparse_config.topk_blocks == 16
+    assert transformer.adapter_enabled is True
+    assert metrics["h3/sparse_teacher_budget"] == 16
+    assert metrics["h3/sparse_teacher_references"] == 2
+    assert metrics["loss/sparse_teacher"] > 0
+    assert metrics["_loss_for_average"] > 0
+    assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
+
+
+def test_h3_sparse_teacher_restores_disabled_adapter_after_teacher_error():
+    args = create_parser().parse_args(
+        ["--h3_sparse_router", "router.pt", "--h3_sparse_teacher_loss_weight", "1", "--h3_sparse_teacher_only"]
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _SparseScaleTransformer()
+    transformer.adapter_enabled = False
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    original_predict = trainer._predict
+    trainer._predict = lambda *values, **kwargs: (_ for _ in ()).throw(RuntimeError("teacher failed"))
+
+    with pytest.raises(RuntimeError, match="teacher failed"):
+        trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            network,
+            {"timesteps": [0.5], H3_REFERENCE_KINDS_KEY: [torch.tensor([0])]},
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+
+    trainer._predict = original_predict
+    assert transformer.adapter_enabled is False
+    assert transformer.reference_sparse_config.topk_blocks == 4
+
+
+def test_h3_sparse_teacher_eval_only_skips_all_parameter_updates():
+    args = create_parser().parse_args(
+        [
+            "--h3_sparse_router",
+            "router.pt",
+            "--h3_sparse_teacher_loss_weight",
+            "1",
+            "--h3_sparse_teacher_only",
+            "--h3_sparse_teacher_eval_only",
+        ]
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _StochasticPreservationBackend()
+    transformer = _SparseScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    before = transformer.scale.detach().clone()
+
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        {"timesteps": [0.5], H3_REFERENCE_KINDS_KEY: [torch.tensor([0])]},
+        torch.zeros(1, 24, 2, 2, 2),
+        torch.ones(1, 24, 2, 2, 2),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+
+    assert not loss.requires_grad
+    assert float(loss) > 0
+    assert metrics["loss/sparse_teacher"] > 0
+    assert metrics["_loss_for_average"] > 0
+    assert trainer.skip_optimizer_step(args, _FakeAccelerator(), network, transformer, 0)
+    assert transformer.scale.grad is None
+    torch.testing.assert_close(transformer.scale, before)
 
 
 def _run_frozen_teacher_fusion(enabled, *, blocks_to_swap=0):

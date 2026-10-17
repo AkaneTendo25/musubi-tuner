@@ -7,7 +7,11 @@ from musubi_tuner.minimax_h3.block_sparse_attention import BlockSparseConfig
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.sparse_attention import H3ReferenceSparseConfig
 from musubi_tuner.minimax_h3.sparse_attention import H3UniversalSparseRouter
-from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
+from musubi_tuner.minimax_h3_train_network import (
+    MiniMaxH3NetworkTrainer,
+    _parse_h3_sparse_teacher_budgets,
+    create_parser,
+)
 
 
 def _tiny_transformer() -> MiniMaxH3Transformer:
@@ -37,12 +41,71 @@ def test_sra_cli_defaults_off_and_metadata_records_configuration() -> None:
     assert args.h3_sparse_exact_blocks == 64
     assert args.h3_sparse_temporal_radius == 2
     assert args.h3_sparse_data_path == "packed"
+    assert args.h3_sparse_teacher_loss_weight == 0
+    assert args.h3_sparse_teacher_only is False
+    assert args.h3_sparse_teacher_eval_only is False
+    assert args.h3_sparse_teacher_budgets == ""
+    assert args.h3_sparse_teacher_budget_offset == 0
 
     metadata = MiniMaxH3NetworkTrainer().extra_metadata(args)
     assert metadata["ss_h3_sparse_reference_attention"] == "False"
     assert metadata["ss_h3_sparse_exact_blocks"] == "64"
     assert metadata["ss_h3_sparse_temporal_radius"] == "2"
     assert metadata["ss_h3_sparse_data_path"] == "packed"
+    assert metadata["ss_h3_sparse_teacher_loss_weight"] == "0.0"
+    assert metadata["ss_h3_sparse_teacher_only"] == "False"
+    assert metadata["ss_h3_sparse_teacher_eval_only"] == "False"
+    assert metadata["ss_h3_sparse_teacher_budgets"] == "fixed"
+    assert metadata["ss_h3_sparse_teacher_budget_offset"] == "0"
+
+
+def test_sparse_teacher_budget_parser_rejects_invalid_values() -> None:
+    assert _parse_h3_sparse_teacher_budgets("") == ()
+    assert _parse_h3_sparse_teacher_budgets("8, 16,24") == (8, 16, 24)
+    with pytest.raises(ValueError, match="positive comma-separated"):
+        _parse_h3_sparse_teacher_budgets("8,0")
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--h3_sparse_teacher_loss_weight", "1"], "requires --h3_sparse_router"),
+        (["--h3_sparse_teacher_only"], "requires --h3_sparse_teacher_loss_weight"),
+        (["--h3_sparse_teacher_eval_only"], "requires --h3_sparse_teacher_only"),
+        (["--h3_sparse_teacher_budget_offset", "-1"], "must be non-negative"),
+        (["--h3_sparse_teacher_budgets", "8,16"], "requires --h3_sparse_teacher_loss_weight"),
+    ],
+)
+def test_sparse_teacher_invalid_combinations_fail_during_argument_setup(arguments, message: str) -> None:
+    args = create_parser().parse_args(arguments)
+
+    with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        ["--h3_dop_loss_weight", "1"],
+        ["--h3_guidance_distillation_scale", "2"],
+        ["--h3_guidance_scale_range", "2,4"],
+    ],
+)
+def test_sparse_teacher_eval_only_rejects_other_training_objectives(objective: list[str]) -> None:
+    args = create_parser().parse_args(
+        [
+            "--h3_sparse_router",
+            "router.pt",
+            "--h3_sparse_teacher_loss_weight",
+            "1",
+            "--h3_sparse_teacher_only",
+            "--h3_sparse_teacher_eval_only",
+        ]
+        + objective
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def test_sra_rejects_other_attention_backends() -> None:

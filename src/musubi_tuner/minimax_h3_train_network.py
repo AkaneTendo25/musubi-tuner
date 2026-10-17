@@ -58,6 +58,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_DOP_TEXT_TOKEN_TAGS_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_REFERENCE_KINDS_KEY,
     H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_TEACHER_CONDITION_IDS as _TEACHER_CONDITION_IDS,
     H3_TEACHER_CONDITIONS_KEY as _TEACHER_ID_KEY,
@@ -165,6 +166,26 @@ from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_h3_sparse_teacher_budgets(spec: str) -> tuple[int, ...]:
+    if not spec.strip():
+        return ()
+    budgets = tuple(int(piece.strip()) for piece in spec.split(",") if piece.strip())
+    if not budgets or any(budget <= 0 for budget in budgets):
+        raise ValueError("H3 sparse teacher budgets must be positive comma-separated integers")
+    return budgets
+
+
+def _h3_reference_count(batch: dict[str, object]) -> int:
+    value = batch.get(H3_REFERENCE_KINDS_KEY)
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError("H3 sparse teacher requires one reference-kind tensor per batch")
+        value = value[0]
+    if not isinstance(value, torch.Tensor) or value.numel() <= 0:
+        raise ValueError("H3 sparse teacher requires non-empty reference-kind metadata")
+    return int(value.numel())
 
 
 def _teacher_conditioned(args, base_sigma: float) -> bool:
@@ -3524,6 +3545,37 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_observed_modality video trains audio and therefore requires --h3_audio_loss_weight > 0")
         if args.h3_observed_modality == "audio" and modality_loss_weights["h3_video_loss_weight"] == 0:
             raise ValueError("--h3_observed_modality audio trains video and therefore requires --h3_video_loss_weight > 0")
+        sparse_teacher_weight = float(getattr(args, "h3_sparse_teacher_loss_weight", 0.0) or 0.0)
+        if not math.isfinite(sparse_teacher_weight) or sparse_teacher_weight < 0:
+            raise ValueError("--h3_sparse_teacher_loss_weight must be finite and non-negative")
+        if sparse_teacher_weight > 0 and getattr(args, "h3_sparse_router", None) is None:
+            raise ValueError("--h3_sparse_teacher_loss_weight requires --h3_sparse_router")
+        if getattr(args, "h3_sparse_teacher_only", False) and sparse_teacher_weight <= 0:
+            raise ValueError("--h3_sparse_teacher_only requires --h3_sparse_teacher_loss_weight")
+        if getattr(args, "h3_sparse_teacher_budget_offset", 0) < 0:
+            raise ValueError("--h3_sparse_teacher_budget_offset must be non-negative")
+        if getattr(args, "h3_sparse_teacher_eval_only", False) and not getattr(args, "h3_sparse_teacher_only", False):
+            raise ValueError("--h3_sparse_teacher_eval_only requires --h3_sparse_teacher_only")
+        if getattr(args, "h3_sparse_teacher_eval_only", False):
+            incompatible = {
+                "guidance distillation": args.h3_guidance_distillation_scale is not None
+                or bool(getattr(args, "h3_guidance_scale_range", None)),
+                "base preservation": float(args.h3_base_preservation_loss_weight) > 0,
+                "DOP": float(args.h3_dop_loss_weight) > 0,
+                "two-teacher training": float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0,
+                "null anchoring": float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0,
+                "rollout supervision": bool(getattr(args, "h3_rollout_supervision", False)),
+                "teacher matching": bool(getattr(args, "h3_teacher_matching", False)),
+                "repair": getattr(args, "h3_repair_reference", None) is not None,
+                "SOAR": float(getattr(args, "h3_soar_weight", 0.0) or 0.0) > 0,
+                "CREPA": args.crepa is not None,
+            }
+            active = [name for name, configured in incompatible.items() if configured]
+            if active:
+                raise ValueError("--h3_sparse_teacher_eval_only cannot be combined with " + ", ".join(active))
+        self._sparse_teacher_budgets = _parse_h3_sparse_teacher_budgets(getattr(args, "h3_sparse_teacher_budgets", ""))
+        if self._sparse_teacher_budgets and sparse_teacher_weight <= 0:
+            raise ValueError("--h3_sparse_teacher_budgets requires --h3_sparse_teacher_loss_weight")
         self._guidance_scale_range = _parse_guidance_scale_range(getattr(args, "h3_guidance_scale_range", None))
         if self._guidance_scale_range is not None:
             if args.h3_guidance_distillation_scale is not None:
@@ -4375,6 +4427,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 data_path=args.h3_sparse_data_path,
             )
             transformer.enable_reference_sparse_attention(sparse_config, router)
+            self._sparse_teacher_base_config = sparse_config
             logger.info(
                 "Enabled H3 sparse reference attention: exact_blocks=%d radius=%d data_path=%s",
                 args.h3_sparse_exact_blocks,
@@ -4716,12 +4769,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             overlay.set_enabled(prior)
 
     def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):
-        if args is not None and (args.h3_base_preservation_loss_weight > 0 or args.h3_dop_loss_weight > 0):
+        if args is not None and (
+            args.h3_base_preservation_loss_weight > 0
+            or args.h3_dop_loss_weight > 0
+            or float(getattr(args, "h3_sparse_teacher_loss_weight", 0.0) or 0.0) > 0
+        ):
             if network is None:
-                raise ValueError("H3 preservation losses require a trainable network")
+                raise ValueError("H3 auxiliary losses require a trainable network")
             set_enabled = getattr(accelerator.unwrap_model(network), "set_enabled", None)
             if not callable(set_enabled):
-                raise TypeError("H3 preservation losses require a network with set_enabled()")
+                raise TypeError("H3 auxiliary losses require a network with set_enabled()")
         if args is not None:
             self.install_overlay_weights(args, accelerator, transformer)
             self.install_teacher_weights(args, accelerator, transformer)
@@ -5733,6 +5790,29 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             set_enabled(enabled)
 
         return tracked
+
+    @classmethod
+    @contextmanager
+    def _network_enabled(cls, accelerator, network, enabled: bool, requirement: str):
+        """Temporarily toggle the trainable adapter and restore its actual prior state."""
+        if network is None:
+            raise ValueError(f"{requirement} requires a trainable network")
+        unwrapped = accelerator.unwrap_model(network)
+        modules = list(getattr(unwrapped, "text_encoder_loras", ())) + list(getattr(unwrapped, "unet_loras", ()))
+        module_states = [bool(getattr(module, "enabled", True)) for module in modules]
+        is_enabled = getattr(unwrapped, "is_enabled", None)
+        prior = bool(is_enabled()) if callable(is_enabled) else bool(getattr(unwrapped, "_h3_adapter_enabled", True))
+        toggle = cls._runtime_network_toggle(accelerator, network, requirement)
+        toggle(enabled)
+        try:
+            yield
+        finally:
+            if modules:
+                for module, state in zip(modules, module_states, strict=True):
+                    module.enabled = state
+                unwrapped._h3_adapter_enabled = all(module_states)
+            else:
+                toggle(prior)
 
     @staticmethod
     @contextmanager
@@ -6819,6 +6899,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         self._batch_backward_performed = False
+        self._sparse_teacher_eval_step = bool(getattr(args, "h3_sparse_teacher_eval_only", False))
         self._adapter_network = network
         self._adapter_prompt_only = bool(getattr(args, "h3_adapter_prompt_only", False))
         self._clean_latent_cache = {}
@@ -6965,6 +7046,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # by validation and sampling between optimizer steps.
             if self._crepa is not None:
                 self._crepa.clear_step()
+
+    def skip_optimizer_step(self, args, accelerator, network, transformer, global_step: int) -> bool:
+        del args, accelerator, network, transformer, global_step
+        return bool(getattr(self, "_sparse_teacher_eval_step", False))
 
     @staticmethod
     def _materialize_metrics(metrics: dict) -> dict[str, float]:
@@ -7294,6 +7379,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 else rollout_active_override
             )
         reference_prediction = None
+        sparse_teacher_prediction = None
         null_anchor_student = None
         null_anchor_reference = None
         null_anchor = None
@@ -7337,6 +7423,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             and conditioning == "prompt"
             and _two_teacher_sigma_active(args, step_video_sigma)
         )
+        sparse_teacher_weight = float(getattr(args, "h3_sparse_teacher_loss_weight", 0.0) or 0.0)
+        sparse_config = getattr(transformer, "reference_sparse_config", None)
+        if sparse_teacher_weight > 0:
+            if network is None:
+                raise ValueError("--h3_sparse_teacher_loss_weight requires a trainable network")
+            if sparse_config is None:
+                raise ValueError("--h3_sparse_teacher_loss_weight requires sparse reference attention")
+            sparse_teacher_budgets = getattr(self, "_sparse_teacher_budgets", ())
+            if sparse_teacher_budgets:
+                sparse_config = replace(
+                    getattr(self, "_sparse_teacher_base_config", sparse_config),
+                    topk_blocks=sparse_teacher_budgets[
+                        (getattr(args, "h3_sparse_teacher_budget_offset", 0) + global_step) % len(sparse_teacher_budgets)
+                    ],
+                )
+                transformer.enable_reference_sparse_attention(sparse_config, transformer.reference_sparse_router)
         if dop_active or two_teacher_active:
             missing_dop = [
                 key for key in (H3_DOP_TEXT_HIDDEN_KEY, H3_DOP_TEXT_TOKEN_TAGS_KEY, H3_DOP_CONFIG_KEY) if key not in batch
@@ -7381,6 +7483,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 or dop_active
                 or null_anchor_active
                 or two_teacher_active
+                or sparse_teacher_weight > 0
                 or getattr(args, "h3_teacher_matching", False)
             )
         )
@@ -7591,6 +7694,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             )
                     finally:
                         set_enabled(True)
+            if sparse_teacher_weight > 0:
+                dense_teacher_config = replace(sparse_config, topk_blocks=1_000_000)
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                with torch.random.fork_rng(devices=fork_devices):
+                    with self._network_enabled(accelerator, network, False, "--h3_sparse_teacher_loss_weight"), torch.no_grad():
+                        try:
+                            transformer.enable_reference_sparse_attention(dense_teacher_config, transformer.reference_sparse_router)
+                            sparse_teacher_prediction = self._predict(
+                                accelerator,
+                                transformer,
+                                batch,
+                                inputs,
+                                conditioning=conditioning,
+                            )
+                        finally:
+                            transformer.enable_reference_sparse_attention(sparse_config, transformer.reference_sparse_router)
             if two_teacher_active:
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_two_teacher_loss_weight")
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
@@ -7721,13 +7840,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if self._crepa is not None:
             self._crepa.begin_step(use_crepa, global_step)
         try:
-            raw_prediction = self._predict(
-                accelerator,
-                transformer,
-                batch,
-                inputs,
-                conditioning=conditioning,
-            )
+            with torch.no_grad() if getattr(args, "h3_sparse_teacher_eval_only", False) else nullcontext():
+                raw_prediction = self._predict(
+                    accelerator,
+                    transformer,
+                    batch,
+                    inputs,
+                    conditioning=conditioning,
+                )
         except Exception:
             if self._crepa is not None:
                 self._crepa.clear_step()
@@ -8227,6 +8347,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # the rollout anchor were already folded into ``loss``, so the objective is
         # the one captured when the rollout loss was formed.
         main_objective = rollout_main_objective if rollout_replaced else loss
+        if getattr(args, "h3_sparse_teacher_only", False):
+            loss = loss * 0
         base_preservation_term = None
         if reference_prediction is not None:
             preservation = joint_prediction_loss(
@@ -8249,6 +8371,50 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.h3_base_preservation_loss_weight > 0:
             metrics["h3/base_preservation_active"] = float(preservation_active)
             metrics.setdefault("loss/base_preservation", 0.0)
+        sparse_teacher_term = None
+        if sparse_teacher_prediction is not None:
+            sparse_teacher = joint_prediction_loss(
+                raw_prediction,
+                sparse_teacher_prediction,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+            sparse_teacher_term = sparse_teacher_weight * sparse_teacher.loss
+            loss = loss + sparse_teacher_term
+            metrics["loss/sparse_teacher"] = sparse_teacher.loss.detach()
+            metrics["h3/sparse_teacher_budget"] = float(sparse_config.topk_blocks)
+            teacher_dot = teacher_error = teacher_norm = student_norm = 0.0
+            for student_value, teacher_value in (
+                (raw_prediction.video, sparse_teacher_prediction.video),
+                (raw_prediction.audio, sparse_teacher_prediction.audio),
+            ):
+                if student_value is None:
+                    continue
+                student_value = student_value.float()
+                teacher_value = teacher_value.float()
+                teacher_error += (student_value - teacher_value).square().sum()
+                teacher_norm += teacher_value.square().sum()
+                student_norm += student_value.square().sum()
+                teacher_dot += (student_value * teacher_value).sum()
+            metrics["h3/sparse_teacher_rel_l2"] = (teacher_error / teacher_norm.clamp_min(1e-12)).sqrt().detach()
+            metrics["h3/sparse_teacher_cosine"] = (
+                teacher_dot / (student_norm.clamp_min(1e-12) * teacher_norm.clamp_min(1e-12)).sqrt()
+            ).detach()
+            reference_count = _h3_reference_count(batch)
+            metrics["h3/sparse_teacher_references"] = float(reference_count)
+            logger.info(
+                "H3 sparse teacher: budget=%d references=%d rel-L2=%.6f cosine=%.6f",
+                sparse_config.topk_blocks,
+                reference_count,
+                metrics["h3/sparse_teacher_rel_l2"],
+                metrics["h3/sparse_teacher_cosine"],
+            )
         if null_anchor_student is not None and null_anchor_reference is not None:
             # A sparse anchor is an estimator of the dense one: the active term is
             # divided by its probability so the expected gradient is unchanged.
@@ -8297,6 +8463,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             or null_anchor is not None
             or two_teacher_trigger_loss is not None
             or soar_weight > 0
+            or sparse_teacher_term is not None
         ):
             average_loss = loss
             if base_preservation_term is not None:
@@ -8306,6 +8473,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # reason: the reported average is the ordinary data loss a run
                 # without the flag would have logged, so two runs stay comparable.
                 average_loss = average_loss - null_anchor
+            if sparse_teacher_term is not None and not getattr(args, "h3_sparse_teacher_only", False):
+                average_loss = average_loss - sparse_teacher_term
             if guidance_rescaled:
                 # Report the dense guidance objective so the running average stays
                 # comparable across a sparse and a dense run.
@@ -8510,6 +8679,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_sparse_exact_blocks": str(getattr(args, "h3_sparse_exact_blocks", 64)),
             "ss_h3_sparse_temporal_radius": str(getattr(args, "h3_sparse_temporal_radius", 2)),
             "ss_h3_sparse_data_path": getattr(args, "h3_sparse_data_path", "packed"),
+            "ss_h3_sparse_teacher_loss_weight": str(getattr(args, "h3_sparse_teacher_loss_weight", 0.0)),
+            "ss_h3_sparse_teacher_only": str(bool(getattr(args, "h3_sparse_teacher_only", False))),
+            "ss_h3_sparse_teacher_eval_only": str(bool(getattr(args, "h3_sparse_teacher_eval_only", False))),
+            "ss_h3_sparse_teacher_budgets": getattr(args, "h3_sparse_teacher_budgets", "") or "fixed",
+            "ss_h3_sparse_teacher_budget_offset": str(getattr(args, "h3_sparse_teacher_budget_offset", 0)),
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(
                 args.h3_image_flow_shift
@@ -9710,6 +9884,37 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "probability of evaluating the frozen-base preservation branch on a batch; active losses are divided by "
             "this probability to preserve the expected gradient, and the draw is synchronized across distributed ranks"
         ),
+    )
+    parser.add_argument(
+        "--h3_sparse_teacher_loss_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "optional sparse-compensation objective weight; matches a frozen dense reference-attention prediction "
+            "before the sparse trainable pass and adds one no-grad transformer forward per batch"
+        ),
+    )
+    parser.add_argument(
+        "--h3_sparse_teacher_only",
+        action="store_true",
+        help="optimize only the sparse-compensation objective and exclude the ordinary flow loss",
+    )
+    parser.add_argument(
+        "--h3_sparse_teacher_eval_only",
+        action="store_true",
+        help="measure sparse compensation without backward, optimizer, scheduler, EMA, or max-norm updates",
+    )
+    parser.add_argument(
+        "--h3_sparse_teacher_budgets",
+        type=str,
+        default="",
+        help="optional comma-separated exact-block budgets cycled by global step",
+    )
+    parser.add_argument(
+        "--h3_sparse_teacher_budget_offset",
+        type=int,
+        default=0,
+        help="non-negative offset added to global step when selecting a sparse-teacher budget",
     )
     parser.add_argument(
         "--h3_dop_loss_weight",

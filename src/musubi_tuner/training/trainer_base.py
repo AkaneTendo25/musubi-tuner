@@ -1316,6 +1316,35 @@ class NetworkTrainer:
         """Backpropagate a loss returned by :meth:`process_batch`."""
         accelerator.backward(loss)
 
+    def skip_optimizer_step(self, args, accelerator, network, transformer, global_step: int) -> bool:
+        """Return true for a measurement step that must not mutate training state."""
+        del args, accelerator, network, transformer, global_step
+        return False
+
+    def _run_optimizer_step(
+        self,
+        args,
+        accelerator,
+        network,
+        transformer,
+        optimizer,
+        lr_scheduler,
+        sds_optimizer_step,
+        global_step: int,
+        *,
+        skip: bool,
+    ) -> None:
+        """Apply one optimizer update, or clear gradients for a read-only measurement step."""
+        if skip:
+            optimizer.zero_grad(set_to_none=True)
+            return
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        if sds_optimizer_step is not None and accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
+            sds_optimizer_step(optimizer)
+        self.on_post_optimizer_step(args, accelerator, network, transformer, accelerator.sync_gradients, global_step)
+
     def get_primary_latents(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Return the tensor used by the common loop for noise/schedule setup."""
         return batch["latents"]
@@ -2482,8 +2511,10 @@ class NetworkTrainer:
                     )
 
                     grad_metrics = {}
-                    self.backward_loss(accelerator, loss)
-                    if accelerator.sync_gradients:
+                    skip_optimizer_step = self.skip_optimizer_step(args, accelerator, network, transformer, global_step)
+                    if not skip_optimizer_step:
+                        self.backward_loss(accelerator, loss)
+                    if accelerator.sync_gradients and not skip_optimizer_step:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
                         if state.distributed_type != accelerate.DistributedType.NO:
@@ -2499,22 +2530,26 @@ class NetworkTrainer:
                             ]
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    self._run_optimizer_step(
+                        args,
+                        accelerator,
+                        network,
+                        transformer,
+                        optimizer,
+                        lr_scheduler,
+                        sds_optimizer_step,
+                        global_step,
+                        skip=skip_optimizer_step,
+                    )
 
-                    if sds_optimizer_step is not None and accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
-                        sds_optimizer_step(optimizer)
-
-                    self.on_post_optimizer_step(args, accelerator, network, transformer, accelerator.sync_gradients, global_step)
-
-                if args.scale_weight_norms:
+                if args.scale_weight_norms and not skip_optimizer_step:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
                         args.scale_weight_norms, accelerator.device
                     )
                     max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
                 else:
                     keys_scaled, mean_norm, maximum_norm = None, None, None
+                    max_mean_logs = {}
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
@@ -2640,7 +2675,7 @@ class NetworkTrainer:
                         max_epochs=num_train_epochs,
                     )
 
-                if args.scale_weight_norms:
+                if args.scale_weight_norms and not skip_optimizer_step:
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if len(accelerator.trackers) > 0:
