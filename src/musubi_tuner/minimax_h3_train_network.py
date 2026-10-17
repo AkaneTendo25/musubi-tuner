@@ -125,6 +125,12 @@ from musubi_tuner.minimax_h3.rollout import (
 from musubi_tuner.minimax_h3.rollout import (
     SIGMA_FLOOR as ROLLOUT_SIGMA_FLOOR,
 )
+from musubi_tuner.minimax_h3.marginal_repair import (
+    guidance_recovered_target,
+    interpolate_schedule,
+    parse_scale_schedule,
+    scale_at,
+)
 from musubi_tuner.minimax_h3.training import (
     H3FusedArm,
     H3JointNoisyInputs,
@@ -3284,7 +3290,77 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 self._masked_rms(adapted_pair[0] - base_pair[1], video_mask) / base_gap
             )
 
+    def _validate_repair_args(self, args):
+        self._repair_schedule = None
+        reference = getattr(args, "h3_repair_reference", None)
+        options = ("h3_repair_scale", "h3_repair_sigma_weight", "h3_repair_target_multiplier")
+        if reference is None:
+            if any(getattr(args, name, None) is not None for name in options) or getattr(args, "h3_repair_reference_weight", 0):
+                raise ValueError("repair options require --h3_repair_reference empty")
+            return
+        if reference != "empty":
+            raise ValueError("--h3_repair_reference supports only empty; caption reconstruction is not implemented")
+        if getattr(args, "h3_repair_scale", None) is None:
+            raise ValueError("--h3_repair_reference requires --h3_repair_scale")
+        self._repair_schedule = parse_scale_schedule(args.h3_repair_scale)
+        if getattr(args, "h3_repair_reference_weight", 0) != 0:
+            raise ValueError("--h3_repair_reference_weight must be 0 for the empty reference")
+        for name, lengths in (("h3_repair_sigma_weight", (2, 3)), ("h3_repair_target_multiplier", (3,))):
+            values = getattr(args, name, None)
+            if isinstance(values, str):
+                try:
+                    values = tuple(float(value.strip()) for value in values.split(","))
+                except ValueError as error:
+                    raise ValueError(f"--{name} requires comma-separated finite positive numbers") from error
+            if values is not None:
+                if not isinstance(values, (tuple, list)) or len(values) not in lengths:
+                    raise ValueError(f"--{name} requires {lengths} finite positive values")
+                if any(not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0 for value in values):
+                    raise ValueError(f"--{name} requires finite positive values")
+                setattr(args, name, tuple(values))
+        # Reconstruction replaces the data objective. Other target-changing or
+        # auxiliary objectives require their own explicitly validated recipe.
+        conflicts = (
+            "h3_guidance_distillation_scale",
+            "h3_guidance_scale_range",
+            "h3_teacher_matching",
+            "h3_rollout_supervision",
+            "h3_soar_weight",
+            "h3_two_teacher_loss_weight",
+            "h3_two_teacher_snapshot_step",
+            "h3_base_preservation_loss_weight",
+            "h3_guidance_null_anchor_weight",
+            "h3_dop_loss_weight",
+            "h3_caption_dropout_rate",
+            "h3_frame_sigma_jitter",
+            "h3_qwen_control_dropout_rate",
+            "h3_adapter_prompt_only",
+            "h3_overlay_weights",
+            "crepa",
+            "network_dropout",
+            "network_rank_dropout",
+            "network_module_dropout",
+        )
+        for name in conflicts:
+            if getattr(args, name, None):
+                raise ValueError(f"--h3_repair_reference cannot be combined with --{name}")
+        if getattr(args, "network_args", None) and any(
+            str(value).startswith(("dropout=", "rank_dropout=", "module_dropout="))
+            and str(value).split("=", 1)[1] not in ("0", "0.0")
+            for value in args.network_args
+        ):
+            raise ValueError("--h3_repair_reference requires network dropout disabled")
+        if callable(getattr(self, "_validate_full_finetune_args", None)):
+            raise ValueError("--h3_repair_reference is supported only for LoRA training")
+        multipliers = getattr(args, "h3_repair_target_multiplier", None)
+        if multipliers is not None:
+            for sigma, multiplier in zip((0.40, 0.80, 0.95), multipliers):
+                scale = max(1.0, self._repair_schedule[0] + self._repair_schedule[1] * sigma)
+                if multiplier * (1 - 1 / scale) > 1 + 1e-7:
+                    raise ValueError("--h3_repair_target_multiplier extrapolates past the reference branch")
+
     def handle_model_specific_args(self, args: argparse.Namespace):
+        self._validate_repair_args(args)
         self.dit_dtype = (
             torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
         )
@@ -6435,6 +6511,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return None
         if (
             args.h3_guidance_distillation_scale is not None
+            or getattr(args, "h3_repair_reference", None) is not None
             or float(args.h3_base_preservation_loss_weight) > 0
             or float(args.h3_dop_loss_weight) > 0
             or float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
@@ -7165,6 +7242,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         dop_reference_prediction = None
         teacher_concept_prediction = None
         matching_teacher_prediction = None
+        repair_frozen = None
+        repair_active = getattr(args, "h3_repair_reference", None) is not None
         teacher_conditioned = False
         if getattr(args, "h3_teacher_matching", False):
             teacher_conditioned = _teacher_conditioned(args, float(base_sigma.reshape(-1)[0]))
@@ -7225,6 +7304,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             and not getattr(self, "_block_swap_h2d_only", False)
             and (
                 use_guidance
+                or repair_active
                 or preservation_active
                 or dop_active
                 or null_anchor_active
@@ -7240,6 +7320,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # the graph-carrying student forward.
             transformer.switch_block_swap_for_inference()
         try:
+            if repair_active:
+                missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+                if missing:
+                    raise KeyError("--h3_repair_reference requires --cache_guidance_empty; missing " + ", ".join(missing))
+                set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_repair_reference")
+                int8_context = getattr(transformer, "int8_attention_context", None)
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                with torch.random.fork_rng(devices=fork_devices):
+                    set_enabled(False)
+                    try:
+                        with torch.no_grad(), int8_context(auxiliary=True) if callable(int8_context) else nullcontext():
+                            prompted = self._predict(accelerator, transformer, batch, inputs, conditioning="prompt")
+                            reference = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                            repair_frozen = (prompted, reference)
+                    finally:
+                        set_enabled(True)
             if getattr(args, "h3_teacher_matching", False):
                 teacher_batch, teacher_mode = self._teacher_matching_batch(args, batch, inputs, teacher_conditioned)
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_teacher_matching")
@@ -7611,7 +7707,53 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 audio_weight=audio_weight,
             )
 
-        result = _velocity_loss(prediction, loss_inputs)
+        if repair_frozen is not None:
+            targets = {}
+            repair_weights = {}
+            for modality, present, normal_weight in (
+                ("video", has_video, video_sample_weight),
+                ("audio", has_audio, audio_sample_weight),
+            ):
+                teacher = getattr(repair_frozen[0], modality)
+                reference = getattr(repair_frozen[1], modality)
+                sigma = getattr(inputs, modality + "_sigma")
+                if present:
+                    multiplier = getattr(args, "h3_repair_target_multiplier", None)
+                    targets[modality] = guidance_recovered_target(
+                        teacher,
+                        reference,
+                        scale_at(self._repair_schedule, sigma),
+                        None if multiplier is None else interpolate_schedule(multiplier, sigma),
+                    )
+                    schedule = getattr(args, "h3_repair_sigma_weight", None)
+                    repair_weights[modality] = normal_weight if schedule is None else interpolate_schedule(schedule, sigma)
+                else:
+                    targets[modality] = None
+                    repair_weights[modality] = None
+            # Common sample-weight reduction normalizes by the sum of weights.
+            # Repair weights instead emphasize steps.
+            # Scale residuals before reduction so masks and modality balance stay
+            # shared while a single item's scalar weight does not cancel.
+            weighted_predictions = {}
+            for modality in ("video", "audio"):
+                value = getattr(raw_prediction, modality)
+                weight = repair_weights[modality]
+                if value is not None and weight is not None:
+                    weight = weight.to(device=value.device, dtype=torch.float32).reshape(-1, *([1] * (value.ndim - 1)))
+                    value = targets[modality].float() + weight.sqrt() * (value.float() - targets[modality].float())
+                weighted_predictions[modality] = value
+            result = joint_prediction_loss(
+                H3ModelPrediction(**weighted_predictions),
+                H3ModelPrediction(**targets),
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+        else:
+            result = _velocity_loss(prediction, loss_inputs)
         # A modality with weight 0 (the observed side of a v2a/a2v step) reports a
         # flat 0.0 rather than disappearing: the key stays in every step's metric
         # set so existing dashboards and the per-item averaging below keep a
@@ -7622,6 +7764,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "h3/sigma_video": inputs.video_sigma.mean().detach(),
             "h3/sigma_audio": inputs.audio_sigma.mean().detach(),
         }
+        if repair_frozen is not None:
+            metrics["loss/repair_video"] = result.video_loss.detach()
+            metrics["loss/repair_audio"] = result.audio_loss.detach()
         # Only slot batches report these keys, so every other run's metric set
         # is unchanged.
         metrics.update(
@@ -8309,6 +8454,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if getattr(args, "h3_teacher_matching", False)
                 else {}
             ),
+            "ss_h3_repair_reference": str(getattr(args, "h3_repair_reference", None) or "none"),
+            "ss_h3_repair_scale": str(getattr(args, "h3_repair_scale", None) or "none"),
+            "ss_h3_repair_reference_weight": str(getattr(args, "h3_repair_reference_weight", 0.0)),
+            "ss_h3_repair_sigma_weight": str(getattr(args, "h3_repair_sigma_weight", None)),
+            "ss_h3_repair_target_multiplier": str(getattr(args, "h3_repair_target_multiplier", None)),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_guidance_audio_scale": str(getattr(args, "h3_guidance_audio_scale", None) or "same"),
             "ss_h3_guidance_scale_range": (
@@ -8420,6 +8570,36 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--h3_repair_reference",
+        choices=("empty",),
+        default=None,
+        help="train a training-only guidance-restoring LoRA using frozen prompted and empty predictions",
+    )
+    parser.add_argument(
+        "--h3_repair_scale",
+        type=str,
+        default=None,
+        help="reconstruction scale: constant >=1, or intercept,slope evaluated at each modality's sigma and floored at 1",
+    )
+    parser.add_argument(
+        "--h3_repair_reference_weight",
+        type=float,
+        default=0.0,
+        help="must remain 0: the empty reference branch is not a separate training target",
+    )
+    parser.add_argument(
+        "--h3_repair_sigma_weight",
+        type=str,
+        default=None,
+        help="repair-only weights low,high at sigma .40/.95 or low,mid,high at .40/.80/.95",
+    )
+    parser.add_argument(
+        "--h3_repair_target_multiplier",
+        type=str,
+        default=None,
+        help="multiply prompted-to-recovered displacement at sigma .40/.80/.95; extrapolation past reference is rejected",
+    )
     parser.description = "Train a MiniMax H3 LoRA with synchronized video and audio flow matching"
     parser.add_argument(
         "--h3_training_mode",
