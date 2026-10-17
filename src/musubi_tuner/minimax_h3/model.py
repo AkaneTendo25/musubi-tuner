@@ -437,6 +437,7 @@ class MiniMaxH3Attention(nn.Module):
         self.reference_sparse_layout: H3ReferenceSparseLayout | None = None
         self.reference_sparse_layer_index = -1
         object.__setattr__(self, "_reference_sparse_router", None)
+        object.__setattr__(self, "_reference_router_teacher", None)
         # Set by ``MiniMaxH3Transformer.set_checkpoint_keep("qkv")``; gates the
         # region ``install_projection_region`` wraps around the base projection.
         self.checkpoint_keep_qkv = False
@@ -448,6 +449,10 @@ class MiniMaxH3Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(self.inner_dim, hidden_size, bias=False)
+
+    def set_reference_router_teacher(self, teacher) -> None:
+        """Attach an optional normalized/rotated Q/K observer without model state."""
+        object.__setattr__(self, "_reference_router_teacher", teacher)
 
     def configure_reference_sparse_attention(
         self,
@@ -535,6 +540,9 @@ class MiniMaxH3Attention(nn.Module):
             query, key = self._norm_and_rotate(query, key, rotary_emb)
         query = query.to(value)
         key = key.to(value)
+        teacher = self._reference_router_teacher
+        if teacher is not None and self.reference_sparse_layout is not None:
+            teacher(query, key, self.reference_sparse_layout, self.reference_sparse_layer_index)
         return query, key, value
 
     def _norm_and_rotate(
