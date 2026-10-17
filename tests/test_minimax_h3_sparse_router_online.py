@@ -322,7 +322,11 @@ def test_visual_latent_selection_ignores_audio_target() -> None:
     )
 
 
-def test_online_cache_loader_preserves_reference_contract_metadata(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "text_contract",
+    [None, torch.tensor(1), torch.tensor(2), torch.tensor(1, dtype=torch.int32), torch.tensor([1])],
+)
+def test_online_cache_loader_preserves_reference_contract_metadata(tmp_path: Path, text_contract: torch.Tensor | None) -> None:
     latent_path = tmp_path / "sample_mmh3.safetensors"
     text_path = tmp_path / "sample_mmh3_te.safetensors"
     save_file(
@@ -346,9 +350,17 @@ def test_online_cache_loader_preserves_reference_contract_metadata(tmp_path: Pat
             H3_CONDITIONING_TASK_KEY: torch.tensor(4),
             H3_REFERENCE_ROUTE_KEY: torch.tensor(0),
             H3_REFERENCE_VIDEO_FPS_KEY: torch.tensor(24.0, dtype=torch.float64),
+            **({H3_REFERENCE_TEMPORAL_CONTRACT_KEY: text_contract} if text_contract is not None else {}),
         },
         text_path,
     )
+
+    if text_contract is not None and (
+        text_contract.dtype != torch.int64 or text_contract.shape != torch.Size([]) or text_contract.item() != 1
+    ):
+        with pytest.raises(ValueError, match="conflicting mmh3_reference_temporal_contract"):
+            _load_example(latent_path, text_path)
+        return
 
     batch, clean = _load_example(latent_path, text_path)
 

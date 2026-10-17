@@ -390,8 +390,10 @@ def _load_example(latent_path: Path, text_path: Path) -> tuple[dict[str, torch.T
     )
     for key in metadata_keys:
         values = [value for tensors in (latent, text) if (value := _optional_tensor_with_prefix(tensors, key)) is not None]
-        if len(values) > 1:
-            raise ValueError(f"{latent_path} and {text_path} both contain {key}")
+        if len(values) > 1 and (
+            values[0].dtype != values[1].dtype or values[0].shape != values[1].shape or not torch.equal(values[0], values[1])
+        ):
+            raise ValueError(f"{latent_path} and {text_path} contain conflicting {key}")
         if values:
             batch[key] = values[0]
     return batch, latent[latent_key].unsqueeze(0)
