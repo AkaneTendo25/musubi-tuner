@@ -452,10 +452,12 @@ def read_config_from_file(
     """Load common config while retaining whether H3's global sampler was explicitly selected."""
     command_line = tuple(sys.argv[1:] if argv is None else argv)
     explicit = any(
-        parsed is not None and parsed[0] is not None and parsed[0].dest == "timestep_sampling"
+        action is not None and action.dest == "timestep_sampling"
         for value in command_line
         if value.startswith("-")
         for parsed in (parser._parse_optional(value),)
+        if parsed is not None
+        for action, *_ in (parsed if isinstance(parsed, list) else (parsed,))
     )
     if not args.config_file:
         args._h3_timestep_sampling_explicit = explicit
