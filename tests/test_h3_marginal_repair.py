@@ -152,7 +152,7 @@ def test_caption_state_rejects_pool_mutation_after_identity_was_cached(tmp_path)
         hooks.load([], tmp_path)
 
 
-@pytest.mark.parametrize("missing", ["activation_generator", "anchor_random"])
+@pytest.mark.parametrize("missing", ["activation_generator", "anchor_random", "caption_dropout_rate"])
 def test_caption_state_rejects_missing_rng_fields_without_mutating_streams(tmp_path, missing):
     _, trainer, hooks, _ = _caption_state_trainer(tmp_path)
     hooks.save([], [], tmp_path)
@@ -170,6 +170,28 @@ def test_caption_state_rejects_missing_rng_fields_without_mutating_streams(tmp_p
         hooks.load([], tmp_path)
     torch.testing.assert_close(trainer._repair_caption_generator.get_state(), generator_state)
     assert trainer._repair_anchor_random.getstate() == random_state
+
+
+def test_caption_state_v1_migrates_only_with_zero_caption_dropout(tmp_path):
+    _, trainer, hooks, _ = _caption_state_trainer(tmp_path)
+    hooks.save([], [], tmp_path)
+    state_path = tmp_path / "h3_caption_repair_state-rank0.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["version"] = 1
+    del state["caption_dropout_rate"]
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    hooks.load([], tmp_path)
+
+    trainer_args = SimpleNamespace(
+        h3_repair_caption_anchors=1,
+        h3_repair_caption_probability=0.5,
+        h3_repair_reference_weight=0.25,
+        h3_caption_dropout_rate=0.5,
+    )
+    rejecting_hooks = _StateHooks()
+    trainer._register_caption_repair_state_hooks(trainer_args, rejecting_hooks)
+    with pytest.raises(ValueError, match="only zero caption dropout"):
+        rejecting_hooks.load([], tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -204,7 +226,6 @@ def test_caption_repair_validation(options, match):
     [
         (["--h3_repair_scale", "4"], "require"),
         (["--h3_repair_reference", "empty"], "requires"),
-        (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_caption_dropout_rate", "0.1"], "caption_dropout"),
         (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_guidance_distillation_scale", "4"], "guidance"),
         (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_repair_sigma_weight", "0,1"], "positive"),
         (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_repair_target_multiplier", "2,2,2"], "extrapolates"),
@@ -356,6 +377,56 @@ def test_caption_reference_auxiliary_leaves_classic_swap_ready_for_primary():
     (_, metrics), model, _ = run_step(args, trainer, swap=True)
     assert model.events == ["inference", "training"]
     assert metrics["loss/repair_reference"] > 0
+
+
+@pytest.mark.parametrize("reference", ["empty", "caption"])
+def test_caption_dropout_uses_current_teacher_and_reuses_primary_empty_graph(reference):
+    class Pool:
+        def draw(self, count, *, generator, exclude):
+            return [torch.full((1, 8), 2.0)]
+
+    options = [
+        "--h3_repair_reference",
+        reference,
+        "--h3_repair_scale",
+        "4",
+        "--h3_caption_dropout_rate",
+        "1",
+    ]
+    if reference == "caption":
+        options += ["--h3_repair_caption_anchors", "1", "--h3_repair_reference_weight", "0.2"]
+    args, trainer = configured(*options)
+    trainer._repair_anchor_pool = Pool()
+    (loss, metrics), model, backend = run_step(args, trainer)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.adapter.grad is not None and torch.isfinite(model.adapter.grad)
+    # Empty repair: one frozen current/empty teacher plus the primary. Caption
+    # repair: one frozen current teacher, one frozen caption, then the primary;
+    # its reference auxiliary reuses that primary graph.
+    expected = 2 if reference == "empty" else 3
+    assert len(backend.calls) == expected
+    assert backend.calls[0] == ("empty", False, False)
+    assert backend.calls[-1] == ("empty", True, True)
+    if reference == "caption":
+        assert metrics["loss/repair_reference"] > 0
+
+
+def test_caption_repair_dropout_trace_is_deterministic():
+    traces = []
+    for _ in range(2):
+        torch.manual_seed(812)
+        args, trainer = configured(
+            "--h3_repair_reference",
+            "empty",
+            "--h3_repair_scale",
+            "4",
+            "--h3_caption_dropout_rate",
+            "0.5",
+        )
+        (_, _), _, backend = run_step(args, trainer)
+        traces.append(backend.calls)
+    assert traces[0] == traces[1]
 
 
 @pytest.mark.parametrize("audio", [False, True])

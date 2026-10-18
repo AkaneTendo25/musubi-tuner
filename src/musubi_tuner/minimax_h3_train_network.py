@@ -1544,12 +1544,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if current_identity != self._repair_anchor_pool_identity:
                 raise ValueError("caption repair anchor pool changed after training started")
             state = {
-                "version": 1,
+                "version": 2,
                 "process_index": accelerator.process_index,
                 "num_processes": accelerator.num_processes,
                 "anchors": int(args.h3_repair_caption_anchors),
                 "probability": float(args.h3_repair_caption_probability),
                 "reference_weight": float(args.h3_repair_reference_weight),
+                "caption_dropout_rate": float(args.h3_caption_dropout_rate),
                 "pool_identity": self._repair_anchor_pool_identity,
                 "pool_size": len(self._repair_anchor_pool),
                 "activation_generator": (
@@ -1567,7 +1568,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if not path.is_file():
                 raise FileNotFoundError(f"caption repair resume state is missing: {path}")
             state = json.loads(path.read_text(encoding="utf-8"))
-            required_keys = {
+            v1_keys = {
                 "version",
                 "process_index",
                 "num_processes",
@@ -1579,13 +1580,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "activation_generator",
                 "anchor_random",
             }
-            if not isinstance(state, dict) or set(state) != required_keys:
+            v2_keys = v1_keys | {"caption_dropout_rate"}
+            if not isinstance(state, dict) or set(state) not in (v1_keys, v2_keys):
+                raise ValueError("caption repair resume state has an incomplete or unsupported schema")
+            version = state["version"]
+            if type(version) is not int or version not in (1, 2):
+                raise ValueError("caption repair resume state version does not match this run")
+            if version == 1:
+                if set(state) != v1_keys or float(args.h3_caption_dropout_rate) != 0:
+                    raise ValueError("caption repair v1 resume state supports only zero caption dropout")
+            elif set(state) != v2_keys:
                 raise ValueError("caption repair resume state has an incomplete or unsupported schema")
             current_identity = self._repair_anchor_pool.compute_identity(refresh=True)
             if current_identity != self._repair_anchor_pool_identity:
                 raise ValueError("caption repair anchor pool changed after training started")
             expected = {
-                "version": 1,
+                "version": version,
                 "process_index": accelerator.process_index,
                 "num_processes": accelerator.num_processes,
                 "anchors": int(args.h3_repair_caption_anchors),
@@ -1594,6 +1604,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "pool_identity": self._repair_anchor_pool_identity,
                 "pool_size": len(self._repair_anchor_pool),
             }
+            if version == 2:
+                expected["caption_dropout_rate"] = float(args.h3_caption_dropout_rate)
             for key, value in expected.items():
                 if type(state.get(key)) is not type(value) or state.get(key) != value:
                     raise ValueError(f"caption repair resume state {key} does not match this run")
@@ -3592,7 +3604,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "h3_base_preservation_loss_weight",
             "h3_guidance_null_anchor_weight",
             "h3_dop_loss_weight",
-            "h3_caption_dropout_rate",
             "h3_frame_sigma_jitter",
             "h3_qwen_control_dropout_rate",
             "h3_adapter_prompt_only",
@@ -7882,11 +7893,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     if args.h3_repair_reference == "caption" and repair_caption_active
                     else None
                 )
-                prompted = frozen_repair_branch(batch, "prompt")
+                conditioned_teacher = frozen_repair_branch(batch, conditioning)
                 needs_empty = args.h3_repair_reference == "empty" or args.h3_repair_caption_probability < 1.0
                 if needs_empty:
-                    empty_reference = frozen_repair_branch(batch, "empty")
-                    repair_empty_frozen = (prompted, empty_reference)
+                    empty_reference = conditioned_teacher if conditioning == "empty" else frozen_repair_branch(batch, "empty")
+                    repair_empty_frozen = (conditioned_teacher, empty_reference)
                 if args.h3_repair_reference == "empty":
                     repair_frozen = repair_empty_frozen
                 elif repair_caption_active:
@@ -7897,7 +7908,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         )
                         for anchor in anchors
                     ]
-                    repair_frozen = (prompted, caption_marginal_reference(caption_predictions))
+                    repair_frozen = (conditioned_teacher, caption_marginal_reference(caption_predictions))
             if field_preservation_active:
                 missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
                 if missing:
@@ -8315,6 +8326,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 field_adapted_empty = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
 
         repair_reference_weight = float(getattr(args, "h3_repair_reference_weight", 0.0) or 0.0)
+        repair_reference_reuses_primary = repair_caption_active and repair_reference_weight > 0 and conditioning == "empty"
         if repair_caption_active and repair_reference_weight > 0:
             repair_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
 
@@ -8336,7 +8348,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     ).loss
                 )
 
-            if auxiliary_block_swap:
+            if repair_reference_reuses_primary:
+                pass
+            elif auxiliary_block_swap:
                 with torch.random.fork_rng(devices=repair_devices):
                     # The frozen repair section above already restored the
                     # training swap schedule. Keep the live empty forward and
@@ -8395,6 +8409,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 self._crepa.clear_step()
             raise
         prediction = raw_prediction
+        if repair_reference_reuses_primary:
+            # Caption dropout already made the primary graph the trainable empty
+            # branch. Reuse it for the caption-reference auxiliary so the dropped
+            # step neither evaluates nor backpropagates a duplicate empty graph.
+            repair_reference_student = raw_prediction
         loss_inputs = inputs
         if use_guidance:
             prediction, loss_inputs = self._guidance_loss_inputs(
