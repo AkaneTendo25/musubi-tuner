@@ -144,6 +144,7 @@ from musubi_tuner.minimax_h3.training import (
     guidance_scale_for_sigma,
     joint_prediction_loss,
     joint_velocity_loss,
+    projection_guidance_target,
     prepare_joint_noisy_inputs,
     prepare_soar_auxiliary_inputs,
     shift_sigma,
@@ -3756,6 +3757,29 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "--h3_field_preservation_weight with classic block swap stages the empty-branch backward before the "
                 "prompted branch, so it cannot use --fused_backward_pass, whose hooks would step parameters between them"
             )
+        projection_scale = getattr(args, "h3_projection_scale", None)
+        if projection_scale is not None:
+            if not math.isfinite(projection_scale) or projection_scale <= 0:
+                raise ValueError("--h3_projection_scale must be finite and greater than 0; omit it to disable")
+            alternatives = {
+                "guidance distillation": args.h3_guidance_distillation_scale is not None
+                or bool(getattr(args, "h3_guidance_scale_range", None)),
+                "repair": getattr(args, "h3_repair_reference", None) is not None,
+                "rollout supervision": bool(getattr(args, "h3_rollout_supervision", False)),
+                "two-teacher training": float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0,
+                "teacher matching": bool(getattr(args, "h3_teacher_matching", False)),
+                "sparse-teacher-only training": bool(getattr(args, "h3_sparse_teacher_only", False)),
+            }
+            active = [name for name, configured in alternatives.items() if configured]
+            if active:
+                raise ValueError(
+                    "--h3_projection_scale replaces the data objective and cannot be combined with " + ", ".join(active)
+                )
+            if getattr(args, "base_weights", None):
+                raise ValueError(
+                    "--h3_projection_scale needs the unmodified checkpoint for its frozen field, but --base_weights "
+                    "is merged and cannot be disabled; use --h3_overlay_weights for a removable training overlay"
+                )
         anchor_weight = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0)
         if getattr(args, "h3_adapter_prompt_only", False):
             if anchor_weight > 0:
@@ -7460,6 +7484,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         field_preservation_active = _field_preservation_active(args, conditioning, global_step)
         field_base_prompt = field_base_empty = field_adapted_empty = None
+        projection_scale = getattr(args, "h3_projection_scale", None)
+        projection_active = projection_scale is not None and conditioning == "prompt"
+        projection_references = None
+        if projection_active:
+            missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+            if missing:
+                raise KeyError("--h3_projection_scale requires --cache_guidance_empty; missing " + ", ".join(missing))
         # The teacher's privilege lives entirely in its prompted presentation, so
         # there is no privileged null field to distil into a dropped step's
         # unconditional branch. Such a step keeps the ordinary data objective,
@@ -7618,6 +7649,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 or two_teacher_active
                 or sparse_teacher_weight > 0
                 or field_preservation_active
+                or projection_active
                 or getattr(args, "h3_teacher_matching", False)
             )
         )
@@ -8061,6 +8093,32 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             with torch.random.fork_rng(devices=[accelerator.device] if accelerator.device.type == "cuda" else []):
                 field_adapted_empty = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
 
+        if projection_active:
+            projection_toggle = self._runtime_network_toggle(accelerator, network, "--h3_projection_scale")
+            projection_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+            projection_int8 = getattr(transformer, "int8_attention_context", None)
+
+            def frozen_projection_branch(branch):
+                with (
+                    torch.random.fork_rng(devices=projection_devices),
+                    torch.no_grad(),
+                    projection_int8(auxiliary=True) if callable(projection_int8) else nullcontext(),
+                    self._overlay_disabled(True),
+                ):
+                    projection_toggle(False)
+                    try:
+                        return self._predict(accelerator, transformer, batch, inputs, conditioning=branch)
+                    finally:
+                        projection_toggle(True)
+
+            if auxiliary_block_swap:
+                transformer.switch_block_swap_for_inference()
+            try:
+                projection_references = (frozen_projection_branch("prompt"), frozen_projection_branch("empty"))
+            finally:
+                if auxiliary_block_swap:
+                    transformer.switch_block_swap_for_training()
+
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
         if self._crepa is not None:
             self._crepa.begin_step(use_crepa, global_step)
@@ -8102,6 +8160,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
             field_preservation_term = float(args.h3_field_preservation_weight) * preserved.loss
 
+        projection_target = None
+        if projection_references is not None:
+            projection_target = projection_guidance_target(
+                H3ModelPrediction(inputs.video_target, inputs.audio_target),
+                projection_references[0],
+                projection_references[1],
+                float(projection_scale),
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+            )
+
         def _velocity_loss(step_prediction, step_inputs):
             return joint_velocity_loss(
                 step_prediction,
@@ -8123,7 +8192,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 audio_weight=audio_weight,
             )
 
-        if repair_frozen is not None:
+        if projection_target is not None:
+            result = joint_prediction_loss(
+                raw_prediction,
+                projection_target,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+        elif repair_frozen is not None:
             targets = {}
             repair_weights = {}
             for modality, present, normal_weight in (
@@ -8183,6 +8265,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if repair_frozen is not None:
             metrics["loss/repair_video"] = result.video_loss.detach()
             metrics["loss/repair_audio"] = result.audio_loss.detach()
+        if projection_target is not None:
+            metrics["loss/projection"] = result.loss.detach()
+        if projection_scale is not None and args.h3_caption_dropout_rate > 0:
+            metrics["h3/projection_active"] = float(projection_target is not None)
         # Only slot batches report these keys, so every other run's metric set
         # is unchanged.
         metrics.update(
@@ -8980,6 +9066,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_field_preservation_weight": str(float(getattr(args, "h3_field_preservation_weight", 0.0) or 0.0)),
             "ss_h3_field_preservation_steps": str(int(getattr(args, "h3_field_preservation_steps", 0) or 0)),
+            "ss_h3_projection_scale": str(getattr(args, "h3_projection_scale", None) or "off"),
             "ss_h3_guidance_null_anchor_weight": str(getattr(args, "h3_guidance_null_anchor_weight", 0.0)),
             "ss_h3_guidance_null_anchor_weight_end": str(getattr(args, "h3_guidance_null_anchor_weight_end", None)),
             "ss_h3_guidance_null_anchor_probability": str(_anchor_probability(args)),
@@ -10112,6 +10199,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="apply field preservation for this many optimizer steps; 0 applies it throughout",
+    )
+    parser.add_argument(
+        "--h3_projection_scale",
+        type=float,
+        default=None,
+        help=(
+            "replace the prompted-step data target with the frozen base prompt plus SCALE times the data increment "
+            "projected perpendicular to the frozen base guidance field; projection is per sample and modality over "
+            "the supervised elements and requires empty conditioning caches. Omit to disable"
+        ),
     )
     parser.add_argument(
         "--h3_base_preservation_loss_weight",

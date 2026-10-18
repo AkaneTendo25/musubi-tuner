@@ -460,6 +460,70 @@ def contrastive_guidance_target(
     )
 
 
+def _projected_increment(
+    increment: torch.Tensor,
+    field: torch.Tensor,
+    mask: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    batch = increment.shape[0]
+    field_flat = field.reshape(batch, -1)
+    increment_flat = increment.reshape(batch, -1)
+    if mask is None:
+        weighted_field = field_flat
+    else:
+        weighted_field = field_flat * _broadcast_mask(mask, field).to(field.dtype).reshape(batch, -1)
+    coefficient = (weighted_field * increment_flat).sum(dim=1) / ((weighted_field * field_flat).sum(dim=1) + eps)
+    parallel = coefficient.reshape(batch, *([1] * (increment.ndim - 1))) * field
+    return increment - parallel
+
+
+def _projection_modality(
+    target: torch.Tensor,
+    base_prompt: torch.Tensor,
+    base_empty: torch.Tensor,
+    scale: float | torch.Tensor,
+    mask: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    scale_values = _expand_scale_values(scale, target) if isinstance(scale, torch.Tensor) else scale
+    prompt = base_prompt.float()
+    empty = base_empty.float()
+    perpendicular = _projected_increment(target.float() - empty, prompt - empty, mask, eps)
+    return (prompt + scale_values * perpendicular).to(target.dtype)
+
+
+def projection_guidance_target(
+    target: H3ModelPrediction,
+    base_prompt: H3ModelPrediction,
+    base_empty: H3ModelPrediction,
+    scale: float | torch.Tensor,
+    *,
+    audio_scale: float | torch.Tensor | None = None,
+    video_mask: torch.Tensor | None = None,
+    audio_mask: torch.Tensor | None = None,
+    eps: float = 1e-12,
+) -> H3ModelPrediction:
+    """Project the data increment off the frozen base guidance field."""
+    if (target.video is None) != (base_prompt.video is None) or (target.video is None) != (base_empty.video is None):
+        raise ValueError("H3 projection target requires the same video modality in the target and both base branches")
+    if (target.audio is None) != (base_prompt.audio is None) or (target.audio is None) != (base_empty.audio is None):
+        raise ValueError("H3 projection target requires the same audio modality in the target and both base branches")
+    audio_scale = scale if audio_scale is None else audio_scale
+    return H3ModelPrediction(
+        video=(
+            None
+            if target.video is None
+            else _projection_modality(target.video, base_prompt.video, base_empty.video, scale, video_mask, eps)
+        ),
+        audio=(
+            None
+            if target.audio is None
+            else _projection_modality(target.audio, base_prompt.audio, base_empty.audio, audio_scale, audio_mask, eps)
+        ),
+    )
+
+
 def _broadcast_mask(mask: torch.Tensor | None, target: torch.Tensor) -> torch.Tensor:
     if mask is None:
         return torch.ones_like(target, dtype=torch.bool)
