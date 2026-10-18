@@ -137,6 +137,190 @@ MAX_ROLLOUT_WINDOW = 3
 SIGMA_FLOOR = 1e-3
 
 
+# Loss semantics follow kohya-ss/musubi-tuner PR #1047 (teacher-matching for MiniMax-H3).
+
+# Guard on the cosine denominator of the decomposed loss. Kohya's value, kept
+# so a hand-computed check against the upstream formula matches bit for bit.
+TEACHER_MATCH_EPS = 1e-12
+
+
+def dc_attenuated_prediction(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    dc_weight: float,
+    *,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Scale the residual's per-channel DC so the loss becomes ``ac + w * dc``.
+
+    Ported from kohya-ss/musubi-tuner PR #1047 (``_dc_attenuated_prediction``).
+    The DC of the residual is a global colour/tone cast -- the style axis -- and
+    attenuating it stops a dataset with a consistent palette from teaching that
+    cast as a small but fully coherent signal, without touching the spatially
+    structured AC content. It is a linear map of the residual, so gradients stay
+    exact and no term is dropped.
+
+    ``mask`` restricts the per-channel mean to the authored elements, which is
+    what makes the attenuation agree with the masked reduction the loss itself
+    uses; upstream has no masks and reduces over everything.
+    """
+    residual = prediction.float() - target.detach().float()
+    axes = tuple(range(2, residual.ndim))
+    if not axes:
+        raise ValueError("H3 DC attenuation needs a per-channel axis to average over")
+    if mask is None:
+        residual_dc = residual.mean(dim=axes, keepdim=True)
+    else:
+        valid = mask.to(device=residual.device, dtype=residual.dtype)
+        # A channel with no authored element contributes no DC at all. Fractional
+        # authored mass remains a weighted mean even when its sum is below one.
+        count = valid.sum(dim=axes, keepdim=True)
+        residual_dc = torch.where(
+            count > 0,
+            (residual * valid).sum(dim=axes, keepdim=True) / count.clamp_min(torch.finfo(residual.dtype).tiny),
+            torch.zeros_like(count),
+        )
+    return prediction - (1.0 - dc_weight**0.5) * residual_dc
+
+
+def decomposed_flow_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mag_weight: float = 1.0,
+    dir_weight: float = 1.0,
+    mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | float]:
+    """Magnitude/direction split of the squared error, norm coupling removed.
+
+    Ported from kohya-ss/musubi-tuner PR #1047 (``_decomposed_flow_loss``). The
+    exact identity is ``||p - t||^2 = (||p|| - ||t||)^2 + 2*||p||*||t||*(1 - cos)``.
+    In a plain MSE the direction term's ``||p||`` factor couples the two components:
+    hedging the direction pays off by shrinking the norm, which drives the
+    prediction toward the conditional mean's reduced magnitude -- the wash-out.
+    Detaching ``||p||`` in the direction term makes its gradient purely
+    rotational, so the magnitude optimum becomes ``E[||t||]`` (full per-sample
+    commitment) rather than ``||E[t]||``. At unit weights the VALUE is still the
+    squared error exactly, so a curve stays comparable across the switch.
+
+    Returns the summed term and the number of elements it was taken over, so the
+    caller pools it with the audio half the way every other H3 loss does. The
+    norms are per batch item, which is what upstream computes (H3 trains one item
+    per step) and what keeps two items from cancelling each other's direction.
+    Masked-out elements are zeroed in BOTH vectors, which leaves their residual
+    exactly zero and therefore removes them from the identity's every term.
+    """
+    if prediction.shape != target.shape:
+        raise ValueError(f"H3 teacher-match prediction {tuple(prediction.shape)} does not match target {tuple(target.shape)}")
+    student = prediction.float()
+    teacher = target.float().detach()
+    if mask is None:
+        elements = student.numel()
+    else:
+        valid = mask.to(device=student.device, dtype=student.dtype).expand_as(student)
+        root = valid.clamp_min(0).sqrt()
+        student = student * root
+        teacher = teacher * root
+        elements = valid.sum()
+    total = None
+    for index in range(student.shape[0]):
+        flat_student = student[index].flatten()
+        flat_teacher = teacher[index].flatten()
+        student_norm = flat_student.norm()
+        teacher_norm = flat_teacher.norm()
+        cosine = torch.dot(flat_student, flat_teacher) / (student_norm * teacher_norm + TEACHER_MATCH_EPS)
+        magnitude = (student_norm - teacher_norm).pow(2)
+        direction = 2.0 * student_norm.detach() * teacher_norm * (1.0 - cosine)
+        term = mag_weight * magnitude + dir_weight * direction
+        total = term if total is None else total + term
+    return total, elements
+
+
+def preservation_density_compensation(sigma_max: float, focus_min: float, focus_max: float, focus_probability: float) -> float:
+    """Keep the preservation anchor's expected gradient share invariant under focus.
+
+    Ported from kohya-ss/musubi-tuner PR #1047
+    (``_preservation_density_compensation``). Timestep focus concentrates the
+    base-sigma draw on the teaching band and thins the anchor band
+    (``base sigma > sigma_max``) from its uniform share ``1 - sigma_max``;
+    multiplying each anchor step's loss by ``uniform / focused`` restores the
+    anchor's per-unit-time pull, so raising the focus does not silently weaken
+    the drift protection.
+    """
+    anchor_width = 1.0 - sigma_max
+    if anchor_width <= 0.0 or focus_probability <= 0.0:
+        return 1.0
+    overlap = max(0.0, focus_max - max(focus_min, sigma_max))
+    focused_share = (1.0 - focus_probability) * anchor_width + focus_probability * overlap / (focus_max - focus_min)
+    if focused_share <= 0.0:
+        # The anchor band is never sampled, so the multiplier is never applied.
+        return 1.0
+    return anchor_width / focused_share
+
+
+def teacher_match_diagnostics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+) -> dict[str, float]:
+    """What the teacher and the student disagree about, in the terms PR #1047 reports.
+
+    The teacher-match loss is a scalar, and a scalar cannot distinguish "the
+    student already predicts what the teacher does" from "the objective never
+    reached the weights". Both leave the number small. The upstream PR resolves
+    that with per-step observability and treats it as a health gate: the residual
+    must fall in the privileged sigma band while the unprivileged bands stay
+    flat, the cosine must rise, and the norm ratio must hold near 1.0 -- a ratio
+    drifting below it is the wash-out the decomposed loss exists to prevent.
+
+    ``flow_gap_rms`` is that residual, per authored element. ``cos`` and
+    ``norm_ratio`` are the components of the loss identity read directly, per
+    batch item, matching how :func:`decomposed_flow_loss` takes its norms. The
+    ``residual_dc``/``residual_ac`` split says how much of the disagreement is a
+    global per-channel cast -- the axis ``dc_weight`` attenuates -- against
+    spatially structured content; a run whose residual is nearly all DC is
+    teaching palette and little else.
+
+    Diagnostic only: everything is detached and returned as plain floats, so a
+    caller may log it on every step without touching the graph.
+    """
+    if prediction.shape != target.shape:
+        raise ValueError(f"H3 teacher-match diagnostics {tuple(prediction.shape)} do not match target {tuple(target.shape)}")
+    with torch.no_grad():
+        student = prediction.detach().float()
+        teacher = target.detach().float()
+        if mask is None:
+            valid = torch.ones_like(student)
+        else:
+            valid = mask.to(device=student.device, dtype=student.dtype).expand_as(student)
+        elements = float(valid.sum())
+        if elements == 0.0:
+            return {}
+        student = student * valid
+        teacher = teacher * valid
+        residual = student - teacher
+        axes = tuple(range(2, residual.ndim))
+        count = valid.sum(dim=axes, keepdim=True).clamp(min=1.0)
+        residual_dc = (residual * valid).sum(dim=axes, keepdim=True) / count
+        cosines = []
+        ratios = []
+        for index in range(student.shape[0]):
+            flat_student = student[index].flatten()
+            flat_teacher = teacher[index].flatten()
+            student_norm = flat_student.norm()
+            teacher_norm = flat_teacher.norm()
+            cosines.append(torch.dot(flat_student, flat_teacher) / (student_norm * teacher_norm + TEACHER_MATCH_EPS))
+            ratios.append(student_norm / (teacher_norm + TEACHER_MATCH_EPS))
+        return {
+            "flow_gap_rms": float((residual.pow(2).sum() / elements).sqrt()),
+            "cos": float(torch.stack(cosines).mean()),
+            "norm_ratio": float(torch.stack(ratios).mean()),
+            "residual_dc_rms": float(((residual_dc.expand_as(residual) * valid).pow(2).sum() / elements).sqrt()),
+            "residual_ac_rms": float(((residual - residual_dc) * valid).pow(2).sum().div(elements).sqrt()),
+        }
+
+
 def rollout_base_sigmas(stop_sigma: float, steps: int, window: int, *, floor: float = SIGMA_FLOOR) -> tuple[float, ...]:
     """Descending *unshifted* base sigmas for one rollout plus its window.
 

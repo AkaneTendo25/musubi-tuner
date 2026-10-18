@@ -43,6 +43,8 @@ from musubi_tuner.minimax_h3.rollout import (
     rollout_base_sigmas,
     rollout_item_key,
     teacher_batch,
+    dc_attenuated_prediction,
+    decomposed_flow_loss,
 )
 from musubi_tuner.minimax_h3.training import H3ModelPrediction, shift_sigma
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
@@ -733,6 +735,7 @@ def _rollout_batch():
 _ROLLOUT_FLAGS = ("--h3_rollout_supervision", "--h3_rollout_teacher_config", "TEACHER")
 _INACTIVE_VELOCITY_FLAGS = (*_ROLLOUT_FLAGS, "--h3_rollout_inactive_supervision", "teacher_velocity")
 _INACTIVE_GAP_FLAGS = (*_ROLLOUT_FLAGS, "--h3_rollout_inactive_supervision", "teacher_gap")
+_MATCH_FLAGS = (*_ROLLOUT_FLAGS, "--h3_rollout_inactive_supervision", "teacher_match")
 
 
 def _flag_args(*extra, teacher=None):
@@ -842,6 +845,53 @@ def test_inactive_rollout_stands_down_on_active_and_ineligible_steps(tmp_path):
     assert empty_metrics["loss/rollout_inactive_video"] == 0.0
 
 
+def test_teacher_match_decomposition_identity_and_detached_direction_norm():
+    prediction = torch.tensor([[3.0, 0.0]], requires_grad=True)
+    target = torch.tensor([[0.0, 4.0]])
+    total, elements = decomposed_flow_loss(prediction, target)
+    assert float(elements) == 2
+    assert float(total.detach()) == pytest.approx(25.0)
+    direction, _ = decomposed_flow_loss(prediction, target, mag_weight=0.0)
+    direction.backward()
+    assert float(torch.dot(prediction.grad.flatten(), prediction.detach().flatten())) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_teacher_match_dc_uses_fractional_authored_mass_as_a_weighted_mean():
+    prediction = torch.ones(1, 1, 1, 1, requires_grad=True)
+    target = torch.zeros_like(prediction)
+    result = dc_attenuated_prediction(prediction, target, 0.0, mask=torch.full_like(prediction, 0.25))
+    torch.testing.assert_close(result, torch.zeros_like(result))
+    result.sum().backward()
+    torch.testing.assert_close(prediction.grad, torch.zeros_like(prediction.grad))
+
+
+def test_teacher_match_replaces_video_and_scales_the_whole_joint_objective(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, plain_loss, _, _ = _run_step(*_ROLLOUT_FLAGS, teacher=teacher, active=False)
+    backend, unit, metrics, _ = _run_step(*_MATCH_FLAGS, teacher=teacher, active=False)
+    _, doubled, _, _ = _run_step(*_MATCH_FLAGS, "--h3_rollout_inactive_weight", "2", teacher=teacher, active=False)
+    unit.backward()
+    assert len(backend.calls) == 2
+    assert metrics["h3/teacher_match_conditioned"] == 1.0
+    assert metrics[LOSS_FOR_AVERAGE_KEY] == pytest.approx(float(plain_loss.detach()))
+    assert float(doubled.detach()) == pytest.approx(2 * float(unit.detach()))
+
+
+@pytest.mark.parametrize("sigma_max", ["0.75", "0.1"])
+def test_teacher_match_fused_two_arm_path_matches_unfused_in_both_bands(tmp_path, sigma_max):
+    teacher = _teacher_file(tmp_path)
+    flags = (*_MATCH_FLAGS, "--h3_rollout_teacher_match_sigma_max", sigma_max)
+    naive_backend, naive_loss, naive_metrics, _ = _run_step(*flags, teacher=teacher, active=False, backend=_FusedRolloutBackend())
+    fused_backend, fused_loss, fused_metrics, _ = _run_step(
+        *flags, "--h3_rollout_fused_teacher", teacher=teacher, active=False, backend=_FusedRolloutBackend()
+    )
+    assert naive_backend.fused_calls == 0
+    assert fused_backend.fused_calls == 1
+    assert len(fused_backend.calls) == 2
+    torch.testing.assert_close(fused_loss, naive_loss)
+    assert fused_metrics == naive_metrics
+
+
 class _StateHookAccelerator(_FakeAccelerator):
     process_index = 0
     num_processes = 1
@@ -891,6 +941,33 @@ def test_inactive_rollout_state_round_trips_all_three_streams(tmp_path):
     for expected, value in zip(generators, actual, strict=True):
         assert value is not None
         assert torch.equal(value.get_state(), expected.get_state())
+
+
+def test_inactive_rollout_v1_state_is_default_safe_for_legacy_modes(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, teacher=teacher)
+    trainer = MiniMaxH3NetworkTrainer()
+    accelerator = _StateHookAccelerator()
+    trainer._register_rollout_inactive_state_hooks(args, accelerator)
+    accelerator.save_hooks[0]([], [], tmp_path)
+    path = tmp_path / "h3_rollout_inactive_state-rank0.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["version"] = 1
+    state["identity"].pop("teacher_match")
+    path.write_text(json.dumps(state), encoding="utf-8")
+    accelerator.load_hooks[0]([], tmp_path)
+
+    match = _flag_args(*_MATCH_FLAGS, "--h3_rollout_teacher_match_dc_weight", "0.3", teacher=teacher)
+    rejected = MiniMaxH3NetworkTrainer()
+    rejected_accelerator = _StateHookAccelerator()
+    rejected._register_rollout_inactive_state_hooks(match, rejected_accelerator)
+    with pytest.raises(ValueError, match="legacy inactive rollout state"):
+        rejected_accelerator.load_hooks[0]([], tmp_path)
+
+    state["version"] = True
+    path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match"):
+        accelerator.load_hooks[0]([], tmp_path)
 
 
 def test_inactive_rollout_state_rejects_mismatch_and_malformed_rng_without_mutation(tmp_path):
@@ -944,6 +1021,16 @@ def test_inactive_rollout_validation_and_metadata(tmp_path):
         args = _flag_args(*_INACTIVE_GAP_FLAGS, teacher=teacher)
         setattr(args, flag.removeprefix("--").replace("-", "_"), True)
         with pytest.raises(ValueError, match="not booleans"):
+            MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+    for name in (
+        "h3_rollout_teacher_match_sigma_max",
+        "h3_rollout_teacher_match_dc_weight",
+        "h3_rollout_teacher_match_mag_weight",
+        "h3_rollout_teacher_match_preservation_weight",
+    ):
+        args = _flag_args(*_MATCH_FLAGS, teacher=teacher)
+        setattr(args, name, True)
+        with pytest.raises(ValueError, match="not a boolean"):
             MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
     args = _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_rollout_probability", "0", teacher=teacher)
     trainer = MiniMaxH3NetworkTrainer()

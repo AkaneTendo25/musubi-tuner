@@ -124,6 +124,8 @@ from musubi_tuner.minimax_h3.rollout import (
     item_key_text_caches,
     rollout_base_sigmas,
     teacher_batch,
+    preservation_density_compensation,
+    teacher_match_diagnostics,
 )
 from musubi_tuner.minimax_h3.reamplify import (
     REAMPLIFY_AUTO,
@@ -155,6 +157,7 @@ from musubi_tuner.minimax_h3.training import (
     guidance_consistent_prediction,
     guidance_scale_for_sigma,
     joint_prediction_loss,
+    joint_teacher_match_loss,
     joint_velocity_loss,
     projection_guidance_target,
     prepare_joint_noisy_inputs,
@@ -1411,9 +1414,30 @@ def _parse_keyframe_anchors(spec: str) -> tuple[int | str, ...]:
 _ROLLOUT_PROBABILITY_DEFAULT = 0.5
 _ROLLOUT_STEPS_DEFAULT = 2
 _ROLLOUT_WINDOW_DEFAULT = 1
-_ROLLOUT_INACTIVE_MODES = ("off", "teacher_velocity", "teacher_gap")
+_ROLLOUT_INACTIVE_MODES = ("off", "teacher_velocity", "teacher_gap", "teacher_match")
 _ROLLOUT_INACTIVE_WEIGHT_DEFAULT = 1.0
 _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT = 1.0
+_TEACHER_MATCH_SIGMA_MAX_DEFAULT = 0.75
+_TEACHER_MATCH_DC_WEIGHT_DEFAULT = 1.0
+_TEACHER_MATCH_MAG_WEIGHT_DEFAULT = 1.0
+_TEACHER_MATCH_PRESERVATION_WEIGHT_DEFAULT = 1.0
+
+
+def _teacher_match_settings(args: argparse.Namespace) -> tuple[tuple[str, float, float], ...]:
+    settings = (
+        ("--h3_rollout_teacher_match_sigma_max", "h3_rollout_teacher_match_sigma_max", 0.75),
+        ("--h3_rollout_teacher_match_dc_weight", "h3_rollout_teacher_match_dc_weight", 1.0),
+        ("--h3_rollout_teacher_match_mag_weight", "h3_rollout_teacher_match_mag_weight", 1.0),
+        ("--h3_rollout_teacher_match_preservation_weight", "h3_rollout_teacher_match_preservation_weight", 1.0),
+    )
+    values = []
+    for flag, name, default in settings:
+        raw = getattr(args, name, default)
+        if isinstance(raw, bool):
+            raise ValueError(f"{flag} must be a real number, not a boolean")
+        values.append((flag, float(raw), default))
+    return tuple(values)
+
 
 # The arguments every H3 training backend has taken positionally since the first
 # one. A described forward is a dict, and these are the entries that go back on
@@ -2404,6 +2428,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "target_noise_coupling": str(getattr(args, "h3_target_noise_coupling", "independent")),
             "rollout_steps": int(args.h3_rollout_steps),
             "rollout_window": int(args.h3_rollout_window),
+            "teacher_match": {flag[2:]: value for flag, value, _default in _teacher_match_settings(args)},
         }
 
         def encoded(generator):
@@ -2413,7 +2438,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if mode == "off":
                 return
             state = {
-                "version": 1,
+                "version": 2,
                 "process_index": accelerator.process_index,
                 "num_processes": accelerator.num_processes,
                 "identity": identity,
@@ -2444,11 +2469,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             }
             if not isinstance(state, dict) or set(state) != keys:
                 raise ValueError("inactive rollout resume state has an incomplete schema")
+            version = state.get("version")
+            if type(version) is not int:
+                raise ValueError("inactive rollout resume state does not match this run")
+            expected_identity = dict(identity)
+            if version == 1:
+                if any(value != default for _flag, value, default in _teacher_match_settings(args)):
+                    raise ValueError("legacy inactive rollout state cannot resume non-default teacher-match settings")
+                expected_identity.pop("teacher_match")
+            elif version != 2:
+                raise ValueError("inactive rollout resume state does not match this run")
             expected = {
-                "version": 1,
+                "version": version,
                 "process_index": accelerator.process_index,
                 "num_processes": accelerator.num_processes,
-                "identity": identity,
+                "identity": expected_identity,
             }
             if any(not self._strict_json_equal(state[key], value) for key, value in expected.items()):
                 raise ValueError("inactive rollout resume state does not match this run")
@@ -6769,6 +6804,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 getattr(args, "h3_rollout_inactive_probability", _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT)
             )
             != _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT,
+            **{flag: value != default for flag, value, default in _teacher_match_settings(args)},
         }
         if not rollout:
             for flag, changed in flags.items():
@@ -6789,10 +6825,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError(f"--h3_rollout_window must lie in [1, {MAX_ROLLOUT_WINDOW}]")
         inactive_mode = getattr(args, "h3_rollout_inactive_supervision", "off")
         if inactive_mode not in _ROLLOUT_INACTIVE_MODES:
-            raise ValueError("--h3_rollout_inactive_supervision must be off, teacher_velocity, or teacher_gap")
-        minimum_rollout_probability = 0.0 if inactive_mode == "teacher_gap" else math.nextafter(0.0, 1.0)
+            raise ValueError("--h3_rollout_inactive_supervision must be off, teacher_velocity, teacher_gap, or teacher_match")
+        minimum_rollout_probability = 0.0 if inactive_mode in {"teacher_gap", "teacher_match"} else math.nextafter(0.0, 1.0)
         if not math.isfinite(args.h3_rollout_probability) or not minimum_rollout_probability <= args.h3_rollout_probability <= 1:
-            raise ValueError("--h3_rollout_probability must lie in [0, 1] for teacher_gap and (0, 1] otherwise")
+            raise ValueError("--h3_rollout_probability must lie in [0, 1] for teacher_gap/teacher_match and (0, 1] otherwise")
         raw_inactive_weight = getattr(args, "h3_rollout_inactive_weight", _ROLLOUT_INACTIVE_WEIGHT_DEFAULT)
         raw_inactive_probability = getattr(args, "h3_rollout_inactive_probability", _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT)
         if isinstance(raw_inactive_weight, bool) or isinstance(raw_inactive_probability, bool):
@@ -6806,6 +6842,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_rollout_inactive_weight must be finite and greater than 0")
         if inactive_mode != "off" and (not math.isfinite(inactive_probability) or not 0 < inactive_probability <= 1):
             raise ValueError("--h3_rollout_inactive_probability must be finite and lie in (0, 1]")
+        for flag, value, default in _teacher_match_settings(args):
+            if value != default and inactive_mode != "teacher_match":
+                raise ValueError(f"{flag} requires --h3_rollout_inactive_supervision teacher_match")
+            if not math.isfinite(value):
+                raise ValueError(f"{flag} must be finite")
+        if inactive_mode == "teacher_match":
+            if not 0 <= args.h3_rollout_teacher_match_sigma_max <= 1:
+                raise ValueError("--h3_rollout_teacher_match_sigma_max must lie in [0, 1]")
+            if args.h3_rollout_teacher_match_dc_weight < 0 or args.h3_rollout_teacher_match_mag_weight < 0:
+                raise ValueError("teacher-match DC and magnitude weights must be non-negative")
+            if args.h3_rollout_teacher_match_preservation_weight <= 0:
+                raise ValueError("--h3_rollout_teacher_match_preservation_weight must be greater than 0")
+            if args.h3_guidance_distillation_scale is not None or bool(getattr(args, "h3_guidance_scale_range", "")):
+                raise ValueError("teacher_match replaces the video data loss and cannot combine with guidance distillation")
         if inactive_mode == "teacher_gap" and bool(getattr(args, "h3_adapter_prompt_only", False)):
             raise ValueError("teacher_gap requires live prompt and empty adapter branches; disable --h3_adapter_prompt_only")
         if getattr(args, "h3_rollout_fused_teacher", False):
@@ -6976,8 +7026,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         return tracked
 
-    def _inactive_rollout_teachers(self, accelerator, transformer, network, batch, inputs, *, gap: bool):
-        presentation = self._teacher_presentation(batch, include_empty=gap)
+    def _inactive_rollout_teachers(self, accelerator, transformer, network, batch, inputs, *, gap: bool, anchor: bool = False):
+        presentation = batch if anchor else self._teacher_presentation(batch, include_empty=gap)
         devices = [accelerator.device] if accelerator.device.type == "cuda" else []
         int8_context = getattr(transformer, "int8_attention_context", None)
 
@@ -7200,9 +7250,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         return self._predict_fused(accelerator, transformer, arms)
 
-    def _fused_depth_zero_arms(self, accelerator, transformer, network, batch, inputs, *, gap: bool):
+    def _fused_depth_zero_arms(self, accelerator, transformer, network, batch, inputs, *, gap: bool, anchor: bool = False):
         """Evaluate inactive depth-zero supervision in one actual fused traversal."""
-        presentation = self._teacher_presentation(batch, include_empty=gap)
+        presentation = batch if anchor else self._teacher_presentation(batch, include_empty=gap)
         devices = [accelerator.device] if accelerator.device.type == "cuda" else []
         set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_rollout_inactive_supervision")
         run = self._frozen_arm_context(set_enabled)
@@ -9082,6 +9132,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         rollout_inactive = (
             inactive_mode != "off" and inactive_drawn and not rollout_active and conditioning == "prompt" and has_video
         )
+        rollout_inactive_teacher_match = rollout_inactive and inactive_mode == "teacher_match"
+        teacher_match_conditioned = rollout_inactive_teacher_match and float(base_sigma.float().mean()) <= float(
+            args.h3_rollout_teacher_match_sigma_max
+        )
+        teacher_match_anchor = rollout_inactive_teacher_match and not teacher_match_conditioned
         inactive_teacher = inactive_teacher_empty = inactive_student_empty = None
         inactive_staged_term = None
         if rollout_inactive and inactive_mode == "teacher_gap":
@@ -9918,6 +9973,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 batch,
                 inputs,
                 gap=inactive_mode == "teacher_gap",
+                anchor=teacher_match_anchor,
             )
             if inactive_mode == "teacher_gap":
                 fused_primary_prediction, inactive_student_empty, inactive_teacher, inactive_teacher_empty = fused_depth_zero
@@ -9951,6 +10007,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     batch,
                     inputs,
                     gap=inactive_mode == "teacher_gap",
+                    anchor=teacher_match_anchor,
                 )
                 if inactive_mode == "teacher_gap":
                     with torch.random.fork_rng(devices=inactive_devices):
@@ -10036,7 +10093,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         audio_weight=0.0,
                     ).loss
                 )
-            else:
+            elif inactive_mode == "teacher_gap":
                 inactive_rollout_term = inactive_gap_loss(raw_prediction, inactive_student_empty)
         if repair_student_reuses_primary:
             # Caption dropout already made the primary graph the trainable empty
@@ -10514,6 +10571,39 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             guidance_rescaled = True
         if args.h3_guidance_distillation_probability < 1.0:
             metrics["h3/guidance_distillation_active"] = float(use_guidance)
+        if rollout_inactive_teacher_match:
+            teacher_match = joint_teacher_match_loss(
+                H3ModelPrediction(raw_prediction.video, prediction.audio),
+                H3ModelPrediction(inactive_teacher.video, loss_inputs.audio_target),
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+                mag_weight=args.h3_rollout_teacher_match_mag_weight if teacher_match_conditioned else 1.0,
+                dc_weight=args.h3_rollout_teacher_match_dc_weight if teacher_match_conditioned else 1.0,
+            )
+            multiplier = inactive_weight
+            if not teacher_match_conditioned:
+                multiplier *= args.h3_rollout_teacher_match_preservation_weight * preservation_density_compensation(
+                    float(args.h3_rollout_teacher_match_sigma_max),
+                    args.h3_timestep_focus_min,
+                    args.h3_timestep_focus_max,
+                    args.h3_timestep_focus_probability,
+                )
+            loss = multiplier * teacher_match.loss
+            rescaled_rollout_loss = loss
+            rollout_replaced = True
+            rollout_main_objective = loss
+            metrics["loss/rollout_inactive_video"] = teacher_match.video_loss.detach()
+            metrics["h3/teacher_match_conditioned"] = float(teacher_match_conditioned)
+            metrics["teacher/base_sigma"] = base_sigma.float().mean().detach()
+            for name, value in teacher_match_diagnostics(
+                raw_prediction.video, inactive_teacher.video, mask=effective_video_mask
+            ).items():
+                metrics[f"teacher/video_{name}"] = value
         # The objective before any auxiliary term is added: what --h3_term_grad_every
         # reports against the anchors and the floor. On a rollout step the floor and
         # the rollout anchor were already folded into ``loss``, so the objective is
@@ -10527,6 +10617,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if inactive_mode != "off":
             metrics["h3/rollout_inactive_active"] = float(rollout_inactive)
             metrics.setdefault("loss/rollout_inactive_video", 0.0)
+            if inactive_mode == "teacher_match":
+                metrics.setdefault("h3/teacher_match_conditioned", 0.0)
         base_preservation_term = None
         if reference_prediction is not None:
             preservation = joint_prediction_loss(
@@ -11011,6 +11103,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_rollout_inactive_probability": str(
                 getattr(args, "h3_rollout_inactive_probability", _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT)
             ),
+            **{f"ss_{flag[2:]}": str(value) for flag, value, _default in _teacher_match_settings(args)},
             "ss_h3_rollout_field_floor": str(float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)),
             "ss_h3_rollout_field_floor_direction": str(getattr(args, "h3_rollout_field_floor_direction", "self")),
             "ss_h3_rollout_field_cap": str(float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)),
@@ -11815,6 +11908,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=_ROLLOUT_INACTIVE_PROBABILITY_DEFAULT,
         help="share of logical steps whose inactive branch is eligible; no probability correction is applied",
+    )
+    parser.add_argument("--h3_rollout_teacher_match_sigma_max", type=float, default=_TEACHER_MATCH_SIGMA_MAX_DEFAULT)
+    parser.add_argument("--h3_rollout_teacher_match_dc_weight", type=float, default=_TEACHER_MATCH_DC_WEIGHT_DEFAULT)
+    parser.add_argument("--h3_rollout_teacher_match_mag_weight", type=float, default=_TEACHER_MATCH_MAG_WEIGHT_DEFAULT)
+    parser.add_argument(
+        "--h3_rollout_teacher_match_preservation_weight",
+        type=float,
+        default=_TEACHER_MATCH_PRESERVATION_WEIGHT_DEFAULT,
     )
     parser.add_argument(
         "--h3_rollout_teacher_magnitude_weight",

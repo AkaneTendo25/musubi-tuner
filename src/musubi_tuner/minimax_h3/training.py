@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 
 from musubi_tuner.minimax_h3.architecture import AUDIO_FLOW_SHIFT, VIDEO_FLOW_SHIFT
+from musubi_tuner.minimax_h3.rollout import dc_attenuated_prediction, decomposed_flow_loss
 
 LossBalance = Literal["token", "modality"]
 H3TrainingMode = Literal["fl2va", "ref2va", "ref2va_omni"]
@@ -756,6 +757,78 @@ def joint_velocity_loss(
         audio_weight=audio_weight,
         mask_normalization=mask_normalization,
     )
+
+
+def joint_teacher_match_loss(
+    prediction: H3ModelPrediction,
+    reference: H3ModelPrediction,
+    *,
+    video_mask: torch.Tensor | None = None,
+    audio_mask: torch.Tensor | None = None,
+    audio_sample_weight: torch.Tensor | None = None,
+    balance: LossBalance = "token",
+    video_weight: float = 1.0,
+    audio_weight: float = 1.0,
+    mag_weight: float = 1.0,
+    dc_weight: float = 1.0,
+    mask_normalization: str = "weighted",
+) -> H3JointLoss:
+    """Decomposed teacher match on video and ordinary data MSE on audio."""
+    if balance not in {"token", "modality"}:
+        raise ValueError(f"unsupported H3 loss balance: {balance}")
+    if video_weight < 0 or audio_weight < 0 or video_weight + audio_weight <= 0:
+        raise ValueError("H3 video/audio loss weights must be non-negative and not both zero")
+    zero_source = prediction.video if prediction.video is not None else prediction.audio
+    if zero_source is None:
+        raise ValueError("H3 prediction contains no target modality")
+    zero = zero_source.sum() * 0.0
+    if prediction.video is None or reference.video is None or video_weight == 0:
+        if (prediction.video is None) != (reference.video is None):
+            raise ValueError("H3 video prediction and target presence differ")
+        video_mean, video_total, video_elements, video_denominator = zero, zero, 0, 0.0
+    else:
+        teacher = reference.video.detach().float()
+        student = prediction.video.float()
+        valid = None if video_mask is None else _broadcast_mask(video_mask, student)
+        if dc_weight != 1.0:
+            student = dc_attenuated_prediction(student, teacher, dc_weight, mask=valid)
+        video_total, weighted_elements = decomposed_flow_loss(student, teacher, mag_weight=mag_weight, dir_weight=1.0, mask=valid)
+        video_denominator = float(student.numel()) if mask_normalization == "full" else weighted_elements
+        video_mean = _safe_divide(video_total, video_denominator)
+        video_elements = student.numel() if valid is None else (valid > 0).sum()
+    if prediction.audio is None or reference.audio is None or audio_weight == 0:
+        if (prediction.audio is None) != (reference.audio is None):
+            raise ValueError("H3 audio prediction and target presence differ")
+        audio_mean, audio_total, audio_elements, audio_denominator = zero, zero, 0, 0.0
+    else:
+        audio_mean, audio_total, audio_elements, audio_denominator = _modality_loss(
+            prediction.audio,
+            reference.audio.detach(),
+            audio_mask,
+            audio_sample_weight,
+            mask_normalization,
+        )
+    if isinstance(video_elements, torch.Tensor) or isinstance(audio_elements, torch.Tensor):
+        device = video_elements.device if isinstance(video_elements, torch.Tensor) else audio_elements.device
+        counts = torch.stack(
+            (
+                video_elements if isinstance(video_elements, torch.Tensor) else torch.tensor(video_elements, device=device),
+                audio_elements if isinstance(audio_elements, torch.Tensor) else torch.tensor(audio_elements, device=device),
+            )
+        )
+        video_elements, audio_elements = (int(value) for value in counts.tolist())
+    active_video = video_weight if video_elements else 0.0
+    active_audio = audio_weight if audio_elements else 0.0
+    if active_video + active_audio == 0:
+        loss = zero
+    elif balance == "modality":
+        loss = (active_video * video_mean + active_audio * audio_mean) / (active_video + active_audio)
+    else:
+        loss = _safe_divide(
+            active_video * video_total + active_audio * audio_total,
+            active_video * video_denominator + active_audio * audio_denominator,
+        )
+    return H3JointLoss(loss, video_mean, audio_mean, video_elements, audio_elements)
 
 
 def joint_prediction_loss(
