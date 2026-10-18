@@ -1,17 +1,23 @@
 from contextlib import nullcontext
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
-from musubi_tuner.minimax_h3.cache import H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY
+from musubi_tuner.minimax_h3.cache import H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY, H3_TEXT_HIDDEN_KEY
 from musubi_tuner.minimax_h3.marginal_repair import (
+    H3CaptionAnchorPool,
+    align_anchor_hidden,
+    caption_marginal_reference,
     guidance_recovered_target,
     interpolate_schedule,
     parse_scale_schedule,
     scale_at,
+    unbiased_caption_repair_loss,
 )
-from musubi_tuner.minimax_h3.training import H3ModelPrediction
+from musubi_tuner.minimax_h3.training import H3JointLoss, H3ModelPrediction
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser, read_config_from_file
 
 
@@ -46,6 +52,151 @@ def test_schedules_and_no_extrapolation():
     torch.testing.assert_close(scale_at((0, 4), sigma), (4 * sigma).clamp_min(1))
     with pytest.raises(ValueError, match="extrapolates"):
         guidance_recovered_target(torch.ones(1, 2), torch.zeros(1, 2), 4, torch.tensor([2.0]))
+
+
+def test_caption_alignment_prediction_mean_and_sparse_expectation():
+    empty = torch.tensor([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]])
+    torch.testing.assert_close(
+        align_anchor_hidden(torch.tensor([[1.0, 2.0]]), empty), torch.tensor([[1.0, 2.0], [20.0, 21.0], [30.0, 31.0]])
+    )
+    reference = caption_marginal_reference(
+        [H3ModelPrediction(torch.tensor([1.0]), None), H3ModelPrediction(torch.tensor([5.0]), None)]
+    )
+    torch.testing.assert_close(reference.video, torch.tensor([3.0]))
+    baseline = H3JointLoss(*(torch.tensor(value) for value in (2.0, 3.0, 0.0)), 1, 0)
+    caption = H3JointLoss(*(torch.tensor(value) for value in (6.0, 7.0, 0.0)), 1, 0)
+    active = unbiased_caption_repair_loss(baseline, caption, 0.25)
+    # E[(1-I)b + I(b + (c-b)/p)] = c.
+    expected = 0.75 * baseline.loss + 0.25 * active.loss
+    torch.testing.assert_close(expected, caption.loss)
+
+
+def test_caption_pool_skips_every_current_caption_duplicate_and_rehashes(tmp_path):
+    paths = []
+    current = torch.ones(2, 3)
+    for index, hidden in enumerate((current, current.clone(), torch.full((1, 3), 2.0), torch.full((4, 3), 3.0))):
+        path = tmp_path / f"caption-{index}.safetensors"
+        save_file({H3_TEXT_HIDDEN_KEY: hidden}, path)
+        paths.append(str(path))
+    pool = H3CaptionAnchorPool(paths)
+    initial = pool.identity
+    selected = pool.draw(2, generator=__import__("random").Random(7), exclude=current)
+    assert sorted(float(value.flatten()[0]) for value in selected) == [2.0, 3.0]
+    save_file({H3_TEXT_HIDDEN_KEY: torch.full((4, 3), 4.0)}, paths[-1])
+    assert pool.compute_identity(refresh=True) != initial
+
+
+class _StateHooks:
+    device = torch.device("cpu")
+    process_index = 0
+    num_processes = 1
+
+    def register_save_state_pre_hook(self, hook):
+        self.save = hook
+
+    def register_load_state_pre_hook(self, hook):
+        self.load = hook
+
+
+def _caption_state_trainer(tmp_path):
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"state-caption-{index}.safetensors"
+        save_file({H3_TEXT_HIDDEN_KEY: torch.full((2, 3), float(index))}, path)
+        paths.append(str(path))
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "caption",
+        "--h3_repair_scale",
+        "4",
+        "--h3_repair_caption_anchors",
+        "1",
+        "--h3_repair_caption_probability",
+        "0.5",
+        "--h3_repair_reference_weight",
+        "0.25",
+    )
+    trainer._repair_anchor_pool = H3CaptionAnchorPool(paths)
+    trainer._repair_anchor_pool_identity = trainer._repair_anchor_pool.identity
+    hooks = _StateHooks()
+    trainer._register_caption_repair_state_hooks(args, hooks)
+    return args, trainer, hooks, paths
+
+
+def test_caption_state_roundtrip_restores_both_rngs_and_lazy_state(tmp_path):
+    _, trainer, hooks, _ = _caption_state_trainer(tmp_path)
+    hooks.save([], [], tmp_path)
+    trainer._repair_caption_generator = torch.Generator().manual_seed(99)
+    trainer._repair_anchor_random = __import__("random").Random(98)
+    hooks.load([], tmp_path)
+    assert trainer._repair_caption_generator is None
+    assert trainer._repair_anchor_random is None
+
+    trainer._repair_caption_generator = torch.Generator().manual_seed(7)
+    trainer._repair_anchor_random = __import__("random").Random(8)
+    hooks.save([], [], tmp_path)
+    expected_torch = torch.rand((), generator=trainer._repair_caption_generator)
+    expected_python = trainer._repair_anchor_random.random()
+    torch.manual_seed(123456)
+    __import__("random").seed(654321)
+    hooks.load([], tmp_path)
+    torch.testing.assert_close(torch.rand((), generator=trainer._repair_caption_generator), expected_torch)
+    assert trainer._repair_anchor_random.random() == expected_python
+
+
+def test_caption_state_rejects_pool_mutation_after_identity_was_cached(tmp_path):
+    _, trainer, hooks, paths = _caption_state_trainer(tmp_path)
+    hooks.save([], [], tmp_path)
+    save_file({H3_TEXT_HIDDEN_KEY: torch.full((2, 3), 9.0)}, paths[-1])
+    with pytest.raises(ValueError, match="pool changed"):
+        hooks.load([], tmp_path)
+
+
+@pytest.mark.parametrize("missing", ["activation_generator", "anchor_random"])
+def test_caption_state_rejects_missing_rng_fields_without_mutating_streams(tmp_path, missing):
+    _, trainer, hooks, _ = _caption_state_trainer(tmp_path)
+    hooks.save([], [], tmp_path)
+    state_path = tmp_path / "h3_caption_repair_state-rank0.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    del state[missing]
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    generator = torch.Generator().manual_seed(111)
+    anchor_random = __import__("random").Random(222)
+    trainer._repair_caption_generator = generator
+    trainer._repair_anchor_random = anchor_random
+    generator_state = generator.get_state().clone()
+    random_state = anchor_random.getstate()
+    with pytest.raises(ValueError, match="schema"):
+        hooks.load([], tmp_path)
+    torch.testing.assert_close(trainer._repair_caption_generator.get_state(), generator_state)
+    assert trainer._repair_anchor_random.getstate() == random_state
+
+
+@pytest.mark.parametrize(
+    "options,match",
+    [
+        (["--h3_repair_reference", "caption", "--h3_repair_scale", "4", "--h3_repair_caption_anchors", "0"], "at least"),
+        (["--h3_repair_reference", "caption", "--h3_repair_scale", "4", "--h3_repair_caption_probability", "0"], "lie in"),
+        (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_repair_reference_weight", "1"], "must be 0"),
+        (
+            [
+                "--h3_repair_reference",
+                "caption",
+                "--h3_repair_scale",
+                "4",
+                "--h3_repair_reference_weight",
+                "1",
+                "--blocks_to_swap",
+                "1",
+                "--fused_backward_pass",
+            ],
+            "cannot use",
+        ),
+    ],
+)
+def test_caption_repair_validation(options, match):
+    with pytest.raises(ValueError, match=match):
+        configured(*options)
 
 
 @pytest.mark.parametrize(
@@ -115,9 +266,9 @@ class TinyBackend:
         )
 
 
-def run_step(args, trainer, *, audio=False, swap=False, fail=False, missing=False, data=0.0):
+def run_step(args, trainer, *, audio=False, swap=False, fail=False, missing=False, data=0.0, backend=None):
     transformer = TinyTransformer()
-    backend = TinyBackend(fail)
+    backend = TinyBackend(fail) if backend is None else backend
     trainer.backend = backend
     trainer.blocks_to_swap = 2 if swap else 0
     trainer.dit_dtype = torch.float32
@@ -131,6 +282,7 @@ def run_step(args, trainer, *, audio=False, swap=False, fail=False, missing=Fals
     video = torch.full((1, 24, 2, 2, 2), data)
     batch = {
         "timesteps": [0.5],
+        H3_TEXT_HIDDEN_KEY: [torch.ones(1, 8)],
         H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 8)],
         H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
     }
@@ -155,6 +307,55 @@ def run_step(args, trainer, *, audio=False, swap=False, fail=False, missing=Fals
         0,
     )
     return result, transformer, backend
+
+
+def test_first_caption_activation_initializes_anchor_rng_before_shared_model_entry():
+    class Pool:
+        def draw(self, count, *, generator, exclude):
+            assert count == 1
+            return [torch.full((1, 8), 2.0)]
+
+    class RandomBackend(TinyBackend):
+        def predict_training(self, *values, **kwargs):
+            self.calls.append(float(torch.rand(())))
+            return super().predict_training(*values, **kwargs)
+
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "caption",
+        "--h3_repair_scale",
+        "4",
+        "--h3_repair_caption_anchors",
+        "1",
+    )
+    trainer._repair_anchor_pool = Pool()
+    torch.manual_seed(404)
+    backend = RandomBackend()
+    run_step(args, trainer, backend=backend)
+    # Every frozen branch forks the exact entry state and the live primary then
+    # consumes that same draw. Lazy sampler initialization has already happened.
+    assert backend.calls[0] == backend.calls[2] == backend.calls[4]
+
+
+def test_caption_reference_auxiliary_leaves_classic_swap_ready_for_primary():
+    class Pool:
+        def draw(self, count, *, generator, exclude):
+            return [torch.full((1, 8), 2.0)]
+
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "caption",
+        "--h3_repair_scale",
+        "4",
+        "--h3_repair_caption_anchors",
+        "1",
+        "--h3_repair_reference_weight",
+        "0.2",
+    )
+    trainer._repair_anchor_pool = Pool()
+    (_, metrics), model, _ = run_step(args, trainer, swap=True)
+    assert model.events == ["inference", "training"]
+    assert metrics["loss/repair_reference"] > 0
 
 
 @pytest.mark.parametrize("audio", [False, True])
