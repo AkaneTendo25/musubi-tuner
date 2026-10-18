@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import shutil
 from contextlib import nullcontext
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load as load_safetensors, load_file, save_file
 from torch import nn
 
 import musubi_tuner.minimax_h3.model as h3_model
@@ -7729,6 +7730,175 @@ def test_h3_overlay_weights_compose_with_the_trainable_network(tmp_path):
     # The trainable adapter still carries gradient through the composed forward.
     transformer(hidden).sum().backward()
     assert all(module.lora_up.weight.grad is not None for module in network.unet_loras)
+
+
+def test_h3_runtime_base_adapters_are_independent_frozen_subsets(tmp_path):
+    first = tmp_path / "first.safetensors"
+    second = tmp_path / "second.safetensors"
+    first_down, first_up = _write_overlay_lora(first, rank=1, alpha=3.0, name="lora_unet_blocks_0_attn")
+    second_down, second_up = _write_overlay_lora(second, rank=2, alpha=1.0, name="lora_unet_blocks_1_attn")
+    transformer = _OverlayTransformer()
+    transformer.blocks.append(MiniMaxH3TransformerBlock())
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._runtime_base_specs = []
+    for path, multiplier in ((first, 0.25), (second, -0.5)):
+        payload = path.read_bytes()
+        weights = load_safetensors(payload)
+        trainer._runtime_base_specs.append(
+            {
+                "weights": weights,
+                "identity": {
+                    "path": str(path.resolve()),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "multiplier": multiplier,
+                    "schema": {
+                        key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(weights.items())
+                    },
+                },
+            }
+        )
+    args = _h3_flag_args("--base_weights", str(first), str(second), "--h3_base_weights_runtime_attach")
+    hidden = torch.randn(3, 4)
+    baseline0 = transformer.blocks[0].attn(hidden)
+    baseline1 = transformer.blocks[1].attn(hidden)
+
+    trainer.install_runtime_base_weights(args, _overlay_accelerator(), transformer)
+
+    torch.testing.assert_close(transformer.blocks[0].attn(hidden), baseline0 + 0.25 * 3.0 * (hidden @ first_down.T) @ first_up.T)
+    torch.testing.assert_close(
+        transformer.blocks[1].attn(hidden), baseline1 - 0.5 * (1.0 / 2.0) * (hidden @ second_down.T) @ second_up.T
+    )
+    assert all(not parameter.requires_grad for network in trainer._runtime_base_networks for parameter in network.parameters())
+
+    with trainer._runtime_base_enabled(False):
+        torch.testing.assert_close(transformer.blocks[0].attn(hidden), baseline0)
+        torch.testing.assert_close(transformer.blocks[1].attn(hidden), baseline1)
+        with trainer._runtime_base_enabled(True):
+            assert not torch.allclose(transformer.blocks[0].attn(hidden), baseline0)
+        torch.testing.assert_close(transformer.blocks[0].attn(hidden), baseline0)
+    assert not torch.allclose(transformer.blocks[1].attn(hidden), baseline1)
+
+
+def test_h3_runtime_base_attach_requires_inputs_and_accepts_reamplify_after_zero(tmp_path):
+    with pytest.raises(ValueError, match="requires at least one"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(_h3_flag_args("--h3_base_weights_runtime_attach"))
+    adapter = tmp_path / "base.safetensors"
+    _write_overlay_lora(adapter)
+    args = _h3_flag_args(
+        "--base_weights",
+        str(adapter),
+        "--h3_base_weights_runtime_attach",
+        "--h3_reamplify_scale",
+        "1.5",
+        "--h3_reamplify_after",
+        "0",
+    )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_runtime_base_resume_binds_ordered_source_bytes_and_opt_out(tmp_path):
+    class Accelerator:
+        process_index = 0
+        num_processes = 1
+
+        def __init__(self):
+            self.save_hooks = []
+            self.load_hooks = []
+
+        def register_save_state_pre_hook(self, hook):
+            self.save_hooks.append(hook)
+
+        def register_load_state_pre_hook(self, hook):
+            self.load_hooks.append(hook)
+
+    adapter = tmp_path / "base.safetensors"
+    _write_overlay_lora(adapter, alpha=3.0)
+    payload = adapter.read_bytes()
+    weights = load_safetensors(payload)
+    args = _h3_flag_args("--base_weights", str(adapter), "--h3_base_weights_runtime_attach")
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._runtime_base_specs = [
+        {
+            "weights": weights,
+            "identity": {
+                "path": str(adapter.resolve()),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "multiplier": 1.0,
+                "schema": {key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(weights.items())},
+            },
+        }
+    ]
+    accelerator = Accelerator()
+    trainer._register_runtime_base_state_hooks(args, accelerator)
+    accelerator.save_hooks[0]([], [], tmp_path)
+    accelerator.load_hooks[0]([], tmp_path)
+
+    _write_overlay_lora(adapter, alpha=4.0)
+    with pytest.raises(ValueError, match="does not match"):
+        accelerator.load_hooks[0]([], tmp_path)
+
+    off_args = _h3_flag_args()
+    off_accelerator = Accelerator()
+    MiniMaxH3NetworkTrainer()._register_runtime_base_state_hooks(off_args, off_accelerator)
+    with pytest.raises(ValueError, match="disabled"):
+        off_accelerator.load_hooks[0]([], tmp_path)
+
+
+def test_h3_runtime_base_normalizes_singleton_factors_and_preserves_zero_alpha():
+    prefix = "lora_unet_blocks_0_attn"
+    raw = {
+        f"{prefix}.lora_down.weight": torch.ones(2, 4, 1, 1),
+        f"{prefix}.lora_up.weight": torch.ones(4, 2, 1, 1),
+        f"{prefix}.alpha": torch.tensor(0.0),
+    }
+    normalized = MiniMaxH3NetworkTrainer()._normalize_runtime_base_weights(raw)
+    assert normalized[f"{prefix}.lora_down.weight"].shape == (2, 4)
+    assert normalized[f"{prefix}.lora_up.weight"].shape == (4, 2)
+    assert torch.count_nonzero(normalized[f"{prefix}.lora_up.weight"]) == 0
+
+    without_alpha = dict(raw)
+    without_alpha.pop(f"{prefix}.alpha")
+    normalized = MiniMaxH3NetworkTrainer()._normalize_runtime_base_weights(without_alpha)
+    assert torch.count_nonzero(normalized[f"{prefix}.lora_up.weight"]) == 8
+
+
+def test_h3_runtime_base_collection_failure_is_transactional_and_retryable(tmp_path):
+    good = tmp_path / "good.safetensors"
+    bad = tmp_path / "bad.safetensors"
+    _write_overlay_lora(good)
+    _write_overlay_lora(bad, name="lora_unet_blocks_0_absent")
+    transformer = _OverlayTransformer()
+    trainer = MiniMaxH3NetworkTrainer()
+    args = _h3_flag_args("--base_weights", str(good), str(bad), "--h3_base_weights_runtime_attach")
+
+    def spec(path):
+        payload = path.read_bytes()
+        raw = load_safetensors(payload)
+        return {
+            "weights": trainer._normalize_runtime_base_weights(raw),
+            "identity": {
+                "path": str(path.resolve()),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "multiplier": 1.0,
+                "schema": {key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(raw.items())},
+            },
+        }
+
+    trainer._runtime_base_specs = [spec(good), spec(bad)]
+    original_forward = transformer.blocks[0].attn.forward
+    hidden = torch.randn(2, 4)
+    baseline = transformer(hidden)
+    with pytest.raises(ValueError, match="no matching module"):
+        trainer.install_runtime_base_weights(args, _overlay_accelerator(), transformer)
+    assert transformer.blocks[0].attn.forward == original_forward
+    assert trainer._runtime_base_networks == []
+    torch.testing.assert_close(transformer(hidden), baseline)
+
+    trainer._runtime_base_specs = [spec(good)]
+    trainer.install_runtime_base_weights(args, _overlay_accelerator(), transformer)
+    once = transformer(hidden)
+    assert not torch.allclose(once, baseline)
+    assert len(trainer._runtime_base_networks) == 1
 
 
 def test_h3_foreign_lora_conversion_accepts_a_peft_adapter_name():

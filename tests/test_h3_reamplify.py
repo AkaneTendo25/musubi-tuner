@@ -234,6 +234,36 @@ def test_external_after_zero_uses_v3_state_without_owned_snapshot(tmp_path: Path
     assert restored._reamplify_snapshot_step == 0
 
 
+def test_runtime_collection_after_zero_uses_v4_state_without_owned_snapshot(tmp_path: Path):
+    adapter = tmp_path / "runtime.safetensors"
+    save_file({"lora_unet_block.lora_down.weight": torch.ones(1, 3)}, str(adapter))
+    identity = {
+        "path": str(adapter.resolve()),
+        "sha256": "a" * 64,
+        "multiplier": 0.5,
+        "schema": {"lora_unet_block.lora_down.weight": {"shape": [1, 3], "dtype": "torch.float32"}},
+    }
+    args = _args(h3_reamplify_after=0, h3_base_weights_runtime_attach=True, base_weights=[str(adapter)])
+    trainer = _trainer(args)
+    trainer._runtime_base_specs = [{"weights": {}, "identity": identity}]
+    hooks = _Hooks()
+    network = _Network()
+    trainer._take_reamplify_snapshot(args, hooks, object(), network, 0)
+    trainer._reamplify_probability_generator = torch.Generator().manual_seed(3)
+    trainer._reamplify_last_global_step = 0
+    trainer._register_reamplify_state_hooks(args, hooks, object(), network)
+    hooks.save([], [], tmp_path)
+    state = json.loads((tmp_path / "h3_reamplify_state-rank0.json").read_text(encoding="utf-8"))
+    assert state["version"] == 4 and state["snapshot"] is None and state["snapshot_step"] == 0
+
+    restored = _trainer(args)
+    restored._runtime_base_specs = [{"weights": {}, "identity": identity}]
+    load_hooks = _Hooks()
+    restored._register_reamplify_state_hooks(args, load_hooks, object(), network)
+    load_hooks.load([], tmp_path)
+    assert restored._reamplify_snapshot_step == 0
+
+
 def test_external_overlay_mutation_is_rejected_before_resolution(tmp_path: Path):
     overlay = tmp_path / "collapsed.safetensors"
     save_file({"lora_unet_block.lora_down.weight": torch.ones(1, 3)}, str(overlay))

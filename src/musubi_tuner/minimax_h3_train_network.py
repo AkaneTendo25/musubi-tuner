@@ -1958,6 +1958,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if getattr(args, "h3_overlay_weights", None):
             identity["composition"] = self._reamplify_overlay_identity_bound or self._reamplify_overlay_identity(args)
             identity["composition_mode"] = "external" if int(args.h3_reamplify_after) == 0 else "overlay+snapshot"
+        if self._runtime_base_specs:
+            identity["runtime_base_adapters"] = self._runtime_base_public_identity()
+            if int(args.h3_reamplify_after) == 0 and not getattr(args, "h3_overlay_weights", None):
+                identity["composition_mode"] = "runtime-base-adapters"
+            elif int(args.h3_reamplify_after) > 0:
+                identity["composition_mode"] = "runtime-base-adapters+overlay+snapshot"
         return identity
 
     @staticmethod
@@ -2024,7 +2030,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         state_name = f"h3_reamplify_state-rank{accelerator.process_index}.json"
         snapshot_name = f"h3_reamplify_snapshot-rank{accelerator.process_index}.safetensors"
         identity = self._reamplify_identity(args)
-        state_version = 3 if getattr(args, "h3_overlay_weights", None) else 2
+        state_version = 4 if self._runtime_base_specs else (3 if getattr(args, "h3_overlay_weights", None) else 2)
 
         def save_state(_models, _weights, output_dir):
             if self._reamplify_overlay_identity_bound is not None and not self._strict_json_equal(
@@ -2092,7 +2098,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if not isinstance(state, dict) or set(state) not in (v1_keys, v2_keys):
                 raise ValueError("reamplification resume state has an incomplete or unsupported schema")
             version = state["version"]
-            if type(version) is not int or version not in (1, 2, 3):
+            if type(version) is not int or version not in (1, 2, 3, 4):
                 raise ValueError("reamplification resume state version does not match this run")
             if version == 1:
                 if self._reamplify_schedule == REAMPLIFY_AUTO or set(state) != v1_keys:
@@ -2101,6 +2107,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("reamplification resume state has an incomplete or unsupported schema")
             if version == 3 and not getattr(args, "h3_overlay_weights", None):
                 raise ValueError("reamplification v3 resume state requires its external overlay")
+            if version == 4 and not self._runtime_base_specs:
+                raise ValueError("reamplification v4 resume state requires runtime base adapters")
+            if self._runtime_base_specs and version != 4:
+                raise ValueError("runtime base-adapter reamplification requires v4 resume state")
             expected = {
                 "version": version,
                 "process_index": accelerator.process_index,
@@ -2124,7 +2134,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("reamplification snapshot was not taken at the configured boundary")
             record = state["snapshot"]
             restored_weights = None
-            external_only = version == 3 and int(args.h3_reamplify_after) == 0
+            external_only = version in (3, 4) and int(args.h3_reamplify_after) == 0
             if step is None or external_only:
                 if record is not None:
                     raise ValueError("reamplification state has snapshot bytes without a snapshot step")
@@ -2674,6 +2684,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._recipe_probability_generator: torch.Generator | None = None
         self._qwen_control_dropout_generator: torch.Generator | None = None
         self._overlay_network = None
+        self._runtime_base_networks: list = []
+        self._runtime_base_specs: list[dict[str, object]] = []
         self._overlay_training_only = False
         self._validate_without_overlay = False
         self._h3_profiler: H3StepProfiler | None = None
@@ -4152,7 +4164,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if key not in self._field_base_gaps:
             set_enabled(False)
             try:
-                with self._overlay_disabled(self._reamplify_schedule == REAMPLIFY_AUTO and self._overlay_network is not None):
+                with (
+                    self._overlay_disabled(self._reamplify_schedule == REAMPLIFY_AUTO and self._overlay_network is not None),
+                    self._runtime_base_enabled(False),
+                ):
                     base_prompted, base_empty = branches()
                 self._field_base_gaps[key] = (
                     0.0 if base_prompted is None or base_empty is None else self._masked_rms(base_prompted - base_empty, video_mask)
@@ -4431,8 +4446,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._reamplify_overlay_identity_bound = self._reamplify_overlay_identity(args)
         if after < 0:
             raise ValueError("--h3_reamplify_after must be non-negative")
-        if after == 0 and not getattr(args, "h3_overlay_weights", None):
-            raise ValueError("--h3_reamplify_after 0 requires --h3_overlay_weights as the collapsed adapter")
+        runtime_base = bool(getattr(args, "h3_base_weights_runtime_attach", False) and getattr(args, "base_weights", None))
+        if after == 0 and not getattr(args, "h3_overlay_weights", None) and not runtime_base:
+            raise ValueError(
+                "--h3_reamplify_after 0 requires --h3_overlay_weights or runtime-attached --base_weights as the collapsed adapter"
+            )
         if getattr(args, "resume_as_new_shard", False):
             raise ValueError("--h3_reamplify_scale cannot use --resume_as_new_shard because its boundary uses the continued step")
         if not math.isfinite(probability) or not 0 < probability <= 1:
@@ -4465,7 +4483,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_two_teacher_loss_weight": float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0,
             "--h3_sparse_teacher_only": bool(getattr(args, "h3_sparse_teacher_only", False)),
             "--h3_caption_dropout_rate": float(getattr(args, "h3_caption_dropout_rate", 0.0) or 0.0) > 0,
-            "--base_weights": bool(getattr(args, "base_weights", None)),
+            "--base_weights": bool(getattr(args, "base_weights", None))
+            and not getattr(args, "h3_base_weights_runtime_attach", False),
         }
         active = [name for name, configured in conflicts.items() if configured]
         if active:
@@ -4730,7 +4749,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._validate_without_overlay = bool(getattr(args, "h3_validate_without_overlay", False))
         if self._validate_without_overlay and not self._overlay_training_only:
             raise ValueError("--h3_validate_without_overlay requires --h3_overlay_training_only")
-        if self._validate_without_overlay and getattr(args, "base_weights", None):
+        if (
+            self._validate_without_overlay
+            and getattr(args, "base_weights", None)
+            and not getattr(args, "h3_base_weights_runtime_attach", False)
+        ):
             raise ValueError(
                 "--h3_validate_without_overlay validates against the stock checkpoint, but --base_weights is merged into "
                 "it and cannot be disabled; drop --base_weights or the flag"
@@ -4749,6 +4772,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if overlay_weights and not Path(overlay_weights).is_file():
             raise FileNotFoundError(f"--h3_overlay_weights file not found: {overlay_weights}")
+        runtime_base = bool(getattr(args, "h3_base_weights_runtime_attach", False))
+        base_paths = list(getattr(args, "base_weights", None) or [])
+        if runtime_base and not base_paths:
+            raise ValueError("--h3_base_weights_runtime_attach requires at least one --base_weights adapter")
+        if runtime_base:
+            for path in base_paths:
+                if not Path(path).expanduser().is_file():
+                    raise FileNotFoundError(f"runtime --base_weights file not found: {path}")
         if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
         self._validate_rollout_args(args)
@@ -4812,7 +4843,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError(
                     "--h3_projection_scale replaces the data objective and cannot be combined with " + ", ".join(active)
                 )
-            if getattr(args, "base_weights", None):
+            if getattr(args, "base_weights", None) and not getattr(args, "h3_base_weights_runtime_attach", False):
                 raise ValueError(
                     "--h3_projection_scale needs the unmodified checkpoint for its frozen field, but --base_weights "
                     "is merged and cannot be disabled; use --h3_overlay_weights for a removable training overlay"
@@ -5492,6 +5523,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         }
         if getattr(args, "h3_overlay_weights", None):
             identity["overlay"] = self._reamplify_overlay_identity(args)
+        if self._runtime_base_specs:
+            identity["runtime_base_adapters"] = self._runtime_base_public_identity()
         return identity
 
     def _install_privileged_teacher_ema(self, args, accelerator, transformer, network) -> None:
@@ -5962,7 +5995,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         weights_sd = self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3")
         return self._frozen_lora_from_weights(weights_sd, multiplier, accelerator, transformer, label, str(path))
 
-    def _frozen_lora_from_weights(self, weights_sd, multiplier, accelerator, transformer, label: str, source: str):
+    def _frozen_lora_from_weights(
+        self, weights_sd, multiplier, accelerator, transformer, label: str, source: str, *, attach: bool = True
+    ):
         """Attach ``weights_sd`` as a live, frozen LoRA on top of the trainable one.
 
         Split out of :meth:`_install_frozen_lora` so the curriculum can build a
@@ -5988,15 +6023,47 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 f"this project expects (`lora_unet_<module_path_with_underscores>.lora_down.weight`), e.g. "
                 f"{', '.join(unmatched[:3])}"
             )
-        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
-        info = network.load_state_dict(weights_sd, False)
-        if info.missing_keys:
-            raise ValueError(f"{path}: {label} LoRA is missing {len(info.missing_keys)} tensor(s), e.g. {info.missing_keys[:3]}")
+        expected = {}
+        for lora in network.text_encoder_loras + network.unet_loras:
+            expected.update(
+                {
+                    f"{lora.lora_name}.{key}": value
+                    for key, value in lora.state_dict().items()
+                    if key == "alpha" or key.startswith(("lora_down.", "lora_up."))
+                }
+            )
+        missing = sorted(set(expected) - set(weights_sd))
+        unexpected = sorted(set(weights_sd) - set(expected))
+        mismatched = sorted(
+            key for key in set(expected) & set(weights_sd) if tuple(expected[key].shape) != tuple(weights_sd[key].shape)
+        )
+        if missing or unexpected or mismatched:
+            raise ValueError(
+                f"{path}: {label} LoRA tensor inventory is invalid; missing={missing[:3]}, "
+                f"unexpected={unexpected[:3]}, shape_mismatch={mismatched[:3]}"
+            )
+        for lora in network.text_encoder_loras + network.unet_loras:
+            prefix = lora.lora_name + "."
+            local = {key[len(prefix) :]: value for key, value in weights_sd.items() if key.startswith(prefix)}
+            info = lora.load_state_dict(local, False)
+            missing_local = [key for key in info.missing_keys if not key.startswith("org_module.")]
+            if missing_local or info.unexpected_keys:
+                raise ValueError(
+                    f"{path}: {label} LoRA failed validated loading; missing={missing_local[:3]}, "
+                    f"unexpected={info.unexpected_keys[:3]}"
+                )
         # fp32 matches the trainable network, which stays fp32 and relies on
         # autocast for the matmul dtype, so both deltas are computed alike.
-        network.to(device=accelerator.device, dtype=torch.float32)
-        network.requires_grad_(False)
-        network.eval()
+        for lora in network.text_encoder_loras + network.unet_loras:
+            lora.lora_down.to(device=accelerator.device, dtype=torch.float32)
+            lora.lora_up.to(device=accelerator.device, dtype=torch.float32)
+            lora.alpha = lora.alpha.to(device=accelerator.device, dtype=torch.float32)
+            lora.requires_grad_(False)
+            lora.eval()
+        if attach:
+            network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+            network.requires_grad_(False)
+            network.eval()
         ranks = sorted({int(lora.lora_dim) for lora in network.unet_loras})
         alphas = sorted({float(lora.alpha.item()) for lora in network.unet_loras})
         accelerator.print(
@@ -6191,6 +6258,172 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         finally:
             overlay.set_enabled(prior)
 
+    @contextmanager
+    def _runtime_base_enabled(self, enabled: bool):
+        """Force every runtime-attached base adapter to one state, then restore it."""
+        saved: list[tuple[object, list[bool] | bool]] = []
+        try:
+            for network in self._runtime_base_networks:
+                modules = list(getattr(network, "text_encoder_loras", ())) + list(getattr(network, "unet_loras", ()))
+                if modules:
+                    prior: list[bool] | bool = [bool(getattr(module, "enabled", True)) for module in modules]
+                else:
+                    is_enabled = getattr(network, "is_enabled", None)
+                    prior = bool(is_enabled()) if callable(is_enabled) else True
+                saved.append((network, prior))
+                network.set_enabled(enabled)
+            yield
+        finally:
+            for network, prior in reversed(saved):
+                if isinstance(prior, list):
+                    modules = list(getattr(network, "text_encoder_loras", ())) + list(getattr(network, "unet_loras", ()))
+                    for module, state in zip(modules, prior):
+                        module.enabled = state
+                else:
+                    network.set_enabled(prior)
+
+    def _runtime_base_public_identity(self) -> list[dict[str, object]]:
+        return [dict(spec["identity"]) for spec in self._runtime_base_specs]
+
+    def _normalize_runtime_base_weights(self, raw_weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        normalized = self.convert_weight_keys(raw_weights, "musubi_tuner.networks.lora_minimax_h3")
+        normalized = {
+            key: (
+                value.squeeze(3).squeeze(2)
+                if key.endswith((".lora_down.weight", ".lora_up.weight")) and value.ndim == 4 and tuple(value.shape[-2:]) == (1, 1)
+                else value
+            )
+            for key, value in normalized.items()
+        }
+        for key, value in tuple(normalized.items()):
+            if not key.endswith(".lora_down.weight"):
+                continue
+            prefix = key[: -len(".lora_down.weight")]
+            alpha_key = prefix + ".alpha"
+            if alpha_key not in normalized:
+                normalized[alpha_key] = torch.tensor(float(value.shape[0]), dtype=torch.float32)
+        # The stock LoRA constructor treats alpha=0 as an omitted alpha and
+        # substitutes rank. Runtime attachment defines explicit zero as a zero
+        # delta; absent alpha still takes the constructor's rank default.
+        for key, value in tuple(normalized.items()):
+            if key.endswith(".alpha") and value.numel() == 1 and float(value) == 0.0:
+                up_key = key[: -len(".alpha")] + ".lora_up.weight"
+                if up_key in normalized:
+                    normalized[up_key] = torch.zeros_like(normalized[up_key])
+        return normalized
+
+    def install_runtime_base_weights(self, args, accelerator, transformer) -> None:
+        if not getattr(args, "h3_base_weights_runtime_attach", False):
+            return
+        if self._runtime_base_networks:
+            raise RuntimeError("H3 runtime base adapters were already installed")
+        devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+        prepared = []
+        try:
+            for index, spec in enumerate(self._runtime_base_specs):
+                with torch.random.fork_rng(devices=devices):
+                    frozen = self._frozen_lora_from_weights(
+                        spec["weights"],
+                        spec["identity"]["multiplier"],
+                        accelerator,
+                        transformer,
+                        f"runtime base adapter {index}",
+                        spec["identity"]["path"],
+                        attach=False,
+                    )
+                prepared.append(frozen)
+            original_forwards = [
+                (lora.org_module, lora.org_module.forward)
+                for frozen in prepared
+                for lora in frozen.text_encoder_loras + frozen.unet_loras
+            ]
+            for frozen in prepared:
+                frozen.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+                frozen.requires_grad_(False)
+                frozen.eval()
+                frozen.set_enabled(True)
+        except Exception:
+            for module, forward in locals().get("original_forwards", []):
+                module.forward = forward
+            for frozen in prepared:
+                frozen.set_enabled(False)
+            raise
+        self._runtime_base_networks = prepared
+
+    def _register_runtime_base_state_hooks(self, args, accelerator) -> None:
+        state_name = f"h3_runtime_base_adapters-rank{accelerator.process_index}.json"
+        active = bool(getattr(args, "h3_base_weights_runtime_attach", False))
+        configuration = {
+            "dit": None if getattr(args, "dit", None) is None else os.path.normcase(str(Path(args.dit).expanduser().resolve())),
+            "training_mode": str(getattr(args, "h3_training_mode", "")),
+            "mixed_precision": str(getattr(args, "mixed_precision", "no")),
+            "dit_dtype": None if getattr(args, "dit_dtype", None) is None else str(args.dit_dtype),
+            "fp8_base": bool(getattr(args, "fp8_base", False)),
+            "fp8_scaled": bool(getattr(args, "fp8_scaled", False)),
+            "convrot_int8": bool(getattr(args, "h3_convrot_int8", False)),
+        }
+
+        def identity():
+            current = []
+            for spec in self._runtime_base_specs:
+                path = Path(spec["identity"]["path"])
+                payload = path.read_bytes()
+                weights = load_safetensors(payload)
+                schema = {key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(weights.items())}
+                item = dict(spec["identity"])
+                item.update(sha256=hashlib.sha256(payload).hexdigest(), schema=schema)
+                current.append(item)
+            return {
+                "version": 1,
+                "process_index": int(accelerator.process_index),
+                "num_processes": int(accelerator.num_processes),
+                "configuration": configuration,
+                "adapters": current,
+            }
+
+        expected = (
+            {
+                "version": 1,
+                "process_index": int(accelerator.process_index),
+                "num_processes": int(accelerator.num_processes),
+                "configuration": configuration,
+                "adapters": self._runtime_base_public_identity(),
+            }
+            if active
+            else None
+        )
+        if active and not self._strict_json_equal(identity(), expected):
+            raise ValueError("runtime base-adapter inputs changed between model loading and attachment")
+
+        def save_state(_models, _weights, output_dir):
+            path = Path(output_dir) / state_name
+            if not active:
+                if path.exists():
+                    raise ValueError("runtime base-adapter state exists although runtime attachment is disabled")
+                return
+            current = identity()
+            if not self._strict_json_equal(current, expected):
+                raise ValueError("runtime base-adapter inputs changed before checkpoint save")
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(json.dumps(current, sort_keys=True, indent=2) + "\n", encoding="utf-8", newline="\n")
+            os.replace(temporary, path)
+
+        def load_state(_models, input_dir):
+            path = Path(input_dir) / state_name
+            if not active:
+                if path.exists():
+                    raise ValueError("checkpoint contains runtime base adapters but this run disabled them")
+                return
+            if not path.is_file():
+                raise ValueError("checkpoint is missing runtime base-adapter state")
+            state = json.loads(path.read_text(encoding="utf-8"))
+            current = identity()
+            if not self._strict_json_equal(state, expected) or not self._strict_json_equal(current, expected):
+                raise ValueError("runtime base-adapter checkpoint identity does not match this run")
+
+        accelerator.register_save_state_pre_hook(save_state)
+        accelerator.register_load_state_pre_hook(load_state)
+
     def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):
         if args is not None and (
             args.h3_base_preservation_loss_weight > 0
@@ -6204,6 +6437,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise TypeError("H3 auxiliary losses require a network with set_enabled()")
         if args is not None:
             self.install_overlay_weights(args, accelerator, transformer)
+            self.install_runtime_base_weights(args, accelerator, transformer)
+            self._register_runtime_base_state_hooks(args, accelerator)
             self.install_teacher_weights(args, accelerator, transformer)
             if self._reamplify_schedule is not None:
                 self._register_reamplify_state_hooks(args, accelerator, transformer, network)
@@ -6527,15 +6762,44 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.fp8_base and dit_weight_dtype is not None:
             raise ValueError("MiniMax H3 scaled FP8 loading requires dit_weight_dtype=None")
         base_weight_paths = list(getattr(args, "base_weights", None) or [])
-        base_lora_weights = [self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3") for path in base_weight_paths]
         base_lora_multipliers = list(getattr(args, "base_weights_multiplier", None) or [])
-        if len(base_lora_multipliers) > len(base_lora_weights):
-            logger.warning(
-                f"--base_weights_multiplier lists {len(base_lora_multipliers)} values for {len(base_lora_weights)} "
-                "--base_weights; the extra ones are ignored"
-            )
-        base_lora_multipliers.extend([1.0] * (len(base_lora_weights) - len(base_lora_multipliers)))
-        base_lora_multipliers = base_lora_multipliers[: len(base_lora_weights)]
+        runtime_attach = bool(getattr(args, "h3_base_weights_runtime_attach", False))
+        if runtime_attach and len(base_lora_multipliers) > len(base_weight_paths):
+            raise ValueError("--base_weights_multiplier has more entries than --base_weights in runtime-attach mode")
+        if not runtime_attach and len(base_lora_multipliers) > len(base_weight_paths):
+            logger.warning("extra --base_weights_multiplier values are ignored")
+        base_lora_multipliers.extend([1.0] * (len(base_weight_paths) - len(base_lora_multipliers)))
+        base_lora_multipliers = base_lora_multipliers[: len(base_weight_paths)]
+        if any(isinstance(value, bool) or not math.isfinite(float(value)) for value in base_lora_multipliers):
+            raise ValueError("--base_weights_multiplier values must be finite real numbers")
+        base_lora_weights = []
+        self._runtime_base_specs = []
+        if runtime_attach:
+            for raw_path, multiplier in zip(base_weight_paths, base_lora_multipliers):
+                path = Path(raw_path).expanduser().resolve()
+                payload = path.read_bytes()
+                raw_weights = load_safetensors(payload)
+                if not raw_weights:
+                    raise ValueError(f"runtime base adapter is empty: {path}")
+                schema = {
+                    key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(raw_weights.items())
+                }
+                normalized = self._normalize_runtime_base_weights(raw_weights)
+                self._runtime_base_specs.append(
+                    {
+                        "weights": normalized,
+                        "identity": {
+                            "path": os.path.normcase(str(path)),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "multiplier": float(multiplier),
+                            "schema": schema,
+                        },
+                    }
+                )
+        else:
+            base_lora_weights = [
+                self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3") for path in base_weight_paths
+            ]
         backend_kwargs = dict(
             model=Path(dit_path),
             device=str(loading_device),
@@ -6597,10 +6861,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if base_weight_paths:
             args.base_weights = None
             args.base_weights_multiplier = None
-            # Remembered because the argument is cleared here and nothing downstream can
-            # tell afterwards that the model it was handed is no longer the checkpoint.
-            self._merged_base_weight_paths = list(base_weight_paths)
-            accelerator.print("all H3 base weights merged during model loading: " + ", ".join(base_weight_paths))
+            if runtime_attach:
+                accelerator.print("H3 base weights queued as frozen runtime adapters: " + ", ".join(base_weight_paths))
+            else:
+                # Remembered because the argument is cleared here and nothing downstream can
+                # tell afterwards that the model it was handed is no longer the checkpoint.
+                self._merged_base_weight_paths = list(base_weight_paths)
+                accelerator.print("all H3 base weights merged during model loading: " + ", ".join(base_weight_paths))
         return transformer
 
     @staticmethod
@@ -10203,6 +10470,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     torch.no_grad(),
                     projection_int8(auxiliary=True) if callable(projection_int8) else nullcontext(),
                     self._overlay_disabled(True),
+                    self._runtime_base_enabled(False),
                 ):
                     projection_toggle(False)
                     try:
@@ -10236,6 +10504,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     torch.no_grad(),
                     int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
                     self._overlay_enabled(collapsed),
+                    self._runtime_base_enabled(collapsed),
                 ):
                     student_toggle(False)
                     if snapshot is not None:
@@ -11350,6 +11619,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             ),
             "ss_h3_guidance_distillation_probability": str(args.h3_guidance_distillation_probability),
             "ss_h3_overlay_weights": str(getattr(args, "h3_overlay_weights", None) or "none"),
+            "ss_h3_base_weights_runtime_attach": str(bool(getattr(args, "h3_base_weights_runtime_attach", False))),
             "ss_h3_overlay_weights_multiplier": str(getattr(args, "h3_overlay_weights_multiplier", 1.0)),
             "ss_h3_overlay_training_only": str(bool(getattr(args, "h3_overlay_training_only", False))),
             "ss_h3_validate_without_overlay": str(bool(getattr(args, "h3_validate_without_overlay", False))),
@@ -11762,6 +12032,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "apply a LoRA (Musubi or Diffusers/PEFT keys) as a separate frozen module instead of merging it into the "
             "base weights; works on an INT8 ConvRot base, is excluded from the optimizer and saved checkpoints, and is "
             "by default active on all forwards including samples and the base-preservation reference"
+        ),
+    )
+    parser.add_argument(
+        "--h3_base_weights_runtime_attach",
+        action="store_true",
+        help=(
+            "attach every --base_weights LoRA as an independently scaled frozen runtime module instead of merging "
+            "it into the H3 checkpoint; adapters remain outside the optimizer and exported trainable LoRA"
         ),
     )
     parser.add_argument(
