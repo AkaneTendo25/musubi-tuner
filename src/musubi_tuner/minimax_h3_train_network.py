@@ -3384,6 +3384,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     raise ValueError("--h3_repair_target_multiplier extrapolates past the reference branch")
 
     def handle_model_specific_args(self, args: argparse.Namespace):
+        if getattr(args, "resume_as_new_shard", False) and not args.resume:
+            raise ValueError("--resume_as_new_shard requires --resume")
         self._validate_repair_args(args)
         self.dit_dtype = (
             torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
@@ -8820,6 +8822,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--resume_as_new_shard",
+        action="store_true",
+        help="load --resume training state but start this new dataset at local step zero, preserving optimizer, scheduler and RNG",
+    )
     parser.add_argument(
         "--h3_repair_reference",
         choices=("empty",),

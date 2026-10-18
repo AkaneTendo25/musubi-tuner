@@ -570,6 +570,9 @@ class NetworkTrainer:
         return recover_global_step(state_dir)
 
     def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
+        new_shard = bool(getattr(args, "resume_as_new_shard", False))
+        if new_shard and not args.resume:
+            raise ValueError("--resume_as_new_shard requires --resume")
         if not args.resume:
             self._resume_state_dir = None
             self._resume_rng_state = None
@@ -581,7 +584,10 @@ class NetworkTrainer:
             accelerator.load_state(args.resume)
             self._resume_rng_state = capture_training_rng_state()
             self._resume_state_dir = args.resume
-            return recover_global_step(args.resume, strict=True)
+            saved_step = recover_global_step(args.resume, strict=True)
+            # The optimizer/scheduler/RNG stay restored; only the new dataset
+            # starts at local step zero, so the loop ignores old cursor metadata.
+            return 0 if new_shard else saved_step
 
         logger.info(f"resume training from huggingface state: {args.resume}")
         repo_id = args.resume.split("/")[0] + "/" + args.resume.split("/")[1]
@@ -629,7 +635,8 @@ class NetworkTrainer:
         self._resume_rng_state = capture_training_rng_state()
         self._resume_state_dir = dirname
 
-        return recover_global_step(dirname, strict=True)
+        saved_step = recover_global_step(dirname, strict=True)
+        return 0 if new_shard else saved_step
 
     def get_bucketed_timestep(self) -> float:
         if self.num_timestep_buckets is None or self.num_timestep_buckets <= 1:
