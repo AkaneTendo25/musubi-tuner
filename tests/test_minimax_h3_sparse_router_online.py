@@ -44,6 +44,7 @@ from scripts.train_minimax_h3_sparse_router_online import (
     _visual_latent_key,
     OnlineRouterTeacher,
 )
+import scripts.train_minimax_h3_sparse_router_online as online
 
 
 def _records(count: int) -> list[tuple[Path, Path]]:
@@ -244,6 +245,29 @@ def test_router_resume_rejects_changed_training_invariants(tmp_path: Path) -> No
             optimizer,
             generator,
             expected_invariants={"seed": 9999},
+        )
+
+
+def test_legacy_resume_defaults_precision_to_fp8_and_rejects_bf16() -> None:
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
+    generator = torch.Generator().manual_seed(1)
+    state = _capture_training_state(
+        model,
+        optimizer,
+        generator,
+        completed_examples=0,
+        completed_optimizer_updates=0,
+        invariants={"num_layers": 50},
+        record_chain_sha256=_extend_record_chain(None, []),
+        parent_state_sha256=None,
+    )
+    assert _restore_training_state(
+        state, model, optimizer, generator, expected_invariants={"num_layers": 50, "base_precision": "fp8"}
+    )[:2] == (0, 0)
+    with pytest.raises(ValueError, match="base_precision"):
+        _restore_training_state(
+            state, model, optimizer, generator, expected_invariants={"num_layers": 50, "base_precision": "bf16"}
         )
 
 
@@ -572,3 +596,27 @@ def test_online_router_config_is_json_compatible() -> None:
         "nested": ["checkpoint.pt", None],
     }
     assert json.loads(json.dumps(converted)) == converted
+
+
+def test_online_router_precision_defaults_to_fp8_and_accepts_bf16() -> None:
+    parser = online.create_parser()
+    required = ["--cache-dir", "cache", "--dit", "dit", "--output", "router.pt"]
+    assert parser.parse_args(required).base_precision == "fp8"
+    assert parser.parse_args([*required, "--base-precision", "bf16"]).base_precision == "bf16"
+
+
+@pytest.mark.parametrize(("precision", "expected_fp8"), [("fp8", True), ("bf16", False)])
+def test_online_router_precision_reaches_model_loader(monkeypatch, precision: str, expected_fp8: bool) -> None:
+    captured = {}
+    model = object()
+
+    def load(*args, **kwargs):
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr(online, "load_transformer", load)
+    result = online._load_dense_teacher(
+        SimpleNamespace(dit=Path("dit.safetensors"), base_precision=precision, adaln_rank=None), torch.device("cpu")
+    )
+    assert result is model
+    assert captured["fp8_scaled"] is expected_fp8

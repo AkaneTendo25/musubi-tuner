@@ -229,6 +229,7 @@ def _training_state_invariants(args: argparse.Namespace, model, router: H3Univer
     training_seed, _ = _resolved_generator_seeds(args.seed, args.validation_seed)
     return {
         "adaln_rank": args.adaln_rank,
+        "base_precision": args.base_precision,
         "block_size": router.block_size,
         "diagnostic_topk": args.diagnostic_topk,
         "head_dim": model.config.attention_head_dim,
@@ -280,6 +281,13 @@ def _restore_training_state(
     if not isinstance(state, dict) or state.get("version") != TRAINING_STATE_VERSION:
         raise ValueError("unsupported router training-state version")
     actual_invariants = state.get("invariants")
+    if (
+        isinstance(actual_invariants, dict)
+        and "base_precision" in expected_invariants
+        and "base_precision" not in actual_invariants
+    ):
+        actual_invariants = dict(actual_invariants)
+        actual_invariants["base_precision"] = "fp8"
     if actual_invariants != expected_invariants:
         keys = sorted(set(expected_invariants) | set(actual_invariants or {}))
         mismatches = {
@@ -492,7 +500,7 @@ class OnlineRouterTeacher:
         return {key: sum(row[key] for row in self.rows) / len(self.rows) for key in ("loss", "retained_mass", "recall")}
 
 
-def main() -> None:
+def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train the H3 sparse-reference router online from dense Q/K over paired Ref2VA caches.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -556,6 +564,28 @@ def main() -> None:
     parser.add_argument("--summary-subblocks", type=int, default=4, help="Summaries retained per 128-row router block.")
     parser.add_argument("--samples-per-block", type=int, default=4, help="Dense teacher query rows sampled per block.")
     parser.add_argument("--diagnostic-topk", type=int, default=16, help="Top-k used for reported mass and recall.")
+    parser.add_argument(
+        "--base-precision",
+        choices=("fp8", "bf16"),
+        default="fp8",
+        help="Dense teacher weight precision (default: fp8).",
+    )
+    return parser
+
+
+def _load_dense_teacher(args: argparse.Namespace, device: torch.device):
+    return load_transformer(
+        args.dit,
+        mode="ref2va",
+        loading_device=device,
+        quantization_device=device,
+        fp8_scaled=args.base_precision == "fp8",
+        adaln_rank=args.adaln_rank,
+    )
+
+
+def main() -> None:
+    parser = create_parser()
     args = parser.parse_args()
 
     _validate_options(args)
@@ -591,18 +621,7 @@ def main() -> None:
     )
 
     device = torch.device("cuda")
-    model = (
-        load_transformer(
-            args.dit,
-            mode="ref2va",
-            loading_device=device,
-            quantization_device=device,
-            fp8_scaled=True,
-            adaln_rank=args.adaln_rank,
-        )
-        .eval()
-        .requires_grad_(False)
-    )
+    model = _load_dense_teacher(args, device).eval().requires_grad_(False)
     router = H3UniversalSparseRouter(
         num_layers=len(model.blocks),
         num_heads=model.config.num_attention_heads,
