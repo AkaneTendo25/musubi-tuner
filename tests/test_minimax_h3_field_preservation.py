@@ -99,12 +99,46 @@ def test_field_preservation_active_window(weight: float, steps: int, conditionin
             ],
             "cannot use --fused_backward_pass",
         ),
+        (
+            [
+                "--h3_guidance_null_anchor_weight",
+                "0.5",
+                "--blocks_to_swap",
+                "1",
+                "--fused_backward_pass",
+                "--optimizer_type",
+                "Adafactor",
+                "--max_grad_norm",
+                "0",
+            ],
+            "null_anchor_weight with classic block swap stages its backward",
+        ),
     ],
 )
 def test_field_preservation_rejects_invalid_configuration(extra: list[str], message: str) -> None:
     args = create_parser().parse_args(["--sdpa", *extra])
     with pytest.raises(ValueError, match=message):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h2d_only_swap_does_not_reject_fused_null_anchor() -> None:
+    args = create_parser().parse_args(
+        [
+            "--sdpa",
+            "--h3_guidance_null_anchor_weight",
+            "0.5",
+            "--blocks_to_swap",
+            "1",
+            "--block_swap_h2d_only",
+            "--use_pinned_memory_for_block_swap",
+            "--fused_backward_pass",
+            "--optimizer_type",
+            "Adafactor",
+            "--max_grad_norm",
+            "0",
+        ]
+    )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def test_field_preservation_parser_defaults_off() -> None:

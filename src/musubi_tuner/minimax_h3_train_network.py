@@ -3746,7 +3746,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "--h3_field_preservation_weight requires both adapted prompt and empty branches; "
                 "it cannot be combined with --h3_adapter_prompt_only"
             )
-        if field_weight > 0 and bool(args.blocks_to_swap or 0) and getattr(args, "fused_backward_pass", False):
+        if (
+            field_weight > 0
+            and bool(args.blocks_to_swap or 0)
+            and not getattr(args, "block_swap_h2d_only", False)
+            and getattr(args, "fused_backward_pass", False)
+        ):
             raise ValueError(
                 "--h3_field_preservation_weight with classic block swap stages the empty-branch backward before the "
                 "prompted branch, so it cannot use --fused_backward_pass, whose hooks would step parameters between them"
@@ -3831,6 +3836,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if getattr(args, "h3_null_anchor_shared_draws", False) and anchor_weight <= 0:
             logger.warning("--h3_null_anchor_shared_draws never engages without --h3_guidance_null_anchor_weight above 0")
+        if (
+            anchor_weight > 0
+            and bool(args.blocks_to_swap or 0)
+            and not getattr(args, "block_swap_h2d_only", False)
+            and getattr(args, "fused_backward_pass", False)
+        ):
+            raise ValueError(
+                "--h3_guidance_null_anchor_weight with classic block swap stages its backward before later forwards, "
+                "so it cannot use --fused_backward_pass, whose hooks would step parameters during the batch"
+            )
         if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
             raise ValueError("--h3_base_preservation_probability must be finite and lie in (0, 1]")
         if not math.isfinite(args.h3_dop_loss_weight) or args.h3_dop_loss_weight < 0:
@@ -7777,7 +7792,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 null_anchor_toggle = self._runtime_network_toggle(accelerator, network, "--h3_guidance_null_anchor_weight")
                 anchor_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
                 anchor_int8 = getattr(transformer, "int8_attention_context", None)
-                stage_null_anchor = field_preservation_active and auxiliary_block_swap
+                stage_null_anchor = auxiliary_block_swap
                 if getattr(args, "h3_null_anchor_shared_draws", False) or stage_null_anchor:
                     # The same discipline the rollout pairs use: capture the entry RNG
                     # so the frozen reference draws the SAME conditioning noise as the
