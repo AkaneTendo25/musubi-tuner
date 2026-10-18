@@ -7,8 +7,14 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
-from musubi_tuner.minimax_h3.reamplify import parse_reamplify_schedule, reamplify_target
+from musubi_tuner.minimax_h3.reamplify import (
+    REAMPLIFY_AUTO,
+    parse_reamplify_schedule,
+    reamplify_target,
+    resolve_reamplify_schedule,
+)
 from musubi_tuner.minimax_h3.training import H3ModelPrediction
+from musubi_tuner.minimax_h3.validation import validation_sigma_bins
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer
 
 
@@ -26,6 +32,11 @@ class _Hooks:
 
     def register_load_state_pre_hook(self, hook):
         self.load = hook
+
+    @staticmethod
+    def reduce(value, reduction):
+        assert reduction == "sum"
+        return value
 
     @staticmethod
     def unwrap_model(model):
@@ -46,6 +57,14 @@ class _Network:
 
     def snapshot_weights(self, dtype):
         return {key: value.detach().to(dtype=dtype).clone() for key, value in self.weights.items()}
+
+
+class _ReducedHooks(_Hooks):
+    @staticmethod
+    def reduce(value, reduction):
+        assert reduction == "sum"
+        # Simulate a second rank contributing one ratio in each bin.
+        return value + torch.tensor([0.25, 1.0, 0.75, 1.0], dtype=value.dtype)
 
 
 class _Teacher:
@@ -76,6 +95,24 @@ def _args(**updates):
         h3_caption_dropout_rate=0.0,
         h3_overlay_weights=None,
         base_weights=None,
+        h3_validation_field_probe=False,
+        h3_validate_ema=False,
+        validation_timestep_bins=2,
+        validation_min_timestep=0,
+        validation_max_timestep=1000,
+        validation_dataset_config=None,
+        validation_seed=17,
+        max_validation_items=4,
+        seed=11,
+        h3_training_mode="t2va",
+        h3_observed_modality=None,
+        h3_video_loss_weight=1.0,
+        h3_audio_loss_weight=1.0,
+        h3_image_timestep_sampling="auto",
+        h3_image_flow_shift=None,
+        timestep_sampling="uniform",
+        h3_shift_video=12.0,
+        h3_shift_audio=3.0,
     )
     values.update(updates)
     return SimpleNamespace(**values)
@@ -97,10 +134,18 @@ def _trainer(args=None):
 
 def test_schedule_and_fp32_binned_target():
     assert parse_reamplify_schedule("2, 3") == (2.0, 3.0)
-    with pytest.raises(ValueError, match="validation-ratio resolver"):
-        parse_reamplify_schedule("auto")
+    assert parse_reamplify_schedule("auto") == REAMPLIFY_AUTO
+    assert resolve_reamplify_schedule({0: 0.5, 1: 2.0}, 2) == (2.0, 1.01)
+    with pytest.raises(ValueError, match="every contiguous"):
+        resolve_reamplify_schedule({0: 0.5}, 2)
+    with pytest.raises(ValueError, match="every contiguous"):
+        resolve_reamplify_schedule({False: 0.5}, 1)
+    with pytest.raises(ValueError, match="finite in FP32"):
+        resolve_reamplify_schedule({0: 1e-320}, 1)
     with pytest.raises(ValueError, match="greater than 1"):
         parse_reamplify_schedule("1,2")
+    with pytest.raises(ValueError, match="finite in FP32"):
+        parse_reamplify_schedule("1e100")
 
     # BF16 rounds 257 to 256. Subtracting before widening would erase the field.
     stock = torch.tensor([[[[0.0]]], [[[0.0]]]], dtype=torch.bfloat16)
@@ -135,6 +180,14 @@ def test_validation_is_default_off_and_rejects_unsupported_combinations():
     ):
         with pytest.raises(ValueError, match=message):
             MiniMaxH3NetworkTrainer()._validate_reamplify_args(_args(**update))
+
+    for update, message in (
+        ({}, "field_probe"),
+        ({"h3_validation_field_probe": True, "validation_min_timestep": 1}, "full validation"),
+        ({"h3_validation_field_probe": True, "h3_validate_ema": True}, "live adapter"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            MiniMaxH3NetworkTrainer()._validate_reamplify_args(_args(h3_reamplify_scale="auto", **update))
 
 
 def test_snapshot_is_taken_at_boundary_before_draw_and_constructor_preserves_rng():
@@ -224,3 +277,175 @@ def test_preboundary_state_can_resume_at_exact_boundary(tmp_path: Path):
     assert restored._reamplify_snapshot_step is None
     restored._take_reamplify_snapshot(args, load_hooks, object(), network, 2)
     assert restored._reamplify_snapshot_step == 2
+
+
+def test_auto_measurement_resolves_once_and_round_trips_provenance(tmp_path: Path):
+    args = _args(h3_reamplify_scale="auto", h3_validation_field_probe=True)
+    trainer = _trainer(args)
+    hooks = _Hooks()
+    network = _Network()
+    bins = validation_sigma_bins(2)
+    trainer._field_ratios = {0: [0.5, 0.5], 1: [0.25]}
+    trainer._record_reamplify_field_measurement(args, hooks, network, bins, 1)
+    assert trainer._reamplify_last_field_ratios == {0: 0.5, 1: 0.25}
+    assert trainer._resolve_reamplify_schedule(args) == (2.0, 4.0)
+    trainer._take_reamplify_snapshot(args, hooks, object(), network, 2)
+    trainer._reamplify_probability_generator = torch.Generator().manual_seed(7)
+    trainer._reamplify_last_global_step = 2
+    trainer._register_reamplify_state_hooks(args, hooks, object(), network)
+    hooks.save([], [], tmp_path)
+
+    restored = _trainer(args)
+    load_hooks = _Hooks()
+    restored._register_reamplify_state_hooks(args, load_hooks, object(), network)
+    load_hooks.load([], tmp_path)
+    assert restored._reamplify_resolved_schedule == (2.0, 4.0)
+    assert restored._reamplify_last_field_measurement["step"] == 1
+    # A later validation cannot move a schedule that the snapshot already bound.
+    restored._field_ratios = {0: [0.1], 1: [0.1]}
+    restored._record_reamplify_field_measurement(args, load_hooks, network, bins, 2)
+    assert restored._reamplify_resolved_schedule == (2.0, 4.0)
+
+
+def test_auto_measurement_uses_global_bin_sums_and_counts():
+    args = _args(h3_reamplify_scale="auto", h3_validation_field_probe=True)
+    trainer = _trainer(args)
+    trainer._field_ratios = {0: [0.75], 1: [0.25]}
+    trainer._record_reamplify_field_measurement(args, _ReducedHooks(), _Network(), validation_sigma_bins(2), 1)
+    assert trainer._reamplify_last_field_ratios == {0: 0.5, 1: 0.5}
+    assert trainer._resolve_reamplify_schedule(args) == (2.0, 2.0)
+
+
+def test_auto_runtime_rechecks_measurement_identity_before_snapshot():
+    args = _args(h3_reamplify_scale="auto", h3_validation_field_probe=True)
+    trainer = _trainer(args)
+    hooks = _Hooks()
+    network = _Network()
+    trainer._field_ratios = {0: [0.5], 1: [0.25]}
+    trainer._record_reamplify_field_measurement(args, hooks, network, validation_sigma_bins(2), 1)
+    trainer._reamplify_last_field_measurement["bins"][0]["base_sigma"] = 0.123
+    with pytest.raises(ValueError, match="no longer matches"):
+        trainer._resolve_reamplify_schedule(args)
+    assert trainer._reamplify_resolved_schedule is None
+
+    trainer._reamplify_last_field_measurement["bins"][0]["base_sigma"] = validation_sigma_bins(2)[0].base_sigma
+    trainer._reamplify_last_field_measurement["step"] = 2
+    trainer._reamplify_last_field_measurement["adapter_sha256"] = "0" * 64
+    trainer._resolve_reamplify_schedule(args)
+    with pytest.raises(ValueError, match="adapter being frozen"):
+        trainer._take_reamplify_snapshot(args, hooks, object(), network, 2)
+    assert trainer._reamplify_snapshot_network is None
+
+
+@pytest.mark.parametrize(
+    ("setting", "changed"),
+    [
+        ("h3_observed_modality", "video"),
+        ("h3_audio_loss_weight", 0.0),
+        ("h3_image_timestep_sampling", "uniform"),
+        ("h3_image_flow_shift", 1.5),
+    ],
+)
+def test_auto_measurement_rejects_changed_validation_task_identity(setting: str, changed):
+    args = _args(h3_reamplify_scale="auto", h3_validation_field_probe=True)
+    trainer = _trainer(args)
+    trainer._field_ratios = {0: [0.5], 1: [0.25]}
+    trainer._record_reamplify_field_measurement(args, _Hooks(), _Network(), validation_sigma_bins(2), 1)
+    setattr(args, setting, changed)
+    with pytest.raises(ValueError, match="no longer matches"):
+        trainer._resolve_reamplify_schedule(args)
+
+
+def test_explicit_v1_state_remains_loadable(tmp_path: Path):
+    args = _args()
+    hooks = _Hooks()
+    network = _Network()
+    trainer = _trainer(args)
+    trainer._take_reamplify_snapshot(args, hooks, object(), network, 2)
+    trainer._reamplify_probability_generator = torch.Generator().manual_seed(4)
+    trainer._reamplify_last_global_step = 2
+    trainer._register_reamplify_state_hooks(args, hooks, object(), network)
+    hooks.save([], [], tmp_path)
+    state_path = tmp_path / "h3_reamplify_state-rank0.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["version"] = 1
+    state["snapshot"].pop("adapter_sha256")
+    for key in ("field_ratios", "field_measurement", "resolved_schedule"):
+        state.pop(key)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    restored = _trainer(args)
+    load_hooks = _Hooks()
+    restored._register_reamplify_state_hooks(args, load_hooks, object(), network)
+    load_hooks.load([], tmp_path)
+    assert restored._reamplify_snapshot_step == 2
+    assert restored._reamplify_resolved_schedule == (2.0, 3.0)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_bin", "future_measurement", "wrong_boundary_adapter", "bool_factor", "bin_geometry"],
+)
+def test_auto_state_rejects_malformed_measurement_before_install(tmp_path: Path, mutation: str):
+    args = _args(h3_reamplify_scale="auto", h3_validation_field_probe=True)
+    hooks = _Hooks()
+    network = _Network()
+    trainer = _trainer(args)
+    bins = validation_sigma_bins(2)
+    trainer._field_ratios = {0: [0.5], 1: [0.25]}
+    trainer._record_reamplify_field_measurement(args, hooks, network, bins, 1)
+    trainer._resolve_reamplify_schedule(args)
+    trainer._take_reamplify_snapshot(args, hooks, object(), network, 2)
+    trainer._reamplify_probability_generator = torch.Generator().manual_seed(5)
+    trainer._reamplify_last_global_step = 2
+    trainer._register_reamplify_state_hooks(args, hooks, object(), network)
+    hooks.save([], [], tmp_path)
+    state_path = tmp_path / "h3_reamplify_state-rank0.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if mutation == "missing_bin":
+        state["field_ratios"].pop("1")
+    elif mutation == "future_measurement":
+        state["field_measurement"]["step"] = state["completed_steps"] + 1
+    elif mutation == "wrong_boundary_adapter":
+        state["field_measurement"]["step"] = state["snapshot_step"]
+        state["field_measurement"]["adapter_sha256"] = "0" * 64
+    elif mutation == "bool_factor":
+        state["resolved_schedule"][0] = True
+    else:
+        state["field_measurement"]["bins"][0]["base_sigma"] = 0.125
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    restored = _trainer(args)
+    load_hooks = _Hooks()
+    restored._register_reamplify_state_hooks(args, load_hooks, object(), network)
+    with pytest.raises(ValueError):
+        load_hooks.load([], tmp_path)
+    assert restored._reamplify_snapshot_network is None
+    assert restored._reamplify_probability_generator is None
+
+
+def test_auto_resume_rejects_changed_validation_task_identity(tmp_path: Path):
+    args = _args(h3_reamplify_scale="auto", h3_validation_field_probe=True)
+    hooks = _Hooks()
+    network = _Network()
+    trainer = _trainer(args)
+    trainer._field_ratios = {0: [0.5], 1: [0.25]}
+    trainer._record_reamplify_field_measurement(args, hooks, network, validation_sigma_bins(2), 1)
+    trainer._resolve_reamplify_schedule(args)
+    trainer._take_reamplify_snapshot(args, hooks, object(), network, 2)
+    trainer._reamplify_probability_generator = torch.Generator().manual_seed(5)
+    trainer._reamplify_last_global_step = 2
+    trainer._register_reamplify_state_hooks(args, hooks, object(), network)
+    hooks.save([], [], tmp_path)
+
+    changed = _args(
+        h3_reamplify_scale="auto",
+        h3_validation_field_probe=True,
+        h3_observed_modality="video",
+    )
+    restored = _trainer(changed)
+    load_hooks = _Hooks()
+    restored._register_reamplify_state_hooks(changed, load_hooks, object(), network)
+    with pytest.raises(ValueError, match="field-measurement identity"):
+        load_hooks.load([], tmp_path)
+    assert restored._reamplify_snapshot_network is None

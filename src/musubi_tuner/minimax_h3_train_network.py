@@ -25,7 +25,7 @@ import toml
 import torch
 from accelerate import Accelerator
 from PIL import Image
-from safetensors.torch import load as load_safetensors, load_file, save_file
+from safetensors.torch import load as load_safetensors, load_file, save as save_safetensors, save_file
 
 from musubi_tuner import convert_lora
 from musubi_tuner.dataset import config_utils
@@ -125,7 +125,12 @@ from musubi_tuner.minimax_h3.rollout import (
     rollout_base_sigmas,
     teacher_batch,
 )
-from musubi_tuner.minimax_h3.reamplify import parse_reamplify_schedule, reamplify_target
+from musubi_tuner.minimax_h3.reamplify import (
+    REAMPLIFY_AUTO,
+    parse_reamplify_schedule,
+    reamplify_target,
+    resolve_reamplify_schedule,
+)
 from musubi_tuner.minimax_h3.rollout import (
     SIGMA_FLOOR as ROLLOUT_SIGMA_FLOOR,
 )
@@ -1756,9 +1761,113 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 digest.update(chunk)
         return digest.hexdigest()
 
+    @staticmethod
+    def _reamplify_adapter_sha256(accelerator, network) -> str:
+        unwrapped = accelerator.unwrap_model(network)
+        snapshot = getattr(unwrapped, "snapshot_weights", None)
+        if not callable(snapshot):
+            raise TypeError("automatic reamplification requires a network with snapshot_weights()")
+        weights = {key: value.detach().to(device="cpu").contiguous() for key, value in sorted(snapshot(torch.float32).items())}
+        if not weights:
+            raise ValueError("automatic reamplification cannot identify an empty adapter")
+        return hashlib.sha256(save_safetensors(weights)).hexdigest()
+
+    @staticmethod
+    def _reamplify_weights_sha256(weights: dict[str, torch.Tensor]) -> str:
+        ordered = {key: value.detach().to(device="cpu").contiguous() for key, value in sorted(weights.items())}
+        return hashlib.sha256(save_safetensors(ordered)).hexdigest()
+
+    def _record_reamplify_field_measurement(self, args, accelerator, network, bins, global_step: int) -> None:
+        if self._reamplify_schedule != REAMPLIFY_AUTO or self._reamplify_resolved_schedule is not None:
+            return
+        step = int(global_step)
+        if step <= 0 or step > int(args.h3_reamplify_after):
+            return
+        if int(args.validation_min_timestep) != 0 or int(args.validation_max_timestep) != 1000:
+            raise ValueError("automatic reamplification field measurements must span base sigma 0..1")
+        local = []
+        for sigma_bin in bins:
+            values = self._field_ratios.get(sigma_bin.index, ())
+            local.extend((float(sum(values)), float(len(values))))
+        reduced = accelerator.reduce(torch.tensor(local, device=accelerator.device, dtype=torch.float64), reduction="sum")
+        ratios = {}
+        for position, sigma_bin in enumerate(bins):
+            total = float(reduced[2 * position].item())
+            count = float(reduced[2 * position + 1].item())
+            if not math.isfinite(total) or not math.isfinite(count) or count <= 0:
+                raise ValueError(f"automatic reamplification validation field bin {sigma_bin.index} is missing or nonfinite")
+            ratio = total / count
+            if not math.isfinite(ratio) or ratio <= 0:
+                raise ValueError(f"automatic reamplification validation field bin {sigma_bin.index} must be finite and positive")
+            ratios[sigma_bin.index] = ratio
+        resolve_reamplify_schedule(ratios, len(bins))
+        measurement = {
+            "step": step,
+            "adapter_sha256": self._reamplify_adapter_sha256(accelerator, network),
+            "field_probe": self._reamplify_field_fingerprint(args),
+            "bins": [
+                {
+                    "index": sigma_bin.index,
+                    "base_sigma": sigma_bin.base_sigma,
+                    "video_sigma": sigma_bin.video_sigma,
+                    "audio_sigma": sigma_bin.audio_sigma,
+                }
+                for sigma_bin in bins
+            ],
+            "ema": False,
+        }
+        self._reamplify_last_field_ratios = ratios
+        self._reamplify_last_field_measurement = measurement
+
+    def _resolve_reamplify_schedule(self, args) -> tuple[float, ...]:
+        if isinstance(self._reamplify_schedule, tuple):
+            return self._reamplify_schedule
+        if self._reamplify_schedule != REAMPLIFY_AUTO:
+            raise RuntimeError("reamplification schedule is not configured")
+        if self._reamplify_resolved_schedule is not None:
+            return self._reamplify_resolved_schedule
+        measurement = self._reamplify_last_field_measurement
+        ratios = self._reamplify_last_field_ratios
+        if measurement is None or ratios is None:
+            raise ValueError("--h3_reamplify_scale auto has no positive field-probe measurement before the snapshot boundary")
+        step = measurement.get("step")
+        if type(step) is not int or not 0 < step <= int(args.h3_reamplify_after):
+            raise ValueError("automatic reamplification field measurement is outside the warm-up window")
+        expected_bins = [
+            {
+                "index": sigma_bin.index,
+                "base_sigma": sigma_bin.base_sigma,
+                "video_sigma": sigma_bin.video_sigma,
+                "audio_sigma": sigma_bin.audio_sigma,
+            }
+            for sigma_bin in validation_sigma_bins(
+                args.validation_timestep_bins,
+                minimum=0.0,
+                maximum=1.0,
+                video_shift=args.h3_shift_video,
+                audio_shift=args.h3_shift_audio,
+            )
+        ]
+        if (
+            not isinstance(measurement, dict)
+            or set(measurement) != {"step", "adapter_sha256", "field_probe", "bins", "ema"}
+            or measurement["ema"] is not False
+            or not self._strict_json_equal(measurement["field_probe"], self._reamplify_field_fingerprint(args))
+            or not self._strict_json_equal(measurement["bins"], expected_bins)
+        ):
+            raise ValueError("automatic reamplification field measurement no longer matches this run")
+        resolved = resolve_reamplify_schedule(ratios, int(args.validation_timestep_bins))
+        self._reamplify_resolved_schedule = resolved
+        logger.info(
+            "MiniMax H3 reamplification: resolved %d field factors from validation step %d",
+            len(resolved),
+            step,
+        )
+        return resolved
+
     def _reamplify_identity(self, args) -> dict[str, object]:
         return {
-            "schedule": list(self._reamplify_schedule or ()),
+            "schedule": REAMPLIFY_AUTO if self._reamplify_schedule == REAMPLIFY_AUTO else list(self._reamplify_schedule or ()),
             "after": int(args.h3_reamplify_after),
             "probability": float(args.h3_reamplify_probability),
             "network_module": str(args.network_module),
@@ -1799,6 +1908,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         weights = {key: value.detach().cpu().float().clone() for key, value in snapshot(torch.float32).items()}
         if not weights:
             raise ValueError("--h3_reamplify_scale cannot snapshot an empty adapter")
+        measurement = self._reamplify_last_field_measurement
+        if (
+            self._reamplify_schedule == REAMPLIFY_AUTO
+            and measurement is not None
+            and measurement.get("step") == int(global_step)
+            and measurement.get("adapter_sha256") != self._reamplify_weights_sha256(weights)
+        ):
+            raise ValueError("boundary field measurement does not identify the adapter being frozen")
         self._install_reamplify_snapshot(weights, args, accelerator, transformer, network, int(global_step))
 
     def _register_reamplify_state_hooks(self, args, accelerator, transformer, network) -> None:
@@ -1817,11 +1934,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 snapshot_record = {
                     "file": snapshot_name,
                     "sha256": self._reamplify_file_sha256(destination),
+                    "adapter_sha256": self._reamplify_weights_sha256(self._reamplify_snapshot_weights),
                     "schema": self._reamplify_snapshot_schema(self._reamplify_snapshot_weights),
                 }
             generator = self._reamplify_probability_generator
             state = {
-                "version": 1,
+                "version": 2,
                 "process_index": accelerator.process_index,
                 "num_processes": accelerator.num_processes,
                 "identity": identity,
@@ -1829,6 +1947,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "snapshot_step": self._reamplify_snapshot_step,
                 "snapshot": snapshot_record,
                 "generator": None if generator is None else generator.get_state().tolist(),
+                "field_ratios": (
+                    None
+                    if self._reamplify_last_field_ratios is None
+                    else {str(key): value for key, value in sorted(self._reamplify_last_field_ratios.items())}
+                ),
+                "field_measurement": self._reamplify_last_field_measurement,
+                "resolved_schedule": (
+                    None if self._reamplify_resolved_schedule is None else list(self._reamplify_resolved_schedule)
+                ),
             }
             destination = output / state_name
             temporary = destination.with_name(destination.name + ".tmp")
@@ -1840,7 +1967,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if not path.is_file():
                 raise FileNotFoundError(f"reamplification resume state is missing: {path}")
             state = json.loads(path.read_text(encoding="utf-8"))
-            required = {
+            v1_keys = {
                 "version",
                 "process_index",
                 "num_processes",
@@ -1850,10 +1977,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "snapshot",
                 "generator",
             }
-            if not isinstance(state, dict) or set(state) != required:
+            v2_keys = v1_keys | {"field_ratios", "field_measurement", "resolved_schedule"}
+            if not isinstance(state, dict) or set(state) not in (v1_keys, v2_keys):
+                raise ValueError("reamplification resume state has an incomplete or unsupported schema")
+            version = state["version"]
+            if type(version) is not int or version not in (1, 2):
+                raise ValueError("reamplification resume state version does not match this run")
+            if version == 1:
+                if self._reamplify_schedule == REAMPLIFY_AUTO or set(state) != v1_keys:
+                    raise ValueError("reamplification v1 resume state supports explicit schedules only")
+            elif set(state) != v2_keys:
                 raise ValueError("reamplification resume state has an incomplete or unsupported schema")
             expected = {
-                "version": 1,
+                "version": version,
                 "process_index": accelerator.process_index,
                 "num_processes": accelerator.num_processes,
                 "identity": identity,
@@ -1879,7 +2015,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if record is not None:
                     raise ValueError("reamplification state has snapshot bytes without a snapshot step")
             else:
-                if not isinstance(record, dict) or set(record) != {"file", "sha256", "schema"}:
+                record_keys = {"file", "sha256", "schema"} if version == 1 else {"file", "sha256", "adapter_sha256", "schema"}
+                if not isinstance(record, dict) or set(record) != record_keys:
                     raise ValueError("invalid reamplification snapshot record")
                 if record["file"] != snapshot_name or not re.fullmatch(r"[0-9a-f]{64}", str(record["sha256"])):
                     raise ValueError("invalid reamplification snapshot identity")
@@ -1895,6 +2032,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 current = accelerator.unwrap_model(network).snapshot_weights(torch.float32)
                 if self._reamplify_snapshot_schema(restored_weights) != self._reamplify_snapshot_schema(current):
                     raise ValueError("reamplification snapshot does not match the trainable adapter topology")
+                if version == 2 and (
+                    not re.fullmatch(r"[0-9a-f]{64}", str(record["adapter_sha256"]))
+                    or self._reamplify_weights_sha256(restored_weights) != record["adapter_sha256"]
+                ):
+                    raise ValueError("reamplification snapshot adapter identity does not match the saved state")
             generator_state = state["generator"]
             restored_generator = None
             if generator_state is not None:
@@ -1911,10 +2053,89 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     raise ValueError("invalid reamplification probability generator state") from error
             if step is not None and float(args.h3_reamplify_probability) < 1.0 and restored_generator is None:
                 raise ValueError("reamplification resume is missing its probability generator state")
+            restored_ratios = None
+            restored_measurement = None
+            restored_resolved = self._reamplify_resolved_schedule
+            if version == 2:
+                raw_ratios = state["field_ratios"]
+                restored_measurement = state["field_measurement"]
+                raw_resolved = state["resolved_schedule"]
+                if (raw_ratios is None) != (restored_measurement is None):
+                    raise ValueError("reamplification field ratios and measurement provenance must be saved together")
+                if raw_ratios is not None:
+                    expected_ratio_keys = {str(index) for index in range(int(args.validation_timestep_bins))}
+                    if not isinstance(raw_ratios, dict) or set(raw_ratios) != expected_ratio_keys:
+                        raise ValueError("invalid reamplification field-ratio state")
+                    restored_ratios = {int(key): value for key, value in raw_ratios.items()}
+                    resolve_reamplify_schedule(restored_ratios, int(args.validation_timestep_bins))
+                    if not isinstance(restored_measurement, dict) or set(restored_measurement) != {
+                        "step",
+                        "adapter_sha256",
+                        "field_probe",
+                        "bins",
+                        "ema",
+                    }:
+                        raise ValueError("invalid reamplification field-measurement provenance")
+                    measurement_step = restored_measurement["step"]
+                    if type(measurement_step) is not int or not 0 < measurement_step <= int(args.h3_reamplify_after):
+                        raise ValueError("reamplification field measurement is outside the warm-up window")
+                    if completed is None or measurement_step > completed:
+                        raise ValueError("reamplification field measurement is newer than the saved training state")
+                    if (
+                        not re.fullmatch(r"[0-9a-f]{64}", str(restored_measurement["adapter_sha256"]))
+                        or restored_measurement["ema"] is not False
+                        or not self._strict_json_equal(restored_measurement["field_probe"], self._reamplify_field_fingerprint(args))
+                    ):
+                        raise ValueError("reamplification field-measurement identity does not match this run")
+                    expected_bins = [
+                        {
+                            "index": sigma_bin.index,
+                            "base_sigma": sigma_bin.base_sigma,
+                            "video_sigma": sigma_bin.video_sigma,
+                            "audio_sigma": sigma_bin.audio_sigma,
+                        }
+                        for sigma_bin in validation_sigma_bins(
+                            args.validation_timestep_bins,
+                            minimum=0.0,
+                            maximum=1.0,
+                            video_shift=args.h3_shift_video,
+                            audio_shift=args.h3_shift_audio,
+                        )
+                    ]
+                    if not self._strict_json_equal(restored_measurement["bins"], expected_bins):
+                        raise ValueError("reamplification validation-bin geometry does not match this run")
+                    if (
+                        step is not None
+                        and measurement_step == step
+                        and restored_measurement["adapter_sha256"] != record["adapter_sha256"]
+                    ):
+                        raise ValueError("boundary field measurement does not identify the frozen adapter snapshot")
+                if raw_resolved is not None:
+                    if not isinstance(raw_resolved, list):
+                        raise ValueError("invalid resolved reamplification schedule")
+                    restored_resolved = tuple(raw_resolved)
+                    if self._reamplify_schedule == REAMPLIFY_AUTO:
+                        expected_resolved = (
+                            None
+                            if restored_ratios is None
+                            else list(resolve_reamplify_schedule(restored_ratios, int(args.validation_timestep_bins)))
+                        )
+                        if expected_resolved is None or not self._strict_json_equal(raw_resolved, expected_resolved):
+                            raise ValueError("resolved reamplification schedule does not match its field ratios")
+                    elif not self._strict_json_equal(raw_resolved, list(self._reamplify_schedule)):
+                        raise ValueError("resolved reamplification schedule does not match the explicit configuration")
+                if self._reamplify_schedule == REAMPLIFY_AUTO:
+                    if step is not None and (restored_resolved is None or restored_measurement is None):
+                        raise ValueError("automatic reamplification snapshot is missing its resolved measurement")
+                    if step is None and restored_resolved is not None:
+                        raise ValueError("automatic reamplification resolved before its snapshot boundary")
             if restored_weights is not None:
                 self._install_reamplify_snapshot(restored_weights, args, accelerator, transformer, network, step)
             self._reamplify_probability_generator = restored_generator
             self._reamplify_snapshot_step = step
+            self._reamplify_last_field_ratios = restored_ratios
+            self._reamplify_last_field_measurement = restored_measurement
+            self._reamplify_resolved_schedule = restored_resolved
             self._reamplify_last_global_step = None if completed is None else completed - 1
             self._reamplify_state_loaded = True
 
@@ -2284,7 +2505,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._repair_anchor_random: random.Random | None = None
         self._repair_caption_generator: torch.Generator | None = None
         self._repair_preservation_generator: torch.Generator | None = None
-        self._reamplify_schedule: tuple[float, ...] | None = None
+        self._reamplify_schedule: tuple[float, ...] | str | None = None
+        self._reamplify_resolved_schedule: tuple[float, ...] | None = None
+        self._reamplify_last_field_ratios: dict[int, float] | None = None
+        self._reamplify_last_field_measurement: dict[str, object] | None = None
         self._reamplify_probability_generator: torch.Generator | None = None
         self._reamplify_snapshot_network = None
         self._reamplify_snapshot_weights: dict[str, torch.Tensor] | None = None
@@ -2997,6 +3221,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 for b, rows in sorted(leak.items()):
                     metrics[f"val/trigger/leak_share/bin{b}"] = sum(share for share, _cos in rows) / len(rows)
                     metrics[f"val/trigger/leak_cos/bin{b}"] = sum(cos for _share, cos in rows) / len(rows)
+        self._record_reamplify_field_measurement(args, accelerator, network, bins, int(global_step))
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
@@ -3059,6 +3284,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "validation_seed": str(args.validation_seed if getattr(args, "validation_seed", None) is not None else args.seed),
             "max_validation_items": str(getattr(args, "max_validation_items", None)),
             "h3_training_mode": str(getattr(args, "h3_training_mode", None)),
+        }
+
+    @classmethod
+    def _reamplify_field_fingerprint(cls, args) -> dict[str, object]:
+        """Bind the validation task grid and image sigma route used by automatic scaling."""
+        return {
+            "field_probe": cls._field_probe_fingerprint(args),
+            "observed_modality": getattr(args, "h3_observed_modality", None),
+            "video_enabled": float(getattr(args, "h3_video_loss_weight", 1.0)) > 0,
+            "audio_enabled": float(getattr(args, "h3_audio_loss_weight", 1.0)) > 0,
+            "image_timestep_sampling": _effective_image_timestep_sampling(args),
+            "image_flow_shift": getattr(args, "h3_image_flow_shift", None),
         }
 
     def _save_field_probe_snapshot(self, path: str, fingerprint: dict[str, str]) -> None:
@@ -3939,6 +4176,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def _validate_reamplify_args(self, args) -> None:
         schedule = parse_reamplify_schedule(getattr(args, "h3_reamplify_scale", None))
         self._reamplify_schedule = schedule
+        self._reamplify_resolved_schedule = schedule if isinstance(schedule, tuple) else None
         after = getattr(args, "h3_reamplify_after", 0)
         probability = getattr(args, "h3_reamplify_probability", 1.0)
         if type(after) is not int:
@@ -3963,6 +4201,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             for value in (getattr(args, "network_args", None) or ())
         ):
             raise ValueError("--h3_reamplify_scale does not support SDS-LoRA")
+        if schedule == REAMPLIFY_AUTO:
+            if not getattr(args, "h3_validation_field_probe", False):
+                raise ValueError("--h3_reamplify_scale auto requires --h3_validation_field_probe")
+            if int(getattr(args, "validation_min_timestep", 0)) != 0 or int(getattr(args, "validation_max_timestep", 1000)) != 1000:
+                raise ValueError("--h3_reamplify_scale auto requires the full validation timestep range 0..1000")
+            if getattr(args, "h3_validate_ema", False):
+                raise ValueError("--h3_reamplify_scale auto measures the live adapter and cannot use --h3_validate_ema")
         conflicts = {
             "--h3_projection_scale": getattr(args, "h3_projection_scale", None) is not None,
             "--h3_repair_reference": getattr(args, "h3_repair_reference", None) is not None,
@@ -7572,6 +7817,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._reamplify_last_global_step = int(global_step)
         self._step_reamplify_active = False
         if self._reamplify_schedule is not None and int(global_step) >= int(args.h3_reamplify_after):
+            self._resolve_reamplify_schedule(args)
             self._take_reamplify_snapshot(args, accelerator, transformer, network, int(global_step))
             self._step_reamplify_active = self._reamplify_active(accelerator, float(args.h3_reamplify_probability))
         self._adapter_prompt_only = bool(getattr(args, "h3_adapter_prompt_only", False))
@@ -8855,7 +9101,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if reamplify_block_swap:
                     transformer.switch_block_swap_for_training()
             reamplify_target_prediction = reamplify_target(
-                stock_empty, snapshot_prompt, snapshot_empty, self._reamplify_schedule, base_sigma
+                stock_empty, snapshot_prompt, snapshot_empty, self._reamplify_resolved_schedule, base_sigma
             )
 
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"

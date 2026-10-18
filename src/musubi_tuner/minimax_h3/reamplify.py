@@ -9,20 +9,40 @@ import torch
 
 from musubi_tuner.minimax_h3.training import H3ModelPrediction
 
+REAMPLIFY_AUTO = "auto"
 
-def parse_reamplify_schedule(value: str | None) -> tuple[float, ...] | None:
+
+def parse_reamplify_schedule(value: str | None) -> tuple[float, ...] | str | None:
     """Parse one or more explicit field scales; an empty value disables the objective."""
     if value is None or not str(value).strip():
         return None
     if str(value).strip().lower() == "auto":
-        raise ValueError("automatic reamplification schedules require the validation-ratio resolver")
+        return REAMPLIFY_AUTO
     try:
         schedule = tuple(float(item.strip()) for item in str(value).split(","))
     except ValueError as error:
         raise ValueError("--h3_reamplify_scale requires comma-separated finite factors greater than 1") from error
-    if not schedule or any(not math.isfinite(item) or item <= 1.0 for item in schedule):
-        raise ValueError("--h3_reamplify_scale factors must be finite and greater than 1")
+    if not schedule or any(not math.isfinite(item) or item <= 1.0 or item > torch.finfo(torch.float32).max for item in schedule):
+        raise ValueError("--h3_reamplify_scale factors must be finite in FP32 and greater than 1")
     return schedule
+
+
+def resolve_reamplify_schedule(ratios: dict[int, float], expected_bins: int) -> tuple[float, ...]:
+    """Resolve a complete validation field-ratio grid into fixed reciprocal factors."""
+    if type(expected_bins) is not int or expected_bins < 1:
+        raise ValueError("automatic reamplification requires a positive validation-bin count")
+    if not isinstance(ratios, dict) or any(type(index) is not int for index in ratios) or set(ratios) != set(range(expected_bins)):
+        raise ValueError("automatic reamplification requires every contiguous validation field bin")
+    values = []
+    for index in range(expected_bins):
+        ratio = ratios[index]
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or ratio <= 0:
+            raise ValueError("automatic reamplification field ratios must be finite and positive")
+        factor = max(1.01, 1.0 / float(ratio))
+        if not math.isfinite(factor) or factor > torch.finfo(torch.float32).max:
+            raise ValueError("automatic reamplification factors must be finite in FP32")
+        values.append(factor)
+    return tuple(values)
 
 
 def reamplify_scale(schedule: Sequence[float], base_sigma: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
