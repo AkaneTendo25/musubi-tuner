@@ -1,13 +1,15 @@
 """Truncated on-policy rollout supervision (D-OPSD) for MiniMax H3."""
 
 import itertools
+import hashlib
 import json
 import logging
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import save as save_safetensors, save_file
 
 from musubi_tuner.dataset.bucket import BucketBatchManager
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
@@ -1043,6 +1045,81 @@ def test_inactive_rollout_validation_and_metadata(tmp_path):
     MiniMaxH3NetworkTrainer().handle_model_specific_args(
         _flag_args(*_INACTIVE_VELOCITY_FLAGS, "--h3_rollout_fused_teacher", teacher=teacher)
     )
+
+
+class _PrivilegedEmaStudent(torch.nn.Module):
+    def __init__(self, value=0.0):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor([value], dtype=torch.float32))
+        self.lora_name = "adapter"
+        self.unet_loras = [self]
+        self.text_encoder_loras = []
+
+    def snapshot_weights(self, _dtype):
+        return {"adapter.weight": self.weight.detach().clone(), "adapter.alpha": torch.tensor(3.0)}
+
+
+class _PrivilegedEmaTeacher:
+    def __init__(self):
+        self.loaded = None
+
+    def load_state_dict(self, state, strict=False):
+        assert strict is False
+        self.loaded = {key: value.clone() for key, value in state.items()}
+        return SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+
+def test_privileged_teacher_ema_updates_once_per_successful_optimizer_step(tmp_path):
+    teacher_path = _teacher_file(tmp_path)
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_teacher_ema_decay", "0.5", teacher=teacher_path)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    trainer._privileged_teacher_ema_weights = {"adapter.weight": torch.zeros(1), "adapter.alpha": torch.tensor(3.0)}
+    trainer._privileged_teacher_ema_trainable_keys = ("adapter.weight",)
+    trainer._privileged_teacher_ema_network = _PrivilegedEmaTeacher()
+    network = _PrivilegedEmaStudent(2.0)
+    accelerator = _FakeAccelerator()
+    accelerator.optimizer_step_was_skipped = False
+
+    trainer.on_post_optimizer_step(args, accelerator, network, None, True, 0)
+    torch.testing.assert_close(trainer._privileged_teacher_ema_weights["adapter.weight"], torch.tensor([1.0]))
+    assert trainer._privileged_teacher_ema_weights["adapter.alpha"].item() == 3.0
+    assert trainer._privileged_teacher_ema_updates == 1
+    assert trainer._privileged_teacher_ema_last_step == 1
+
+    network.weight.data.fill_(4.0)
+    accelerator.optimizer_step_was_skipped = True
+    trainer.on_post_optimizer_step(args, accelerator, network, None, True, 1)
+    trainer.on_post_optimizer_step(args, accelerator, network, None, False, 1)
+    torch.testing.assert_close(trainer._privileged_teacher_ema_weights["adapter.weight"], torch.tensor([1.0]))
+    assert trainer._privileged_teacher_ema_updates == 1
+
+    accelerator.optimizer_step_was_skipped = False
+    trainer.on_post_optimizer_step(args, accelerator, network, None, True, 2)
+    torch.testing.assert_close(trainer._privileged_teacher_ema_weights["adapter.weight"], torch.tensor([2.5]))
+    assert trainer._privileged_teacher_ema_updates == 2
+    assert trainer._privileged_teacher_ema_last_step == 3
+
+
+def test_privileged_teacher_ema_validation_and_metadata(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    for value in ("-0.1", "1", "nan"):
+        with pytest.raises(ValueError, match="teacher_ema_decay"):
+            MiniMaxH3NetworkTrainer().handle_model_specific_args(
+                _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_teacher_ema_decay", value, teacher=teacher)
+            )
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_teacher_ema_decay", "0.5", teacher=teacher)
+    args.h3_teacher_ema_decay = True
+    with pytest.raises(ValueError, match="real number"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+    with pytest.raises(ValueError, match="depth-zero inactive"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args(*_ROLLOUT_FLAGS, "--h3_teacher_ema_decay", "0.5", teacher=teacher)
+        )
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_teacher_ema_decay", "0.5", teacher=teacher)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_teacher_ema_decay"] == "0.5"
     for dropout in (
         ("--network_dropout", "0.1"),
         ("--network_args", "rank_dropout=0.1"),
@@ -4435,3 +4512,111 @@ def test_null_anchor_weight_end_needs_a_start_weight():
     args = _flag_args("--h3_guidance_null_anchor_weight_end", "0.2")
     with pytest.raises(ValueError, match="needs --h3_guidance_null_anchor_weight above 0"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_privileged_teacher_ema_state_roundtrip_and_rejects_non_fp32_shadow(tmp_path):
+    teacher_path = _teacher_file(tmp_path)
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_teacher_ema_decay", "0.5", teacher=teacher_path)
+    student = _PrivilegedEmaStudent(1.0)
+
+    def prepare(trainer):
+        trainer._privileged_teacher_ema_network = _PrivilegedEmaTeacher()
+        trainer._privileged_teacher_ema_weights = student.snapshot_weights(torch.float32)
+        trainer._privileged_teacher_ema_trainable_keys = ("adapter.weight",)
+        trainer._privileged_teacher_ema_updates = 0
+        trainer._privileged_teacher_ema_last_step = None
+
+        def install(_args, _accelerator, _transformer, _network):
+            prepare(trainer)
+
+        trainer._install_privileged_teacher_ema = install
+
+    trainer = MiniMaxH3NetworkTrainer()
+    prepare(trainer)
+    accelerator = _StateHookAccelerator()
+    trainer._register_privileged_teacher_ema_state_hooks(args, accelerator, object(), student)
+    student.weight.data.fill_(3.0)
+    trainer._update_privileged_teacher_ema(args, accelerator, student, 0)
+    accelerator.save_hooks[0]([], [], tmp_path)
+    torch.save({"last_epoch": 1}, tmp_path / "scheduler.bin")
+
+    restored = MiniMaxH3NetworkTrainer()
+    prepare(restored)
+    loader = _StateHookAccelerator()
+    restored._register_privileged_teacher_ema_state_hooks(args, loader, object(), student)
+    loader.load_hooks[0]([], tmp_path)
+    torch.testing.assert_close(restored._privileged_teacher_ema_weights["adapter.weight"], torch.tensor([2.0]))
+    assert restored._privileged_teacher_ema_updates == 1
+    assert restored._privileged_teacher_ema_last_step == 1
+
+    weights_path = tmp_path / "h3_privileged_teacher_ema-rank0.safetensors"
+    state_path = tmp_path / "h3_privileged_teacher_ema-rank0.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["last_successful_step"] = 2
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="saved progress"):
+        loader.load_hooks[0]([], tmp_path)
+    assert restored._privileged_teacher_ema_last_step == 1
+    state["last_successful_step"] = 1
+
+    payload = save_safetensors({"adapter.weight": torch.tensor([2.0], dtype=torch.bfloat16), "adapter.alpha": torch.tensor(3.0)})
+    weights_path.write_bytes(payload)
+    state["weights_sha256"] = hashlib.sha256(payload).hexdigest()
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="finite FP32"):
+        loader.load_hooks[0]([], tmp_path)
+    torch.testing.assert_close(restored._privileged_teacher_ema_weights["adapter.weight"], torch.tensor([2.0]))
+
+    payload = save_safetensors({"adapter.weight": torch.tensor([2.0]), "adapter.alpha": torch.tensor(4.0)})
+    weights_path.write_bytes(payload)
+    state["weights_sha256"] = hashlib.sha256(payload).hexdigest()
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="fixed adapter buffers"):
+        loader.load_hooks[0]([], tmp_path)
+
+
+def test_privileged_teacher_ema_fused_context_restores_exact_adapter_states():
+    class Toggle:
+        def __init__(self, states):
+            self.unet_loras = [SimpleNamespace(enabled=value) for value in states]
+            self.text_encoder_loras = []
+
+        def set_enabled(self, enabled):
+            for module in self.unet_loras:
+                module.enabled = enabled
+
+        def is_enabled(self):
+            return all(module.enabled for module in self.unet_loras)
+
+    accelerator = _FakeAccelerator()
+    live = Toggle([True, False])
+    teacher = Toggle([False, True])
+    toggle = MiniMaxH3NetworkTrainer._runtime_network_toggle(accelerator, live, "test")
+    enter = MiniMaxH3NetworkTrainer._frozen_arm_context(toggle, teacher)
+    with enter():
+        assert [module.enabled for module in live.unet_loras] == [False, False]
+        assert [module.enabled for module in teacher.unet_loras] == [True, True]
+    assert [module.enabled for module in live.unet_loras] == [True, False]
+    assert [module.enabled for module in teacher.unet_loras] == [False, True]
+
+
+def test_privileged_teacher_ema_refreshes_after_prepare_but_not_after_resume(tmp_path):
+    teacher_path = _teacher_file(tmp_path)
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_teacher_ema_decay", "0.5", teacher=teacher_path)
+    student = _PrivilegedEmaStudent(2.0)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._privileged_teacher_ema_network = _PrivilegedEmaTeacher()
+    trainer._privileged_teacher_ema_weights = {
+        "adapter.weight": torch.tensor([-4.0]),
+        "adapter.alpha": torch.tensor(3.0),
+    }
+    trainer._refresh_privileged_teacher_ema_after_prepare(args, _FakeAccelerator(), student)
+    torch.testing.assert_close(trainer._privileged_teacher_ema_weights["adapter.weight"], torch.tensor([2.0]))
+    assert trainer._privileged_teacher_ema_train_start_refreshed
+
+    trainer._privileged_teacher_ema_weights["adapter.weight"].fill_(7.0)
+    trainer._privileged_teacher_ema_state_loaded = True
+    trainer._privileged_teacher_ema_train_start_refreshed = False
+    student.weight.data.fill_(9.0)
+    trainer._refresh_privileged_teacher_ema_after_prepare(args, _FakeAccelerator(), student)
+    torch.testing.assert_close(trainer._privileged_teacher_ema_weights["adapter.weight"], torch.tensor([7.0]))

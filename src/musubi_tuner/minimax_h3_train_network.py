@@ -79,6 +79,7 @@ from musubi_tuner.minimax_h3.one_frame import (
     validate_reference_route,
     validate_target_noise_coupling,
 )
+from musubi_tuner.training.resume_utils import recover_global_step
 from musubi_tuner.minimax_h3.dop import dop_config_identity
 from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
@@ -1467,6 +1468,7 @@ def _forked_frozen_build(
     set_enabled,
     cpu_rng: torch.Tensor | None = None,
     cuda_rng: list[torch.Tensor] | None = None,
+    teacher_network=None,
 ):
     """Build one frozen arm's packed sequence without disturbing the others.
 
@@ -1480,11 +1482,34 @@ def _forked_frozen_build(
         _restore_rng(cpu_rng, cuda_rng, fork_devices)
         is_enabled = getattr(set_enabled, "is_enabled", None)
         prior = bool(is_enabled()) if callable(is_enabled) else True
+        live_network = getattr(set_enabled, "network", None)
+        live_modules = (
+            []
+            if live_network is None
+            else list(getattr(live_network, "text_encoder_loras", ())) + list(getattr(live_network, "unet_loras", ()))
+        )
+        live_prior = [bool(getattr(module, "enabled", True)) for module in live_modules]
+        teacher_modules = (
+            []
+            if teacher_network is None
+            else list(getattr(teacher_network, "text_encoder_loras", ())) + list(getattr(teacher_network, "unet_loras", ()))
+        )
+        teacher_prior = [bool(getattr(module, "enabled", True)) for module in teacher_modules]
         try:
             set_enabled(False)
+            if teacher_network is not None:
+                teacher_network.set_enabled(True)
             yield
         finally:
-            set_enabled(prior)
+            if teacher_network is not None:
+                for module, enabled in zip(teacher_modules, teacher_prior, strict=True):
+                    module.enabled = enabled
+            if live_modules:
+                for module, enabled in zip(live_modules, live_prior, strict=True):
+                    module.enabled = enabled
+                live_network._h3_adapter_enabled = all(live_prior)
+            else:
+                set_enabled(prior)
 
 
 def _aux_int8_run(run, int8_context):
@@ -2722,6 +2747,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._teacher_network = None
         self._rollout_noise_generator: torch.Generator | None = None
         self._rollout_teacher: H3RolloutTeacherCache | None = None
+        self._privileged_teacher_ema_network = None
+        self._privileged_teacher_ema_weights: dict[str, torch.Tensor] | None = None
+        self._privileged_teacher_ema_trainable_keys: tuple[str, ...] = ()
+        self._privileged_teacher_ema_updates = 0
+        self._privileged_teacher_ema_last_step: int | None = None
+        self._privileged_teacher_ema_state_loaded = False
+        self._privileged_teacher_ema_train_start_refreshed = False
         self._rollout_data_err: dict[int, list[float]] = {}
         self._rollout_field: list[float] = []
         self._rollout_field_cos: list[float] = []
@@ -5322,6 +5354,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def on_train_start(self, args, accelerator, network, transformer, optimizer) -> None:
         super().on_train_start(args, accelerator, network, transformer, optimizer)
+        self._refresh_privileged_teacher_ema_after_prepare(args, accelerator, network)
         self._install_fused_optimizer(args, accelerator, optimizer)
         if getattr(args, "h3_fused_elementwise", False) and isinstance(network, torch.nn.Module):
             # The adapters' delta add joins the single-rounding regime for factors that are not
@@ -5384,6 +5417,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step) -> None:
         super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        successful = sync_gradients and not bool(getattr(accelerator, "optimizer_step_was_skipped", False))
+        if successful:
+            self._update_privileged_teacher_ema(args, accelerator, network, global_step)
         if sync_gradients:
             self._update_adapter_ema(args, accelerator, network, global_step)
             self.snapshot_teacher(args, accelerator, network, transformer, global_step)
@@ -5394,6 +5430,230 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._h3_profiler = None
 
     # ------------------------------------------------------------------ adapter EMA
+    @staticmethod
+    def _adapter_snapshot(accelerator, network) -> dict[str, torch.Tensor]:
+        unwrapped = accelerator.unwrap_model(network)
+        snapshot = getattr(unwrapped, "snapshot_weights", None)
+        if not callable(snapshot):
+            raise TypeError("--h3_teacher_ema_decay requires a stock H3 LoRA network with snapshot_weights()")
+        weights = snapshot(torch.float32)
+        if not weights:
+            raise ValueError("--h3_teacher_ema_decay found no adapter tensors")
+        return {key: value.detach().cpu().float().clone() for key, value in sorted(weights.items())}
+
+    @staticmethod
+    def _adapter_snapshot_schema(weights: dict[str, torch.Tensor]) -> dict[str, dict[str, object]]:
+        return {key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(weights.items())}
+
+    @staticmethod
+    def _adapter_snapshot_trainable_keys(accelerator, network, weights) -> tuple[str, ...]:
+        unwrapped = accelerator.unwrap_model(network)
+        keys = []
+        for module in list(getattr(unwrapped, "text_encoder_loras", ())) + list(getattr(unwrapped, "unet_loras", ())):
+            prefix = getattr(module, "lora_name", None)
+            if not prefix:
+                continue
+            keys.extend(f"{prefix}.{name}" for name, parameter in module.named_parameters() if parameter.requires_grad)
+        keys = tuple(sorted(keys))
+        missing = sorted(set(keys) - set(weights))
+        if not keys or missing:
+            raise ValueError(f"privileged teacher EMA cannot map trainable adapter tensors, missing={missing[:3]}")
+        return keys
+
+    def _privileged_teacher_ema_identity(self, args, accelerator, weights) -> dict[str, object]:
+        identity: dict[str, object] = {
+            "decay": float(args.h3_teacher_ema_decay),
+            "role": "privileged_depth_zero",
+            "process_index": int(accelerator.process_index),
+            "num_processes": int(accelerator.num_processes),
+            "network_module": str(args.network_module),
+            "network_dim": None if getattr(args, "network_dim", None) is None else int(args.network_dim),
+            "network_alpha": None if getattr(args, "network_alpha", None) is None else float(args.network_alpha),
+            "dit": (None if getattr(args, "dit", None) is None else os.path.normcase(str(Path(args.dit).expanduser().resolve()))),
+            "precision": {
+                "mixed_precision": str(getattr(args, "mixed_precision", "no")),
+                "dit_dtype": None if getattr(args, "dit_dtype", None) is None else str(args.dit_dtype),
+                "fp8_base": bool(getattr(args, "fp8_base", False)),
+                "fp8_scaled": bool(getattr(args, "fp8_scaled", False)),
+            },
+            "merged_base_weights": [
+                {
+                    "path": os.path.normcase(str(Path(path).expanduser().resolve())),
+                    "multiplier": float(
+                        args.base_weights_multiplier[index]
+                        if getattr(args, "base_weights_multiplier", None) is not None and index < len(args.base_weights_multiplier)
+                        else 1.0
+                    ),
+                }
+                for index, path in enumerate(getattr(args, "base_weights", None) or ())
+            ],
+            "topology": self._adapter_snapshot_schema(weights),
+            "trainable_tensors": list(self._privileged_teacher_ema_trainable_keys),
+        }
+        if getattr(args, "h3_overlay_weights", None):
+            identity["overlay"] = self._reamplify_overlay_identity(args)
+        return identity
+
+    def _install_privileged_teacher_ema(self, args, accelerator, transformer, network) -> None:
+        decay = float(getattr(args, "h3_teacher_ema_decay", 0.0) or 0.0)
+        if decay == 0:
+            return
+        weights = self._adapter_snapshot(accelerator, network)
+        trainable_keys = self._adapter_snapshot_trainable_keys(accelerator, network, weights)
+        devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            teacher = self._frozen_lora_from_weights(
+                weights,
+                1.0,
+                accelerator,
+                transformer,
+                "privileged teacher EMA",
+                "the trainable adapter before its first optimizer update",
+            )
+        teacher.set_enabled(False)
+        self._privileged_teacher_ema_network = teacher
+        self._privileged_teacher_ema_weights = weights
+        self._privileged_teacher_ema_trainable_keys = trainable_keys
+        self._privileged_teacher_ema_updates = 0
+        self._privileged_teacher_ema_last_step = None
+
+    def _update_privileged_teacher_ema(self, args, accelerator, network, global_step: int) -> None:
+        decay = float(getattr(args, "h3_teacher_ema_decay", 0.0) or 0.0)
+        if decay == 0:
+            return
+        if self._privileged_teacher_ema_network is None or self._privileged_teacher_ema_weights is None:
+            raise RuntimeError("privileged teacher EMA was not initialized before the optimizer step")
+        completed_step = int(global_step) + 1
+        if self._privileged_teacher_ema_last_step is not None and completed_step <= self._privileged_teacher_ema_last_step:
+            raise RuntimeError("privileged teacher EMA received a duplicate or non-monotonic optimizer step")
+        current = self._adapter_snapshot(accelerator, network)
+        if self._adapter_snapshot_schema(current) != self._adapter_snapshot_schema(self._privileged_teacher_ema_weights):
+            raise RuntimeError("privileged teacher EMA adapter topology changed during training")
+        trainable = set(self._privileged_teacher_ema_trainable_keys)
+        updated = {
+            key: (
+                self._privileged_teacher_ema_weights[key].mul(decay).add(current[key], alpha=1.0 - decay)
+                if key in trainable
+                else self._privileged_teacher_ema_weights[key].clone()
+            )
+            for key in current
+        }
+        info = self._privileged_teacher_ema_network.load_state_dict(updated, strict=False)
+        if info.missing_keys or info.unexpected_keys:
+            raise RuntimeError(
+                f"privileged teacher EMA topology changed: missing={info.missing_keys}, unexpected={info.unexpected_keys}"
+            )
+        self._privileged_teacher_ema_weights = updated
+        self._privileged_teacher_ema_updates += 1
+        self._privileged_teacher_ema_last_step = completed_step
+
+    def _refresh_privileged_teacher_ema_after_prepare(self, args, accelerator, network) -> None:
+        decay = float(getattr(args, "h3_teacher_ema_decay", 0.0) or 0.0)
+        if decay == 0 or self._privileged_teacher_ema_state_loaded or self._privileged_teacher_ema_train_start_refreshed:
+            return
+        current = self._adapter_snapshot(accelerator, network)
+        trainable_keys = self._adapter_snapshot_trainable_keys(accelerator, network, current)
+        if self._adapter_snapshot_schema(current) != self._adapter_snapshot_schema(self._privileged_teacher_ema_weights or {}):
+            raise RuntimeError("privileged teacher EMA adapter topology changed during distributed preparation")
+        info = self._privileged_teacher_ema_network.load_state_dict(current, strict=False)
+        if info.missing_keys or info.unexpected_keys:
+            raise RuntimeError("privileged teacher EMA cannot refresh from the prepared adapter")
+        self._privileged_teacher_ema_weights = current
+        self._privileged_teacher_ema_trainable_keys = trainable_keys
+        self._privileged_teacher_ema_updates = 0
+        self._privileged_teacher_ema_last_step = None
+        self._privileged_teacher_ema_train_start_refreshed = True
+
+    def _register_privileged_teacher_ema_state_hooks(self, args, accelerator, transformer, network) -> None:
+        self._install_privileged_teacher_ema(args, accelerator, transformer, network)
+        state_name = f"h3_privileged_teacher_ema-rank{accelerator.process_index}.json"
+        weights_name = f"h3_privileged_teacher_ema-rank{accelerator.process_index}.safetensors"
+
+        def save_state(_models, _weights, output_dir):
+            decay = float(getattr(args, "h3_teacher_ema_decay", 0.0) or 0.0)
+            if decay == 0:
+                return
+            weights = self._privileged_teacher_ema_weights
+            if weights is None:
+                raise RuntimeError("privileged teacher EMA checkpoint has no initialized shadow")
+            payload = save_safetensors({key: value.detach().cpu().float() for key, value in sorted(weights.items())})
+            state = {
+                "version": 1,
+                "identity": self._privileged_teacher_ema_identity(args, accelerator, weights),
+                "initialized": True,
+                "successful_updates": int(self._privileged_teacher_ema_updates),
+                "last_successful_step": self._privileged_teacher_ema_last_step,
+                "weights_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            root = Path(output_dir)
+            weights_path = root / weights_name
+            state_path = root / state_name
+            weights_tmp = weights_path.with_suffix(weights_path.suffix + ".tmp")
+            state_tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+            weights_tmp.write_bytes(payload)
+            state_tmp.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+            os.replace(weights_tmp, weights_path)
+            os.replace(state_tmp, state_path)
+
+        def load_state(_models, input_dir):
+            decay = float(getattr(args, "h3_teacher_ema_decay", 0.0) or 0.0)
+            root = Path(input_dir)
+            state_path = root / state_name
+            weights_path = root / weights_name
+            present = state_path.is_file() or weights_path.is_file()
+            if decay == 0:
+                if present:
+                    raise ValueError("privileged teacher EMA state cannot be loaded with --h3_teacher_ema_decay 0")
+                return
+            if not state_path.is_file() or not weights_path.is_file():
+                raise FileNotFoundError("privileged teacher EMA resume state is incomplete")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            keys = {"version", "identity", "initialized", "successful_updates", "last_successful_step", "weights_sha256"}
+            if not isinstance(state, dict) or set(state) != keys or type(state["version"]) is not int or state["version"] != 1:
+                raise ValueError("privileged teacher EMA resume state has an incomplete or unsupported schema")
+            payload = weights_path.read_bytes()
+            if type(state["weights_sha256"]) is not str or hashlib.sha256(payload).hexdigest() != state["weights_sha256"]:
+                raise ValueError("privileged teacher EMA shadow digest does not match its receipt")
+            restored_raw = load_safetensors(payload)
+            if not restored_raw or any(
+                value.dtype != torch.float32 or not torch.isfinite(value).all() for value in restored_raw.values()
+            ):
+                raise ValueError("privileged teacher EMA shadow must contain finite FP32 tensors")
+            restored = {key: value.detach().cpu().clone() for key, value in sorted(restored_raw.items())}
+            current = self._adapter_snapshot(accelerator, network)
+            expected_identity = self._privileged_teacher_ema_identity(args, accelerator, current)
+            if not self._strict_json_equal(state["identity"], expected_identity):
+                raise ValueError("privileged teacher EMA resume identity does not match this run")
+            if self._adapter_snapshot_schema(restored) != self._adapter_snapshot_schema(current):
+                raise ValueError("privileged teacher EMA shadow topology does not match the trainable adapter")
+            trainable = set(self._privileged_teacher_ema_trainable_keys)
+            if any(not torch.equal(restored[key], current[key]) for key in current if key not in trainable):
+                raise ValueError("privileged teacher EMA fixed adapter buffers do not match the trainable adapter")
+            updates = state["successful_updates"]
+            last_step = state["last_successful_step"]
+            if (
+                state["initialized"] is not True
+                or type(updates) is not int
+                or updates < 0
+                or (last_step is not None and (type(last_step) is not int or last_step <= 0))
+                or (updates == 0) != (last_step is None)
+                or (last_step is not None and last_step < updates)
+            ):
+                raise ValueError("privileged teacher EMA counters are invalid")
+            saved_progress = recover_global_step(str(root), strict=True)
+            if last_step is not None and last_step > saved_progress:
+                raise ValueError("privileged teacher EMA update clock exceeds the checkpoint's saved progress")
+            info = self._privileged_teacher_ema_network.load_state_dict(restored, strict=False)
+            if info.missing_keys or info.unexpected_keys:
+                raise ValueError("privileged teacher EMA shadow tensors do not match the installed teacher")
+            self._privileged_teacher_ema_weights = restored
+            self._privileged_teacher_ema_updates = updates
+            self._privileged_teacher_ema_last_step = last_step
+            self._privileged_teacher_ema_state_loaded = True
+
+        accelerator.register_save_state_pre_hook(save_state)
+        accelerator.register_load_state_pre_hook(load_state)
+
     @staticmethod
     def _adapter_parameters(accelerator, network) -> list[tuple[str, torch.nn.Parameter]]:
         unwrapped = accelerator.unwrap_model(network)
@@ -5949,6 +6209,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 self._register_reamplify_state_hooks(args, accelerator, transformer, network)
             if getattr(args, "h3_rollout_supervision", False):
                 self._register_rollout_inactive_state_hooks(args, accelerator)
+                self._register_privileged_teacher_ema_state_hooks(args, accelerator, transformer, network)
         del args, network, transformer
         if self._crepa is None:
             return trainable_params
@@ -6804,6 +7065,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 getattr(args, "h3_rollout_inactive_probability", _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT)
             )
             != _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT,
+            "--h3_teacher_ema_decay": float(getattr(args, "h3_teacher_ema_decay", 0.0) or 0.0) != 0.0,
             **{flag: value != default for flag, value, default in _teacher_match_settings(args)},
         }
         if not rollout:
@@ -6842,6 +7104,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_rollout_inactive_weight must be finite and greater than 0")
         if inactive_mode != "off" and (not math.isfinite(inactive_probability) or not 0 < inactive_probability <= 1):
             raise ValueError("--h3_rollout_inactive_probability must be finite and lie in (0, 1]")
+        raw_teacher_ema_decay = getattr(args, "h3_teacher_ema_decay", 0.0)
+        if isinstance(raw_teacher_ema_decay, bool):
+            raise ValueError("--h3_teacher_ema_decay must be a real number, not a boolean")
+        teacher_ema_decay = float(raw_teacher_ema_decay)
+        if not math.isfinite(teacher_ema_decay) or not (teacher_ema_decay == 0 or 0 < teacher_ema_decay < 1):
+            raise ValueError("--h3_teacher_ema_decay must be 0 or lie in (0, 1)")
+        if teacher_ema_decay > 0:
+            if inactive_mode == "off":
+                raise ValueError("--h3_teacher_ema_decay requires privileged depth-zero inactive supervision")
+            if getattr(args, "resume_as_new_shard", False):
+                raise ValueError("--h3_teacher_ema_decay cannot use --resume_as_new_shard because its update clock is continued")
+            if getattr(args, "network_module", None) not in (
+                "networks.lora_minimax_h3",
+                "musubi_tuner.networks.lora_minimax_h3",
+            ):
+                raise ValueError("--h3_teacher_ema_decay requires the stock MiniMax H3 LoRA network")
+            if any(
+                str(value).lower().startswith("sds=") and str(value).split("=", 1)[1].lower() in ("true", "1")
+                for value in (getattr(args, "network_args", None) or ())
+            ):
+                raise ValueError("--h3_teacher_ema_decay does not support SDS-LoRA")
         for flag, value, default in _teacher_match_settings(args):
             if value != default and inactive_mode != "teacher_match":
                 raise ValueError(f"{flag} requires --h3_rollout_inactive_supervision teacher_match")
@@ -7023,6 +7306,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         tracked.is_enabled = lambda: (
             bool(is_enabled()) if callable(is_enabled) else bool(getattr(unwrapped_network, "_h3_adapter_enabled", True))
         )
+        tracked.network = unwrapped_network
 
         return tracked
 
@@ -7037,6 +7321,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 torch.no_grad(),
                 int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
                 self._network_enabled(accelerator, network, False, "--h3_rollout_inactive_supervision"),
+                self._privileged_teacher_ema_enabled(not anchor),
             ):
                 return self._predict(accelerator, transformer, presentation, inputs, conditioning=branch)
 
@@ -7067,6 +7352,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 unwrapped._h3_adapter_enabled = all(module_states)
             else:
                 toggle(prior)
+
+    @contextmanager
+    def _privileged_teacher_ema_enabled(self, enabled: bool):
+        teacher = self._privileged_teacher_ema_network
+        if teacher is None or not enabled:
+            yield
+            return
+        modules = list(getattr(teacher, "text_encoder_loras", ())) + list(getattr(teacher, "unet_loras", ()))
+        prior = [bool(getattr(module, "enabled", True)) for module in modules]
+        teacher.set_enabled(True)
+        try:
+            yield
+        finally:
+            for module, state in zip(modules, prior, strict=True):
+                module.enabled = state
 
     @staticmethod
     @contextmanager
@@ -7137,7 +7437,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
 
     @staticmethod
-    def _frozen_arm_context(set_enabled):
+    def _frozen_arm_context(set_enabled, teacher_network=None):
         """The context a frozen arm of a fused forward is evaluated under.
 
         Re-entered around every stage of that arm -- its embedding, each of its
@@ -7152,11 +7452,34 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             with torch.no_grad():
                 is_enabled = getattr(set_enabled, "is_enabled", None)
                 prior = bool(is_enabled()) if callable(is_enabled) else True
+                live_network = getattr(set_enabled, "network", None)
+                live_modules = (
+                    []
+                    if live_network is None
+                    else list(getattr(live_network, "text_encoder_loras", ())) + list(getattr(live_network, "unet_loras", ()))
+                )
+                live_prior = [bool(getattr(module, "enabled", True)) for module in live_modules]
+                teacher_modules = (
+                    []
+                    if teacher_network is None
+                    else list(getattr(teacher_network, "text_encoder_loras", ())) + list(getattr(teacher_network, "unet_loras", ()))
+                )
+                teacher_prior = [bool(getattr(module, "enabled", True)) for module in teacher_modules]
                 try:
                     set_enabled(False)
+                    if teacher_network is not None:
+                        teacher_network.set_enabled(True)
                     yield
                 finally:
-                    set_enabled(prior)
+                    if teacher_network is not None:
+                        for module, state in zip(teacher_modules, teacher_prior, strict=True):
+                            module.enabled = state
+                    if live_modules:
+                        for module, state in zip(live_modules, live_prior, strict=True):
+                            module.enabled = state
+                        live_network._h3_adapter_enabled = all(live_prior)
+                    else:
+                        set_enabled(prior)
 
         return enter
 
@@ -7255,7 +7578,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         presentation = batch if anchor else self._teacher_presentation(batch, include_empty=gap)
         devices = [accelerator.device] if accelerator.device.type == "cuda" else []
         set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_rollout_inactive_supervision")
-        run = self._frozen_arm_context(set_enabled)
+        teacher_ema = None if anchor else self._privileged_teacher_ema_network
+        run = self._frozen_arm_context(set_enabled, teacher_ema)
         int8_context = getattr(transformer, "int8_attention_context", None)
         if callable(int8_context) and getattr(transformer, "int8_attention_mode", "off") == "aux":
             run = _aux_int8_run(run, int8_context)
@@ -7272,7 +7596,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         arms.append(
             H3FusedArm(
                 call=self._predict_call(accelerator, presentation, inputs, conditioning="prompt"),
-                build=lambda: _forked_frozen_build(devices, set_enabled, entry_cpu_rng, entry_cuda_rng),
+                build=lambda: _forked_frozen_build(devices, set_enabled, entry_cpu_rng, entry_cuda_rng, teacher_ema),
                 run=run,
             )
         )
@@ -7280,7 +7604,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             arms.append(
                 H3FusedArm(
                     call=self._predict_call(accelerator, presentation, inputs, conditioning="empty"),
-                    build=lambda: _forked_frozen_build(devices, set_enabled, entry_cpu_rng, entry_cuda_rng),
+                    build=lambda: _forked_frozen_build(devices, set_enabled, entry_cpu_rng, entry_cuda_rng, teacher_ema),
                     run=run,
                 )
             )
@@ -11103,6 +11427,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_rollout_inactive_probability": str(
                 getattr(args, "h3_rollout_inactive_probability", _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT)
             ),
+            "ss_h3_teacher_ema_decay": str(float(getattr(args, "h3_teacher_ema_decay", 0.0) or 0.0)),
             **{f"ss_{flag[2:]}": str(value) for flag, value, _default in _teacher_match_settings(args)},
             "ss_h3_rollout_field_floor": str(float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)),
             "ss_h3_rollout_field_floor_direction": str(getattr(args, "h3_rollout_field_floor_direction", "self")),
@@ -11908,6 +12233,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=_ROLLOUT_INACTIVE_PROBABILITY_DEFAULT,
         help="share of logical steps whose inactive branch is eligible; no probability correction is applied",
+    )
+    parser.add_argument(
+        "--h3_teacher_ema_decay",
+        type=float,
+        default=0.0,
+        help=("fixed EMA decay in (0, 1) for a frozen adapter used only by privileged depth-zero rollout teacher arms; 0 disables"),
     )
     parser.add_argument("--h3_rollout_teacher_match_sigma_max", type=float, default=_TEACHER_MATCH_SIGMA_MAX_DEFAULT)
     parser.add_argument("--h3_rollout_teacher_match_dc_weight", type=float, default=_TEACHER_MATCH_DC_WEIGHT_DEFAULT)
