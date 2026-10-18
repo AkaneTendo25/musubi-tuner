@@ -152,7 +152,7 @@ def test_caption_state_rejects_pool_mutation_after_identity_was_cached(tmp_path)
         hooks.load([], tmp_path)
 
 
-@pytest.mark.parametrize("missing", ["activation_generator", "anchor_random", "caption_dropout_rate"])
+@pytest.mark.parametrize("missing", ["activation_generator", "anchor_random", "caption_dropout_rate", "null_anchor_weight"])
 def test_caption_state_rejects_missing_rng_fields_without_mutating_streams(tmp_path, missing):
     _, trainer, hooks, _ = _caption_state_trainer(tmp_path)
     hooks.save([], [], tmp_path)
@@ -179,6 +179,7 @@ def test_caption_state_v1_migrates_only_with_zero_caption_dropout(tmp_path):
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state["version"] = 1
     del state["caption_dropout_rate"]
+    del state["null_anchor_weight"]
     state_path.write_text(json.dumps(state), encoding="utf-8")
     hooks.load([], tmp_path)
 
@@ -186,11 +187,33 @@ def test_caption_state_v1_migrates_only_with_zero_caption_dropout(tmp_path):
         h3_repair_caption_anchors=1,
         h3_repair_caption_probability=0.5,
         h3_repair_reference_weight=0.25,
+        h3_repair_null_anchor_weight=0.0,
         h3_caption_dropout_rate=0.5,
     )
     rejecting_hooks = _StateHooks()
     trainer._register_caption_repair_state_hooks(trainer_args, rejecting_hooks)
     with pytest.raises(ValueError, match="only zero caption dropout"):
+        rejecting_hooks.load([], tmp_path)
+
+
+def test_caption_state_v2_rejects_nonzero_repair_null_anchor(tmp_path):
+    _, trainer, hooks, _ = _caption_state_trainer(tmp_path)
+    hooks.save([], [], tmp_path)
+    state_path = tmp_path / "h3_caption_repair_state-rank0.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["version"] = 2
+    del state["null_anchor_weight"]
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    trainer_args = SimpleNamespace(
+        h3_repair_caption_anchors=1,
+        h3_repair_caption_probability=0.5,
+        h3_repair_reference_weight=0.25,
+        h3_repair_null_anchor_weight=0.5,
+        h3_caption_dropout_rate=0.0,
+    )
+    rejecting_hooks = _StateHooks()
+    trainer._register_caption_repair_state_hooks(trainer_args, rejecting_hooks)
+    with pytest.raises(ValueError, match="v2 resume state"):
         rejecting_hooks.load([], tmp_path)
 
 
@@ -225,6 +248,7 @@ def test_caption_repair_validation(options, match):
     "options,match",
     [
         (["--h3_repair_scale", "4"], "require"),
+        (["--h3_repair_null_anchor_weight", "0.5"], "require"),
         (["--h3_repair_reference", "empty"], "requires"),
         (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_guidance_distillation_scale", "4"], "guidance"),
         (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_repair_sigma_weight", "0,1"], "positive"),
@@ -427,6 +451,96 @@ def test_caption_repair_dropout_trace_is_deterministic():
         (_, _), _, backend = run_step(args, trainer)
         traces.append(backend.calls)
     assert traces[0] == traces[1]
+
+
+def test_repair_null_anchor_is_opportunistic_and_not_probability_scaled():
+    class Pool:
+        def draw(self, count, *, generator, exclude):
+            return [torch.full((1, 8), 2.0)]
+
+    class DistinctBackend(TinyBackend):
+        def predict_training(self, transformer, batch, video, audio, video_sigma, audio_sigma, *, conditioning="prompt"):
+            self.calls.append((conditioning, torch.is_grad_enabled(), transformer.enabled))
+            if conditioning == "prompt":
+                offset = 4.0
+            elif transformer.enabled:
+                offset = 0.0
+            else:
+                value = batch[H3_EMPTY_TEXT_HIDDEN_KEY]
+                value = value[0] if isinstance(value, (list, tuple)) else value
+                offset = float(value.mean())
+            delta = transformer.adapter if transformer.enabled else 0
+            return H3ModelPrediction(
+                None if video is None else torch.ones_like(video) * (offset + delta),
+                None if audio is None else torch.ones_like(audio) * (offset + delta),
+            )
+
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "caption",
+        "--h3_repair_scale",
+        "4",
+        "--h3_repair_caption_anchors",
+        "1",
+        "--h3_repair_caption_probability",
+        "0.25",
+        "--h3_repair_reference_weight",
+        "0.2",
+        "--h3_repair_null_anchor_weight",
+        "0.5",
+    )
+    trainer._repair_anchor_pool = Pool()
+    trainer._repair_caption_active = lambda *_: True
+    (loss, metrics), model, backend = run_step(args, trainer, swap=True, backend=DistinctBackend())
+    # The trainable empty prediction is .5 and the frozen base empty is 0.
+    # Weight .5 therefore contributes .5 * .5^2, with no division by p=.25.
+    assert metrics["loss/repair_null_anchor"] == pytest.approx(0.125)
+    # The caption reference is 2 while the frozen base empty is 0, proving the
+    # two auxiliary targets are not accidentally shared.
+    assert metrics["loss/repair_reference"] == pytest.approx((0.2 / 0.25) * (0.5 - 2.0) ** 2)
+    assert [call[:2] for call in backend.calls if call[1]] == [("empty", True), ("prompt", True)]
+    assert model.events == ["inference", "training"]
+    assert metrics["_loss_for_average"] == pytest.approx(metrics["loss/repair_video"])
+
+
+def test_repair_null_anchor_never_buys_a_trainable_empty_forward():
+    class Pool:
+        def draw(self, count, *, generator, exclude):
+            return [torch.full((1, 8), 2.0)]
+
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "caption",
+        "--h3_repair_scale",
+        "4",
+        "--h3_repair_caption_anchors",
+        "1",
+        "--h3_repair_null_anchor_weight",
+        "0.5",
+    )
+    trainer._repair_anchor_pool = Pool()
+    (_, metrics), _, backend = run_step(args, trainer)
+    assert len(backend.calls) == 3
+    assert [call for call in backend.calls if call[1]] == [("prompt", True, True)]
+    assert metrics["loss/repair_null_anchor"] == 0.0
+
+
+def test_repair_null_anchor_reuses_dropped_primary_empty():
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "empty",
+        "--h3_repair_scale",
+        "4",
+        "--h3_caption_dropout_rate",
+        "1",
+        "--h3_repair_null_anchor_weight",
+        "0.5",
+    )
+    (loss, metrics), _, backend = run_step(args, trainer)
+    assert len(backend.calls) == 2
+    assert backend.calls[-1] == ("empty", True, True)
+    assert metrics["loss/repair_null_anchor"] == pytest.approx(0.125)
+    assert metrics["_loss_for_average"] == pytest.approx(float(loss.detach()) - 0.125)
 
 
 @pytest.mark.parametrize("audio", [False, True])
