@@ -125,7 +125,16 @@ def test_euler_advance_refuses_to_run_the_schedule_backwards():
 # ---------------------------------------------------------------------------
 
 
-def _write_teacher_cache(directory, item_key: str, *, controls: bool, fill: float = 0.5, control_payload=None, task: str = "t2va"):
+def _write_teacher_cache(
+    directory,
+    item_key: str,
+    *,
+    controls: bool,
+    fill: float = 0.5,
+    control_payload=None,
+    task: str = "t2va",
+    empty: bool = False,
+):
     path = directory / f"{item_key}_mmh3_te.safetensors"
     tensors = {
         f"varlen_{H3_TEXT_HIDDEN_KEY}_float32": torch.full((4, 8), fill),
@@ -135,6 +144,9 @@ def _write_teacher_cache(directory, item_key: str, *, controls: bool, fill: floa
     if controls:
         # The production marker: how many visuals the conditioner was shown.
         tensors[H3_QWEN_CONTROL_VISUALS_KEY] = torch.tensor(2, dtype=torch.long) if control_payload is None else control_payload
+    if empty:
+        tensors[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_float32"] = torch.full((3, 8), fill - 0.25)
+        tensors[f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64"] = torch.ones(3, dtype=torch.long)
     save_file(tensors, str(path))
     return path
 
@@ -193,6 +205,18 @@ def test_teacher_map_keys_by_item_and_collapses_num_repeats(tmp_path):
     entries = cache.entries("clip_b")
     torch.testing.assert_close(entries[H3_TEXT_HIDDEN_KEY], torch.full((4, 8), 0.25))
     assert int(entries[H3_QWEN_CONTROL_VISUALS_KEY]) == 2
+
+
+def test_teacher_cache_reads_its_own_empty_presentation_for_gap_supervision(tmp_path):
+    path = _write_teacher_cache(tmp_path, "clip_a", controls=True, fill=0.75, empty=True)
+    cache = H3RolloutTeacherCache({"clip_a": str(path)})
+    empty = cache.empty_entries("clip_a")
+    torch.testing.assert_close(empty[H3_EMPTY_TEXT_HIDDEN_KEY], torch.full((3, 8), 0.5))
+    assert empty[H3_EMPTY_TEXT_TOKEN_TAGS_KEY].shape == (3,)
+
+    missing = _write_teacher_cache(tmp_path, "clip_b", controls=True)
+    with pytest.raises(ValueError, match="teacher_gap requires"):
+        H3RolloutTeacherCache({"clip_b": str(missing)}).empty_entries("clip_b")
 
 
 def test_teacher_map_names_the_items_it_cannot_pair(tmp_path):
@@ -707,6 +731,8 @@ def _rollout_batch():
 
 
 _ROLLOUT_FLAGS = ("--h3_rollout_supervision", "--h3_rollout_teacher_config", "TEACHER")
+_INACTIVE_VELOCITY_FLAGS = (*_ROLLOUT_FLAGS, "--h3_rollout_inactive_supervision", "teacher_velocity")
+_INACTIVE_GAP_FLAGS = (*_ROLLOUT_FLAGS, "--h3_rollout_inactive_supervision", "teacher_gap")
 
 
 def _flag_args(*extra, teacher=None):
@@ -766,6 +792,189 @@ def test_rollout_flag_off_leaves_the_step_bit_identical(tmp_path):
     assert inactive_metrics["loss/rollout_video"] == 0.0
     assert LOSS_FOR_AVERAGE_KEY not in inactive_metrics
     assert {key for key in inactive_metrics if "rollout" not in key} == set(baseline_metrics)
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_calls"),
+    [(_INACTIVE_VELOCITY_FLAGS, 2), (_INACTIVE_GAP_FLAGS, 4)],
+)
+def test_inactive_rollout_adds_video_only_teacher_objectives(tmp_path, flags, expected_calls):
+    teacher = _teacher_file(tmp_path)
+    _, plain_loss, plain_metrics, _ = _run_step(*_ROLLOUT_FLAGS, teacher=teacher, active=False)
+    backend, loss, metrics, _ = _run_step(*flags, teacher=teacher, active=False)
+    loss.backward()
+
+    assert len(backend.calls) == expected_calls
+    assert metrics["h3/rollout_inactive_active"] == 1.0
+    assert metrics["loss/rollout_inactive_video"] > 0
+    assert float(loss.detach()) == pytest.approx(
+        float(plain_loss.detach()) + float(metrics["loss/rollout_inactive_video"]), rel=1e-6
+    )
+    assert metrics[LOSS_FOR_AVERAGE_KEY] == pytest.approx(float(plain_loss.detach()), rel=1e-6)
+    assert metrics["loss/audio"] == pytest.approx(plain_metrics["loss/audio"])
+
+
+def test_inactive_teacher_gap_keeps_both_student_branches_live(tmp_path):
+    backend, loss, _, _ = _run_step(*_INACTIVE_GAP_FLAGS, teacher=_teacher_file(tmp_path), active=False)
+    loss.backward()
+
+    assert [(call["conditioning"], call["adapter"], call["grad"]) for call in backend.calls] == [
+        ("prompt", False, False),
+        ("empty", False, False),
+        ("empty", True, True),
+        ("prompt", True, True),
+    ]
+
+
+def test_inactive_rollout_stands_down_on_active_and_ineligible_steps(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    _, _, active_metrics, _ = _run_step(*_INACTIVE_VELOCITY_FLAGS, teacher=teacher, active=True)
+    _, _, empty_metrics, _ = _run_step(
+        *_INACTIVE_VELOCITY_FLAGS,
+        "--h3_caption_dropout_rate",
+        "1.0",
+        teacher=teacher,
+        active=False,
+    )
+    assert active_metrics["h3/rollout_inactive_active"] == 0.0
+    assert active_metrics["loss/rollout_inactive_video"] == 0.0
+    assert empty_metrics["h3/rollout_inactive_active"] == 0.0
+    assert empty_metrics["loss/rollout_inactive_video"] == 0.0
+
+
+class _StateHookAccelerator(_FakeAccelerator):
+    process_index = 0
+    num_processes = 1
+
+    def __init__(self):
+        self.save_hooks = []
+        self.load_hooks = []
+
+    def register_save_state_pre_hook(self, hook):
+        self.save_hooks.append(hook)
+
+    def register_load_state_pre_hook(self, hook):
+        self.load_hooks.append(hook)
+
+
+def test_inactive_rollout_state_round_trips_all_three_streams(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    args = _flag_args(
+        *_INACTIVE_GAP_FLAGS,
+        "--h3_rollout_probability",
+        "0.5",
+        "--h3_rollout_inactive_probability",
+        "0.5",
+        teacher=teacher,
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    accelerator = _StateHookAccelerator()
+    trainer._register_rollout_inactive_state_hooks(args, accelerator)
+    generators = [torch.Generator().manual_seed(seed) for seed in (11, 12, 13)]
+    (
+        trainer._rollout_probability_generator,
+        trainer._rollout_inactive_probability_generator,
+        trainer._rollout_noise_generator,
+    ) = generators
+    accelerator.save_hooks[0]([], [], tmp_path)
+
+    restored = MiniMaxH3NetworkTrainer()
+    load_accelerator = _StateHookAccelerator()
+    restored._register_rollout_inactive_state_hooks(args, load_accelerator)
+    torch.manual_seed(999)
+    load_accelerator.load_hooks[0]([], tmp_path)
+    actual = (
+        restored._rollout_probability_generator,
+        restored._rollout_inactive_probability_generator,
+        restored._rollout_noise_generator,
+    )
+    for expected, value in zip(generators, actual, strict=True):
+        assert value is not None
+        assert torch.equal(value.get_state(), expected.get_state())
+
+
+def test_inactive_rollout_state_rejects_mismatch_and_malformed_rng_without_mutation(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_rollout_inactive_probability", "0.5", teacher=teacher)
+    trainer = MiniMaxH3NetworkTrainer()
+    accelerator = _StateHookAccelerator()
+    trainer._register_rollout_inactive_state_hooks(args, accelerator)
+    trainer._rollout_probability_generator = torch.Generator().manual_seed(1)
+    trainer._rollout_inactive_probability_generator = torch.Generator().manual_seed(2)
+    trainer._rollout_noise_generator = torch.Generator().manual_seed(3)
+    accelerator.save_hooks[0]([], [], tmp_path)
+    path = tmp_path / "h3_rollout_inactive_state-rank0.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+
+    target = MiniMaxH3NetworkTrainer()
+    target._rollout_probability_generator = torch.Generator().manual_seed(21)
+    target._rollout_inactive_probability_generator = torch.Generator().manual_seed(22)
+    target._rollout_noise_generator = torch.Generator().manual_seed(23)
+    before = tuple(
+        value.get_state().clone()
+        for value in (
+            target._rollout_probability_generator,
+            target._rollout_inactive_probability_generator,
+            target._rollout_noise_generator,
+        )
+    )
+    load_accelerator = _StateHookAccelerator()
+    target._register_rollout_inactive_state_hooks(args, load_accelerator)
+    state["noise_generator"] = [-1]
+    path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="generator state"):
+        load_accelerator.load_hooks[0]([], tmp_path)
+    after = (
+        target._rollout_probability_generator,
+        target._rollout_inactive_probability_generator,
+        target._rollout_noise_generator,
+    )
+    assert all(torch.equal(saved, value.get_state()) for saved, value in zip(before, after, strict=True))
+
+    state["noise_generator"] = trainer._rollout_noise_generator.get_state().tolist()
+    state["identity"]["video_shift"] += 1
+    path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match"):
+        load_accelerator.load_hooks[0]([], tmp_path)
+
+
+def test_inactive_rollout_validation_and_metadata(tmp_path):
+    teacher = _teacher_file(tmp_path)
+    for flag in ("--h3_rollout_inactive_weight", "--h3_rollout_inactive_probability"):
+        args = _flag_args(*_INACTIVE_GAP_FLAGS, teacher=teacher)
+        setattr(args, flag.removeprefix("--").replace("-", "_"), True)
+        with pytest.raises(ValueError, match="not booleans"):
+            MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_rollout_probability", "0", teacher=teacher)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    assert trainer.extra_metadata(args)["ss_h3_rollout_inactive_supervision"] == "teacher_gap"
+    with pytest.raises(ValueError, match=r"\(0, 1\]"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args(*_INACTIVE_VELOCITY_FLAGS, "--h3_rollout_probability", "0", teacher=teacher)
+        )
+    with pytest.raises(ValueError, match="fused_teacher to be disabled"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args(*_INACTIVE_VELOCITY_FLAGS, "--h3_rollout_fused_teacher", teacher=teacher)
+        )
+    with pytest.raises(ValueError, match="live prompt and empty"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_adapter_prompt_only", teacher=teacher)
+        )
+    with pytest.raises(ValueError, match="classic block swap"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(
+            _flag_args(
+                *_ROLLOUT_FLAGS,
+                "--blocks_to_swap",
+                "1",
+                "--fused_backward_pass",
+                "--optimizer_type",
+                "Adafactor",
+                "--max_grad_norm",
+                "0",
+                teacher=teacher,
+            )
+        )
 
 
 def test_rollout_active_step_runs_j_no_grad_then_m_graded_pairs(tmp_path):
@@ -1036,6 +1245,45 @@ class _SwapRecordingBackend(_RolloutBackend):
         return prediction
 
 
+def test_inactive_teacher_gap_stages_classic_empty_gradient_on_training_layout(tmp_path):
+    args = _flag_args(*_INACTIVE_GAP_FLAGS, teacher=_teacher_file(tmp_path))
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+    trainer.dit_dtype = torch.float32
+    trainer.blocks_to_swap = 4
+    trainer.backend = backend = _SwapRecordingBackend()
+    trainer._rollout_teacher = _StubTeacherCache()
+    trainer._rollout_supervision_active = lambda accelerator, probability: False
+    transformer = _SwapAwareScaleTransformer()
+    video, batch = _rollout_batch()
+
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        _ToggleNetwork(transformer),
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+    assert [(call["conditioning"], call["swap_mode"]) for call in backend.calls] == [
+        ("prompt", "training"),
+        ("prompt", "inference"),
+        ("empty", "inference"),
+        ("empty", "training"),
+        ("prompt", "training"),
+    ]
+    assert transformer.swap_mode == "training"
+    assert transformer.scale.grad is not None
+    assert metrics["loss/rollout_inactive_video"] > 0
+
+
 def test_rollout_brackets_every_no_grad_forward_on_the_forward_only_swap(tmp_path):
     teacher = _teacher_file(tmp_path)
     args = _flag_args(
@@ -1079,10 +1327,63 @@ def test_rollout_brackets_every_no_grad_forward_on_the_forward_only_swap(tmp_pat
     # Every no-grad forward runs on the cyclic forward-only schedule; every
     # graph-carrying one runs on the training layout that its backward restores.
     assert [mode == "inference" for mode in modes] == [not grad for grad in grads]
-    # The contiguous rollout prefix shares one bracket rather than paying two
-    # switches per step; each teacher forward gets its own.
-    assert transformer.swap_events == ["inference", "training"] * 3
+    # Every inference bracket is closed before the next live traversal. The
+    # serialized classic path also probes the primary and each rollout state so
+    # no graph survives a later streamed forward.
+    assert transformer.swap_events == ["inference", "training"] * 6
     assert transformer.swap_mode == "training"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        (),
+        ("--h3_loss_balance", "token", "--weighting_scheme", "sigma_sqrt"),
+        ("--h3_rollout_field_floor", "0.2", "--h3_rollout_null_anchor_weight", "0.3"),
+    ],
+)
+def test_classic_staged_rollout_matches_retained_joint_loss_and_gradient(tmp_path, extra):
+    teacher = _teacher_file(tmp_path)
+    args = _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_window", "2", *extra, teacher=teacher)
+
+    def run(classic):
+        trainer = MiniMaxH3NetworkTrainer()
+        trainer.handle_model_specific_args(args)
+        trainer.dit_dtype = torch.float32
+        trainer.blocks_to_swap = 4 if classic else 0
+        trainer.backend = _SwapRecordingBackend()
+        trainer._rollout_teacher = _StubTeacherCache()
+        trainer._rollout_supervision_active = lambda accelerator, probability: True
+        transformer = _SwapAwareScaleTransformer()
+        video, batch = _rollout_batch()
+        torch.manual_seed(41)
+        loss, metrics = trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            _ToggleNetwork(transformer),
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+        loss.backward()
+        return loss.detach(), transformer.scale.grad.detach(), metrics
+
+    retained_loss, retained_grad, retained_metrics = run(False)
+    staged_loss, staged_grad, staged_metrics = run(True)
+    torch.testing.assert_close(staged_loss, retained_loss)
+    torch.testing.assert_close(staged_grad, retained_grad)
+    for key in ("loss/rollout_video", "loss/audio", LOSS_FOR_AVERAGE_KEY):
+        torch.testing.assert_close(torch.as_tensor(staged_metrics[key]), torch.as_tensor(retained_metrics[key]))
+    if "--h3_rollout_field_floor" in extra:
+        for key in ("loss/rollout_field_floor", "loss/rollout_null_anchor"):
+            assert key in staged_metrics
+            torch.testing.assert_close(torch.as_tensor(staged_metrics[key]), torch.as_tensor(retained_metrics[key]))
 
 
 def test_rollout_draws_come_off_dedicated_streams(tmp_path):

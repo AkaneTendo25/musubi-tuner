@@ -44,6 +44,8 @@ from safetensors import safe_open
 from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_IDS,
     H3_CONDITIONING_TASK_KEY,
+    H3_EMPTY_TEXT_HIDDEN_KEY,
+    H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_KEYFRAME_VISUALS_KEY,
     H3_QWEN_CONTROL_VISUALS_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
@@ -69,9 +71,9 @@ _WINDOW_SUFFIX = re.compile(r"_\d{5}-\d{3}(?:-\d+)?$")
 # schema changes.
 H3_ROLLOUT_ITEM_KEYS_BATCH_KEY = "mmh3_item_keys"
 
-# The text-side tensors a teacher forward substitutes. The prompt branch only:
-# the ROLLOUT never evaluates an empty teacher, and on an active step the
-# student's own empty presentation must stay the student's.
+# The text-side tensors a teacher forward substitutes. Active rollout uses the
+# prompt branch. Inactive teacher-gap supervision additionally reads the
+# teacher cache's own empty branch.
 TEACHER_REQUIRED_KEYS = (H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY)
 # Presentation markers that travel with the hidden states. The control marker is
 # what makes the teacher a teacher; the keyframe marker is carried so a corpus
@@ -304,6 +306,7 @@ class H3RolloutTeacherCache:
         self._latent_paths = dict(latent_paths or {})
         self._cache_size = cache_size
         self._cache: dict[str, dict[str, torch.Tensor]] = {}
+        self._empty_cache: dict[str, dict[str, torch.Tensor]] = {}
         self._reference_cache: dict[str, dict[str, torch.Tensor]] = {}
         # Memoised key resolution, and the sources already warned about, so a
         # teacher cached at one window does not print once per step.
@@ -620,6 +623,35 @@ class H3RolloutTeacherCache:
             # no recency order carries information worth the bookkeeping.
             self._cache.pop(next(iter(self._cache)))
         self._cache[path] = entries
+        return entries
+
+    def empty_entries(self, item_key: str) -> dict[str, torch.Tensor]:
+        """The teacher item's own cached empty-text presentation."""
+        resolved_key = self._resolve(item_key)
+        path = self._paths.get(resolved_key) if resolved_key else None
+        if path is None:
+            raise KeyError(f"H3 rollout teacher has no entry for item {item_key!r}")
+        cached = self._empty_cache.get(path)
+        if cached is not None:
+            return cached
+        entries: dict[str, torch.Tensor] = {}
+        required = (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                logical = logical_cache_key(key)
+                if logical in required:
+                    if logical in entries:
+                        raise ValueError(f"H3 teacher text cache {path} carries two {logical} tensors")
+                    entries[logical] = handle.get_tensor(key)
+        missing = [key for key in required if key not in entries]
+        if missing:
+            raise ValueError(
+                f"H3 teacher text cache {path} is missing {', '.join(missing)}; "
+                "teacher_gap requires caches built with guidance-empty conditioning"
+            )
+        if len(self._empty_cache) >= self._cache_size:
+            self._empty_cache.pop(next(iter(self._empty_cache)))
+        self._empty_cache[path] = entries
         return entries
 
     def reference_entries(self, item_key: str) -> dict[str, torch.Tensor]:

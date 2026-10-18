@@ -1411,6 +1411,9 @@ def _parse_keyframe_anchors(spec: str) -> tuple[int | str, ...]:
 _ROLLOUT_PROBABILITY_DEFAULT = 0.5
 _ROLLOUT_STEPS_DEFAULT = 2
 _ROLLOUT_WINDOW_DEFAULT = 1
+_ROLLOUT_INACTIVE_MODES = ("off", "teacher_velocity", "teacher_gap")
+_ROLLOUT_INACTIVE_WEIGHT_DEFAULT = 1.0
+_ROLLOUT_INACTIVE_PROBABILITY_DEFAULT = 1.0
 
 # The arguments every H3 training backend has taken positionally since the first
 # one. A described forward is a dict, and these are the entries that go back on
@@ -2351,6 +2354,103 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._rollout_probability_generator = generator
         return self._sparse_branch_active(accelerator, probability, generator)
 
+    def _rollout_inactive_supervision_active(self, accelerator: Accelerator, probability: float) -> bool:
+        if probability >= 1.0:
+            return True
+        generator = self._rollout_inactive_probability_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._rollout_inactive_probability_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
+
+    def _register_rollout_inactive_state_hooks(self, args, accelerator) -> None:
+        state_name = f"h3_rollout_inactive_state-rank{accelerator.process_index}.json"
+        mode = str(getattr(args, "h3_rollout_inactive_supervision", "off"))
+        identity = {
+            "mode": mode,
+            "inactive_probability": float(args.h3_rollout_inactive_probability),
+            "inactive_weight": float(args.h3_rollout_inactive_weight),
+            "rollout_probability": float(args.h3_rollout_probability),
+            "rollout_stop_shifted": bool(args.h3_rollout_stop_shifted),
+            "rollout_stop_min": float(args.h3_rollout_stop_min),
+            "num_timestep_buckets": getattr(args, "num_timestep_buckets", None),
+            "video_shift": float(args.h3_shift_video),
+            "audio_shift": float(args.h3_shift_audio),
+            "target_noise_coupling": str(getattr(args, "h3_target_noise_coupling", "independent")),
+            "rollout_steps": int(args.h3_rollout_steps),
+            "rollout_window": int(args.h3_rollout_window),
+        }
+
+        def encoded(generator):
+            return None if generator is None else generator.get_state().tolist()
+
+        def save_state(_models, _weights, output_dir):
+            if mode == "off":
+                return
+            state = {
+                "version": 1,
+                "process_index": accelerator.process_index,
+                "num_processes": accelerator.num_processes,
+                "identity": identity,
+                "rollout_generator": encoded(self._rollout_probability_generator),
+                "inactive_generator": encoded(self._rollout_inactive_probability_generator),
+                "noise_generator": encoded(self._rollout_noise_generator),
+            }
+            destination = Path(output_dir) / state_name
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+            os.replace(temporary, destination)
+
+        def load_state(_models, input_dir):
+            path = Path(input_dir) / state_name
+            if not path.is_file():
+                if mode == "off":
+                    return
+                raise FileNotFoundError(f"inactive rollout resume state is missing: {path}")
+            state = json.loads(path.read_text(encoding="utf-8"))
+            keys = {
+                "version",
+                "process_index",
+                "num_processes",
+                "identity",
+                "rollout_generator",
+                "inactive_generator",
+                "noise_generator",
+            }
+            if not isinstance(state, dict) or set(state) != keys:
+                raise ValueError("inactive rollout resume state has an incomplete schema")
+            expected = {
+                "version": 1,
+                "process_index": accelerator.process_index,
+                "num_processes": accelerator.num_processes,
+                "identity": identity,
+            }
+            if any(not self._strict_json_equal(state[key], value) for key, value in expected.items()):
+                raise ValueError("inactive rollout resume state does not match this run")
+
+            def decoded(value):
+                if value is None:
+                    return None
+                if not isinstance(value, list) or not value or any(type(item) is not int or not 0 <= item <= 255 for item in value):
+                    raise ValueError("invalid inactive rollout generator state")
+                generator = torch.Generator()
+                try:
+                    generator.set_state(torch.tensor(value, dtype=torch.uint8))
+                except RuntimeError as error:
+                    raise ValueError("invalid inactive rollout generator state") from error
+                return generator
+
+            restored = tuple(decoded(state[key]) for key in ("rollout_generator", "inactive_generator", "noise_generator"))
+            if mode == "off":
+                raise ValueError("inactive rollout state cannot be loaded with supervision disabled")
+            self._rollout_probability_generator, self._rollout_inactive_probability_generator, self._rollout_noise_generator = (
+                restored
+            )
+
+        accelerator.register_save_state_pre_hook(save_state)
+        accelerator.register_load_state_pre_hook(load_state)
+
     def _draw_rollout_stop_sigma(self, args: argparse.Namespace, video_shift: float = 1.0) -> float:
         """Draw the *unshifted* base sigma the rollout stops at.
 
@@ -2557,6 +2657,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._reamplify_last_global_step: int | None = None
         self._step_reamplify_active = False
         self._rollout_probability_generator: torch.Generator | None = None
+        self._rollout_inactive_probability_generator: torch.Generator | None = None
         self._preservation_probability_generator: torch.Generator | None = None
         self._dop_probability_generator: torch.Generator | None = None
         self._teacher_network = None
@@ -2682,6 +2783,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 channel=getattr(args, "h3_rollout_teacher_privilege", "auto"),
                 student_text_paths=item_key_text_caches(train_dataset_group),
             )
+            if getattr(args, "h3_rollout_inactive_supervision", "off") == "teacher_gap":
+                for item_key in sorted(self._rollout_teacher.item_keys):
+                    self._rollout_teacher.empty_entries(item_key)
             # Named per channel rather than as a binary: this line is the only
             # place a run says which privilege it actually resolved, and a label
             # that quietly describes the wrong one turns the run's whole premise
@@ -5784,6 +5888,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self.install_teacher_weights(args, accelerator, transformer)
             if self._reamplify_schedule is not None:
                 self._register_reamplify_state_hooks(args, accelerator, transformer, network)
+            if getattr(args, "h3_rollout_supervision", False):
+                self._register_rollout_inactive_state_hooks(args, accelerator)
         del args, network, transformer
         if self._crepa is None:
             return trainable_params
@@ -6632,6 +6738,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_rollout_prefix": getattr(args, "h3_rollout_prefix", "student") != "student",
             "--h3_rollout_null_anchor_weight": float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0) != 0.0,
             "--h3_rollout_field_cap": float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0) != 0.0,
+            "--h3_rollout_inactive_supervision": getattr(args, "h3_rollout_inactive_supervision", "off") != "off",
+            "--h3_rollout_inactive_weight": float(getattr(args, "h3_rollout_inactive_weight", _ROLLOUT_INACTIVE_WEIGHT_DEFAULT))
+            != _ROLLOUT_INACTIVE_WEIGHT_DEFAULT,
+            "--h3_rollout_inactive_probability": float(
+                getattr(args, "h3_rollout_inactive_probability", _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT)
+            )
+            != _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT,
         }
         if not rollout:
             for flag, changed in flags.items():
@@ -6650,8 +6763,39 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_rollout_steps must be at least 1")
         if not 1 <= args.h3_rollout_window <= MAX_ROLLOUT_WINDOW:
             raise ValueError(f"--h3_rollout_window must lie in [1, {MAX_ROLLOUT_WINDOW}]")
-        if not math.isfinite(args.h3_rollout_probability) or not 0 < args.h3_rollout_probability <= 1:
-            raise ValueError("--h3_rollout_probability must be finite and lie in (0, 1]")
+        inactive_mode = getattr(args, "h3_rollout_inactive_supervision", "off")
+        if inactive_mode not in _ROLLOUT_INACTIVE_MODES:
+            raise ValueError("--h3_rollout_inactive_supervision must be off, teacher_velocity, or teacher_gap")
+        minimum_rollout_probability = 0.0 if inactive_mode == "teacher_gap" else math.nextafter(0.0, 1.0)
+        if not math.isfinite(args.h3_rollout_probability) or not minimum_rollout_probability <= args.h3_rollout_probability <= 1:
+            raise ValueError("--h3_rollout_probability must lie in [0, 1] for teacher_gap and (0, 1] otherwise")
+        raw_inactive_weight = getattr(args, "h3_rollout_inactive_weight", _ROLLOUT_INACTIVE_WEIGHT_DEFAULT)
+        raw_inactive_probability = getattr(args, "h3_rollout_inactive_probability", _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT)
+        if isinstance(raw_inactive_weight, bool) or isinstance(raw_inactive_probability, bool):
+            raise ValueError("inactive rollout weight and probability must be real numbers, not booleans")
+        inactive_weight = float(raw_inactive_weight)
+        inactive_probability = float(raw_inactive_probability)
+        if inactive_mode == "off":
+            if inactive_weight != _ROLLOUT_INACTIVE_WEIGHT_DEFAULT or inactive_probability != _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT:
+                raise ValueError("inactive rollout weight/probability requires --h3_rollout_inactive_supervision")
+        elif not math.isfinite(inactive_weight) or inactive_weight <= 0:
+            raise ValueError("--h3_rollout_inactive_weight must be finite and greater than 0")
+        if inactive_mode != "off" and (not math.isfinite(inactive_probability) or not 0 < inactive_probability <= 1):
+            raise ValueError("--h3_rollout_inactive_probability must be finite and lie in (0, 1]")
+        if inactive_mode != "off" and bool(getattr(args, "h3_rollout_fused_teacher", False)):
+            raise ValueError("inactive rollout supervision currently requires --h3_rollout_fused_teacher to be disabled")
+        if inactive_mode == "teacher_gap" and bool(getattr(args, "h3_adapter_prompt_only", False)):
+            raise ValueError("teacher_gap requires live prompt and empty adapter branches; disable --h3_adapter_prompt_only")
+        if (
+            bool(args.blocks_to_swap or 0)
+            and not getattr(args, "block_swap_h2d_only", False)
+            and not bool(getattr(args, "h3_rollout_fused_teacher", False))
+            and getattr(args, "fused_backward_pass", False)
+        ):
+            raise ValueError(
+                "rollout supervision with classic block swap stages backward passes within the batch "
+                "and cannot use --fused_backward_pass"
+            )
         if args.h3_video_loss_weight <= 0:
             raise ValueError("--h3_rollout_supervision trains the video field and therefore needs --h3_video_loss_weight > 0")
         field_floor = float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)
@@ -6792,6 +6936,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             set_enabled(enabled)
 
         return tracked
+
+    def _inactive_rollout_teachers(self, accelerator, transformer, network, batch, inputs, *, gap: bool):
+        presentation = self._teacher_presentation(batch, include_empty=gap)
+        devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+        int8_context = getattr(transformer, "int8_attention_context", None)
+
+        def evaluate(branch):
+            with (
+                torch.random.fork_rng(devices=devices),
+                torch.no_grad(),
+                int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                self._network_enabled(accelerator, network, False, "--h3_rollout_inactive_supervision"),
+            ):
+                return self._predict(accelerator, transformer, presentation, inputs, conditioning=branch)
+
+        auxiliary_swap = bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False)
+        with self._auxiliary_block_swap(transformer, auxiliary_swap):
+            prompted = evaluate("prompt")
+            return prompted, evaluate("empty") if gap else None
 
     @classmethod
     @contextmanager
@@ -6989,7 +7152,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             arms.append(H3FusedArm(call=self._predict_call(accelerator, batch, state, conditioning="empty")))
         return self._predict_fused(accelerator, transformer, arms)
 
-    def _teacher_presentation(self, batch: dict) -> dict:
+    def _teacher_presentation(self, batch: dict, *, include_empty: bool = False) -> dict:
         """The privileged teacher's conditioning, presented through this batch.
 
         The reference bundle is the teacher's under variant B and empty under
@@ -7001,11 +7164,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if self._rollout_teacher is None:
             raise RuntimeError("--h3_rollout_supervision was configured without a teacher cache")
         item_key = batch_item_key(batch)
-        return teacher_batch(
+        presentation = teacher_batch(
             batch,
             self._rollout_teacher.entries(item_key),
             self._rollout_teacher.reference_entries(item_key),
         )
+        if include_empty:
+            for key, tensor in self._rollout_teacher.empty_entries(item_key).items():
+                presentation[key] = [tensor]
+        return presentation
 
     def _rollout_supervision(
         self,
@@ -7242,6 +7409,389 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             bases if (field_floor or rollout_anchor) else None,
             student_empties if rollout_anchor else None,
         )
+
+    def _rollout_state_loss_terms(
+        self,
+        args,
+        student,
+        teacher,
+        base_pair,
+        student_empty,
+        sigma,
+        audio_prediction,
+        audio_target,
+        video_mask,
+        audio_mask,
+        video_sample_weight,
+        audio_sample_weight,
+        video_weight,
+        audio_weight,
+    ):
+        """Build every differentiable term for one supervised rollout state."""
+        magnitude_weight = float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0))
+        decompose = magnitude_weight < 1.0 and base_pair is not None
+        base_prompt, base_empty = base_pair if base_pair is not None else (None, None)
+        scored_video = student.video
+        magnitude_term = None
+        length_sum = torch.zeros((), device=student.video.device)
+        length_count = torch.zeros((), device=student.video.device)
+        if decompose:
+            scored_video, _gap, _authored, ratio, directed_valid = self._directed_field_residual(
+                student.video, teacher.video, base_empty.video, video_mask
+            )
+            empty = base_empty.video.detach()
+            student_field = student.video - empty
+            student_length, _ = self._masked_field_lengths(student_field, video_mask)
+            teacher_length, _ = self._masked_field_lengths((teacher.video - empty).detach(), video_mask)
+            eps = torch.finfo(torch.float32).eps * 64
+            radial_scale = (teacher_length / student_length.clamp_min(eps)).detach()
+            shape = (-1,) + (1,) * (student_field.dim() - 1)
+            radial_target = empty + (student_field.detach().float() * radial_scale.reshape(shape)).to(student.video.dtype)
+            radial_target = torch.where(directed_valid.reshape(shape), radial_target, teacher.video.detach())
+            magnitude_term = (
+                magnitude_weight
+                * joint_prediction_loss(
+                    H3ModelPrediction(student.video, audio_prediction),
+                    H3ModelPrediction(radial_target, None if audio_prediction is None else audio_prediction.detach()),
+                    video_mask=video_mask,
+                    audio_mask=audio_mask,
+                    video_sample_weight=video_sample_weight,
+                    audio_sample_weight=audio_sample_weight,
+                    balance=args.h3_loss_balance,
+                    mask_normalization=args.h3_loss_mask_normalization,
+                    video_weight=video_weight,
+                    audio_weight=audio_weight,
+                ).loss
+            )
+            length_sum = (ratio * directed_valid.to(ratio.dtype)).sum().detach()
+            length_count = directed_valid.sum().detach()
+        teacher_result = joint_prediction_loss(
+            H3ModelPrediction(scored_video, audio_prediction),
+            H3ModelPrediction(teacher.video, audio_target),
+            video_mask=video_mask,
+            audio_mask=audio_mask,
+            video_sample_weight=video_sample_weight,
+            audio_sample_weight=audio_sample_weight,
+            balance=args.h3_loss_balance,
+            mask_normalization=args.h3_loss_mask_normalization,
+            video_weight=video_weight,
+            audio_weight=audio_weight,
+        )
+        null_anchor_term = None
+        if student_empty is not None:
+            null_anchor_term = (
+                float(args.h3_rollout_null_anchor_weight)
+                * joint_prediction_loss(
+                    student_empty,
+                    base_empty,
+                    video_mask=video_mask,
+                    audio_mask=audio_mask,
+                    video_sample_weight=video_sample_weight,
+                    audio_sample_weight=audio_sample_weight,
+                    balance=args.h3_loss_balance,
+                    mask_normalization=args.h3_loss_mask_normalization,
+                    video_weight=video_weight,
+                    audio_weight=audio_weight,
+                ).loss
+            )
+        floor_ratio = floor_valid = None
+        diagnostics = None
+        if base_prompt is not None:
+            empty = base_empty.video.detach()
+            adapted = student.video - empty
+            base_field = base_prompt.video - empty
+            if getattr(args, "h3_rollout_field_floor_direction", "self") == "teacher":
+                floor_ratio, floor_valid = self._field_projection_ratio(adapted, base_field, teacher.video - empty, video_mask)
+            else:
+                floor_ratio, floor_valid = self._field_length_ratio(adapted, base_field, video_mask)
+            with torch.no_grad():
+                teacher_field = teacher.video - base_empty.video
+                base_gap = self._masked_rms(base_prompt.video - student.video.detach(), video_mask)
+                diagnostics = {
+                    "cos": self._masked_cosine(teacher_field, base_field, video_mask),
+                    "ratio": None
+                    if base_gap <= 0
+                    else self._masked_rms(teacher.video - student.video.detach(), video_mask) / base_gap,
+                }
+        return {
+            "teacher_result": teacher_result,
+            "magnitude_term": magnitude_term,
+            "length_sum": length_sum,
+            "length_count": length_count,
+            "null_anchor_term": null_anchor_term,
+            "floor_ratio": floor_ratio,
+            "floor_valid": floor_valid,
+            "diagnostics": diagnostics,
+            "sigma": sigma,
+        }
+
+    def _classic_staged_rollout_supervision(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        *,
+        video_latents,
+        audio_latents,
+        video_shift,
+        audio_shift,
+        conditioning,
+        video_mask,
+        audio_mask,
+        audio_sample_weight,
+        video_weight,
+        audio_weight,
+        auxiliary_backward_scale,
+    ):
+        """Apply a classic block-swap rollout one live traversal at a time.
+
+        Classic swap cannot retain several transformer graphs: a later traversal
+        repoints the streamed parameter slots needed by a pending backward.  The
+        no-grad probes below consume each state's stochastic-conditioning slot,
+        teachers replay that slot under a fork, and the live student replays it
+        once more and is backpropagated before the next live traversal.
+        """
+        teacher_presentation = self._teacher_presentation(batch)
+        set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_rollout_supervision")
+        int8_context = getattr(transformer, "int8_attention_context", None)
+        devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+        field_floor_weight = float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)
+        anchor_weight = float(getattr(args, "h3_rollout_null_anchor_weight", 0.0) or 0.0)
+        magnitude_weight = float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0))
+        needs_base = field_floor_weight > 0 or magnitude_weight < 1.0
+        needs_empty = needs_base or anchor_weight > 0
+
+        stop_sigma = self._draw_rollout_stop_sigma(args, video_shift)
+        base = torch.tensor(rollout_base_sigmas(stop_sigma, args.h3_rollout_steps, args.h3_rollout_window), dtype=torch.float32)
+        video_sigmas = shift_sigma(base, video_shift)
+        audio_sigmas = shift_sigma(base, audio_shift)
+        video_state = None if video_latents is None else self._slot_coupled_noise(args, batch, self._rollout_noise(video_latents))
+        audio_state = None if audio_latents is None else self._rollout_noise(audio_latents)
+
+        def state_at(index):
+            return self._rollout_state(
+                video=video_state,
+                audio=audio_state,
+                video_sigma=video_sigmas[index : index + 1],
+                audio_sigma=audio_sigmas[index : index + 1],
+            )
+
+        def advance(index, prediction):
+            nonlocal video_state, audio_state
+            if index + 1 >= base.shape[0]:
+                return
+            if video_state is not None:
+                video_state = euler_advance(
+                    video_state, prediction.video, float(video_sigmas[index]), float(video_sigmas[index + 1])
+                )
+            if audio_state is not None:
+                audio_state = euler_advance(
+                    audio_state, prediction.audio, float(audio_sigmas[index]), float(audio_sigmas[index + 1])
+                )
+
+        teacher_prefix = getattr(args, "h3_rollout_prefix", "student") == "teacher"
+        with (
+            self._auxiliary_block_swap(transformer, True),
+            torch.no_grad(),
+            int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+        ):
+            if teacher_prefix:
+                with torch.random.fork_rng(devices=devices):
+                    try:
+                        set_enabled(False)
+                        for index in range(args.h3_rollout_steps):
+                            advance(
+                                index,
+                                self._predict(
+                                    accelerator,
+                                    transformer,
+                                    teacher_presentation,
+                                    state_at(index),
+                                    conditioning="prompt",
+                                    role="rollout",
+                                ),
+                            )
+                    finally:
+                        set_enabled(True)
+            else:
+                for index in range(args.h3_rollout_steps):
+                    advance(
+                        index,
+                        self._predict(accelerator, transformer, batch, state_at(index), conditioning=conditioning, role="rollout"),
+                    )
+
+        records = []
+        for index in range(args.h3_rollout_steps, base.shape[0]):
+            state = state_at(index)
+            cpu_rng = torch.get_rng_state()
+            cuda_rng = [torch.cuda.get_rng_state(device) for device in devices]
+            with (
+                self._auxiliary_block_swap(transformer, True),
+                torch.no_grad(),
+            ):
+                probe = self._predict(accelerator, transformer, batch, state, conditioning=conditioning)
+
+            def frozen(presentation, branch):
+                with (
+                    torch.random.fork_rng(devices=devices),
+                    self._auxiliary_block_swap(transformer, True),
+                    torch.no_grad(),
+                    int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                ):
+                    torch.set_rng_state(cpu_rng)
+                    for device, rng in zip(devices, cuda_rng, strict=True):
+                        torch.cuda.set_rng_state(rng, device)
+                    try:
+                        set_enabled(False)
+                        return self._predict(accelerator, transformer, presentation, state, conditioning=branch)
+                    finally:
+                        set_enabled(True)
+
+            teacher = frozen(teacher_presentation, "prompt")
+            base_prompt = frozen(batch, "prompt") if needs_base else None
+            base_empty = frozen(batch, "empty") if needs_empty else None
+            records.append((index, state, cpu_rng, cuda_rng, probe, teacher, base_prompt, base_empty))
+            advance(
+                index,
+                H3ModelPrediction(
+                    None if probe.video is None else probe.video.detach(),
+                    None if probe.audio is None else probe.audio.detach(),
+                ),
+            )
+
+        window = float(len(records))
+        # The floor's denominator is independent of the live prompt values.  Find
+        # it from the probes so each serialized backward receives its exact share
+        # of the original across-window reduction.
+        floor_valid = []
+        if field_floor_weight > 0:
+            along_teacher = getattr(args, "h3_rollout_field_floor_direction", "self") == "teacher"
+            sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
+            sigma_min = float(getattr(args, "h3_rollout_field_floor_sigma_min", 0.0) or 0.0)
+            for index, _state, _cpu, _cuda, probe, teacher, base_prompt, base_empty in records:
+                adapted = probe.video - base_empty.video
+                base_field = base_prompt.video - base_empty.video
+                measured = (
+                    self._field_projection_ratio(adapted, base_field, teacher.video - base_empty.video, video_mask)
+                    if along_teacher
+                    else self._field_length_ratio(adapted, base_field, video_mask)
+                )
+                valid = measured[1]
+                if not sigma_min <= float(video_sigmas[index]) <= sigma_max:
+                    valid = torch.zeros_like(valid)
+                floor_valid.append(valid)
+            floor_denominator = sum(flag.to(torch.float32).sum() for flag in floor_valid).clamp_min(1.0)
+        else:
+            floor_denominator = None
+
+        teacher_total = torch.zeros((), device=accelerator.device)
+        teacher_video_total = torch.zeros((), device=accelerator.device)
+        magnitude_total = torch.zeros((), device=accelerator.device)
+        anchor_total = torch.zeros((), device=accelerator.device)
+        floor_total = torch.zeros((), device=accelerator.device)
+        length_numerator = torch.zeros((), device=accelerator.device)
+        length_count = torch.zeros((), device=accelerator.device)
+        floor_numerator = torch.zeros((), device=accelerator.device)
+        floor_count = torch.zeros((), device=accelerator.device)
+        diagnostic_cos = []
+        diagnostic_ratio = []
+        for record_index, (index, state, cpu_rng, cuda_rng, _probe, teacher, base_prompt, base_empty) in enumerate(records):
+            state_sigma = video_sigmas[index : index + 1]
+            sample_weight = self._sample_weight(args, state_sigma)
+
+            def replay_rng():
+                torch.set_rng_state(cpu_rng)
+                for device, rng in zip(devices, cuda_rng, strict=True):
+                    torch.cuda.set_rng_state(rng, device)
+
+            if anchor_weight > 0:
+                with torch.random.fork_rng(devices=devices):
+                    replay_rng()
+                    student_empty = self._predict(accelerator, transformer, batch, state, conditioning="empty")
+                    anchor_terms = self._rollout_state_loss_terms(
+                        args,
+                        _probe,
+                        teacher,
+                        (base_prompt, base_empty),
+                        student_empty,
+                        state_sigma,
+                        student_empty.audio.detach() if student_empty.audio is not None else None,
+                        student_empty.audio.detach() if student_empty.audio is not None else None,
+                        video_mask,
+                        audio_mask,
+                        sample_weight,
+                        audio_sample_weight,
+                        video_weight,
+                        audio_weight,
+                    )
+                    anchor = anchor_terms["null_anchor_term"] / window
+                    accelerator.backward(anchor * auxiliary_backward_scale)
+                    anchor_total = anchor_total + anchor.detach()
+
+            with torch.random.fork_rng(devices=devices):
+                replay_rng()
+                student = self._predict(accelerator, transformer, batch, state, conditioning=conditioning)
+                zero_audio = student.audio.detach() if student.audio is not None else None
+                terms = self._rollout_state_loss_terms(
+                    args,
+                    student,
+                    teacher,
+                    (base_prompt, base_empty) if needs_base else None,
+                    None,
+                    state_sigma,
+                    zero_audio,
+                    zero_audio,
+                    video_mask,
+                    audio_mask,
+                    sample_weight,
+                    audio_sample_weight,
+                    video_weight,
+                    audio_weight,
+                )
+                teacher_loss = terms["teacher_result"].loss / window
+                magnitude = None if terms["magnitude_term"] is None else terms["magnitude_term"] / window
+                length_numerator += terms["length_sum"]
+                length_count += terms["length_count"]
+                prompt_loss = teacher_loss if magnitude is None else teacher_loss + magnitude
+                floor = None
+                if field_floor_weight > 0:
+                    ratios = terms["floor_ratio"]
+                    valid = floor_valid[record_index].to(ratios.dtype)
+                    band = torch.relu(1.0 - ratios).pow(2)
+                    cap = float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)
+                    if cap > 0:
+                        band = band + torch.relu(ratios - cap).pow(2)
+                    floor = field_floor_weight * (band * valid).sum() / floor_denominator
+                    prompt_loss = prompt_loss + floor
+                    floor_numerator += (ratios.detach() * valid).sum()
+                    floor_count += valid.sum()
+                accelerator.backward(prompt_loss * auxiliary_backward_scale)
+                teacher_total = teacher_total + teacher_loss.detach()
+                teacher_video_total = teacher_video_total + terms["teacher_result"].video_loss.detach() / window
+                if magnitude is not None:
+                    magnitude_total = magnitude_total + magnitude.detach()
+                if floor is not None:
+                    floor_total = floor_total + floor.detach()
+                if terms["diagnostics"] is not None:
+                    diagnostic_cos.append(terms["diagnostics"]["cos"])
+                    if terms["diagnostics"]["ratio"] is not None:
+                        diagnostic_ratio.append(terms["diagnostics"]["ratio"])
+
+        return {
+            "stop_sigma": stop_sigma,
+            "video_sigmas": [video_sigmas[index : index + 1] for index, *_rest in records],
+            "video": teacher_total,
+            "video_metric": teacher_video_total,
+            "magnitude": magnitude_total if magnitude_weight < 1.0 else None,
+            "length_ratio": length_numerator / length_count.clamp_min(1.0),
+            "anchor": anchor_total if anchor_weight > 0 else None,
+            "floor": floor_total if field_floor_weight > 0 else None,
+            "floor_ratio": floor_numerator / floor_count.clamp_min(1.0),
+            "teacher_cos_base": None if not diagnostic_cos else sum(diagnostic_cos) / len(diagnostic_cos),
+            "teacher_vs_base": None if not diagnostic_ratio else sum(diagnostic_ratio) / len(diagnostic_ratio),
+        }
 
     @staticmethod
     def _masked_field_lengths(tensor: torch.Tensor, mask) -> tuple[torch.Tensor, torch.Tensor]:
@@ -7954,6 +8504,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         rollout_active = getattr(args, "h3_rollout_supervision", False) and self._rollout_supervision_active(
             accelerator, args.h3_rollout_probability
         )
+        inactive_drawn = getattr(args, "h3_rollout_inactive_supervision", "off") != "off" and (
+            self._rollout_inactive_supervision_active(accelerator, args.h3_rollout_inactive_probability)
+        )
         if batch_size == 1:
             loss, metrics = self._process_single_batch(
                 args,
@@ -7975,6 +8528,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 recipe_override=recipe,
                 qwen_control_dropout_override=qwen_control_dropout,
                 rollout_active_override=rollout_active,
+                rollout_inactive_drawn_override=inactive_drawn,
             )
             return loss, self._materialize_metrics(metrics)
 
@@ -8027,6 +8581,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     recipe_override=recipe,
                     qwen_control_dropout_override=qwen_control_dropout,
                     rollout_active_override=rollout_active,
+                    rollout_inactive_drawn_override=inactive_drawn,
                     crepa_update_similarity_threshold=False,
                 )
                 accelerator.backward(item_loss / batch_size)
@@ -8149,6 +8704,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         recipe_override: str | None = None,
         qwen_control_dropout_override: bool | None = None,
         rollout_active_override: bool | None = None,
+        rollout_inactive_drawn_override: bool | None = None,
         crepa_update_similarity_threshold: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         del network_dtype, vae
@@ -8405,6 +8961,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if rollout_active_override is None
                 else rollout_active_override
             )
+        inactive_mode = getattr(args, "h3_rollout_inactive_supervision", "off")
+        inactive_drawn = (
+            self._rollout_inactive_supervision_active(accelerator, args.h3_rollout_inactive_probability)
+            if rollout_inactive_drawn_override is None and inactive_mode != "off"
+            else bool(rollout_inactive_drawn_override)
+        )
+        rollout_inactive = (
+            inactive_mode != "off" and inactive_drawn and not rollout_active and conditioning == "prompt" and has_video
+        )
+        inactive_teacher = inactive_teacher_empty = inactive_student_empty = None
+        inactive_staged_term = None
+        if rollout_inactive and inactive_mode == "teacher_gap":
+            missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+            if missing:
+                raise KeyError("teacher_gap requires empty conditioning caches; missing " + ", ".join(missing))
         reference_prediction = None
         sparse_teacher_prediction = None
         null_anchor_student = None
@@ -9198,23 +9769,148 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 stock_empty, snapshot_prompt, snapshot_empty, self._reamplify_resolved_schedule, base_sigma
             )
 
+        inactive_weight = float(getattr(args, "h3_rollout_inactive_weight", _ROLLOUT_INACTIVE_WEIGHT_DEFAULT))
+        inactive_block_swap = bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False)
+        inactive_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+
+        def inactive_gap_loss(prompt_prediction, empty_prediction):
+            student_field = H3ModelPrediction(
+                None if prompt_prediction.video is None else prompt_prediction.video.float() - empty_prediction.video.float(),
+                None,
+            )
+            teacher_field = H3ModelPrediction(
+                None if inactive_teacher.video is None else inactive_teacher.video.float() - inactive_teacher_empty.video.float(),
+                None,
+            )
+            return (
+                inactive_weight
+                * joint_prediction_loss(
+                    student_field,
+                    teacher_field,
+                    video_mask=effective_video_mask,
+                    video_sample_weight=video_sample_weight,
+                    balance=args.h3_loss_balance,
+                    mask_normalization=args.h3_loss_mask_normalization,
+                    video_weight=video_weight,
+                    audio_weight=0.0,
+                ).loss
+            )
+
+        if rollout_inactive:
+            if inactive_mode == "teacher_gap" and inactive_block_swap:
+                # Classic block swap cannot retain two live graphs while frozen
+                # forwards move the streamed blocks. Replay the primary entry for
+                # each branch, apply the empty derivative immediately, and leave
+                # the prompt derivative attached to the ordinary caller backward.
+                with torch.random.fork_rng(devices=inactive_devices), torch.no_grad():
+                    inactive_prompt_probe = self._predict(accelerator, transformer, batch, inputs, conditioning="prompt")
+                inactive_teacher, inactive_teacher_empty = self._inactive_rollout_teachers(
+                    accelerator, transformer, network, batch, inputs, gap=True
+                )
+                with torch.random.fork_rng(devices=inactive_devices):
+                    inactive_empty_graph = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                    inactive_staged_term = inactive_gap_loss(inactive_prompt_probe, inactive_empty_graph)
+                    accelerator.backward(inactive_staged_term * auxiliary_backward_scale)
+                inactive_student_empty = H3ModelPrediction(
+                    None if inactive_empty_graph.video is None else inactive_empty_graph.video.detach(),
+                    None if inactive_empty_graph.audio is None else inactive_empty_graph.audio.detach(),
+                )
+                del inactive_prompt_probe, inactive_empty_graph
+            else:
+                inactive_teacher, inactive_teacher_empty = self._inactive_rollout_teachers(
+                    accelerator,
+                    transformer,
+                    network,
+                    batch,
+                    inputs,
+                    gap=inactive_mode == "teacher_gap",
+                )
+                if inactive_mode == "teacher_gap":
+                    with torch.random.fork_rng(devices=inactive_devices):
+                        inactive_student_empty = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+
+        classic_staged_rollout = (
+            rollout_active and inactive_block_swap and not bool(getattr(args, "h3_rollout_fused_teacher", False))
+        )
+        staged_rollout = None
+        primary_replay_rng = None
+        if classic_staged_rollout:
+            # Consume the primary stochastic-conditioning slot before rollout work.
+            # Rollout work may then advance the caller's
+            # stream; the final live primary replays this slot under a fork and so
+            # leaves that post-rollout stream untouched.
+            primary_cpu_rng = torch.get_rng_state()
+            primary_cuda_rng = [torch.cuda.get_rng_state(device) for device in inactive_devices]
+            with self._auxiliary_block_swap(transformer, True), torch.no_grad():
+                self._predict(accelerator, transformer, batch, inputs, conditioning=conditioning)
+            primary_replay_rng = (primary_cpu_rng, primary_cuda_rng)
+            staged_rollout = self._classic_staged_rollout_supervision(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                video_latents=video_latents,
+                audio_latents=audio_latents,
+                video_shift=1.0 if is_image else args.h3_shift_video,
+                audio_shift=1.0 if is_image else args.h3_shift_audio,
+                conditioning=conditioning,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                audio_sample_weight=audio_sample_weight,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+                auxiliary_backward_scale=auxiliary_backward_scale,
+            )
+
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
         if self._crepa is not None:
             self._crepa.begin_step(use_crepa, global_step)
         try:
             with torch.no_grad() if getattr(args, "h3_sparse_teacher_eval_only", False) else nullcontext():
-                raw_prediction = self._predict(
-                    accelerator,
-                    transformer,
-                    batch,
-                    inputs,
-                    conditioning=conditioning,
-                )
+                if primary_replay_rng is None:
+                    raw_prediction = self._predict(
+                        accelerator,
+                        transformer,
+                        batch,
+                        inputs,
+                        conditioning=conditioning,
+                    )
+                else:
+                    with torch.random.fork_rng(devices=inactive_devices):
+                        torch.set_rng_state(primary_replay_rng[0])
+                        for device, rng in zip(inactive_devices, primary_replay_rng[1], strict=True):
+                            torch.cuda.set_rng_state(rng, device)
+                        raw_prediction = self._predict(
+                            accelerator,
+                            transformer,
+                            batch,
+                            inputs,
+                            conditioning=conditioning,
+                        )
         except Exception:
             if self._crepa is not None:
                 self._crepa.clear_step()
             raise
         prediction = raw_prediction
+        inactive_rollout_term = None
+        if rollout_inactive:
+            if inactive_mode == "teacher_velocity":
+                inactive_rollout_term = (
+                    inactive_weight
+                    * joint_prediction_loss(
+                        H3ModelPrediction(raw_prediction.video, None),
+                        H3ModelPrediction(inactive_teacher.video, None),
+                        video_mask=effective_video_mask,
+                        video_sample_weight=video_sample_weight,
+                        balance=args.h3_loss_balance,
+                        mask_normalization=args.h3_loss_mask_normalization,
+                        video_weight=video_weight,
+                        audio_weight=0.0,
+                    ).loss
+                )
+            else:
+                inactive_rollout_term = inactive_gap_loss(raw_prediction, inactive_student_empty)
         if repair_student_reuses_primary:
             # Caption dropout already made the primary graph the trainable empty
             # branch. Reuse it for the caption-reference auxiliary so the dropped
@@ -9502,7 +10198,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         rollout_main_objective = None
         rollout_field_floor = None
         rollout_null_anchor = None
-        if rollout_active:
+        if rollout_active and staged_rollout is None:
             # On-policy supervision REPLACES the video half of the data objective
             # and leaves the audio half alone. The two halves are reduced in one
             # joint call per sub-step rather than separately, so the mask, the
@@ -9538,213 +10234,72 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             rollout_audio_prediction = prediction.audio
             rollout_audio_target = loss_inputs.audio_target
             magnitude_weight = float(getattr(args, "h3_rollout_teacher_magnitude_weight", 1.0))
-            decompose_teacher = magnitude_weight < 1.0 and rollout_bases is not None
-            rollout_magnitude_terms: list[torch.Tensor] = []
-            rollout_length_ratios: list[float] = []
-            if decompose_teacher:
-                # The privileged teacher knows the target better than the student
-                # and predicts with less guidance: its FIELD (prediction minus the
-                # frozen empty branch) is shorter than the base's, and matching it
-                # whole teaches that shortening along with the direction. Here the
-                # teacher's field is matched in DIRECTION only: the student's field
-                # is rescaled to the teacher's length before the residual is taken,
-                # which is scale-invariant in the student's field and so carries no
-                # gradient on its length. The length is the floor's business (and,
-                # weighted by --h3_rollout_teacher_magnitude_weight, a separate
-                # magnitude term), so the two no longer pull against each other.
-                # (The same decomposition upstream musubi-tuner applies to its
-                # off-policy teacher-matching loss; kohya-ss/musubi-tuner#1065, #1086.)
-                directed_students = []
-                ratio_sum, ratio_count = 0.0, 0.0
-                for (student, teacher), (_base_prompted, base_empty), sigma in zip(
-                    rollout_pairs, rollout_bases, rollout_video_sigmas, strict=True
-                ):
-                    directed, _gap, _authored, ratio, directed_valid = self._directed_field_residual(
-                        student.video, teacher.video, base_empty.video, effective_video_mask
+            state_terms = []
+            for index, ((student, teacher), sigma) in enumerate(zip(rollout_pairs, rollout_video_sigmas, strict=True)):
+                base_pair = None if rollout_bases is None else rollout_bases[index]
+                student_empty = None if rollout_student_empties is None else rollout_student_empties[index]
+                state_terms.append(
+                    self._rollout_state_loss_terms(
+                        args,
+                        student,
+                        teacher,
+                        base_pair,
+                        student_empty,
+                        sigma,
+                        rollout_audio_prediction,
+                        rollout_audio_target,
+                        effective_video_mask,
+                        effective_audio_mask,
+                        self._sample_weight(args, sigma) if has_video else None,
+                        audio_sample_weight,
+                        video_weight,
+                        audio_weight,
                     )
-                    directed_students.append(directed)
-                    # The magnitude half in the joint loss's own units and reduction:
-                    # the student's field against a detached copy of itself rescaled
-                    # to the teacher's length. Per sample that residual's masked MSE
-                    # is exactly (||g' - e|| - ||t - e||)^2, and its gradient is
-                    # radial (along the student's own field), so this term and the
-                    # directed one partition the teacher match into length and
-                    # direction. Same mask, sample weight and balance as every other
-                    # video term; the audio half is present with a zero residual.
-                    empty = base_empty.video.detach()
-                    student_field = student.video - empty
-                    student_length, _ = self._masked_field_lengths(student_field, effective_video_mask)
-                    teacher_length, _ = self._masked_field_lengths((teacher.video - empty).detach(), effective_video_mask)
-                    eps = torch.finfo(torch.float32).eps * 64
-                    radial_scale = (teacher_length / student_length.clamp_min(eps)).detach()
-                    shape = (-1,) + (1,) * (student_field.dim() - 1)
-                    radial_target = empty + (student_field.detach().float() * radial_scale.reshape(shape)).to(student.video.dtype)
-                    # A student field with no direction cannot be rescaled: its
-                    # length gap is scored against the teacher itself (residual
-                    # -(t - e), squared length L_t^2), whose gradient points at the
-                    # teacher. That is the documented subgradient of the gap at a
-                    # zero field.
-                    radial_target = torch.where(directed_valid.reshape(shape), radial_target, teacher.video.detach())
-                    # Reduced with the SAME joint call as the direction term: the
-                    # audio half is present with a zero residual (the prediction
-                    # against its own detached copy), so the token/modality balance
-                    # and the denominators are the direction term's, and the video
-                    # share of this term equals the video share of that one.
-                    rollout_magnitude_terms.append(
-                        joint_prediction_loss(
-                            H3ModelPrediction(video=student.video, audio=rollout_audio_prediction),
-                            H3ModelPrediction(
-                                video=radial_target,
-                                audio=rollout_audio_prediction.detach() if rollout_audio_prediction is not None else None,
-                            ),
-                            video_mask=effective_video_mask,
-                            audio_mask=effective_audio_mask,
-                            video_sample_weight=self._sample_weight(args, sigma) if has_video else None,
-                            audio_sample_weight=audio_sample_weight,
-                            balance=args.h3_loss_balance,
-                            mask_normalization=args.h3_loss_mask_normalization,
-                            video_weight=video_weight,
-                            audio_weight=audio_weight,
-                        ).loss
-                    )
-                    ratio_sum += float((ratio * directed_valid.to(ratio.dtype)).sum())
-                    ratio_count += float(directed_valid.sum())
-                rollout_length_ratios.append(ratio_sum / ratio_count if ratio_count > 0 else 1.0)
-            # The pairs the teacher term is formed from: the directed students when the
-            # split is on, the raw students otherwise. ``rollout_pairs`` itself is left
-            # alone: the floor and the teacher metrics below measure the student's
-            # actual field, not the rescaled one.
-            term_pairs = (
-                [
-                    (H3ModelPrediction(video=directed, audio=student.audio), teacher)
-                    for directed, (student, teacher) in zip(directed_students, rollout_pairs, strict=True)
-                ]
-                if decompose_teacher
-                else rollout_pairs
-            )
-            rollout_terms = [
-                joint_prediction_loss(
-                    H3ModelPrediction(video=student.video, audio=rollout_audio_prediction),
-                    # ``joint_prediction_loss`` detaches its whole reference, which
-                    # is the stop-gradient on the teacher; detaching the audio data
-                    # target alongside it is a no-op.
-                    H3ModelPrediction(video=teacher.video, audio=rollout_audio_target),
-                    # The authored masks describe padding and authored regions of
-                    # the packed layout, which a rollout state shares with the data
-                    # state because it has the same shape; keeping them out would
-                    # train the video field on padding rows.
-                    video_mask=effective_video_mask,
-                    audio_mask=effective_audio_mask,
-                    # The video half is scored at the sub-step's own shifted sigma;
-                    # the audio half is still the data step and keeps the data
-                    # step's weight.
-                    video_sample_weight=self._sample_weight(args, sigma) if has_video else None,
-                    audio_sample_weight=audio_sample_weight,
-                    balance=args.h3_loss_balance,
-                    mask_normalization=args.h3_loss_mask_normalization,
-                    video_weight=video_weight,
-                    audio_weight=audio_weight,
                 )
-                for (student, teacher), sigma in zip(term_pairs, rollout_video_sigmas, strict=True)
-            ]
+            rollout_terms = [terms["teacher_result"] for terms in state_terms]
             window = float(len(rollout_terms))
             loss = sum(term.loss for term in rollout_terms) / window
-            if decompose_teacher:
-                # The magnitude half of the teacher term, weighted down (0 leaves
-                # the length to the floor alone). Averaged over the window like
-                # the direction half, scaled by the video weight the joint loss
-                # gives its video term.
-                rollout_teacher_magnitude = magnitude_weight * sum(rollout_magnitude_terms) / float(len(rollout_magnitude_terms))
+            magnitude_terms = [terms["magnitude_term"] for terms in state_terms if terms["magnitude_term"] is not None]
+            if magnitude_terms:
+                rollout_teacher_magnitude = sum(magnitude_terms) / window
                 loss = loss + rollout_teacher_magnitude
                 metrics["loss/rollout_teacher_magnitude"] = rollout_teacher_magnitude.detach()
-                metrics["h3/rollout_teacher_length_ratio"] = sum(rollout_length_ratios) / float(len(rollout_length_ratios))
+                length_sum = sum(terms["length_sum"] for terms in state_terms)
+                length_count = sum(terms["length_count"] for terms in state_terms).clamp_min(1.0)
+                metrics["h3/rollout_teacher_length_ratio"] = length_sum / length_count
             rescaled_rollout_loss = loss
             rollout_main_objective = loss
             rollout_replaced = True
-            # With the split on, this is the direction half; the magnitude half is
-            # loss/rollout_teacher_magnitude.
             metrics["loss/rollout_video"] = sum(term.video_loss.detach() for term in rollout_terms) / window
             metrics["h3/rollout_stop_sigma"] = rollout_stop_sigma
-            if rollout_student_empties is not None:
-                # The null anchor at the supervised states: the student's own empty
-                # branch held to the frozen base's, where generation walks.
-                anchor_terms = [
-                    joint_prediction_loss(
-                        student_empty,
-                        base_empty,
-                        video_mask=effective_video_mask,
-                        audio_mask=effective_audio_mask,
-                        video_sample_weight=self._sample_weight(args, sigma) if has_video else None,
-                        audio_sample_weight=audio_sample_weight,
-                        balance=args.h3_loss_balance,
-                        mask_normalization=args.h3_loss_mask_normalization,
-                        video_weight=video_weight,
-                        audio_weight=audio_weight,
-                    ).loss
-                    for student_empty, (_base_prompted, base_empty), sigma in zip(
-                        rollout_student_empties, rollout_bases, rollout_video_sigmas, strict=True
-                    )
-                ]
-                rollout_null_anchor = float(args.h3_rollout_null_anchor_weight) * sum(anchor_terms) / float(len(anchor_terms))
+
+            anchor_terms = [terms["null_anchor_term"] for terms in state_terms if terms["null_anchor_term"] is not None]
+            if anchor_terms:
+                rollout_null_anchor = sum(anchor_terms) / window
                 loss = loss + rollout_null_anchor
                 metrics["loss/rollout_null_anchor"] = rollout_null_anchor.detach()
-            if rollout_bases is not None and float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0:
-                # A LENGTH floor on the guidance field at the supervised states.
-                # The teacher term above sets the field's direction; this holds
-                # its length at no less than the checkpoint's, and nothing more.
-                # Both fields are taken against the FROZEN empty branch: with the
-                # student's own null in the difference, the cheapest way to lengthen
-                # the field would be to move that null, which is the degeneracy the
-                # frozen-null forms exist to remove.
-                # Along the student's own field ('self'), or along the teacher's
-                # field at the same state ('teacher'), where lengthening in a wrong
-                # direction earns nothing and the gradient turns the field as it
-                # lengthens it.
-                # How much the privileged teacher still knows at these states: the
-                # direction of its field against the base's, and its distance from
-                # the student against the base's. A teacher that has collapsed onto
-                # the base reads cos 1 and ratio 1 here, and then supervises nothing.
-                teacher_cos, teacher_ratio = [], []
-                for (student, teacher), (base_prompted, base_empty) in zip(rollout_pairs, rollout_bases, strict=True):
-                    if base_prompted is None:
-                        continue
-                    teacher_field = teacher.video - base_empty.video
-                    base_field = base_prompted.video - base_empty.video
-                    teacher_cos.append(self._masked_cosine(teacher_field, base_field, effective_video_mask))
-                    base_gap = self._masked_rms(base_prompted.video - student.video.detach(), effective_video_mask)
-                    if base_gap > 0:
-                        teacher_ratio.append(
-                            self._masked_rms(teacher.video - student.video.detach(), effective_video_mask) / base_gap
-                        )
-                if teacher_cos:
-                    metrics["h3/rollout_teacher_cos_base"] = sum(teacher_cos) / len(teacher_cos)
+
+            diagnostics = [terms["diagnostics"] for terms in state_terms if terms["diagnostics"] is not None]
+            if diagnostics:
+                teacher_cos = [value["cos"] for value in diagnostics]
+                teacher_ratio = [value["ratio"] for value in diagnostics if value["ratio"] is not None]
+                metrics["h3/rollout_teacher_cos_base"] = sum(teacher_cos) / len(teacher_cos)
                 if teacher_ratio:
                     metrics["h3/rollout_teacher_vs_base"] = sum(teacher_ratio) / len(teacher_ratio)
-                along_teacher = getattr(args, "h3_rollout_field_floor_direction", "self") == "teacher"
-                measured = []
-                for (student, teacher), (base_prompted, base_empty) in zip(rollout_pairs, rollout_bases, strict=True):
-                    empty = base_empty.video.detach()
-                    adapted_field = student.video - empty
-                    base_field = base_prompted.video - empty
-                    if along_teacher:
-                        measured.append(
-                            self._field_projection_ratio(adapted_field, base_field, teacher.video - empty, effective_video_mask)
-                        )
-                    else:
-                        measured.append(self._field_length_ratio(adapted_field, base_field, effective_video_mask))
-                ratios = torch.stack([ratio for ratio, _valid in measured])
-                valid = torch.stack([flag for _ratio, flag in measured]).to(ratios.dtype)
-                # States above the sigma ceiling drop out of the mean, like
-                # unauthored samples.
+
+            floor_terms = [terms for terms in state_terms if terms["floor_ratio"] is not None]
+            if floor_terms and float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0) > 0:
+                ratios = torch.stack([terms["floor_ratio"] for terms in floor_terms])
+                valid = torch.stack([terms["floor_valid"] for terms in floor_terms]).to(ratios.dtype)
                 sigma_max = float(getattr(args, "h3_rollout_field_floor_sigma_max", 1.0))
                 sigma_min = float(getattr(args, "h3_rollout_field_floor_sigma_min", 0.0) or 0.0)
                 if sigma_max < 1.0 or sigma_min > 0.0:
                     in_band = torch.stack(
                         [
-                            ((sigma.reshape(-1)[:1] <= sigma_max) & (sigma.reshape(-1)[:1] >= sigma_min))
+                            ((terms["sigma"].reshape(-1)[:1] <= sigma_max) & (terms["sigma"].reshape(-1)[:1] >= sigma_min))
                             .to(ratios.dtype)
                             .to(ratios.device)
-                            for sigma in rollout_video_sigmas
+                            for terms in floor_terms
                         ]
                     ).expand_as(valid)
                     valid = valid * in_band
@@ -9752,14 +10307,57 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 band = torch.relu(1.0 - ratios).pow(2)
                 field_cap = float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)
                 if field_cap > 0:
-                    # Two-sided: an over-long field burns colour and, once
-                    # co-adapted into the weights, is not undone by an inference
-                    # multiplier, so it is held from above as well.
                     band = band + torch.relu(ratios - field_cap).pow(2)
                 rollout_field_floor = float(args.h3_rollout_field_floor) * (band * valid).sum() / scored
                 loss = loss + rollout_field_floor
                 metrics["loss/rollout_field_floor"] = rollout_field_floor.detach()
                 metrics["h3/rollout_field_ratio"] = (ratios.detach() * valid).sum() / scored
+        if staged_rollout is not None:
+            # The video derivatives were applied state by state above. Keep only
+            # the ordinary audio derivative on the final primary graph, while a
+            # zero video residual preserves the original joint denominators.
+            audio_only = sum(
+                joint_prediction_loss(
+                    H3ModelPrediction(video=raw_prediction.video, audio=prediction.audio),
+                    H3ModelPrediction(video=raw_prediction.video.detach(), audio=loss_inputs.audio_target),
+                    video_mask=effective_video_mask,
+                    audio_mask=effective_audio_mask,
+                    video_sample_weight=self._sample_weight(args, sigma) if has_video else None,
+                    audio_sample_weight=audio_sample_weight,
+                    balance=args.h3_loss_balance,
+                    mask_normalization=args.h3_loss_mask_normalization,
+                    video_weight=video_weight,
+                    audio_weight=audio_weight,
+                ).loss
+                for sigma in staged_rollout["video_sigmas"]
+            ) / float(len(staged_rollout["video_sigmas"]))
+            staged_video = staged_rollout["video"]
+            rollout_field_floor = staged_rollout["floor"]
+            rollout_null_anchor = staged_rollout["anchor"]
+            rollout_teacher_magnitude = staged_rollout["magnitude"]
+            rescaled_rollout_loss = audio_only + staged_video
+            if rollout_teacher_magnitude is not None:
+                rescaled_rollout_loss = rescaled_rollout_loss + rollout_teacher_magnitude
+            rollout_main_objective = rescaled_rollout_loss
+            loss = rescaled_rollout_loss
+            for auxiliary in (rollout_field_floor, rollout_null_anchor):
+                if auxiliary is not None:
+                    loss = loss + auxiliary
+            rollout_replaced = True
+            metrics["loss/rollout_video"] = staged_rollout["video_metric"]
+            metrics["h3/rollout_stop_sigma"] = staged_rollout["stop_sigma"]
+            if rollout_teacher_magnitude is not None:
+                metrics["loss/rollout_teacher_magnitude"] = rollout_teacher_magnitude
+                metrics["h3/rollout_teacher_length_ratio"] = staged_rollout["length_ratio"]
+            if rollout_null_anchor is not None:
+                metrics["loss/rollout_null_anchor"] = rollout_null_anchor
+            if rollout_field_floor is not None:
+                metrics["loss/rollout_field_floor"] = rollout_field_floor
+                metrics["h3/rollout_field_ratio"] = staged_rollout["floor_ratio"]
+            if staged_rollout["teacher_cos_base"] is not None:
+                metrics["h3/rollout_teacher_cos_base"] = staged_rollout["teacher_cos_base"]
+            if staged_rollout["teacher_vs_base"] is not None:
+                metrics["h3/rollout_teacher_vs_base"] = staged_rollout["teacher_vs_base"]
         if getattr(args, "h3_rollout_supervision", False):
             # Only reported when the feature is on, so an existing run's metric
             # set is unchanged.
@@ -9796,6 +10394,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         main_objective = rollout_main_objective if rollout_replaced else loss
         if getattr(args, "h3_sparse_teacher_only", False):
             loss = loss * 0
+        if inactive_rollout_term is not None:
+            loss = loss + inactive_rollout_term
+            metrics["loss/rollout_inactive_video"] = inactive_rollout_term.detach()
+        if inactive_mode != "off":
+            metrics["h3/rollout_inactive_active"] = float(rollout_inactive)
+            metrics.setdefault("loss/rollout_inactive_video", 0.0)
         base_preservation_term = None
         if reference_prediction is not None:
             preservation = joint_prediction_loss(
@@ -9928,6 +10532,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             or repair_reference_term is not None
             or repair_null_anchor_term is not None
             or repair_rescaled
+            or inactive_rollout_term is not None
         ):
             average_loss = loss
             if base_preservation_term is not None:
@@ -9938,6 +10543,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 average_loss = average_loss - repair_reference_term
             if repair_null_anchor_term is not None:
                 average_loss = average_loss - repair_null_anchor_term
+            if inactive_rollout_term is not None:
+                average_loss = average_loss - inactive_rollout_term
             if repair_rescaled:
                 # The optimized active-step term is an inverse-probability
                 # estimator. Report the evaluated dense caption objective while
@@ -10272,6 +10879,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # knob that changes how the step is executed rather than what it
             # optimizes, and a reader comparing two runs' throughput needs it.
             "ss_h3_rollout_fused_teacher": str(bool(getattr(args, "h3_rollout_fused_teacher", False))),
+            "ss_h3_rollout_inactive_supervision": str(getattr(args, "h3_rollout_inactive_supervision", "off")),
+            "ss_h3_rollout_inactive_weight": str(getattr(args, "h3_rollout_inactive_weight", _ROLLOUT_INACTIVE_WEIGHT_DEFAULT)),
+            "ss_h3_rollout_inactive_probability": str(
+                getattr(args, "h3_rollout_inactive_probability", _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT)
+            ),
             "ss_h3_rollout_field_floor": str(float(getattr(args, "h3_rollout_field_floor", 0.0) or 0.0)),
             "ss_h3_rollout_field_floor_direction": str(getattr(args, "h3_rollout_field_floor_direction", "self")),
             "ss_h3_rollout_field_cap": str(float(getattr(args, "h3_rollout_field_cap", 0.0) or 0.0)),
@@ -11058,6 +11670,24 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "attention exactly what it was and makes --blocks_to_swap stream each swapped block once per sub-step "
             "instead of twice. Off by default so the two paths stay A/B comparable"
         ),
+    )
+    parser.add_argument(
+        "--h3_rollout_inactive_supervision",
+        choices=_ROLLOUT_INACTIVE_MODES,
+        default="off",
+        help="optional privileged depth-zero supervision on steps not selected for rollout",
+    )
+    parser.add_argument(
+        "--h3_rollout_inactive_weight",
+        type=float,
+        default=_ROLLOUT_INACTIVE_WEIGHT_DEFAULT,
+        help="positive weight of the inactive teacher-velocity or teacher-gap auxiliary",
+    )
+    parser.add_argument(
+        "--h3_rollout_inactive_probability",
+        type=float,
+        default=_ROLLOUT_INACTIVE_PROBABILITY_DEFAULT,
+        help="share of logical steps whose inactive branch is eligible; no probability correction is applied",
     )
     parser.add_argument(
         "--h3_rollout_teacher_magnitude_weight",
