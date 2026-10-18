@@ -1650,6 +1650,79 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._repair_caption_generator = generator
         return self._sparse_branch_active(accelerator, probability, generator)
 
+    def _repair_preservation_active(self, accelerator: Accelerator, probability: float) -> bool:
+        if probability <= 0:
+            return False
+        generator = self._repair_preservation_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._repair_preservation_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
+
+    def _register_repair_preservation_state_hooks(self, args, accelerator):
+        state_name = f"h3_repair_preservation_state-rank{accelerator.process_index}.json"
+
+        def save_state(_models, _weights, output_dir):
+            if float(args.h3_repair_preservation_probability) == 0:
+                return
+            state = {
+                "version": 1,
+                "process_index": accelerator.process_index,
+                "num_processes": accelerator.num_processes,
+                "probability": float(args.h3_repair_preservation_probability),
+                "reference": str(args.h3_repair_reference),
+                "generator": (
+                    None
+                    if self._repair_preservation_generator is None
+                    else self._repair_preservation_generator.get_state().tolist()
+                ),
+            }
+            path = Path(output_dir) / state_name
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+            os.replace(temporary, path)
+
+        def load_state(_models, input_dir):
+            path = Path(input_dir) / state_name
+            if not path.is_file():
+                if float(args.h3_repair_preservation_probability) == 0:
+                    self._repair_preservation_generator = None
+                    return
+                raise FileNotFoundError(f"repair preservation resume state is missing: {path}")
+            state = json.loads(path.read_text(encoding="utf-8"))
+            required = {"version", "process_index", "num_processes", "probability", "reference", "generator"}
+            if not isinstance(state, dict) or set(state) != required:
+                raise ValueError("repair preservation resume state has an incomplete or unsupported schema")
+            expected = {
+                "version": 1,
+                "process_index": accelerator.process_index,
+                "num_processes": accelerator.num_processes,
+                "probability": float(args.h3_repair_preservation_probability),
+                "reference": str(args.h3_repair_reference),
+            }
+            for key, value in expected.items():
+                if type(state[key]) is not type(value) or state[key] != value:
+                    raise ValueError(f"repair preservation resume state {key} does not match this run")
+            generator_state = state["generator"]
+            restored = None
+            if generator_state is not None:
+                if (
+                    not isinstance(generator_state, list)
+                    or not generator_state
+                    or any(type(item) is not int or not 0 <= item <= 255 for item in generator_state)
+                ):
+                    raise ValueError("invalid repair preservation generator state")
+                try:
+                    restored = torch.Generator()
+                    restored.set_state(torch.tensor(generator_state, dtype=torch.uint8))
+                except RuntimeError as error:
+                    raise ValueError("invalid repair preservation generator state") from error
+            self._repair_preservation_generator = restored
+
+        accelerator.register_save_state_pre_hook(save_state)
+        accelerator.register_load_state_pre_hook(load_state)
+
     @staticmethod
     def _one(batch: dict, key: str) -> torch.Tensor:
         value = batch[key]
@@ -2012,6 +2085,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._repair_anchor_pool_identity: str | None = None
         self._repair_anchor_random: random.Random | None = None
         self._repair_caption_generator: torch.Generator | None = None
+        self._repair_preservation_generator: torch.Generator | None = None
         self._rollout_probability_generator: torch.Generator | None = None
         self._preservation_probability_generator: torch.Generator | None = None
         self._dop_probability_generator: torch.Generator | None = None
@@ -3547,6 +3621,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 any(getattr(args, name, None) is not None for name in options)
                 or getattr(args, "h3_repair_reference_weight", 0)
                 or getattr(args, "h3_repair_null_anchor_weight", 0)
+                or getattr(args, "h3_repair_preservation_probability", 0)
                 or getattr(args, "h3_repair_caption_anchors", 4) != 4
                 or getattr(args, "h3_repair_caption_probability", 1.0) != 1.0
             ):
@@ -3571,6 +3646,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         null_anchor_weight = float(raw_null_anchor_weight)
         if not math.isfinite(null_anchor_weight) or null_anchor_weight < 0:
             raise ValueError("--h3_repair_null_anchor_weight must be finite and non-negative")
+        raw_preservation_probability = getattr(args, "h3_repair_preservation_probability", 0.0)
+        if isinstance(raw_preservation_probability, bool):
+            raise ValueError("--h3_repair_preservation_probability must be a real number")
+        preservation_probability = float(raw_preservation_probability)
+        if not math.isfinite(preservation_probability) or not 0 <= preservation_probability < 1:
+            raise ValueError("--h3_repair_preservation_probability must be finite and lie in [0, 1)")
         raw_caption_anchors = getattr(args, "h3_repair_caption_anchors", 4)
         raw_caption_probability = getattr(args, "h3_repair_caption_probability", 1.0)
         if type(raw_caption_anchors) is not int:
@@ -4846,6 +4927,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         if getattr(args, "h3_repair_reference", None) == "caption":
             self._register_caption_repair_state_hooks(args, accelerator)
+        if getattr(args, "h3_repair_reference", None) is not None:
+            self._register_repair_preservation_state_hooks(args, accelerator)
 
         sampler_state_path = "h3_timestep_sampler.json"
 
@@ -7739,7 +7822,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         teacher_concept_prediction = None
         matching_teacher_prediction = None
         repair_frozen = None
-        repair_active = getattr(args, "h3_repair_reference", None) is not None
+        repair_configured = getattr(args, "h3_repair_reference", None) is not None
+        repair_preservation_active = repair_configured and self._repair_preservation_active(
+            accelerator, float(args.h3_repair_preservation_probability)
+        )
+        repair_preservation_reference = None
+        repair_active = repair_configured and not repair_preservation_active
         repair_caption_active = (
             repair_active
             and args.h3_repair_reference == "caption"
@@ -7866,6 +7954,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             and (
                 use_guidance
                 or repair_active
+                or repair_preservation_active
                 or preservation_active
                 or dop_active
                 or null_anchor_active
@@ -7884,6 +7973,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # the graph-carrying student forward.
             transformer.switch_block_swap_for_inference()
         try:
+            if repair_preservation_active:
+                preservation_toggle = self._runtime_network_toggle(accelerator, network, "--h3_repair_preservation_probability")
+                preservation_int8 = getattr(transformer, "int8_attention_context", None)
+                with (
+                    torch.random.fork_rng(devices=[accelerator.device] if accelerator.device.type == "cuda" else []),
+                    torch.no_grad(),
+                    preservation_int8(auxiliary=True) if callable(preservation_int8) else nullcontext(),
+                ):
+                    preservation_toggle(False)
+                    try:
+                        repair_preservation_reference = self._predict(
+                            accelerator, transformer, batch, inputs, conditioning=conditioning
+                        )
+                    finally:
+                        preservation_toggle(True)
             if repair_active:
                 missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
                 if missing:
@@ -8350,8 +8454,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             with torch.random.fork_rng(devices=[accelerator.device] if accelerator.device.type == "cuda" else []):
                 field_adapted_empty = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
 
-        repair_reference_weight = float(getattr(args, "h3_repair_reference_weight", 0.0) or 0.0)
-        repair_null_anchor_weight = float(getattr(args, "h3_repair_null_anchor_weight", 0.0) or 0.0)
+        repair_reference_weight = float(getattr(args, "h3_repair_reference_weight", 0.0) or 0.0) if repair_active else 0.0
+        repair_null_anchor_weight = float(getattr(args, "h3_repair_null_anchor_weight", 0.0) or 0.0) if repair_active else 0.0
         repair_student_reuses_primary = conditioning == "empty" and (
             (repair_caption_active and repair_reference_weight > 0) or repair_null_anchor_weight > 0
         )
@@ -8526,7 +8630,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         repair_report_result = None
         repair_rescaled = False
-        if projection_target is not None:
+        if repair_preservation_reference is not None:
+            result = joint_prediction_loss(
+                raw_prediction,
+                repair_preservation_reference,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+        elif projection_target is not None:
             result = joint_prediction_loss(
                 raw_prediction,
                 projection_target,
@@ -8618,6 +8735,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics["loss/repair_audio"] = repair_report_result.audio_loss.detach()
         if args.h3_repair_reference == "caption":
             metrics["h3/repair_caption_active"] = float(repair_caption_active)
+        if args.h3_repair_preservation_probability > 0:
+            metrics["h3/repair_preservation_active"] = float(repair_preservation_active)
+            metrics["loss/repair_preservation"] = result.loss.detach() if repair_preservation_active else 0.0
         if projection_target is not None:
             metrics["loss/projection"] = result.loss.detach()
         if projection_scale is not None and args.h3_caption_dropout_rate > 0:
@@ -9399,6 +9519,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_repair_scale": str(getattr(args, "h3_repair_scale", None) or "none"),
             "ss_h3_repair_reference_weight": str(getattr(args, "h3_repair_reference_weight", 0.0)),
             "ss_h3_repair_null_anchor_weight": str(getattr(args, "h3_repair_null_anchor_weight", 0.0)),
+            "ss_h3_repair_preservation_probability": str(getattr(args, "h3_repair_preservation_probability", 0.0)),
             "ss_h3_repair_caption_anchors": str(int(getattr(args, "h3_repair_caption_anchors", 4))),
             "ss_h3_repair_caption_probability": str(float(getattr(args, "h3_repair_caption_probability", 1.0))),
             "ss_h3_repair_sigma_weight": str(getattr(args, "h3_repair_sigma_weight", None)),
@@ -9548,6 +9669,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=("hold an already-evaluated trainable empty branch to the frozen base empty branch; never adds a trainable forward"),
+    )
+    parser.add_argument(
+        "--h3_repair_preservation_probability",
+        type=float,
+        default=0.0,
+        help=(
+            "probability of replacing the complete repair objective with a frozen-base match under the step's "
+            "selected conditioning; must lie in [0, 1)"
+        ),
     )
     parser.add_argument(
         "--h3_repair_caption_anchors",

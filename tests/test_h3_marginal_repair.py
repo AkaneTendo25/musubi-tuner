@@ -217,6 +217,61 @@ def test_caption_state_v2_rejects_nonzero_repair_null_anchor(tmp_path):
         rejecting_hooks.load([], tmp_path)
 
 
+def _preservation_state_trainer(probability):
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "empty",
+        "--h3_repair_scale",
+        "4",
+        "--h3_repair_preservation_probability",
+        str(probability),
+    )
+    hooks = _StateHooks()
+    trainer._register_repair_preservation_state_hooks(args, hooks)
+    return args, trainer, hooks
+
+
+def test_repair_preservation_state_restores_used_and_lazy_streams(tmp_path):
+    _, trainer, hooks = _preservation_state_trainer(0.5)
+    hooks.save([], [], tmp_path)
+    trainer._repair_preservation_generator = torch.Generator().manual_seed(8)
+    hooks.load([], tmp_path)
+    assert trainer._repair_preservation_generator is None
+
+    trainer._repair_preservation_generator = torch.Generator().manual_seed(19)
+    hooks.save([], [], tmp_path)
+    expected = torch.rand((), generator=trainer._repair_preservation_generator)
+    torch.manual_seed(9876)
+    hooks.load([], tmp_path)
+    torch.testing.assert_close(torch.rand((), generator=trainer._repair_preservation_generator), expected)
+
+
+def test_repair_preservation_zero_accepts_legacy_missing_state_but_rejects_existing_cycle(tmp_path):
+    _, zero_trainer, zero_hooks = _preservation_state_trainer(0)
+    zero_hooks.load([], tmp_path)
+    assert zero_trainer._repair_preservation_generator is None
+    _, active_trainer, active_hooks = _preservation_state_trainer(0.5)
+    active_hooks.save([], [], tmp_path)
+    with pytest.raises(ValueError, match="probability"):
+        zero_hooks.load([], tmp_path)
+
+
+@pytest.mark.parametrize("bad", [[], [-1], [256], [1, 2, 3]])
+def test_repair_preservation_state_rejects_malformed_generator_without_mutation(tmp_path, bad):
+    _, trainer, hooks = _preservation_state_trainer(0.5)
+    hooks.save([], [], tmp_path)
+    path = tmp_path / "h3_repair_preservation_state-rank0.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["generator"] = bad
+    path.write_text(json.dumps(state), encoding="utf-8")
+    current = torch.Generator().manual_seed(77)
+    trainer._repair_preservation_generator = current
+    before = current.get_state().clone()
+    with pytest.raises(ValueError, match="generator state"):
+        hooks.load([], tmp_path)
+    torch.testing.assert_close(trainer._repair_preservation_generator.get_state(), before)
+
+
 @pytest.mark.parametrize(
     "options,match",
     [
@@ -249,10 +304,12 @@ def test_caption_repair_validation(options, match):
     [
         (["--h3_repair_scale", "4"], "require"),
         (["--h3_repair_null_anchor_weight", "0.5"], "require"),
+        (["--h3_repair_preservation_probability", "0.5"], "require"),
         (["--h3_repair_reference", "empty"], "requires"),
         (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_guidance_distillation_scale", "4"], "guidance"),
         (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_repair_sigma_weight", "0,1"], "positive"),
         (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_repair_target_multiplier", "2,2,2"], "extrapolates"),
+        (["--h3_repair_reference", "empty", "--h3_repair_scale", "4", "--h3_repair_preservation_probability", "1"], "lie in"),
     ],
 )
 def test_early_validation(options, match):
@@ -541,6 +598,75 @@ def test_repair_null_anchor_reuses_dropped_primary_empty():
     assert backend.calls[-1] == ("empty", True, True)
     assert metrics["loss/repair_null_anchor"] == pytest.approx(0.125)
     assert metrics["_loss_for_average"] == pytest.approx(float(loss.detach()) - 0.125)
+
+
+def test_repair_preservation_replaces_whole_objective_without_rescaling_or_repair_draws():
+    class Pool:
+        def draw(self, count, *, generator, exclude):
+            raise AssertionError("preservation steps must not draw caption anchors")
+
+    class EntryStateBackend(TinyBackend):
+        def __init__(self):
+            super().__init__()
+            self.entry_states = []
+
+        def predict_training(self, *values, **kwargs):
+            self.entry_states.append(torch.get_rng_state().clone())
+            return super().predict_training(*values, **kwargs)
+
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "caption",
+        "--h3_repair_scale",
+        "4",
+        "--h3_repair_caption_anchors",
+        "1",
+        "--h3_repair_caption_probability",
+        "0.25",
+        "--h3_repair_reference_weight",
+        "0.2",
+        "--h3_repair_null_anchor_weight",
+        "0.5",
+        "--h3_repair_preservation_probability",
+        "0.25",
+    )
+    trainer._repair_anchor_pool = Pool()
+    trainer._repair_preservation_active = lambda *_: True
+    caption_generator = torch.Generator().manual_seed(31)
+    anchor_random = __import__("random").Random(32)
+    trainer._repair_caption_generator = caption_generator
+    trainer._repair_anchor_random = anchor_random
+    caption_state = caption_generator.get_state().clone()
+    anchor_state = anchor_random.getstate()
+    (loss, metrics), _, backend = run_step(args, trainer, swap=True, backend=EntryStateBackend())
+    # Frozen current prompt is 4 and the live prompt is 4.5: MSE .25. The
+    # preservation probability does not scale either objective.
+    assert float(loss.detach()) == pytest.approx(0.25)
+    assert metrics["loss/repair_preservation"] == pytest.approx(0.25)
+    assert metrics["h3/repair_preservation_active"] == 1.0
+    assert backend.calls == [("prompt", False, False), ("prompt", True, True)]
+    torch.testing.assert_close(backend.entry_states[0], backend.entry_states[1])
+    assert "loss/repair_reference" not in metrics
+    assert "loss/repair_null_anchor" not in metrics
+    torch.testing.assert_close(caption_generator.get_state(), caption_state)
+    assert anchor_random.getstate() == anchor_state
+
+
+def test_repair_preservation_inactive_step_keeps_repair_objective_and_reports_zero():
+    args, trainer = configured(
+        "--h3_repair_reference",
+        "empty",
+        "--h3_repair_scale",
+        "4",
+        "--h3_repair_preservation_probability",
+        "0.25",
+    )
+    trainer._repair_preservation_active = lambda *_: False
+    (loss, metrics), _, backend = run_step(args, trainer)
+    assert float(loss.detach()) == pytest.approx(3.5**2)
+    assert metrics["h3/repair_preservation_active"] == 0.0
+    assert metrics["loss/repair_preservation"] == 0.0
+    assert len(backend.calls) == 3
 
 
 @pytest.mark.parametrize("audio", [False, True])
