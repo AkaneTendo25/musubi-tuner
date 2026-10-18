@@ -25,7 +25,7 @@ import toml
 import torch
 from accelerate import Accelerator
 from PIL import Image
-from safetensors.torch import load_file
+from safetensors.torch import load as load_safetensors, load_file, save_file
 
 from musubi_tuner import convert_lora
 from musubi_tuner.dataset import config_utils
@@ -125,6 +125,7 @@ from musubi_tuner.minimax_h3.rollout import (
     rollout_base_sigmas,
     teacher_batch,
 )
+from musubi_tuner.minimax_h3.reamplify import parse_reamplify_schedule, reamplify_target
 from musubi_tuner.minimax_h3.rollout import (
     SIGMA_FLOOR as ROLLOUT_SIGMA_FLOOR,
 )
@@ -1723,6 +1724,203 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         accelerator.register_save_state_pre_hook(save_state)
         accelerator.register_load_state_pre_hook(load_state)
 
+    def _reamplify_active(self, accelerator: Accelerator, probability: float) -> bool:
+        if probability >= 1.0:
+            return True
+        generator = self._reamplify_probability_generator
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(torch.randint(0, 1 << 62, (), device="cpu").item()))
+            self._reamplify_probability_generator = generator
+        return self._sparse_branch_active(accelerator, probability, generator)
+
+    @staticmethod
+    def _reamplify_snapshot_schema(weights: dict[str, torch.Tensor]) -> dict[str, dict[str, object]]:
+        return {key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(weights.items())}
+
+    @classmethod
+    def _strict_json_equal(cls, left, right) -> bool:
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            return set(left) == set(right) and all(cls._strict_json_equal(left[key], right[key]) for key in left)
+        if isinstance(left, list):
+            return len(left) == len(right) and all(cls._strict_json_equal(a, b) for a, b in zip(left, right))
+        return left == right
+
+    @staticmethod
+    def _reamplify_file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _reamplify_identity(self, args) -> dict[str, object]:
+        return {
+            "schedule": list(self._reamplify_schedule or ()),
+            "after": int(args.h3_reamplify_after),
+            "probability": float(args.h3_reamplify_probability),
+            "network_module": str(args.network_module),
+            "network_dim": None if getattr(args, "network_dim", None) is None else int(args.network_dim),
+            "network_alpha": None if getattr(args, "network_alpha", None) is None else float(args.network_alpha),
+            "dit": str(Path(args.dit).resolve()),
+        }
+
+    def _install_reamplify_snapshot(self, weights, args, accelerator, transformer, network, step: int) -> None:
+        current = accelerator.unwrap_model(network).snapshot_weights(torch.float32)
+        expected = self._reamplify_snapshot_schema(current)
+        if self._reamplify_snapshot_schema(weights) != expected:
+            raise ValueError("reamplification snapshot tensor inventory does not match the trainable adapter")
+        devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            teacher = self._frozen_lora_from_weights(
+                {key: value.detach().cpu().float() for key, value in weights.items()},
+                1.0,
+                accelerator,
+                transformer,
+                "reamplification snapshot",
+                f"student snapshot at completed step {step}",
+            )
+        teacher.set_enabled(False)
+        self._reamplify_snapshot_network = teacher
+        self._reamplify_snapshot_weights = {key: value.detach().cpu().float().clone() for key, value in weights.items()}
+        self._reamplify_snapshot_step = int(step)
+
+    def _take_reamplify_snapshot(self, args, accelerator, transformer, network, global_step: int) -> None:
+        if self._reamplify_snapshot_network is not None:
+            return
+        if self._reamplify_state_loaded and self._reamplify_snapshot_step is not None:
+            raise RuntimeError("reamplification resume state declared a snapshot that was not restored")
+        unwrapped = accelerator.unwrap_model(network)
+        snapshot = getattr(unwrapped, "snapshot_weights", None)
+        if not callable(snapshot):
+            raise TypeError("--h3_reamplify_scale requires a network with snapshot_weights()")
+        weights = {key: value.detach().cpu().float().clone() for key, value in snapshot(torch.float32).items()}
+        if not weights:
+            raise ValueError("--h3_reamplify_scale cannot snapshot an empty adapter")
+        self._install_reamplify_snapshot(weights, args, accelerator, transformer, network, int(global_step))
+
+    def _register_reamplify_state_hooks(self, args, accelerator, transformer, network) -> None:
+        state_name = f"h3_reamplify_state-rank{accelerator.process_index}.json"
+        snapshot_name = f"h3_reamplify_snapshot-rank{accelerator.process_index}.safetensors"
+        identity = self._reamplify_identity(args)
+
+        def save_state(_models, _weights, output_dir):
+            output = Path(output_dir)
+            snapshot_record = None
+            if self._reamplify_snapshot_weights is not None:
+                destination = output / snapshot_name
+                temporary = destination.with_name(destination.name + ".tmp")
+                save_file(self._reamplify_snapshot_weights, str(temporary))
+                os.replace(temporary, destination)
+                snapshot_record = {
+                    "file": snapshot_name,
+                    "sha256": self._reamplify_file_sha256(destination),
+                    "schema": self._reamplify_snapshot_schema(self._reamplify_snapshot_weights),
+                }
+            generator = self._reamplify_probability_generator
+            state = {
+                "version": 1,
+                "process_index": accelerator.process_index,
+                "num_processes": accelerator.num_processes,
+                "identity": identity,
+                "completed_steps": None if self._reamplify_last_global_step is None else self._reamplify_last_global_step + 1,
+                "snapshot_step": self._reamplify_snapshot_step,
+                "snapshot": snapshot_record,
+                "generator": None if generator is None else generator.get_state().tolist(),
+            }
+            destination = output / state_name
+            temporary = destination.with_name(destination.name + ".tmp")
+            temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+            os.replace(temporary, destination)
+
+        def load_state(_models, input_dir):
+            path = Path(input_dir) / state_name
+            if not path.is_file():
+                raise FileNotFoundError(f"reamplification resume state is missing: {path}")
+            state = json.loads(path.read_text(encoding="utf-8"))
+            required = {
+                "version",
+                "process_index",
+                "num_processes",
+                "identity",
+                "completed_steps",
+                "snapshot_step",
+                "snapshot",
+                "generator",
+            }
+            if not isinstance(state, dict) or set(state) != required:
+                raise ValueError("reamplification resume state has an incomplete or unsupported schema")
+            expected = {
+                "version": 1,
+                "process_index": accelerator.process_index,
+                "num_processes": accelerator.num_processes,
+                "identity": identity,
+            }
+            for key, value in expected.items():
+                if not self._strict_json_equal(state[key], value):
+                    raise ValueError(f"reamplification resume state {key} does not match this run")
+            completed = state["completed_steps"]
+            step = state["snapshot_step"]
+            if completed is not None and (type(completed) is not int or completed < 0):
+                raise ValueError("invalid reamplification completed-step counter")
+            if step is not None and (type(step) is not int or step < int(args.h3_reamplify_after)):
+                raise ValueError("invalid reamplification snapshot step")
+            if step is None and completed is not None and completed > int(args.h3_reamplify_after):
+                raise ValueError("reamplification resume passed its boundary without a snapshot")
+            if step is not None and (completed is None or completed < step + 1):
+                raise ValueError("reamplification snapshot step is inconsistent with completed training")
+            if step is not None and step != int(args.h3_reamplify_after):
+                raise ValueError("reamplification snapshot was not taken at the configured boundary")
+            record = state["snapshot"]
+            restored_weights = None
+            if step is None:
+                if record is not None:
+                    raise ValueError("reamplification state has snapshot bytes without a snapshot step")
+            else:
+                if not isinstance(record, dict) or set(record) != {"file", "sha256", "schema"}:
+                    raise ValueError("invalid reamplification snapshot record")
+                if record["file"] != snapshot_name or not re.fullmatch(r"[0-9a-f]{64}", str(record["sha256"])):
+                    raise ValueError("invalid reamplification snapshot identity")
+                snapshot_path = Path(input_dir) / snapshot_name
+                if not snapshot_path.is_file():
+                    raise ValueError("reamplification snapshot bytes do not match the saved state")
+                payload = snapshot_path.read_bytes()
+                if hashlib.sha256(payload).hexdigest() != record["sha256"]:
+                    raise ValueError("reamplification snapshot bytes do not match the saved state")
+                restored_weights = load_safetensors(payload)
+                if not self._strict_json_equal(self._reamplify_snapshot_schema(restored_weights), record["schema"]):
+                    raise ValueError("reamplification snapshot schema does not match the saved state")
+                current = accelerator.unwrap_model(network).snapshot_weights(torch.float32)
+                if self._reamplify_snapshot_schema(restored_weights) != self._reamplify_snapshot_schema(current):
+                    raise ValueError("reamplification snapshot does not match the trainable adapter topology")
+            generator_state = state["generator"]
+            restored_generator = None
+            if generator_state is not None:
+                if (
+                    not isinstance(generator_state, list)
+                    or not generator_state
+                    or any(type(item) is not int or not 0 <= item <= 255 for item in generator_state)
+                ):
+                    raise ValueError("invalid reamplification probability generator state")
+                try:
+                    restored_generator = torch.Generator()
+                    restored_generator.set_state(torch.tensor(generator_state, dtype=torch.uint8))
+                except RuntimeError as error:
+                    raise ValueError("invalid reamplification probability generator state") from error
+            if step is not None and float(args.h3_reamplify_probability) < 1.0 and restored_generator is None:
+                raise ValueError("reamplification resume is missing its probability generator state")
+            if restored_weights is not None:
+                self._install_reamplify_snapshot(restored_weights, args, accelerator, transformer, network, step)
+            self._reamplify_probability_generator = restored_generator
+            self._reamplify_snapshot_step = step
+            self._reamplify_last_global_step = None if completed is None else completed - 1
+            self._reamplify_state_loaded = True
+
+        accelerator.register_save_state_pre_hook(save_state)
+        accelerator.register_load_state_pre_hook(load_state)
+
     @staticmethod
     def _one(batch: dict, key: str) -> torch.Tensor:
         value = batch[key]
@@ -2086,6 +2284,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._repair_anchor_random: random.Random | None = None
         self._repair_caption_generator: torch.Generator | None = None
         self._repair_preservation_generator: torch.Generator | None = None
+        self._reamplify_schedule: tuple[float, ...] | None = None
+        self._reamplify_probability_generator: torch.Generator | None = None
+        self._reamplify_snapshot_network = None
+        self._reamplify_snapshot_weights: dict[str, torch.Tensor] | None = None
+        self._reamplify_snapshot_step: int | None = None
+        self._reamplify_state_loaded = False
+        self._reamplify_last_global_step: int | None = None
+        self._step_reamplify_active = False
         self._rollout_probability_generator: torch.Generator | None = None
         self._preservation_probability_generator: torch.Generator | None = None
         self._dop_probability_generator: torch.Generator | None = None
@@ -3730,10 +3936,57 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if multiplier * (1 - 1 / scale) > 1 + 1e-7:
                     raise ValueError("--h3_repair_target_multiplier extrapolates past the reference branch")
 
+    def _validate_reamplify_args(self, args) -> None:
+        schedule = parse_reamplify_schedule(getattr(args, "h3_reamplify_scale", None))
+        self._reamplify_schedule = schedule
+        after = getattr(args, "h3_reamplify_after", 0)
+        probability = getattr(args, "h3_reamplify_probability", 1.0)
+        if type(after) is not int:
+            raise ValueError("--h3_reamplify_after must be an integer")
+        if isinstance(probability, bool):
+            raise ValueError("--h3_reamplify_probability must be a real number")
+        probability = float(probability)
+        if schedule is None:
+            if after != 0 or probability != 1.0:
+                raise ValueError("reamplification scheduling options require --h3_reamplify_scale")
+            return
+        if after <= 0:
+            raise ValueError("--h3_reamplify_after must be greater than 0 for an in-run adapter snapshot")
+        if getattr(args, "resume_as_new_shard", False):
+            raise ValueError("--h3_reamplify_scale cannot use --resume_as_new_shard because its boundary uses the continued step")
+        if not math.isfinite(probability) or not 0 < probability <= 1:
+            raise ValueError("--h3_reamplify_probability must be finite and lie in (0, 1]")
+        if getattr(args, "network_module", None) not in ("networks.lora_minimax_h3", "musubi_tuner.networks.lora_minimax_h3"):
+            raise ValueError("--h3_reamplify_scale requires the stock musubi_tuner.networks.lora_minimax_h3 adapter")
+        if any(
+            str(value).lower().startswith("sds=") and str(value).split("=", 1)[1].lower() in ("true", "1")
+            for value in (getattr(args, "network_args", None) or ())
+        ):
+            raise ValueError("--h3_reamplify_scale does not support SDS-LoRA")
+        conflicts = {
+            "--h3_projection_scale": getattr(args, "h3_projection_scale", None) is not None,
+            "--h3_repair_reference": getattr(args, "h3_repair_reference", None) is not None,
+            "--h3_guidance_distillation_scale": getattr(args, "h3_guidance_distillation_scale", None) is not None,
+            "--h3_guidance_scale_range": bool(getattr(args, "h3_guidance_scale_range", None)),
+            "--h3_rollout_supervision": bool(getattr(args, "h3_rollout_supervision", False)),
+            "--h3_teacher_matching": bool(getattr(args, "h3_teacher_matching", False)),
+            "--h3_two_teacher_loss_weight": float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0,
+            "--h3_sparse_teacher_only": bool(getattr(args, "h3_sparse_teacher_only", False)),
+            "--h3_caption_dropout_rate": float(getattr(args, "h3_caption_dropout_rate", 0.0) or 0.0) > 0,
+            "--h3_overlay_weights": bool(getattr(args, "h3_overlay_weights", None)),
+            "--base_weights": bool(getattr(args, "base_weights", None)),
+        }
+        active = [name for name, configured in conflicts.items() if configured]
+        if active:
+            raise ValueError("--h3_reamplify_scale cannot be combined with " + ", ".join(active))
+        if callable(getattr(self, "_validate_full_finetune_args", None)):
+            raise ValueError("--h3_reamplify_scale is supported only for stock LoRA training")
+
     def handle_model_specific_args(self, args: argparse.Namespace):
         if getattr(args, "resume_as_new_shard", False) and not args.resume:
             raise ValueError("--resume_as_new_shard requires --resume")
         self._validate_repair_args(args)
+        self._validate_reamplify_args(args)
         self.dit_dtype = (
             torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
         )
@@ -5193,6 +5446,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args is not None:
             self.install_overlay_weights(args, accelerator, transformer)
             self.install_teacher_weights(args, accelerator, transformer)
+            if self._reamplify_schedule is not None:
+                self._register_reamplify_state_hooks(args, accelerator, transformer, network)
         del args, network, transformer
         if self._crepa is None:
             return trainable_params
@@ -7075,6 +7330,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if (
             args.h3_guidance_distillation_scale is not None
             or getattr(args, "h3_repair_reference", None) is not None
+            or self._reamplify_schedule is not None
             or float(args.h3_base_preservation_loss_weight) > 0
             or float(getattr(args, "h3_field_preservation_weight", 0.0) or 0.0) > 0
             or float(args.h3_dop_loss_weight) > 0
@@ -7313,6 +7569,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._batch_backward_performed = False
         self._sparse_teacher_eval_step = bool(getattr(args, "h3_sparse_teacher_eval_only", False))
         self._adapter_network = network
+        self._reamplify_last_global_step = int(global_step)
+        self._step_reamplify_active = False
+        if self._reamplify_schedule is not None and int(global_step) >= int(args.h3_reamplify_after):
+            self._take_reamplify_snapshot(args, accelerator, transformer, network, int(global_step))
+            self._step_reamplify_active = self._reamplify_active(accelerator, float(args.h3_reamplify_probability))
         self._adapter_prompt_only = bool(getattr(args, "h3_adapter_prompt_only", False))
         self._clean_latent_cache = {}
         # The block-swap arm gate is balanced by construction -- one hook firing
@@ -7784,6 +8045,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         projection_scale = getattr(args, "h3_projection_scale", None)
         projection_active = projection_scale is not None and conditioning == "prompt"
         projection_references = None
+        reamplify_active = bool(self._step_reamplify_active)
+        reamplify_target_prediction = None
+        if reamplify_active:
+            missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+            if missing:
+                raise KeyError("--h3_reamplify_scale requires --cache_guidance_empty; missing " + ", ".join(missing))
+            if self._reamplify_snapshot_network is None:
+                raise RuntimeError("reamplification is active without its frozen adapter snapshot")
         if projection_active:
             missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
             if missing:
@@ -8550,6 +8819,45 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if auxiliary_block_swap:
                     transformer.switch_block_swap_for_training()
 
+        if reamplify_active:
+            # Evaluate the three frozen branches at the final primary-entry RNG.
+            # Live auxiliary forwards (null anchor, DOP, field preservation)
+            # are allowed to advance the caller stream; placing this triplet here
+            # keeps every frozen branch and the primary prediction on that same
+            # resulting conditioning-noise sample.
+            student_toggle = self._runtime_network_toggle(accelerator, network, "--h3_reamplify_scale")
+            snapshot = self._reamplify_snapshot_network
+            fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+            int8_context = getattr(transformer, "int8_attention_context", None)
+            reamplify_block_swap = bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False)
+
+            def frozen_reamplify_branch(branch: str, snapshot_enabled: bool):
+                with (
+                    torch.random.fork_rng(devices=fork_devices),
+                    torch.no_grad(),
+                    int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                ):
+                    student_toggle(False)
+                    snapshot.set_enabled(snapshot_enabled)
+                    try:
+                        return self._predict(accelerator, transformer, batch, inputs, conditioning=branch)
+                    finally:
+                        snapshot.set_enabled(False)
+                        student_toggle(True)
+
+            if reamplify_block_swap:
+                transformer.switch_block_swap_for_inference()
+            try:
+                stock_empty = frozen_reamplify_branch("empty", False)
+                snapshot_prompt = frozen_reamplify_branch("prompt", True)
+                snapshot_empty = frozen_reamplify_branch("empty", True)
+            finally:
+                if reamplify_block_swap:
+                    transformer.switch_block_swap_for_training()
+            reamplify_target_prediction = reamplify_target(
+                stock_empty, snapshot_prompt, snapshot_empty, self._reamplify_schedule, base_sigma
+            )
+
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
         if self._crepa is not None:
             self._crepa.begin_step(use_crepa, global_step)
@@ -8634,6 +8942,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             result = joint_prediction_loss(
                 raw_prediction,
                 repair_preservation_reference,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+        elif reamplify_target_prediction is not None:
+            result = joint_prediction_loss(
+                raw_prediction,
+                reamplify_target_prediction,
                 video_mask=effective_video_mask,
                 audio_mask=effective_audio_mask,
                 video_sample_weight=video_sample_weight,
@@ -8740,6 +9061,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics["loss/repair_preservation"] = result.loss.detach() if repair_preservation_active else 0.0
         if projection_target is not None:
             metrics["loss/projection"] = result.loss.detach()
+        if self._reamplify_schedule is not None and global_step >= int(args.h3_reamplify_after):
+            metrics["h3/reamplify_active"] = float(reamplify_target_prediction is not None)
+            metrics["loss/reamplify"] = result.loss.detach() if reamplify_target_prediction is not None else 0.0
         if projection_scale is not None and args.h3_caption_dropout_rate > 0:
             metrics["h3/projection_active"] = float(projection_target is not None)
         # Only slot batches report these keys, so every other run's metric set
@@ -9524,6 +9848,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_repair_caption_probability": str(float(getattr(args, "h3_repair_caption_probability", 1.0))),
             "ss_h3_repair_sigma_weight": str(getattr(args, "h3_repair_sigma_weight", None)),
             "ss_h3_repair_target_multiplier": str(getattr(args, "h3_repair_target_multiplier", None)),
+            "ss_h3_reamplify_scale": str(getattr(args, "h3_reamplify_scale", None) or "off"),
+            "ss_h3_reamplify_after": str(getattr(args, "h3_reamplify_after", 0)),
+            "ss_h3_reamplify_probability": str(getattr(args, "h3_reamplify_probability", 1.0)),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_guidance_audio_scale": str(getattr(args, "h3_guidance_audio_scale", None) or "same"),
             "ss_h3_guidance_scale_range": (
@@ -10747,6 +11074,27 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "projected perpendicular to the frozen base guidance field; projection is per sample and modality over "
             "the supervised elements and requires empty conditioning caches. Omit to disable"
         ),
+    )
+    parser.add_argument(
+        "--h3_reamplify_scale",
+        type=str,
+        default=None,
+        help=(
+            "replace post-warmup data targets with a frozen adapter snapshot's prompt-to-empty field multiplied by "
+            "one explicit factor or comma-separated equal-width base-sigma-bin factors; every factor must exceed 1"
+        ),
+    )
+    parser.add_argument(
+        "--h3_reamplify_after",
+        type=int,
+        default=0,
+        help="completed optimizer steps before freezing this run's adapter as the reamplification snapshot",
+    )
+    parser.add_argument(
+        "--h3_reamplify_probability",
+        type=float,
+        default=1.0,
+        help="post-warmup share of steps using the reamplified target; other steps keep the ordinary data objective",
     )
     parser.add_argument(
         "--h3_base_preservation_loss_weight",
