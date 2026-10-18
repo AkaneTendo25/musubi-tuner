@@ -168,6 +168,60 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 logger = logging.getLogger(__name__)
 
 
+def guidance_field_preservation_loss(
+    adapted_prompt: H3ModelPrediction,
+    adapted_empty: H3ModelPrediction,
+    base_prompt: H3ModelPrediction,
+    base_empty: H3ModelPrediction,
+    *,
+    video_mask=None,
+    audio_mask=None,
+    video_sample_weight=None,
+    audio_sample_weight=None,
+    balance="token",
+    mask_normalization="weighted",
+    video_weight=1.0,
+    audio_weight=1.0,
+):
+    """Measure drift of the adapted prompt-to-empty field from the frozen base field."""
+
+    def difference(left, right, *, frozen=False):
+        if left is None or right is None:
+            return None
+        value = left.float() - right.float()
+        return value.detach() if frozen else value
+
+    adapted_field = H3ModelPrediction(
+        video=difference(adapted_prompt.video, adapted_empty.video),
+        audio=difference(adapted_prompt.audio, adapted_empty.audio),
+    )
+    base_field = H3ModelPrediction(
+        video=difference(base_prompt.video, base_empty.video, frozen=True),
+        audio=difference(base_prompt.audio, base_empty.audio, frozen=True),
+    )
+    return joint_prediction_loss(
+        adapted_field,
+        base_field,
+        video_mask=video_mask,
+        audio_mask=audio_mask,
+        video_sample_weight=video_sample_weight,
+        audio_sample_weight=audio_sample_weight,
+        balance=balance,
+        mask_normalization=mask_normalization,
+        video_weight=video_weight,
+        audio_weight=audio_weight,
+    )
+
+
+def _field_preservation_active(args, conditioning: str, global_step: int) -> bool:
+    steps = int(getattr(args, "h3_field_preservation_steps", 0) or 0)
+    return (
+        float(getattr(args, "h3_field_preservation_weight", 0.0) or 0.0) > 0
+        and conditioning == "prompt"
+        and (steps == 0 or global_step < steps)
+    )
+
+
 def _parse_h3_sparse_teacher_budgets(spec: str) -> tuple[int, ...]:
     if not spec.strip():
         return ()
@@ -3563,6 +3617,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "guidance distillation": args.h3_guidance_distillation_scale is not None
                 or bool(getattr(args, "h3_guidance_scale_range", None)),
                 "base preservation": float(args.h3_base_preservation_loss_weight) > 0,
+                "field preservation": float(getattr(args, "h3_field_preservation_weight", 0.0) or 0.0) > 0,
                 "DOP": float(args.h3_dop_loss_weight) > 0,
                 "two-teacher training": float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0,
                 "null anchoring": float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0,
@@ -3678,6 +3733,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_distillation_probability requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
+        field_weight = float(getattr(args, "h3_field_preservation_weight", 0.0) or 0.0)
+        field_steps = int(getattr(args, "h3_field_preservation_steps", 0) or 0)
+        if not math.isfinite(field_weight) or field_weight < 0:
+            raise ValueError("--h3_field_preservation_weight must be finite and non-negative")
+        if field_steps < 0:
+            raise ValueError("--h3_field_preservation_steps must be non-negative")
+        if field_steps and field_weight <= 0:
+            raise ValueError("--h3_field_preservation_steps requires --h3_field_preservation_weight above 0")
+        if field_weight > 0 and getattr(args, "h3_adapter_prompt_only", False):
+            raise ValueError(
+                "--h3_field_preservation_weight requires both adapted prompt and empty branches; "
+                "it cannot be combined with --h3_adapter_prompt_only"
+            )
+        if field_weight > 0 and bool(args.blocks_to_swap or 0) and getattr(args, "fused_backward_pass", False):
+            raise ValueError(
+                "--h3_field_preservation_weight with classic block swap stages the empty-branch backward before the "
+                "prompted branch, so it cannot use --fused_backward_pass, whose hooks would step parameters between them"
+            )
         anchor_weight = float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0)
         if getattr(args, "h3_adapter_prompt_only", False):
             if anchor_weight > 0:
@@ -6667,6 +6740,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             args.h3_guidance_distillation_scale is not None
             or getattr(args, "h3_repair_reference", None) is not None
             or float(args.h3_base_preservation_loss_weight) > 0
+            or float(getattr(args, "h3_field_preservation_weight", 0.0) or 0.0) > 0
             or float(args.h3_dop_loss_weight) > 0
             or float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0
             or bool(getattr(args, "h3_rollout_supervision", False))
@@ -7369,6 +7443,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if guidance_active_override is None
                 else guidance_active_override
             )
+        field_preservation_active = _field_preservation_active(args, conditioning, global_step)
+        field_base_prompt = field_base_empty = field_adapted_empty = None
         # The teacher's privilege lives entirely in its prompted presentation, so
         # there is no privileged null field to distil into a dropped step's
         # unconditional branch. Such a step keeps the ordinary data objective,
@@ -7468,6 +7544,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # like the others and needs the same forward-only bracket; without it a
         # run with nothing but the anchor left classic swap in the training
         # layout after a forward that never ran its backward.
+        video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
+        audio_sample_weight = self._sample_weight(args, inputs.audio_sigma, modality="audio") if has_audio else None
+        video_weight = 0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight
+        audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
+        effective_video_mask = self._mask_to_loss(
+            self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3),
+            inputs.video_target,
+            None if self._step_mask is None else self._step_mask.video_latent,
+            axis=-3,
+        )
+        effective_audio_mask = self._mask_to_loss(
+            self._extension_masked(
+                batch.get("audio_loss_mask"), inputs.audio_target, self._active_extension_audio_latents, axis=-1
+            ),
+            inputs.audio_target,
+            None if self._step_mask is None else self._step_mask.audio_latent,
+            axis=-1,
+        )
+
         null_anchor_probability = _anchor_probability(args)
         null_anchor_active = (
             float(getattr(args, "h3_guidance_null_anchor_weight", 0.0) or 0.0) > 0
@@ -7475,6 +7570,27 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             and _null_anchor_sigma_active(args, step_video_sigma)
             and self._null_anchor_probability_active(accelerator, null_anchor_probability)
         )
+        null_anchor_staged = False
+
+        def null_anchor_loss():
+            scheduled_weight = _null_anchor_weight_at(args, global_step)
+            return (
+                scheduled_weight
+                / null_anchor_probability
+                * joint_prediction_loss(
+                    null_anchor_student,
+                    null_anchor_reference,
+                    video_mask=effective_video_mask,
+                    audio_mask=effective_audio_mask,
+                    video_sample_weight=video_sample_weight,
+                    audio_sample_weight=audio_sample_weight,
+                    balance=args.h3_loss_balance,
+                    mask_normalization=args.h3_loss_mask_normalization,
+                    video_weight=video_weight,
+                    audio_weight=audio_weight,
+                ).loss
+            )
+
         auxiliary_block_swap = (
             bool(self.blocks_to_swap)
             and not getattr(self, "_block_swap_h2d_only", False)
@@ -7486,6 +7602,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 or null_anchor_active
                 or two_teacher_active
                 or sparse_teacher_weight > 0
+                or field_preservation_active
                 or getattr(args, "h3_teacher_matching", False)
             )
         )
@@ -7513,6 +7630,26 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             repair_frozen = (prompted, reference)
                     finally:
                         set_enabled(True)
+            if field_preservation_active:
+                missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+                if missing:
+                    raise KeyError("--h3_field_preservation_weight requires --cache_guidance_empty; missing " + ", ".join(missing))
+                set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_field_preservation_weight")
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                int8_context = getattr(transformer, "int8_attention_context", None)
+
+                def frozen_field_branch(branch):
+                    with (
+                        torch.random.fork_rng(devices=fork_devices),
+                        torch.no_grad(),
+                        int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                    ):
+                        set_enabled(False)
+                        try:
+                            return self._predict(accelerator, transformer, batch, inputs, conditioning=branch)
+                        finally:
+                            set_enabled(True)
+
             if getattr(args, "h3_teacher_matching", False):
                 teacher_batch, teacher_mode = self._teacher_matching_batch(args, batch, inputs, teacher_conditioned)
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_teacher_matching")
@@ -7640,15 +7777,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 null_anchor_toggle = self._runtime_network_toggle(accelerator, network, "--h3_guidance_null_anchor_weight")
                 anchor_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
                 anchor_int8 = getattr(transformer, "int8_attention_context", None)
-                if getattr(args, "h3_null_anchor_shared_draws", False):
+                stage_null_anchor = field_preservation_active and auxiliary_block_swap
+                if getattr(args, "h3_null_anchor_shared_draws", False) or stage_null_anchor:
                     # The same discipline the rollout pairs use: capture the entry RNG
                     # so the frozen reference draws the SAME conditioning noise as the
                     # student rather than the continuation of its stream. ``fork_rng``
                     # alone would only restore the state the student left behind.
                     anchor_cpu_rng = torch.get_rng_state()
                     anchor_cuda_rng = [torch.cuda.get_rng_state(device) for device in anchor_devices]
-                with self._trainable_block_swap(transformer, auxiliary_block_swap):
-                    null_anchor_student = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                if stage_null_anchor:
+                    # Consume the same draw as the ordinary live student while
+                    # leaving no graph whose streamed weights a later reference
+                    # forward could repoint. The live pass is replayed below.
+                    with torch.no_grad():
+                        self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                else:
+                    with self._trainable_block_swap(transformer, auxiliary_block_swap):
+                        null_anchor_student = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
                 if getattr(args, "h3_null_anchor_reuse_empty", False) and use_guidance and args.h3_guidance_null_source == "frozen":
                     # The guidance step already computed exactly this tensor: the
                     # frozen base's empty-prompt prediction at this state, under
@@ -7674,6 +7819,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             null_anchor_reference = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
                         finally:
                             null_anchor_toggle(True)
+                if stage_null_anchor:
+                    # The field objective stages another live derivative later.
+                    # Replay the student from its original entry RNG only after
+                    # the frozen reference has finished, then backpropagate while
+                    # the classic ring still points at this live graph.
+                    with torch.random.fork_rng(devices=anchor_devices):
+                        torch.set_rng_state(anchor_cpu_rng)
+                        for device, rng_state in zip(anchor_devices, anchor_cuda_rng):
+                            torch.cuda.set_rng_state(rng_state, device)
+                        with self._trainable_block_swap(transformer, auxiliary_block_swap):
+                            null_anchor_student = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+                            null_anchor = null_anchor_loss()
+                            accelerator.backward(null_anchor * auxiliary_backward_scale)
+                    null_anchor = null_anchor.detach()
+                    null_anchor_student = null_anchor_reference = None
+                    null_anchor_staged = True
             if preservation_active and not fused_teachers_completed:
                 set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_base_preservation_loss_weight")
                 fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
@@ -7838,6 +7999,53 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             accelerator.backward(bare_term * auxiliary_backward_scale)
             del two_teacher_bare_prediction, teacher_bare_prediction
 
+        if field_preservation_active and auxiliary_block_swap:
+            # Classic block swap cannot retain two live graphs: the second forward
+            # repoints the first graph's streamed weights. Split the exact field
+            # derivative into its two partials. The prompt value for the empty-arm
+            # partial is a no-grad probe; that partial is backpropagated before the
+            # primary prompted graph is built. The returned loss below contributes
+            # the prompted partial against the detached empty value.
+            fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+            transformer.switch_block_swap_for_inference()
+            try:
+                field_base_prompt = frozen_field_branch("prompt")
+                field_base_empty = frozen_field_branch("empty")
+                with torch.random.fork_rng(devices=fork_devices), torch.no_grad():
+                    field_prompt_probe = self._predict(accelerator, transformer, batch, inputs, conditioning="prompt")
+            finally:
+                transformer.switch_block_swap_for_training()
+            with torch.random.fork_rng(devices=fork_devices):
+                field_empty_graph = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+            empty_partial = guidance_field_preservation_loss(
+                H3ModelPrediction(
+                    None if field_prompt_probe.video is None else field_prompt_probe.video.detach(),
+                    None if field_prompt_probe.audio is None else field_prompt_probe.audio.detach(),
+                ),
+                field_empty_graph,
+                field_base_prompt,
+                field_base_empty,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+            accelerator.backward(float(args.h3_field_preservation_weight) * empty_partial.loss * auxiliary_backward_scale)
+            field_adapted_empty = H3ModelPrediction(
+                None if field_empty_graph.video is None else field_empty_graph.video.detach(),
+                None if field_empty_graph.audio is None else field_empty_graph.audio.detach(),
+            )
+            del field_prompt_probe, field_empty_graph
+        elif field_preservation_active:
+            field_base_prompt = frozen_field_branch("prompt")
+            field_base_empty = frozen_field_branch("empty")
+            with torch.random.fork_rng(devices=[accelerator.device] if accelerator.device.type == "cuda" else []):
+                field_adapted_empty = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
+
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
         if self._crepa is not None:
             self._crepa.begin_step(use_crepa, global_step)
@@ -7861,24 +8069,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 args, prediction, empty_prediction, inputs, accelerator=accelerator
             )
 
-        video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
-        audio_sample_weight = self._sample_weight(args, inputs.audio_sigma, modality="audio") if has_audio else None
-        video_weight = 0.0 if observed == "video" or spatial_tokens else args.h3_video_loss_weight
-        audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
-        effective_video_mask = self._mask_to_loss(
-            self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._active_extension_video_frames, axis=-3),
-            inputs.video_target,
-            None if self._step_mask is None else self._step_mask.video_latent,
-            axis=-3,
-        )
-        effective_audio_mask = self._mask_to_loss(
-            self._extension_masked(
-                batch.get("audio_loss_mask"), inputs.audio_target, self._active_extension_audio_latents, axis=-1
-            ),
-            inputs.audio_target,
-            None if self._step_mask is None else self._step_mask.audio_latent,
-            axis=-1,
-        )
+        field_preservation_term = None
+        if field_preservation_active:
+            preserved = guidance_field_preservation_loss(
+                raw_prediction,
+                field_adapted_empty,
+                field_base_prompt,
+                field_base_empty,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
+                balance=args.h3_loss_balance,
+                mask_normalization=args.h3_loss_mask_normalization,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+            field_preservation_term = float(args.h3_field_preservation_weight) * preserved.loss
 
         def _velocity_loss(step_prediction, step_inputs):
             return joint_velocity_loss(
@@ -8373,6 +8580,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.h3_base_preservation_loss_weight > 0:
             metrics["h3/base_preservation_active"] = float(preservation_active)
             metrics.setdefault("loss/base_preservation", 0.0)
+        if field_preservation_term is not None:
+            loss = loss + field_preservation_term
+            metrics["loss/field_preservation"] = field_preservation_term.detach()
+        if float(getattr(args, "h3_field_preservation_weight", 0.0) or 0.0) > 0:
+            metrics.setdefault("loss/field_preservation", 0.0)
         sparse_teacher_term = None
         if sparse_teacher_prediction is not None:
             sparse_teacher = joint_prediction_loss(
@@ -8417,26 +8629,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 metrics["h3/sparse_teacher_rel_l2"],
                 metrics["h3/sparse_teacher_cosine"],
             )
-        if null_anchor_student is not None and null_anchor_reference is not None:
+        if null_anchor_staged:
+            # The derivative was applied above, but retain the scalar in the
+            # reported total before the average-loss normalization removes it.
+            loss = loss + null_anchor
+            metrics["loss/guidance_null_anchor"] = null_anchor.detach()
+            if getattr(args, "h3_guidance_null_anchor_weight_end", None) is not None:
+                metrics["h3/null_anchor_weight"] = _null_anchor_weight_at(args, global_step)
+        elif null_anchor_student is not None and null_anchor_reference is not None:
             # A sparse anchor is an estimator of the dense one: the active term is
             # divided by its probability so the expected gradient is unchanged.
             scheduled_anchor_weight = _null_anchor_weight_at(args, global_step)
-            null_anchor = (
-                scheduled_anchor_weight
-                / null_anchor_probability
-                * joint_prediction_loss(
-                    null_anchor_student,
-                    null_anchor_reference,
-                    video_mask=effective_video_mask,
-                    audio_mask=effective_audio_mask,
-                    video_sample_weight=video_sample_weight,
-                    audio_sample_weight=audio_sample_weight,
-                    balance=args.h3_loss_balance,
-                    mask_normalization=args.h3_loss_mask_normalization,
-                    video_weight=video_weight,
-                    audio_weight=audio_weight,
-                ).loss
-            )
+            null_anchor = null_anchor_loss()
             loss = loss + null_anchor
             metrics["loss/guidance_null_anchor"] = null_anchor.detach()
             if getattr(args, "h3_guidance_null_anchor_weight_end", None) is not None:
@@ -8459,6 +8663,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics.update(self._crepa.status_metrics())
         if (
             base_preservation_term is not None
+            or field_preservation_term is not None
             or guidance_rescaled
             or dop_term is not None
             or rollout_replaced
@@ -8470,6 +8675,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             average_loss = loss
             if base_preservation_term is not None:
                 average_loss = average_loss - base_preservation_term
+            if field_preservation_term is not None:
+                average_loss = average_loss - field_preservation_term
             if null_anchor is not None:
                 # An auxiliary term like preservation, and removed for the same
                 # reason: the reported average is the ordinary data loss a run
@@ -8756,6 +8963,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_mask_mode": args.h3_mask_mode,
             "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
+            "ss_h3_field_preservation_weight": str(float(getattr(args, "h3_field_preservation_weight", 0.0) or 0.0)),
+            "ss_h3_field_preservation_steps": str(int(getattr(args, "h3_field_preservation_steps", 0) or 0)),
             "ss_h3_guidance_null_anchor_weight": str(getattr(args, "h3_guidance_null_anchor_weight", 0.0)),
             "ss_h3_guidance_null_anchor_weight_end": str(getattr(args, "h3_guidance_null_anchor_weight_end", None)),
             "ss_h3_guidance_null_anchor_probability": str(_anchor_probability(args)),
@@ -9873,6 +10082,21 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "and the anchored student's draw is independent of either. No effect without guidance distillation, a "
             "frozen null source, or an active anchor"
         ),
+    )
+    parser.add_argument(
+        "--h3_field_preservation_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "penalty on drift of the adapted prompt-to-empty prediction field from the frozen base field; "
+            "both adapted branches carry gradient and the feature requires empty conditioning caches"
+        ),
+    )
+    parser.add_argument(
+        "--h3_field_preservation_steps",
+        type=int,
+        default=0,
+        help="apply field preservation for this many optimizer steps; 0 applies it throughout",
     )
     parser.add_argument(
         "--h3_base_preservation_loss_weight",
