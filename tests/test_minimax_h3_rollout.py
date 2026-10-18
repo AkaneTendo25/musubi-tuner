@@ -953,28 +953,60 @@ def test_inactive_rollout_validation_and_metadata(tmp_path):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(
             _flag_args(*_INACTIVE_VELOCITY_FLAGS, "--h3_rollout_probability", "0", teacher=teacher)
         )
-    with pytest.raises(ValueError, match="fused_teacher to be disabled"):
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(
+        _flag_args(*_INACTIVE_VELOCITY_FLAGS, "--h3_rollout_fused_teacher", teacher=teacher)
+    )
+    for dropout in (
+        ("--network_dropout", "0.1"),
+        ("--network_args", "rank_dropout=0.1"),
+        ("--network_args", "module_dropout=0.1"),
+    ):
+        with pytest.raises(ValueError, match="dropout to be disabled"):
+            MiniMaxH3NetworkTrainer().handle_model_specific_args(
+                _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_fused_teacher", *dropout, teacher=teacher)
+            )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(
+        _flag_args(
+            *_ROLLOUT_FLAGS,
+            "--h3_rollout_fused_teacher",
+            "--network_args",
+            "rank_dropout=invalid",
+            "rank_dropout=0",
+            teacher=teacher,
+        )
+    )
+    with pytest.raises(ValueError, match="dropout to be disabled"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(
-            _flag_args(*_INACTIVE_VELOCITY_FLAGS, "--h3_rollout_fused_teacher", teacher=teacher)
+            _flag_args(
+                *_ROLLOUT_FLAGS,
+                "--h3_rollout_fused_teacher",
+                "--network_dropout",
+                "0.1",
+                "--network_args",
+                "dropout=0",
+                teacher=teacher,
+            )
         )
     with pytest.raises(ValueError, match="live prompt and empty"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(
             _flag_args(*_INACTIVE_GAP_FLAGS, "--h3_adapter_prompt_only", teacher=teacher)
         )
-    with pytest.raises(ValueError, match="classic block swap"):
-        MiniMaxH3NetworkTrainer().handle_model_specific_args(
-            _flag_args(
-                *_ROLLOUT_FLAGS,
-                "--blocks_to_swap",
-                "1",
-                "--fused_backward_pass",
-                "--optimizer_type",
-                "Adafactor",
-                "--max_grad_norm",
-                "0",
-                teacher=teacher,
+    for fused in ((), ("--h3_rollout_fused_teacher",)):
+        with pytest.raises(ValueError, match="classic block swap"):
+            MiniMaxH3NetworkTrainer().handle_model_specific_args(
+                _flag_args(
+                    *_ROLLOUT_FLAGS,
+                    *fused,
+                    "--blocks_to_swap",
+                    "1",
+                    "--fused_backward_pass",
+                    "--optimizer_type",
+                    "Adafactor",
+                    "--max_grad_norm",
+                    "0",
+                    teacher=teacher,
+                )
             )
-        )
 
 
 def test_rollout_active_step_runs_j_no_grad_then_m_graded_pairs(tmp_path):
@@ -1342,16 +1374,18 @@ def test_rollout_brackets_every_no_grad_forward_on_the_forward_only_swap(tmp_pat
         ("--h3_rollout_field_floor", "0.2", "--h3_rollout_null_anchor_weight", "0.3"),
     ],
 )
-def test_classic_staged_rollout_matches_retained_joint_loss_and_gradient(tmp_path, extra):
+@pytest.mark.parametrize("fused", [False, True])
+def test_classic_staged_rollout_matches_retained_joint_loss_and_gradient(tmp_path, extra, fused):
     teacher = _teacher_file(tmp_path)
-    args = _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_window", "2", *extra, teacher=teacher)
+    fused_flag = ("--h3_rollout_fused_teacher",) if fused else ()
+    args = _flag_args(*_ROLLOUT_FLAGS, "--h3_rollout_window", "2", *extra, *fused_flag, teacher=teacher)
 
     def run(classic):
         trainer = MiniMaxH3NetworkTrainer()
         trainer.handle_model_specific_args(args)
         trainer.dit_dtype = torch.float32
         trainer.blocks_to_swap = 4 if classic else 0
-        trainer.backend = _SwapRecordingBackend()
+        trainer.backend = _FusedRolloutBackend() if fused else _SwapRecordingBackend()
         trainer._rollout_teacher = _StubTeacherCache()
         trainer._rollout_supervision_active = lambda accelerator, probability: True
         transformer = _SwapAwareScaleTransformer()
@@ -1910,6 +1944,86 @@ class _FusedRolloutBackend(_RolloutBackend):
                     )
                 )
         return predictions
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_arms"),
+    [(_INACTIVE_VELOCITY_FLAGS, 2), (_INACTIVE_GAP_FLAGS, 4)],
+)
+def test_inactive_depth_zero_fusion_uses_actual_sibling_arms_and_matches_unfused(tmp_path, flags, expected_arms):
+    teacher = _teacher_file(tmp_path)
+    unfused_transformer = _ScaleTransformer()
+    unfused_backend, unfused_loss, unfused_metrics, _ = _run_step(
+        *flags,
+        teacher=teacher,
+        active=False,
+        backend=_FusedRolloutBackend(),
+        transformer=unfused_transformer,
+        seed=37,
+    )
+    unfused_loss.backward()
+    unfused_rng = torch.get_rng_state().clone()
+
+    fused_transformer = _ScaleTransformer()
+    fused_backend, fused_loss, fused_metrics, _ = _run_step(
+        *flags,
+        "--h3_rollout_fused_teacher",
+        teacher=teacher,
+        active=False,
+        backend=_FusedRolloutBackend(),
+        transformer=fused_transformer,
+        seed=37,
+    )
+    fused_loss.backward()
+    fused_rng = torch.get_rng_state().clone()
+
+    assert unfused_backend.fused_calls == 0
+    assert fused_backend.fused_calls == 1
+    assert len(fused_backend.calls) == expected_arms
+    expected = (
+        [("prompt", True, True), ("prompt", False, False)]
+        if expected_arms == 2
+        else [
+            ("prompt", True, True),
+            ("empty", True, True),
+            ("prompt", False, False),
+            ("empty", False, False),
+        ]
+    )
+    assert [(call["conditioning"], call["adapter"], call["grad"]) for call in fused_backend.calls] == expected
+    torch.testing.assert_close(fused_loss, unfused_loss, rtol=0, atol=0)
+    torch.testing.assert_close(fused_transformer.scale.grad, unfused_transformer.scale.grad, rtol=0, atol=0)
+    assert fused_metrics == unfused_metrics
+    assert torch.equal(fused_rng, unfused_rng)
+
+
+def test_frozen_fused_contexts_restore_the_actual_prior_adapter_state_on_exceptions():
+    from musubi_tuner.minimax_h3_train_network import _forked_frozen_build
+
+    class Toggle:
+        def __init__(self, enabled):
+            self.enabled = enabled
+
+        def __call__(self, enabled):
+            self.enabled = bool(enabled)
+
+        def is_enabled(self):
+            return self.enabled
+
+    for enabled in (False, True):
+        toggle = Toggle(enabled)
+        with pytest.raises(RuntimeError, match="build"):
+            with _forked_frozen_build([], toggle):
+                assert toggle.enabled is False
+                raise RuntimeError("build")
+        assert toggle.enabled is enabled
+
+        run = MiniMaxH3NetworkTrainer._frozen_arm_context(toggle)
+        with pytest.raises(RuntimeError, match="run"):
+            with run():
+                assert toggle.enabled is False
+                raise RuntimeError("run")
+        assert toggle.enabled is enabled
 
 
 class _Int8AwareScaleTransformer(_ScaleTransformer):

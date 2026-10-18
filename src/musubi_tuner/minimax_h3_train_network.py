@@ -1421,8 +1421,29 @@ _ROLLOUT_INACTIVE_PROBABILITY_DEFAULT = 1.0
 _PREDICT_POSITIONAL_KEYS = frozenset(("batch", "video_hidden_states", "audio_hidden_states", "video_timestep", "audio_timestep"))
 
 
+def _restore_rng(cpu_rng: torch.Tensor | None, cuda_rng: list[torch.Tensor] | None, devices: list) -> None:
+    if cpu_rng is None:
+        return
+    torch.set_rng_state(cpu_rng)
+    for device, state in zip(devices, cuda_rng or (), strict=True):
+        torch.cuda.set_rng_state(state, device)
+
+
 @contextmanager
-def _forked_frozen_build(fork_devices: list, set_enabled):
+def _forked_build_replay(fork_devices: list, cpu_rng: torch.Tensor, cuda_rng: list[torch.Tensor]):
+    """Build a sibling fused arm from the first arm's RNG entry."""
+    with torch.random.fork_rng(devices=fork_devices):
+        _restore_rng(cpu_rng, cuda_rng, fork_devices)
+        yield
+
+
+@contextmanager
+def _forked_frozen_build(
+    fork_devices: list,
+    set_enabled,
+    cpu_rng: torch.Tensor | None = None,
+    cuda_rng: list[torch.Tensor] | None = None,
+):
     """Build one frozen arm's packed sequence without disturbing the others.
 
     Entered once per fused forward, around the stage that draws: the conditioning
@@ -1432,11 +1453,14 @@ def _forked_frozen_build(fork_devices: list, set_enabled):
     the build rather than of the block loop.
     """
     with torch.random.fork_rng(devices=fork_devices), torch.no_grad():
-        set_enabled(False)
+        _restore_rng(cpu_rng, cuda_rng, fork_devices)
+        is_enabled = getattr(set_enabled, "is_enabled", None)
+        prior = bool(is_enabled()) if callable(is_enabled) else True
         try:
+            set_enabled(False)
             yield
         finally:
-            set_enabled(True)
+            set_enabled(prior)
 
 
 def _aux_int8_run(run, int8_context):
@@ -6782,14 +6806,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_rollout_inactive_weight must be finite and greater than 0")
         if inactive_mode != "off" and (not math.isfinite(inactive_probability) or not 0 < inactive_probability <= 1):
             raise ValueError("--h3_rollout_inactive_probability must be finite and lie in (0, 1]")
-        if inactive_mode != "off" and bool(getattr(args, "h3_rollout_fused_teacher", False)):
-            raise ValueError("inactive rollout supervision currently requires --h3_rollout_fused_teacher to be disabled")
         if inactive_mode == "teacher_gap" and bool(getattr(args, "h3_adapter_prompt_only", False)):
             raise ValueError("teacher_gap requires live prompt and empty adapter branches; disable --h3_adapter_prompt_only")
+        if getattr(args, "h3_rollout_fused_teacher", False):
+            scalar_dropout = float(getattr(args, "network_dropout", 0.0) or 0.0)
+            dropout_values = {}
+            for value in getattr(args, "network_args", None) or ():
+                key, separator, raw = str(value).partition("=")
+                if separator and key in {"dropout", "rank_dropout", "module_dropout"}:
+                    dropout_values[key] = raw
+            try:
+                configured_dropouts = (scalar_dropout, *(float(value) for value in dropout_values.values()))
+            except ValueError as error:
+                raise ValueError("invalid network dropout value") from error
+            if any(not math.isfinite(value) or value != 0 for value in configured_dropouts):
+                raise ValueError("--h3_rollout_fused_teacher requires network, rank, and module dropout to be disabled")
         if (
             bool(args.blocks_to_swap or 0)
             and not getattr(args, "block_swap_h2d_only", False)
-            and not bool(getattr(args, "h3_rollout_fused_teacher", False))
             and getattr(args, "fused_backward_pass", False)
         ):
             raise ValueError(
@@ -6926,6 +6960,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         set_enabled = getattr(unwrapped_network, "set_enabled", None)
         if not callable(set_enabled):
             raise TypeError(f"{requirement} requires a network with set_enabled()")
+        is_enabled = getattr(unwrapped_network, "is_enabled", None)
 
         # Every frozen-base forward in this trainer takes its toggle from here, so
         # recording the requested state on the network is enough for the
@@ -6934,6 +6969,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         def tracked(enabled: bool) -> None:
             unwrapped_network._h3_adapter_enabled = bool(enabled)
             set_enabled(enabled)
+
+        tracked.is_enabled = lambda: (
+            bool(is_enabled()) if callable(is_enabled) else bool(getattr(unwrapped_network, "_h3_adapter_enabled", True))
+        )
 
         return tracked
 
@@ -7061,11 +7100,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         @contextmanager
         def enter():
             with torch.no_grad():
-                set_enabled(False)
+                is_enabled = getattr(set_enabled, "is_enabled", None)
+                prior = bool(is_enabled()) if callable(is_enabled) else True
                 try:
+                    set_enabled(False)
                     yield
                 finally:
-                    set_enabled(True)
+                    set_enabled(prior)
 
         return enter
 
@@ -7116,6 +7157,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # alone -- the same coverage the unfused window gives those arms.
             # The student and its empty branch keep the dense kernel.
             run = _aux_int8_run(run, int8_context)
+        entry_cpu_rng = torch.get_rng_state()
+        entry_cuda_rng = [torch.cuda.get_rng_state(device) for device in fork_devices]
         student = H3FusedArm(call=self._predict_call(accelerator, batch, state, conditioning=conditioning))
         teacher = H3FusedArm(
             call=self._predict_call(
@@ -7132,7 +7175,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # state and not two. It brackets the teacher's packed-sequence build,
             # which is the only stage that draws; the block loop draws nothing,
             # which is why ``run`` must not fork and does not.
-            build=lambda: _forked_frozen_build(fork_devices, set_enabled),
+            build=lambda: _forked_frozen_build(fork_devices, set_enabled, entry_cpu_rng, entry_cuda_rng),
             run=run,
         )
         arms = [student, teacher]
@@ -7142,14 +7185,55 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         arms.extend(
             H3FusedArm(
                 call=self._predict_call(accelerator, batch, state, conditioning=branch),
-                build=lambda: _forked_frozen_build(fork_devices, set_enabled),
+                build=lambda: _forked_frozen_build(fork_devices, set_enabled, entry_cpu_rng, entry_cuda_rng),
                 run=run,
             )
             for branch in frozen_branches
         )
         if student_empty:
             # Graded, adapter on: the student's own empty branch at this state.
-            arms.append(H3FusedArm(call=self._predict_call(accelerator, batch, state, conditioning="empty")))
+            arms.append(
+                H3FusedArm(
+                    call=self._predict_call(accelerator, batch, state, conditioning="empty"),
+                    build=lambda: _forked_build_replay(fork_devices, entry_cpu_rng, entry_cuda_rng),
+                )
+            )
+        return self._predict_fused(accelerator, transformer, arms)
+
+    def _fused_depth_zero_arms(self, accelerator, transformer, network, batch, inputs, *, gap: bool):
+        """Evaluate inactive depth-zero supervision in one actual fused traversal."""
+        presentation = self._teacher_presentation(batch, include_empty=gap)
+        devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+        set_enabled = self._runtime_network_toggle(accelerator, network, "--h3_rollout_inactive_supervision")
+        run = self._frozen_arm_context(set_enabled)
+        int8_context = getattr(transformer, "int8_attention_context", None)
+        if callable(int8_context) and getattr(transformer, "int8_attention_mode", "off") == "aux":
+            run = _aux_int8_run(run, int8_context)
+        entry_cpu_rng = torch.get_rng_state()
+        entry_cuda_rng = [torch.cuda.get_rng_state(device) for device in devices]
+        arms = [H3FusedArm(call=self._predict_call(accelerator, batch, inputs, conditioning="prompt"))]
+        if gap:
+            arms.append(
+                H3FusedArm(
+                    call=self._predict_call(accelerator, batch, inputs, conditioning="empty"),
+                    build=lambda: _forked_build_replay(devices, entry_cpu_rng, entry_cuda_rng),
+                )
+            )
+        arms.append(
+            H3FusedArm(
+                call=self._predict_call(accelerator, presentation, inputs, conditioning="prompt"),
+                build=lambda: _forked_frozen_build(devices, set_enabled, entry_cpu_rng, entry_cuda_rng),
+                run=run,
+            )
+        )
+        if gap:
+            arms.append(
+                H3FusedArm(
+                    call=self._predict_call(accelerator, presentation, inputs, conditioning="empty"),
+                    build=lambda: _forked_frozen_build(devices, set_enabled, entry_cpu_rng, entry_cuda_rng),
+                    run=run,
+                )
+            )
         return self._predict_fused(accelerator, transformer, arms)
 
     def _teacher_presentation(self, batch: dict, *, include_empty: bool = False) -> dict:
@@ -7697,6 +7781,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         floor_count = torch.zeros((), device=accelerator.device)
         diagnostic_cos = []
         diagnostic_ratio = []
+        fused = bool(getattr(args, "h3_rollout_fused_teacher", False))
         for record_index, (index, state, cpu_rng, cuda_rng, _probe, teacher, base_prompt, base_empty) in enumerate(records):
             state_sigma = video_sigmas[index : index + 1]
             sample_weight = self._sample_weight(args, state_sigma)
@@ -7706,7 +7791,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 for device, rng in zip(devices, cuda_rng, strict=True):
                     torch.cuda.set_rng_state(rng, device)
 
-            if anchor_weight > 0:
+            if anchor_weight > 0 and not fused:
                 with torch.random.fork_rng(devices=devices):
                     replay_rng()
                     student_empty = self._predict(accelerator, transformer, batch, state, conditioning="empty")
@@ -7732,14 +7817,36 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
             with torch.random.fork_rng(devices=devices):
                 replay_rng()
-                student = self._predict(accelerator, transformer, batch, state, conditioning=conditioning)
+                student_empty = None
+                if fused:
+                    student, teacher, *siblings = self._fused_rollout_pair(
+                        accelerator,
+                        transformer,
+                        batch,
+                        teacher_presentation,
+                        state,
+                        conditioning=conditioning,
+                        set_enabled=set_enabled,
+                        fork_devices=devices,
+                        frozen_base=needs_base,
+                        frozen_empty=anchor_weight > 0 and not needs_base,
+                        student_empty=anchor_weight > 0,
+                    )
+                    if anchor_weight > 0:
+                        student_empty = siblings.pop()
+                    if needs_base:
+                        base_prompt, base_empty = siblings
+                    elif anchor_weight > 0:
+                        base_empty = siblings[0]
+                else:
+                    student = self._predict(accelerator, transformer, batch, state, conditioning=conditioning)
                 zero_audio = student.audio.detach() if student.audio is not None else None
                 terms = self._rollout_state_loss_terms(
                     args,
                     student,
                     teacher,
                     (base_prompt, base_empty) if needs_base else None,
-                    None,
+                    student_empty,
                     state_sigma,
                     zero_audio,
                     zero_audio,
@@ -7755,6 +7862,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 length_numerator += terms["length_sum"]
                 length_count += terms["length_count"]
                 prompt_loss = teacher_loss if magnitude is None else teacher_loss + magnitude
+                anchor = None if terms["null_anchor_term"] is None else terms["null_anchor_term"] / window
+                if anchor is not None:
+                    prompt_loss = prompt_loss + anchor
                 floor = None
                 if field_floor_weight > 0:
                     ratios = terms["floor_ratio"]
@@ -7772,6 +7882,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 teacher_video_total = teacher_video_total + terms["teacher_result"].video_loss.detach() / window
                 if magnitude is not None:
                     magnitude_total = magnitude_total + magnitude.detach()
+                if anchor is not None:
+                    anchor_total = anchor_total + anchor.detach()
                 if floor is not None:
                     floor_total = floor_total + floor.detach()
                 if terms["diagnostics"] is not None:
@@ -9796,7 +9908,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 ).loss
             )
 
-        if rollout_inactive:
+        inactive_fused = rollout_inactive and bool(getattr(args, "h3_rollout_fused_teacher", False))
+        fused_primary_prediction = None
+        if inactive_fused:
+            fused_depth_zero = self._fused_depth_zero_arms(
+                accelerator,
+                transformer,
+                network,
+                batch,
+                inputs,
+                gap=inactive_mode == "teacher_gap",
+            )
+            if inactive_mode == "teacher_gap":
+                fused_primary_prediction, inactive_student_empty, inactive_teacher, inactive_teacher_empty = fused_depth_zero
+            else:
+                fused_primary_prediction, inactive_teacher = fused_depth_zero
+        elif rollout_inactive:
             if inactive_mode == "teacher_gap" and inactive_block_swap:
                 # Classic block swap cannot retain two live graphs while frozen
                 # forwards move the streamed blocks. Replay the primary entry for
@@ -9829,9 +9956,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     with torch.random.fork_rng(devices=inactive_devices):
                         inactive_student_empty = self._predict(accelerator, transformer, batch, inputs, conditioning="empty")
 
-        classic_staged_rollout = (
-            rollout_active and inactive_block_swap and not bool(getattr(args, "h3_rollout_fused_teacher", False))
-        )
+        classic_staged_rollout = rollout_active and inactive_block_swap
         staged_rollout = None
         primary_replay_rng = None
         if classic_staged_rollout:
@@ -9868,7 +9993,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._crepa.begin_step(use_crepa, global_step)
         try:
             with torch.no_grad() if getattr(args, "h3_sparse_teacher_eval_only", False) else nullcontext():
-                if primary_replay_rng is None:
+                if fused_primary_prediction is not None:
+                    raw_prediction = fused_primary_prediction
+                elif primary_replay_rng is None:
                     raw_prediction = self._predict(
                         accelerator,
                         transformer,
