@@ -1820,6 +1820,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._reamplify_last_field_measurement = measurement
 
     def _resolve_reamplify_schedule(self, args) -> tuple[float, ...]:
+        if self._reamplify_overlay_identity_bound is not None and not self._reamplify_overlay_runtime_verified:
+            if not self._strict_json_equal(self._reamplify_overlay_identity(args), self._reamplify_overlay_identity_bound):
+                raise ValueError("reamplification overlay bytes or topology changed after configuration")
+            self._reamplify_overlay_runtime_verified = True
         if isinstance(self._reamplify_schedule, tuple):
             return self._reamplify_schedule
         if self._reamplify_schedule != REAMPLIFY_AUTO:
@@ -1866,7 +1870,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return resolved
 
     def _reamplify_identity(self, args) -> dict[str, object]:
-        return {
+        identity = {
             "schedule": REAMPLIFY_AUTO if self._reamplify_schedule == REAMPLIFY_AUTO else list(self._reamplify_schedule or ()),
             "after": int(args.h3_reamplify_after),
             "probability": float(args.h3_reamplify_probability),
@@ -1874,6 +1878,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "network_dim": None if getattr(args, "network_dim", None) is None else int(args.network_dim),
             "network_alpha": None if getattr(args, "network_alpha", None) is None else float(args.network_alpha),
             "dit": str(Path(args.dit).resolve()),
+        }
+        if getattr(args, "h3_overlay_weights", None):
+            identity["composition"] = self._reamplify_overlay_identity_bound or self._reamplify_overlay_identity(args)
+            identity["composition_mode"] = "external" if int(args.h3_reamplify_after) == 0 else "overlay+snapshot"
+        return identity
+
+    @staticmethod
+    def _reamplify_overlay_identity(args) -> dict[str, object]:
+        path = Path(args.h3_overlay_weights).expanduser().resolve()
+        payload = path.read_bytes()
+        weights = load_safetensors(payload)
+        schema = {key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(weights.items())}
+        if not schema:
+            raise ValueError("--h3_overlay_weights cannot identify an empty adapter")
+        return {
+            "path": os.path.normcase(str(path)),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "multiplier": float(args.h3_overlay_weights_multiplier),
+            "schema": schema,
         }
 
     def _install_reamplify_snapshot(self, weights, args, accelerator, transformer, network, step: int) -> None:
@@ -1897,6 +1920,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._reamplify_snapshot_step = int(step)
 
     def _take_reamplify_snapshot(self, args, accelerator, transformer, network, global_step: int) -> None:
+        if int(args.h3_reamplify_after) == 0:
+            self._reamplify_snapshot_step = 0
+            return
         if self._reamplify_snapshot_network is not None:
             return
         if self._reamplify_state_loaded and self._reamplify_snapshot_step is not None:
@@ -1922,8 +1948,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         state_name = f"h3_reamplify_state-rank{accelerator.process_index}.json"
         snapshot_name = f"h3_reamplify_snapshot-rank{accelerator.process_index}.safetensors"
         identity = self._reamplify_identity(args)
+        state_version = 3 if getattr(args, "h3_overlay_weights", None) else 2
 
         def save_state(_models, _weights, output_dir):
+            if self._reamplify_overlay_identity_bound is not None and not self._strict_json_equal(
+                self._reamplify_overlay_identity(args), self._reamplify_overlay_identity_bound
+            ):
+                raise ValueError("reamplification overlay changed before checkpoint save")
             output = Path(output_dir)
             snapshot_record = None
             if self._reamplify_snapshot_weights is not None:
@@ -1939,7 +1970,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 }
             generator = self._reamplify_probability_generator
             state = {
-                "version": 2,
+                "version": state_version,
                 "process_index": accelerator.process_index,
                 "num_processes": accelerator.num_processes,
                 "identity": identity,
@@ -1963,6 +1994,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             os.replace(temporary, destination)
 
         def load_state(_models, input_dir):
+            if self._reamplify_overlay_identity_bound is not None and not self._strict_json_equal(
+                self._reamplify_overlay_identity(args), self._reamplify_overlay_identity_bound
+            ):
+                raise ValueError("reamplification overlay changed before checkpoint load")
             path = Path(input_dir) / state_name
             if not path.is_file():
                 raise FileNotFoundError(f"reamplification resume state is missing: {path}")
@@ -1981,13 +2016,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if not isinstance(state, dict) or set(state) not in (v1_keys, v2_keys):
                 raise ValueError("reamplification resume state has an incomplete or unsupported schema")
             version = state["version"]
-            if type(version) is not int or version not in (1, 2):
+            if type(version) is not int or version not in (1, 2, 3):
                 raise ValueError("reamplification resume state version does not match this run")
             if version == 1:
                 if self._reamplify_schedule == REAMPLIFY_AUTO or set(state) != v1_keys:
                     raise ValueError("reamplification v1 resume state supports explicit schedules only")
             elif set(state) != v2_keys:
                 raise ValueError("reamplification resume state has an incomplete or unsupported schema")
+            if version == 3 and not getattr(args, "h3_overlay_weights", None):
+                raise ValueError("reamplification v3 resume state requires its external overlay")
             expected = {
                 "version": version,
                 "process_index": accelerator.process_index,
@@ -2011,7 +2048,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("reamplification snapshot was not taken at the configured boundary")
             record = state["snapshot"]
             restored_weights = None
-            if step is None:
+            external_only = version == 3 and int(args.h3_reamplify_after) == 0
+            if step is None or external_only:
                 if record is not None:
                     raise ValueError("reamplification state has snapshot bytes without a snapshot step")
             else:
@@ -2032,7 +2070,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 current = accelerator.unwrap_model(network).snapshot_weights(torch.float32)
                 if self._reamplify_snapshot_schema(restored_weights) != self._reamplify_snapshot_schema(current):
                     raise ValueError("reamplification snapshot does not match the trainable adapter topology")
-                if version == 2 and (
+                if version >= 2 and (
                     not re.fullmatch(r"[0-9a-f]{64}", str(record["adapter_sha256"]))
                     or self._reamplify_weights_sha256(restored_weights) != record["adapter_sha256"]
                 ):
@@ -2056,7 +2094,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             restored_ratios = None
             restored_measurement = None
             restored_resolved = self._reamplify_resolved_schedule
-            if version == 2:
+            if version >= 2:
                 raw_ratios = state["field_ratios"]
                 restored_measurement = state["field_measurement"]
                 raw_resolved = state["resolved_schedule"]
@@ -2506,6 +2544,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._repair_caption_generator: torch.Generator | None = None
         self._repair_preservation_generator: torch.Generator | None = None
         self._reamplify_schedule: tuple[float, ...] | str | None = None
+        self._reamplify_overlay_identity_bound: dict[str, object] | None = None
+        self._reamplify_overlay_runtime_verified = False
         self._reamplify_resolved_schedule: tuple[float, ...] | None = None
         self._reamplify_last_field_ratios: dict[int, float] | None = None
         self._reamplify_last_field_measurement: dict[str, object] | None = None
@@ -3286,17 +3326,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "h3_training_mode": str(getattr(args, "h3_training_mode", None)),
         }
 
-    @classmethod
-    def _reamplify_field_fingerprint(cls, args) -> dict[str, object]:
+    def _reamplify_field_fingerprint(self, args) -> dict[str, object]:
         """Bind the validation task grid and image sigma route used by automatic scaling."""
-        return {
-            "field_probe": cls._field_probe_fingerprint(args),
+        fingerprint = {
+            "field_probe": self._field_probe_fingerprint(args),
             "observed_modality": getattr(args, "h3_observed_modality", None),
             "video_enabled": float(getattr(args, "h3_video_loss_weight", 1.0)) > 0,
             "audio_enabled": float(getattr(args, "h3_audio_loss_weight", 1.0)) > 0,
             "image_timestep_sampling": _effective_image_timestep_sampling(args),
             "image_flow_shift": getattr(args, "h3_image_flow_shift", None),
         }
+        if getattr(args, "h3_overlay_weights", None):
+            fingerprint["composition"] = self._reamplify_overlay_identity_bound or self._reamplify_overlay_identity(args)
+            fingerprint["base_policy"] = "stock_without_overlay"
+        return fingerprint
 
     def _save_field_probe_snapshot(self, path: str, fingerprint: dict[str, str]) -> None:
         """Keep the step-zero base reference beside the checkpoints, for resumes."""
@@ -3914,7 +3957,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if key not in self._field_base_gaps:
             set_enabled(False)
             try:
-                base_prompted, base_empty = branches()
+                with self._overlay_disabled(self._reamplify_schedule == REAMPLIFY_AUTO and self._overlay_network is not None):
+                    base_prompted, base_empty = branches()
                 self._field_base_gaps[key] = (
                     0.0 if base_prompted is None or base_empty is None else self._masked_rms(base_prompted - base_empty, video_mask)
                 )
@@ -4188,8 +4232,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if after != 0 or probability != 1.0:
                 raise ValueError("reamplification scheduling options require --h3_reamplify_scale")
             return
-        if after <= 0:
-            raise ValueError("--h3_reamplify_after must be greater than 0 for an in-run adapter snapshot")
+        if getattr(args, "h3_overlay_weights", None):
+            self._reamplify_overlay_identity_bound = self._reamplify_overlay_identity(args)
+        if after < 0:
+            raise ValueError("--h3_reamplify_after must be non-negative")
+        if after == 0 and not getattr(args, "h3_overlay_weights", None):
+            raise ValueError("--h3_reamplify_after 0 requires --h3_overlay_weights as the collapsed adapter")
         if getattr(args, "resume_as_new_shard", False):
             raise ValueError("--h3_reamplify_scale cannot use --resume_as_new_shard because its boundary uses the continued step")
         if not math.isfinite(probability) or not 0 < probability <= 1:
@@ -4202,12 +4250,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         ):
             raise ValueError("--h3_reamplify_scale does not support SDS-LoRA")
         if schedule == REAMPLIFY_AUTO:
+            if after == 0:
+                raise ValueError("--h3_reamplify_scale auto requires a positive snapshot boundary")
             if not getattr(args, "h3_validation_field_probe", False):
                 raise ValueError("--h3_reamplify_scale auto requires --h3_validation_field_probe")
             if int(getattr(args, "validation_min_timestep", 0)) != 0 or int(getattr(args, "validation_max_timestep", 1000)) != 1000:
                 raise ValueError("--h3_reamplify_scale auto requires the full validation timestep range 0..1000")
             if getattr(args, "h3_validate_ema", False):
                 raise ValueError("--h3_reamplify_scale auto measures the live adapter and cannot use --h3_validate_ema")
+            if getattr(args, "h3_validate_without_overlay", False):
+                raise ValueError("--h3_reamplify_scale auto with an overlay requires validation with that overlay active")
         conflicts = {
             "--h3_projection_scale": getattr(args, "h3_projection_scale", None) is not None,
             "--h3_repair_reference": getattr(args, "h3_repair_reference", None) is not None,
@@ -4218,7 +4270,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "--h3_two_teacher_loss_weight": float(getattr(args, "h3_two_teacher_loss_weight", 0.0) or 0.0) > 0,
             "--h3_sparse_teacher_only": bool(getattr(args, "h3_sparse_teacher_only", False)),
             "--h3_caption_dropout_rate": float(getattr(args, "h3_caption_dropout_rate", 0.0) or 0.0) > 0,
-            "--h3_overlay_weights": bool(getattr(args, "h3_overlay_weights", None)),
             "--base_weights": bool(getattr(args, "base_weights", None)),
         }
         active = [name for name, configured in conflicts.items() if configured]
@@ -4493,6 +4544,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             self._overlay_training_only
             and not self._validate_without_overlay
             and (getattr(args, "h3_validation_field_probe", False) or int(getattr(args, "h3_validation_rollout_probe", 0) or 0) > 0)
+            and getattr(args, "h3_reamplify_scale", None) != REAMPLIFY_AUTO
         ):
             raise ValueError(
                 "--h3_overlay_training_only cannot be combined with --h3_validation_field_probe or "
@@ -5640,9 +5692,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         path = getattr(args, "h3_overlay_weights", None)
         if not path:
             return None
-        overlay = self._install_frozen_lora(
-            path, float(getattr(args, "h3_overlay_weights_multiplier", 1.0)), accelerator, transformer, "overlay"
-        )
+        multiplier = float(getattr(args, "h3_overlay_weights_multiplier", 1.0))
+        if self._reamplify_schedule is not None:
+            resolved = Path(path).expanduser().resolve()
+            payload = resolved.read_bytes()
+            weights = load_safetensors(payload)
+            installed_identity = {
+                "path": os.path.normcase(str(resolved)),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "multiplier": multiplier,
+                "schema": {key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in sorted(weights.items())},
+            }
+            if not self._strict_json_equal(installed_identity, self._reamplify_overlay_identity_bound):
+                raise ValueError("reamplification overlay changed before it was installed")
+            normalized = self.convert_weight_keys(weights, "musubi_tuner.networks.lora_minimax_h3")
+            overlay = self._frozen_lora_from_weights(normalized, multiplier, accelerator, transformer, "overlay", str(resolved))
+        else:
+            overlay = self._install_frozen_lora(path, multiplier, accelerator, transformer, "overlay")
         self._overlay_network = overlay
         return overlay
 
@@ -5672,6 +5738,31 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         is_enabled = getattr(overlay, "is_enabled", None)
         prior = bool(is_enabled()) if callable(is_enabled) else True
         overlay.set_enabled(False)
+        try:
+            yield
+        finally:
+            overlay.set_enabled(prior)
+
+    @contextmanager
+    def _overlay_enabled(self, enabled: bool):
+        """Force the frozen overlay to one state and restore its exact prior state."""
+        overlay = self._overlay_network
+        if overlay is None:
+            yield
+            return
+        modules = list(getattr(overlay, "text_encoder_loras", ())) + list(getattr(overlay, "unet_loras", ()))
+        if modules:
+            prior = [bool(getattr(module, "enabled", True)) for module in modules]
+            overlay.set_enabled(enabled)
+            try:
+                yield
+            finally:
+                for module, state in zip(modules, prior):
+                    module.enabled = state
+            return
+        is_enabled = getattr(overlay, "is_enabled", None)
+        prior = bool(is_enabled()) if callable(is_enabled) else True
+        overlay.set_enabled(enabled)
         try:
             yield
         finally:
@@ -8297,7 +8388,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
             if missing:
                 raise KeyError("--h3_reamplify_scale requires --cache_guidance_empty; missing " + ", ".join(missing))
-            if self._reamplify_snapshot_network is None:
+            if self._reamplify_snapshot_network is None and int(args.h3_reamplify_after) > 0:
                 raise RuntimeError("reamplification is active without its frozen adapter snapshot")
         if projection_active:
             missing = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
@@ -9077,18 +9168,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             int8_context = getattr(transformer, "int8_attention_context", None)
             reamplify_block_swap = bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False)
 
-            def frozen_reamplify_branch(branch: str, snapshot_enabled: bool):
+            def frozen_reamplify_branch(branch: str, collapsed: bool):
                 with (
                     torch.random.fork_rng(devices=fork_devices),
                     torch.no_grad(),
                     int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                    self._overlay_enabled(collapsed),
                 ):
                     student_toggle(False)
-                    snapshot.set_enabled(snapshot_enabled)
+                    if snapshot is not None:
+                        snapshot.set_enabled(collapsed)
                     try:
                         return self._predict(accelerator, transformer, batch, inputs, conditioning=branch)
                     finally:
-                        snapshot.set_enabled(False)
+                        if snapshot is not None:
+                            snapshot.set_enabled(False)
                         student_toggle(True)
 
             if reamplify_block_swap:

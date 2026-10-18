@@ -6,6 +6,7 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from musubi_tuner.minimax_h3.reamplify import (
     REAMPLIFY_AUTO,
@@ -94,6 +95,9 @@ def _args(**updates):
         h3_sparse_teacher_only=False,
         h3_caption_dropout_rate=0.0,
         h3_overlay_weights=None,
+        h3_overlay_weights_multiplier=1.0,
+        h3_overlay_training_only=False,
+        h3_validate_without_overlay=False,
         base_weights=None,
         h3_validation_field_probe=False,
         h3_validate_ema=False,
@@ -167,7 +171,7 @@ def test_validation_is_default_off_and_rejects_unsupported_combinations():
     trainer._validate_reamplify_args(_args(h3_reamplify_scale=None, h3_reamplify_after=0, h3_reamplify_probability=1.0))
     assert trainer._reamplify_schedule is None
     for update, message in (
-        ({"h3_reamplify_after": 0}, "greater than 0"),
+        ({"h3_reamplify_after": 0}, "requires --h3_overlay_weights"),
         ({"h3_reamplify_probability": 0.0}, "lie in"),
         ({"resume_as_new_shard": True}, "resume_as_new_shard"),
         ({"h3_projection_scale": 2.0}, "cannot be combined"),
@@ -202,6 +206,83 @@ def test_snapshot_is_taken_at_boundary_before_draw_and_constructor_preserves_rng
     assert trainer._reamplify_snapshot_network.enabled is False
     network.weights["lora_unet_block.lora_up.weight"].add_(100)
     assert float(trainer._reamplify_snapshot_weights["lora_unet_block.lora_up.weight"].max()) == 7.0
+
+
+def test_external_after_zero_uses_v3_state_without_owned_snapshot(tmp_path: Path):
+    overlay = tmp_path / "collapsed.safetensors"
+    save_file({"lora_unet_block.lora_down.weight": torch.ones(1, 3)}, str(overlay))
+    args = _args(h3_reamplify_after=0, h3_overlay_weights=str(overlay), h3_overlay_weights_multiplier=0.5)
+    trainer = _trainer(args)
+    hooks = _Hooks()
+    network = _Network()
+    trainer._take_reamplify_snapshot(args, hooks, object(), network, 0)
+    assert trainer._reamplify_snapshot_step == 0
+    assert trainer._reamplify_snapshot_network is None
+    trainer._reamplify_probability_generator = torch.Generator().manual_seed(3)
+    trainer._reamplify_last_global_step = 0
+    trainer._register_reamplify_state_hooks(args, hooks, object(), network)
+    hooks.save([], [], tmp_path)
+    state = json.loads((tmp_path / "h3_reamplify_state-rank0.json").read_text(encoding="utf-8"))
+    assert state["version"] == 3
+    assert state["snapshot"] is None
+    assert state["identity"]["composition_mode"] == "external"
+
+    restored = _trainer(args)
+    load_hooks = _Hooks()
+    restored._register_reamplify_state_hooks(args, load_hooks, object(), network)
+    load_hooks.load([], tmp_path)
+    assert restored._reamplify_snapshot_step == 0
+
+
+def test_external_overlay_mutation_is_rejected_before_resolution(tmp_path: Path):
+    overlay = tmp_path / "collapsed.safetensors"
+    save_file({"lora_unet_block.lora_down.weight": torch.ones(1, 3)}, str(overlay))
+    args = _args(h3_reamplify_after=0, h3_overlay_weights=str(overlay))
+    trainer = _trainer(args)
+    save_file({"lora_unet_block.lora_down.weight": torch.zeros(1, 3)}, str(overlay))
+    with pytest.raises(ValueError, match="changed after configuration"):
+        trainer._resolve_reamplify_schedule(args)
+
+
+def test_reamp_overlay_installs_converted_keys_from_the_bound_payload(tmp_path: Path):
+    overlay = tmp_path / "diffusers.safetensors"
+    save_file({"transformer.foo.lora_A.weight": torch.ones(1, 3)}, str(overlay))
+    args = _args(h3_reamplify_after=0, h3_overlay_weights=str(overlay))
+    trainer = _trainer(args)
+    captured = {}
+
+    def frozen(self, weights, multiplier, _accelerator, _transformer, _label, source):
+        captured.update(weights=weights, multiplier=multiplier, source=source)
+        return _Teacher()
+
+    trainer._frozen_lora_from_weights = MethodType(frozen, trainer)
+    trainer.install_overlay_weights(args, _Hooks(), object())
+    assert set(captured["weights"]) == {"lora_unet_foo.lora_down.weight", "lora_unet_foo.alpha"}
+    assert captured["source"] == str(overlay.resolve())
+
+
+def test_overlay_state_context_restores_mixed_modules_after_error():
+    class Module:
+        def __init__(self, enabled):
+            self.enabled = enabled
+
+    class Overlay:
+        text_encoder_loras = ()
+
+        def __init__(self):
+            self.unet_loras = (Module(True), Module(False))
+
+        def set_enabled(self, enabled):
+            for module in self.unet_loras:
+                module.enabled = enabled
+
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._overlay_network = Overlay()
+    with pytest.raises(RuntimeError):
+        with trainer._overlay_enabled(True):
+            assert [module.enabled for module in trainer._overlay_network.unet_loras] == [True, True]
+            raise RuntimeError("probe")
+    assert [module.enabled for module in trainer._overlay_network.unet_loras] == [True, False]
 
 
 def test_state_round_trip_restores_snapshot_and_probability_stream(tmp_path: Path):
