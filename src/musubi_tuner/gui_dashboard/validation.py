@@ -10,7 +10,9 @@ from typing import Any
 
 from musubi_tuner.gui_dashboard.cli_defaults import get_ltx2_training_network_module_default
 from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
+from musubi_tuner.minimax_h3.marginal_repair import parse_scale_schedule
 from musubi_tuner.minimax_h3.one_frame import parse_one_frame_options
+from musubi_tuner.minimax_h3.reamplify import parse_reamplify_schedule
 
 try:
     from musubi_tuner.ltx2_av_cross_grad_surgery import parse_av_cross_grad_surgery_args
@@ -66,6 +68,13 @@ def _split_cli_args(raw: str | None) -> list[str]:
         return shlex.split(raw, posix=False)
     except ValueError:
         return []
+
+
+def _normalized_cli_args(raw: str | None) -> list[str]:
+    """Match the command builder's removal of one shell-quoting layer."""
+    return [
+        item[1:-1] if len(item) >= 2 and item[0] == item[-1] and item[0] in ('"', "'") else item for item in _split_cli_args(raw)
+    ]
 
 
 def _accelerate_num_processes(raw: str | None) -> int | None:
@@ -828,6 +837,307 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     "error", "training.h3_model", "MiniMax H3 DiT checkpoint is required.", label="H3 Model", page="training"
                 )
             )
+
+        def h3_error(field: str, message: str) -> None:
+            errors.append(_make_issue("error", f"training.{field}", message, page="training"))
+
+        network_args = tuple(_normalized_cli_args(t.network_args))
+
+        new_float_controls = (
+            "h3_field_preservation_weight",
+            "h3_projection_scale",
+            "h3_repair_reference_weight",
+            "h3_repair_null_anchor_weight",
+            "h3_repair_preservation_probability",
+            "h3_repair_caption_probability",
+            "h3_reamplify_probability",
+            "h3_rollout_inactive_weight",
+            "h3_rollout_inactive_probability",
+            "h3_teacher_ema_decay",
+            "h3_rollout_teacher_match_sigma_max",
+            "h3_rollout_teacher_match_dc_weight",
+            "h3_rollout_teacher_match_mag_weight",
+            "h3_rollout_teacher_match_preservation_weight",
+            "h3_sparse_teacher_loss_weight",
+        )
+        for field in new_float_controls:
+            value = getattr(t, field)
+            if value is not None and not math.isfinite(value):
+                h3_error(field, "This H3 control must be finite.")
+
+        repair_options = (
+            t.h3_repair_scale is not None
+            or t.h3_repair_reference_weight != 0
+            or t.h3_repair_null_anchor_weight != 0
+            or t.h3_repair_preservation_probability != 0
+            or t.h3_repair_caption_anchors != 4
+            or t.h3_repair_caption_probability != 1
+            or t.h3_repair_sigma_weight is not None
+            or t.h3_repair_target_multiplier is not None
+        )
+        if repair_options and t.h3_repair_reference is None:
+            h3_error("h3_repair_reference", "Repair options require an empty or caption repair reference.")
+        if t.h3_repair_reference is not None and t.h3_repair_scale is None:
+            h3_error("h3_repair_scale", "Repair requires a reconstruction scale.")
+        if t.h3_repair_scale is not None:
+            try:
+                repair_schedule = parse_scale_schedule(t.h3_repair_scale)
+                for field, lengths in (("h3_repair_sigma_weight", (2, 3)), ("h3_repair_target_multiplier", (3,))):
+                    raw_values = getattr(t, field)
+                    if raw_values is None:
+                        continue
+                    values = tuple(float(item.strip()) for item in raw_values.split(","))
+                    if len(values) not in lengths or any(not math.isfinite(value) or value <= 0 for value in values):
+                        raise ValueError(f"{field} requires {lengths} finite positive values")
+                if t.h3_repair_target_multiplier:
+                    for sigma, multiplier in zip((0.40, 0.80, 0.95), values):
+                        scale = max(1.0, repair_schedule[0] + repair_schedule[1] * sigma)
+                        if multiplier * (1 - 1 / scale) > 1 + 1e-7:
+                            raise ValueError("h3_repair_target_multiplier extrapolates past the reference branch")
+            except (TypeError, ValueError) as error:
+                h3_error("h3_repair_scale", str(error))
+        repair_conflicts = (
+            t.h3_guidance_distillation_scale is not None
+            or bool(t.h3_guidance_scale_range)
+            or bool(getattr(t, "h3_teacher_matching", False))
+            or t.h3_rollout_supervision
+            or t.h3_two_teacher_loss_weight > 0
+            or t.h3_two_teacher_snapshot_step > 0
+            or t.h3_base_preservation_loss_weight > 0
+            or t.h3_guidance_null_anchor_weight > 0
+            or t.h3_dop_loss_weight > 0
+            or t.h3_frame_sigma_jitter > 0
+            or t.h3_qwen_control_dropout_rate > 0
+            or t.h3_adapter_prompt_only
+            or bool(t.h3_overlay_weights)
+            or t.crepa
+            or (t.network_dropout is not None and t.network_dropout != 0)
+            or any(
+                item.strip().lower().startswith(("dropout=", "rank_dropout=", "module_dropout="))
+                and item.split("=", 1)[1].strip() not in ("0", "0.0")
+                for item in network_args
+            )
+        )
+        if t.h3_repair_reference is not None and repair_conflicts:
+            h3_error("h3_repair_reference", "Repair conflicts with another target-changing or auxiliary H3 objective.")
+        if t.h3_repair_reference == "empty" and t.h3_repair_reference_weight != 0:
+            h3_error("h3_repair_reference_weight", "Empty repair requires reference weight 0.")
+        if t.h3_repair_reference_weight < 0 or t.h3_repair_null_anchor_weight < 0:
+            h3_error("h3_repair_reference_weight", "Repair reference and null-anchor weights must be non-negative.")
+        if t.h3_repair_reference != "caption" and (t.h3_repair_caption_anchors != 4 or t.h3_repair_caption_probability != 1):
+            h3_error("h3_repair_caption_anchors", "Caption anchor controls require caption repair.")
+        if t.h3_repair_caption_anchors < 1:
+            h3_error("h3_repair_caption_anchors", "Caption repair requires at least one anchor.")
+        if not 0 < t.h3_repair_caption_probability <= 1:
+            h3_error("h3_repair_caption_probability", "Caption repair probability must lie in (0, 1].")
+        if not 0 <= t.h3_repair_preservation_probability < 1:
+            h3_error("h3_repair_preservation_probability", "Repair preservation probability must lie in [0, 1).")
+        if t.h3_field_preservation_weight < 0 or t.h3_field_preservation_steps < 0:
+            h3_error("h3_field_preservation_weight", "Field preservation weight and steps must be non-negative.")
+        if t.h3_field_preservation_steps and t.h3_field_preservation_weight <= 0:
+            h3_error("h3_field_preservation_steps", "A field-preservation window requires a positive weight.")
+        if t.h3_field_preservation_weight > 0 and t.h3_adapter_prompt_only:
+            h3_error("h3_field_preservation_weight", "Field preservation requires live prompt and empty adapter branches.")
+        classic_staged = bool(t.blocks_to_swap and not t.block_swap_h2d_only and t.h3_fused_backward_pass)
+        if classic_staged and (
+            t.h3_field_preservation_weight > 0
+            or (t.h3_repair_reference is not None and (t.h3_repair_reference_weight > 0 or t.h3_repair_null_anchor_weight > 0))
+        ):
+            h3_error("h3_fused_backward_pass", "Classic block-swap staged objectives cannot use fused backward updates.")
+        if t.h3_projection_scale is not None and (not math.isfinite(t.h3_projection_scale) or t.h3_projection_scale <= 0):
+            h3_error("h3_projection_scale", "Projection scale must be finite and greater than zero.")
+        if t.h3_projection_scale is not None and (
+            t.h3_guidance_distillation_scale is not None
+            or bool(t.h3_guidance_scale_range)
+            or t.h3_rollout_supervision
+            or t.h3_two_teacher_loss_weight > 0
+        ):
+            h3_error("h3_projection_scale", "Projection conflicts with another replacement objective.")
+        replacements = sum(
+            (
+                t.h3_projection_scale is not None,
+                t.h3_repair_reference is not None,
+                t.h3_reamplify_scale is not None,
+                getattr(t, "h3_teacher_matching", False),
+                t.h3_sparse_teacher_only,
+            )
+        )
+        if replacements > 1:
+            h3_error("h3_projection_scale", "Choose only one H3 replacement objective.")
+        if t.h3_projection_scale is not None and t.base_weights and not t.h3_base_weights_runtime_attach:
+            h3_error("h3_projection_scale", "Projection requires the unmodified checkpoint; merged base weights are incompatible.")
+        if t.h3_reamplify_after < 0 or not 0 < t.h3_reamplify_probability <= 1:
+            h3_error("h3_reamplify_probability", "Re-amplification needs a non-negative boundary and probability in (0, 1].")
+        if t.h3_reamplify_scale is not None:
+            try:
+                parse_reamplify_schedule(t.h3_reamplify_scale)
+            except ValueError as error:
+                h3_error("h3_reamplify_scale", str(error))
+            reamplify_conflicts = (
+                t.h3_guidance_distillation_scale is not None
+                or bool(t.h3_guidance_scale_range)
+                or t.h3_rollout_supervision
+                or bool(getattr(t, "h3_teacher_matching", False))
+                or t.h3_two_teacher_loss_weight > 0
+                or t.h3_sparse_teacher_only
+                or t.h3_caption_dropout_rate > 0
+                or bool(t.base_weights and not t.h3_base_weights_runtime_attach)
+            )
+            if reamplify_conflicts:
+                h3_error(
+                    "h3_reamplify_scale", "Re-amplification conflicts with another replacement objective or merged base weights."
+                )
+            if t.network_module and t.network_module not in (
+                "networks.lora_minimax_h3",
+                "musubi_tuner.networks.lora_minimax_h3",
+            ):
+                h3_error("h3_reamplify_scale", "Re-amplification requires the stock MiniMax H3 LoRA network.")
+            if any(
+                item.strip().lower().startswith("sds=") and item.split("=", 1)[1].strip().lower() in ("true", "1")
+                for item in network_args
+            ):
+                h3_error("h3_reamplify_scale", "Re-amplification does not support SDS-LoRA.")
+        if t.h3_reamplify_scale is None and (t.h3_reamplify_after != 0 or t.h3_reamplify_probability != 1):
+            h3_error("h3_reamplify_scale", "Re-amplification schedule controls require a scale.")
+        if (
+            t.h3_reamplify_scale is not None
+            and t.h3_reamplify_after == 0
+            and not (t.h3_overlay_weights or (t.h3_base_weights_runtime_attach and t.base_weights))
+        ):
+            h3_error("h3_reamplify_after", "A zero-step boundary requires an overlay or runtime-attached base weights.")
+        if t.h3_reamplify_scale == "auto":
+            if t.h3_reamplify_after <= 0 or not t.h3_validation_field_probe:
+                h3_error("h3_reamplify_scale", "Automatic re-amplification requires a positive boundary and field probe.")
+            if t.validation_min_timestep != 0 or t.validation_max_timestep != 1000:
+                h3_error("h3_reamplify_scale", "Automatic re-amplification requires validation timesteps 0 through 1000.")
+            if t.h3_validate_ema or (t.h3_overlay_weights and t.h3_validate_without_overlay):
+                h3_error("h3_reamplify_scale", "Automatic re-amplification measures the live composed adapter.")
+        inactive = t.h3_rollout_inactive_supervision != "off"
+        if inactive and not t.h3_rollout_supervision:
+            h3_error("h3_rollout_inactive_supervision", "Inactive supervision requires rollout supervision.")
+        if not inactive and (t.h3_rollout_inactive_weight != 1 or t.h3_rollout_inactive_probability != 1):
+            h3_error("h3_rollout_inactive_supervision", "Inactive rollout weight and probability require a supervision mode.")
+        if t.h3_rollout_inactive_weight <= 0 or not 0 < t.h3_rollout_inactive_probability <= 1:
+            h3_error("h3_rollout_inactive_weight", "Inactive rollout weight must be positive and probability in (0, 1].")
+        match_controls = (
+            t.h3_rollout_teacher_match_sigma_max != 0.75
+            or t.h3_rollout_teacher_match_dc_weight != 1
+            or t.h3_rollout_teacher_match_mag_weight != 1
+            or t.h3_rollout_teacher_match_preservation_weight != 1
+        )
+        if match_controls and t.h3_rollout_inactive_supervision != "teacher_match":
+            h3_error("h3_rollout_inactive_supervision", "Teacher-match controls require teacher_match supervision.")
+        if t.h3_rollout_inactive_supervision == "teacher_match" and (
+            not 0 <= t.h3_rollout_teacher_match_sigma_max <= 1
+            or t.h3_rollout_teacher_match_dc_weight < 0
+            or t.h3_rollout_teacher_match_mag_weight < 0
+            or t.h3_rollout_teacher_match_preservation_weight <= 0
+        ):
+            h3_error("h3_rollout_teacher_match_sigma_max", "Teacher-match controls are outside their supported ranges.")
+        if t.h3_rollout_inactive_supervision == "teacher_match" and (
+            t.h3_guidance_distillation_scale is not None or bool(t.h3_guidance_scale_range)
+        ):
+            h3_error("h3_rollout_inactive_supervision", "Teacher-match supervision conflicts with guidance distillation.")
+        if t.h3_rollout_inactive_supervision == "teacher_gap" and t.h3_adapter_prompt_only:
+            h3_error("h3_rollout_inactive_supervision", "Teacher-gap supervision requires live prompt and empty branches.")
+        if classic_staged and t.h3_rollout_supervision:
+            h3_error("h3_fused_backward_pass", "Classic block-swap rollout staging cannot use fused backward updates.")
+        if t.h3_teacher_ema_decay != 0 and not (0 < t.h3_teacher_ema_decay < 1 and inactive and t.h3_rollout_supervision):
+            h3_error("h3_teacher_ema_decay", "Teacher EMA requires privileged inactive supervision and decay in (0, 1).")
+        if t.h3_teacher_ema_decay != 0 and (
+            (t.network_module and t.network_module not in ("networks.lora_minimax_h3", "musubi_tuner.networks.lora_minimax_h3"))
+            or any(
+                item.strip().lower().startswith("sds=") and item.split("=", 1)[1].strip().lower() in ("true", "1")
+                for item in network_args
+            )
+        ):
+            h3_error("h3_teacher_ema_decay", "Teacher EMA requires the stock non-SDS MiniMax H3 LoRA network.")
+        if t.h3_base_weights_runtime_attach and not _has_text(t.base_weights):
+            h3_error("h3_base_weights_runtime_attach", "Runtime base attachment requires at least one base-weight adapter.")
+        if t.h3_base_weights_runtime_attach:
+            base_weights = _normalized_cli_args(t.base_weights)
+            multipliers = _normalized_cli_args(t.base_weights_multiplier)
+            if len(multipliers) > len(base_weights):
+                h3_error("base_weights_multiplier", "Runtime base multipliers cannot outnumber base-weight adapters.")
+            try:
+                if any(not math.isfinite(float(value)) for value in multipliers):
+                    raise ValueError
+            except ValueError:
+                h3_error("base_weights_multiplier", "Runtime base multipliers must be finite numbers.")
+        if t.h3_sparse_router:
+            if t.h3_training_mode != "ref2va":
+                h3_error("h3_sparse_router", "The learned sparse router requires Ref2VA training.")
+            if t.h3_sparse_exact_blocks <= 0 or t.h3_sparse_temporal_radius < 0:
+                h3_error("h3_sparse_exact_blocks", "Sparse exact blocks must be positive and temporal radius non-negative.")
+            if t.h3_int8_attention != "off" or t.h3_checkpoint_keep != "none" or t.h3_varlen_padding or t.h3_guide_specs:
+                h3_error(
+                    "h3_sparse_router",
+                    "The learned sparse router conflicts with attention, checkpoint, padding, or guide controls.",
+                )
+            if (
+                t.h3_block_sparse_kv_fraction != 0
+                or t.h3_block_sparse_threshold != 0
+                or t.h3_block_sparse_start_block != 0
+                or t.h3_block_sparse_block_shape is not None
+            ):
+                h3_error("h3_sparse_router", "The learned sparse router conflicts with fixed block-sparse attention controls.")
+        if t.h3_sparse_teacher_loss_weight < 0:
+            h3_error("h3_sparse_teacher_loss_weight", "Sparse-teacher loss weight must be non-negative.")
+        if t.h3_sparse_teacher_loss_weight > 0 and not t.h3_sparse_router:
+            h3_error("h3_sparse_teacher_loss_weight", "Sparse-teacher loss requires a learned sparse router.")
+        if t.h3_sparse_teacher_only and t.h3_sparse_teacher_loss_weight <= 0:
+            h3_error("h3_sparse_teacher_only", "Sparse-teacher-only mode requires a positive sparse-teacher loss.")
+        if t.h3_sparse_teacher_eval_only and not t.h3_sparse_teacher_only:
+            h3_error("h3_sparse_teacher_eval_only", "Sparse-teacher evaluation requires sparse-teacher-only mode.")
+        if t.h3_sparse_teacher_budgets and t.h3_sparse_teacher_loss_weight <= 0:
+            h3_error("h3_sparse_teacher_budgets", "Sparse-teacher budgets require a positive sparse-teacher loss.")
+        if t.h3_sparse_teacher_budgets:
+            try:
+                budgets = tuple(int(piece.strip()) for piece in t.h3_sparse_teacher_budgets.split(",") if piece.strip())
+                if not budgets or any(budget <= 0 for budget in budgets):
+                    raise ValueError
+            except ValueError:
+                h3_error("h3_sparse_teacher_budgets", "Sparse-teacher budgets must be positive comma-separated integers.")
+        if t.h3_sparse_teacher_eval_only and (
+            t.h3_guidance_distillation_scale is not None
+            or bool(t.h3_guidance_scale_range)
+            or t.h3_base_preservation_loss_weight > 0
+            or t.h3_field_preservation_weight > 0
+            or t.h3_dop_loss_weight > 0
+            or t.h3_two_teacher_loss_weight > 0
+            or t.h3_guidance_null_anchor_weight > 0
+            or t.h3_rollout_supervision
+            or t.h3_repair_reference is not None
+            or t.crepa
+        ):
+            h3_error("h3_sparse_teacher_eval_only", "Sparse-teacher evaluation conflicts with other H3 objectives.")
+        if t.h3_sparse_teacher_budget_offset < 0:
+            h3_error("h3_sparse_teacher_budget_offset", "Sparse-teacher budget offset must be non-negative.")
+        if t.h3_training_type == "learned_context" and any(
+            getattr(t, field) != type(t).model_fields[field].default
+            for field in new_float_controls
+            + (
+                "h3_field_preservation_steps",
+                "h3_repair_reference",
+                "h3_repair_scale",
+                "h3_repair_caption_anchors",
+                "h3_repair_sigma_weight",
+                "h3_repair_target_multiplier",
+                "h3_reamplify_scale",
+                "h3_reamplify_after",
+                "h3_rollout_inactive_supervision",
+                "h3_base_weights_runtime_attach",
+                "h3_sparse_router",
+                "h3_sparse_exact_blocks",
+                "h3_sparse_temporal_radius",
+                "h3_sparse_data_path",
+                "h3_sparse_teacher_only",
+                "h3_sparse_teacher_eval_only",
+                "h3_sparse_teacher_budgets",
+                "h3_sparse_teacher_budget_offset",
+            )
+        ):
+            h3_error("h3_training_type", "These H3 adapter objectives require LoRA training.")
         if t.h3_training_type == "learned_context":
             has_prompt_initializer = _has_text(t.h3_learned_context_init_prompt)
             has_checkpoint_initializer = _has_text(t.h3_learned_context_init)

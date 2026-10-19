@@ -785,6 +785,26 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_base_preservation_loss_weight", str(t.h3_base_preservation_loss_weight)]
         if t.h3_base_preservation_probability != 1.0:
             cmd += ["--h3_base_preservation_probability", str(t.h3_base_preservation_probability)]
+    if not learned_context:
+        for flag, value, default in (
+            ("--h3_field_preservation_weight", t.h3_field_preservation_weight, 0.0),
+            ("--h3_field_preservation_steps", t.h3_field_preservation_steps, 0),
+            ("--h3_projection_scale", t.h3_projection_scale, None),
+            ("--h3_repair_reference", t.h3_repair_reference, None),
+            ("--h3_repair_scale", t.h3_repair_scale, None),
+            ("--h3_repair_reference_weight", t.h3_repair_reference_weight, 0.0),
+            ("--h3_repair_null_anchor_weight", t.h3_repair_null_anchor_weight, 0.0),
+            ("--h3_repair_preservation_probability", t.h3_repair_preservation_probability, 0.0),
+            ("--h3_repair_caption_anchors", t.h3_repair_caption_anchors, 4),
+            ("--h3_repair_caption_probability", t.h3_repair_caption_probability, 1.0),
+            ("--h3_repair_sigma_weight", t.h3_repair_sigma_weight, None),
+            ("--h3_repair_target_multiplier", t.h3_repair_target_multiplier, None),
+            ("--h3_reamplify_scale", t.h3_reamplify_scale, None),
+            ("--h3_reamplify_after", t.h3_reamplify_after, 0),
+            ("--h3_reamplify_probability", t.h3_reamplify_probability, 1.0),
+        ):
+            if value != default:
+                cmd += [flag, str(value)]
     # The trigger-free presentation is shared: DOP and two-teacher distillation both
     # read it, so the caption arguments are emitted whenever either one is on.
     if not learned_context and (t.h3_dop_loss_weight > 0 or t.h3_two_teacher_loss_weight > 0):
@@ -825,6 +845,40 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd.append("--h3_overlay_training_only")
             if t.h3_validate_without_overlay:
                 cmd.append("--h3_validate_without_overlay")
+    if not learned_context:
+        for flag, value, default in (
+            ("--h3_rollout_inactive_supervision", t.h3_rollout_inactive_supervision, "off"),
+            ("--h3_rollout_inactive_weight", t.h3_rollout_inactive_weight, 1.0),
+            ("--h3_rollout_inactive_probability", t.h3_rollout_inactive_probability, 1.0),
+            ("--h3_teacher_ema_decay", t.h3_teacher_ema_decay, 0.0),
+            ("--h3_rollout_teacher_match_sigma_max", t.h3_rollout_teacher_match_sigma_max, 0.75),
+            ("--h3_rollout_teacher_match_dc_weight", t.h3_rollout_teacher_match_dc_weight, 1.0),
+            ("--h3_rollout_teacher_match_mag_weight", t.h3_rollout_teacher_match_mag_weight, 1.0),
+            (
+                "--h3_rollout_teacher_match_preservation_weight",
+                t.h3_rollout_teacher_match_preservation_weight,
+                1.0,
+            ),
+        ):
+            if value != default:
+                cmd += [flag, str(value)]
+        if t.h3_base_weights_runtime_attach:
+            cmd.append("--h3_base_weights_runtime_attach")
+        for flag, value, default in (
+            ("--h3_sparse_router", t.h3_sparse_router, None),
+            ("--h3_sparse_exact_blocks", t.h3_sparse_exact_blocks, 64),
+            ("--h3_sparse_temporal_radius", t.h3_sparse_temporal_radius, 2),
+            ("--h3_sparse_data_path", t.h3_sparse_data_path, "packed"),
+            ("--h3_sparse_teacher_loss_weight", t.h3_sparse_teacher_loss_weight, 0.0),
+            ("--h3_sparse_teacher_budgets", t.h3_sparse_teacher_budgets, ""),
+            ("--h3_sparse_teacher_budget_offset", t.h3_sparse_teacher_budget_offset, 0),
+        ):
+            if value != default:
+                cmd += [flag, str(value)]
+        if t.h3_sparse_teacher_only:
+            cmd.append("--h3_sparse_teacher_only")
+        if t.h3_sparse_teacher_eval_only:
+            cmd.append("--h3_sparse_teacher_eval_only")
     if t.network_weights and not learned_context:
         cmd += ["--network_weights", t.network_weights]
     if t.dim_from_weights and not learned_context:
