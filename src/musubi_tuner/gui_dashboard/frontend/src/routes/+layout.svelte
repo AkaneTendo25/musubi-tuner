@@ -19,8 +19,7 @@
 		'/tools',
 		'/training/conditioning',
 		'/training/full-finetune',
-		'/training/rl',
-		'/training/techniques'
+		'/training/rl'
 	]);
 
 	function commitTooltipState(nextState) {

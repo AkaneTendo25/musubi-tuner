@@ -7,7 +7,7 @@
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { projectConfig, projectLoaded, saveProjectDebounced } from '$lib/stores/project.js';
-	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
+	import { processStatuses, processLogs, processValidation, startProcess, stopProcess, validateProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
 	import { onMount } from 'svelte';
 
@@ -25,6 +25,11 @@
 		saveProjectDebounced();
 	}
 
+	function resetTraining(values) {
+		projectConfig.update((c) => c ? { ...c, training: { ...(c.training || {}), ...values } } : c);
+		saveProjectDebounced();
+	}
+
 	function updateCaching(key, value) {
 		projectConfig.update((c) => {
 			if (!c) return c;
@@ -35,6 +40,16 @@
 
 	let dinoStatus = $derived($processStatuses.cache_dino || { state: 'idle', exit_code: null });
 	let dinoLogs = $derived($processLogs.cache_dino || []);
+	let trainingValidation = $derived($processValidation.training || { errors: [], warnings: [], field_errors: {} });
+	let validationTimer = null;
+
+	$effect(() => {
+		if (!$projectLoaded || !$projectConfig) return;
+		clearTimeout(validationTimer);
+		const snapshot = $projectConfig;
+		validationTimer = setTimeout(() => validateProcess('training', snapshot).catch(() => {}), 250);
+		return () => clearTimeout(validationTimer);
+	});
 </script>
 
 {#if !$projectLoaded}
@@ -50,6 +65,134 @@
 	</div>
 {:else}
 	<div class="space-y-5">
+		{#if $projectConfig?.training?.model_type === 'minimax_h3' && ($projectConfig?.training?.h3_training_type || 'lora') === 'lora'}
+			<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); overflow: hidden;">
+				<div class="p-5">
+					<div class="text-[13px] font-semibold" style="color: var(--text-primary);">H3 Adapter Objectives</div>
+					<p class="text-[12px] mt-1" style="color: var(--text-secondary);">Configure H3 reconstruction, field, rollout, and sparse-router training. Replacement objectives are mutually exclusive; validation reports incompatible combinations.</p>
+					{#if trainingValidation.errors?.length}
+						<div class="mt-3 p-3 text-[11px] space-y-1" style="background: color-mix(in srgb, var(--danger) 10%, transparent); border: 1px solid var(--danger); border-radius: var(--radius-sm); color: var(--danger);">
+							<div class="font-semibold">Training configuration needs attention</div>
+							{#each trainingValidation.errors.filter((issue) => issue.field?.startsWith('training.')).slice(0, 6) as issue}
+								<div>{issue.message}</div>
+							{/each}
+						</div>
+					{/if}
+
+					<div class="mt-4 p-3 space-y-2" style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+						<div class="text-[11px] font-semibold" style="color: var(--text-primary);">Field and projection objectives</div>
+						<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+							<FormField label="Field weight" type="number" fieldPath="training.h3_field_preservation_weight" value={$projectConfig?.training?.h3_field_preservation_weight ?? 0} oninput={(e) => updateTraining('h3_field_preservation_weight', Number(e.target.value))} min={0} step="0.01" tooltip="Preserve the adapted prompt-minus-empty difference against the frozen base field. Zero disables it." />
+							<FormField label="Field steps" type="number" fieldPath="training.h3_field_preservation_steps" value={$projectConfig?.training?.h3_field_preservation_steps ?? 0} oninput={(e) => updateTraining('h3_field_preservation_steps', Number(e.target.value))} min={0} step="1" disabled={($projectConfig?.training?.h3_field_preservation_weight ?? 0) <= 0} tooltip="Limit field preservation to the first N steps. Zero keeps it active." />
+							<FormField label="Projection scale" type="number" fieldPath="training.h3_projection_scale" value={$projectConfig?.training?.h3_projection_scale ?? ''} oninput={(e) => updateTraining('h3_projection_scale', e.target.value === '' ? null : Number(e.target.value))} min={0} step="0.1" placeholder="Off" tooltip="Replace the data objective with orthogonal output projection. Blank disables it." />
+						</div>
+						<button type="button" class="text-[11px] underline" style="color: var(--text-muted);" onclick={() => resetTraining({ h3_field_preservation_weight: 0, h3_field_preservation_steps: 0 })}>Reset field preservation</button>
+					</div>
+
+					<div class="mt-3 p-3 space-y-2" style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+						<div class="text-[11px] font-semibold" style="color: var(--text-primary);">Marginal repair</div>
+						<FormSelect label="Reference" fieldPath="training.h3_repair_reference" value={$projectConfig?.training?.h3_repair_reference ?? ''} onchange={(e) => updateTraining('h3_repair_reference', e.target.value || null)} options={[{value:'',label:'Off'}, {value:'empty',label:'Empty caption'}, {value:'caption',label:'Caption marginal'}]} tooltip="Choose the reconstruction reference. Caption mode samples cached captions." />
+						<button type="button" class="text-[11px] underline" style="color: var(--text-muted);" onclick={() => resetTraining({ h3_repair_reference: null, h3_repair_scale: null, h3_repair_reference_weight: 0, h3_repair_null_anchor_weight: 0, h3_repair_preservation_probability: 0, h3_repair_caption_anchors: 4, h3_repair_caption_probability: 1, h3_repair_sigma_weight: null, h3_repair_target_multiplier: null })}>Reset repair controls</button>
+						<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+								<FormField label="Scale schedule" fieldPath="training.h3_repair_scale" value={$projectConfig?.training?.h3_repair_scale ?? ''} oninput={(e) => updateTraining('h3_repair_scale', e.target.value || null)} placeholder="1.5 or 1,2" disabled={!$projectConfig?.training?.h3_repair_reference} tooltip="Reconstruction scale or two-value sigma schedule." />
+								<FormField label="Reference weight" type="number" fieldPath="training.h3_repair_reference_weight" value={$projectConfig?.training?.h3_repair_reference_weight ?? 0} oninput={(e) => updateTraining('h3_repair_reference_weight', Number(e.target.value))} min={0} step="0.01" disabled={$projectConfig?.training?.h3_repair_reference !== 'caption'} tooltip="Auxiliary caption-reference weight. Empty-reference repair requires zero." />
+								<FormField label="Base-empty anchor" type="number" fieldPath="training.h3_repair_null_anchor_weight" value={$projectConfig?.training?.h3_repair_null_anchor_weight ?? 0} oninput={(e) => updateTraining('h3_repair_null_anchor_weight', Number(e.target.value))} min={0} step="0.01" disabled={!$projectConfig?.training?.h3_repair_reference} tooltip="Opportunistic frozen base-empty anchor weight." />
+								<FormField label="Preservation probability" type="number" fieldPath="training.h3_repair_preservation_probability" value={$projectConfig?.training?.h3_repair_preservation_probability ?? 0} oninput={(e) => updateTraining('h3_repair_preservation_probability', Number(e.target.value))} min={0} max={0.999} step="0.01" disabled={!$projectConfig?.training?.h3_repair_reference} tooltip="Probability of replacing repair with frozen-base preservation." />
+								<FormField label="Caption anchors" type="number" fieldPath="training.h3_repair_caption_anchors" value={$projectConfig?.training?.h3_repair_caption_anchors ?? 4} oninput={(e) => updateTraining('h3_repair_caption_anchors', Number(e.target.value))} min={1} step="1" disabled={$projectConfig?.training?.h3_repair_reference !== 'caption'} tooltip="Other cached captions averaged for the marginal reference." />
+								<FormField label="Caption probability" type="number" fieldPath="training.h3_repair_caption_probability" value={$projectConfig?.training?.h3_repair_caption_probability ?? 1} oninput={(e) => updateTraining('h3_repair_caption_probability', Number(e.target.value))} min={0.0001} max={1} step="0.01" disabled={$projectConfig?.training?.h3_repair_reference !== 'caption'} tooltip="Sparse activation probability for caption repair." />
+								<FormField label="Sigma weights" fieldPath="training.h3_repair_sigma_weight" value={$projectConfig?.training?.h3_repair_sigma_weight ?? ''} oninput={(e) => updateTraining('h3_repair_sigma_weight', e.target.value || null)} placeholder="1,1 or 1,1,1" disabled={!$projectConfig?.training?.h3_repair_reference} tooltip="Positive weights interpolated at sigma 0.40/0.95, or 0.40/0.80/0.95." />
+								<FormField label="Target multipliers" fieldPath="training.h3_repair_target_multiplier" value={$projectConfig?.training?.h3_repair_target_multiplier ?? ''} oninput={(e) => updateTraining('h3_repair_target_multiplier', e.target.value || null)} placeholder="1,1,1" disabled={!$projectConfig?.training?.h3_repair_reference} tooltip="Three positive target multipliers for low, middle, and high sigma." />
+						</div>
+					</div>
+
+					<div class="mt-3 p-3 space-y-2" style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+						<div class="text-[11px] font-semibold" style="color: var(--text-primary);">Re-amplification</div>
+						<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+							<FormField label="Scale bins" fieldPath="training.h3_reamplify_scale" value={$projectConfig?.training?.h3_reamplify_scale ?? ''} oninput={(e) => updateTraining('h3_reamplify_scale', e.target.value || null)} placeholder="Off, auto, or 2,3" tooltip="Explicit FP32 scale bins greater than one, or auto from validation field ratios." />
+							<FormField label="Snapshot after" type="number" fieldPath="training.h3_reamplify_after" value={$projectConfig?.training?.h3_reamplify_after ?? 0} oninput={(e) => updateTraining('h3_reamplify_after', Number(e.target.value))} min={0} step="1" disabled={!$projectConfig?.training?.h3_reamplify_scale} tooltip="Global training step where the warmup adapter is captured. Zero uses an attached collapsed adapter." />
+							<FormField label="Probability" type="number" fieldPath="training.h3_reamplify_probability" value={$projectConfig?.training?.h3_reamplify_probability ?? 1} oninput={(e) => updateTraining('h3_reamplify_probability', Number(e.target.value))} min={0.0001} max={1} step="0.01" disabled={!$projectConfig?.training?.h3_reamplify_scale} tooltip="Probability of selecting the re-amplified target after the boundary." />
+						</div>
+						<button type="button" class="text-[11px] underline" style="color: var(--text-muted);" onclick={() => resetTraining({ h3_reamplify_scale: null, h3_reamplify_after: 0, h3_reamplify_probability: 1 })}>Reset re-amplification</button>
+					</div>
+
+					<div class="mt-3 p-3 space-y-2" style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+						<div class="text-[11px] font-semibold" style="color: var(--text-primary);">Inactive rollout teacher</div>
+						<FormSelect label="Inactive supervision" fieldPath="training.h3_rollout_inactive_supervision" value={$projectConfig?.training?.h3_rollout_inactive_supervision || 'off'} onchange={(e) => updateTraining('h3_rollout_inactive_supervision', e.target.value)} options={[{value:'off',label:'Off'}, {value:'teacher_velocity',label:'Teacher velocity'}, {value:'teacher_gap',label:'Teacher guidance gap'}, {value:'teacher_match',label:'Teacher match'}]} disabled={!$projectConfig?.training?.h3_rollout_supervision} tooltip="Supervise logical steps where rollout itself is inactive. Requires rollout supervision." />
+						<button type="button" class="text-[11px] underline" style="color: var(--text-muted);" onclick={() => resetTraining({ h3_rollout_inactive_supervision: 'off', h3_rollout_inactive_weight: 1, h3_rollout_inactive_probability: 1, h3_teacher_ema_decay: 0, h3_rollout_teacher_match_sigma_max: 0.75, h3_rollout_teacher_match_dc_weight: 1, h3_rollout_teacher_match_mag_weight: 1, h3_rollout_teacher_match_preservation_weight: 1 })}>Reset inactive teacher controls</button>
+						<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+								<FormField label="Inactive weight" type="number" fieldPath="training.h3_rollout_inactive_weight" value={$projectConfig?.training?.h3_rollout_inactive_weight ?? 1} oninput={(e) => updateTraining('h3_rollout_inactive_weight', Number(e.target.value))} min={0.0001} step="0.1" disabled={($projectConfig?.training?.h3_rollout_inactive_supervision || 'off') === 'off'} tooltip="Whole inactive-objective weight." />
+								<FormField label="Inactive probability" type="number" fieldPath="training.h3_rollout_inactive_probability" value={$projectConfig?.training?.h3_rollout_inactive_probability ?? 1} oninput={(e) => updateTraining('h3_rollout_inactive_probability', Number(e.target.value))} min={0.0001} max={1} step="0.01" disabled={($projectConfig?.training?.h3_rollout_inactive_supervision || 'off') === 'off'} tooltip="Independent synchronized activation probability." />
+								<FormField label="Teacher EMA decay" type="number" fieldPath="training.h3_teacher_ema_decay" value={$projectConfig?.training?.h3_teacher_ema_decay ?? 0} oninput={(e) => updateTraining('h3_teacher_ema_decay', Number(e.target.value))} min={0} max={0.9999} step="0.001" disabled={($projectConfig?.training?.h3_rollout_inactive_supervision || 'off') === 'off'} tooltip="Frozen privileged-teacher EMA. Zero uses the fixed teacher." />
+						</div>
+						<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 mt-2">
+								<FormField label="Sigma max" type="number" fieldPath="training.h3_rollout_teacher_match_sigma_max" value={$projectConfig?.training?.h3_rollout_teacher_match_sigma_max ?? 0.75} oninput={(e) => updateTraining('h3_rollout_teacher_match_sigma_max', Number(e.target.value))} min={0} max={1} step="0.01" tooltip="Upper base-sigma bound for privileged matching." />
+								<FormField label="DC weight" type="number" fieldPath="training.h3_rollout_teacher_match_dc_weight" value={$projectConfig?.training?.h3_rollout_teacher_match_dc_weight ?? 1} oninput={(e) => updateTraining('h3_rollout_teacher_match_dc_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Mean-residual component weight." />
+								<FormField label="Magnitude weight" type="number" fieldPath="training.h3_rollout_teacher_match_mag_weight" value={$projectConfig?.training?.h3_rollout_teacher_match_mag_weight ?? 1} oninput={(e) => updateTraining('h3_rollout_teacher_match_mag_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Teacher residual-magnitude weight." />
+								<FormField label="Preservation weight" type="number" fieldPath="training.h3_rollout_teacher_match_preservation_weight" value={$projectConfig?.training?.h3_rollout_teacher_match_preservation_weight ?? 1} oninput={(e) => updateTraining('h3_rollout_teacher_match_preservation_weight', Number(e.target.value))} min={0.0001} step="0.1" tooltip="High-sigma unprivileged preservation weight." />
+						</div>
+					</div>
+
+					<div class="mt-3 p-3 space-y-2" style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+						<div class="flex items-center justify-between gap-3">
+							<div><div class="text-[11px] font-semibold" style="color: var(--text-primary);">Runtime base adapters</div><div class="text-[10px]" style="color: var(--text-muted);">Attach every Base Weights entry as a removable frozen adapter instead of merging it.</div></div>
+							<FormToggle label="Runtime attach" fieldPath="training.h3_base_weights_runtime_attach" checked={$projectConfig?.training?.h3_base_weights_runtime_attach ?? false} onchange={(e) => updateTraining('h3_base_weights_runtime_attach', e.target.checked)} tooltip="Keeps ordered base adapters independently scaled and removable in stock-reference contexts." />
+						</div>
+					</div>
+
+					<div class="mt-3 p-3 space-y-2" style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+						<div class="text-[11px] font-semibold" style="color: var(--text-primary);">Learned reference router</div>
+						<PathInput label="Router checkpoint" fieldPath="training.h3_sparse_router" value={$projectConfig?.training?.h3_sparse_router ?? ''} oninput={(e) => updateTraining('h3_sparse_router', e.target.value || null)} showFiles tooltip="Learned Ref2VA sparse-router checkpoint. This is separate from fixed block-sparse attention." />
+						<button type="button" class="text-[11px] underline" style="color: var(--text-muted);" onclick={() => resetTraining({ h3_sparse_router: null, h3_sparse_exact_blocks: 64, h3_sparse_temporal_radius: 2, h3_sparse_data_path: 'packed', h3_sparse_teacher_loss_weight: 0, h3_sparse_teacher_only: false, h3_sparse_teacher_eval_only: false, h3_sparse_teacher_budgets: '', h3_sparse_teacher_budget_offset: 0 })}>Reset router controls</button>
+						<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+								<FormField label="Exact blocks" type="number" fieldPath="training.h3_sparse_exact_blocks" value={$projectConfig?.training?.h3_sparse_exact_blocks ?? 64} oninput={(e) => updateTraining('h3_sparse_exact_blocks', Number(e.target.value))} min={1} step="1" tooltip="Highest-scoring exact attention blocks." />
+								<FormField label="Temporal radius" type="number" fieldPath="training.h3_sparse_temporal_radius" value={$projectConfig?.training?.h3_sparse_temporal_radius ?? 2} oninput={(e) => updateTraining('h3_sparse_temporal_radius', Number(e.target.value))} min={0} step="1" tooltip="Adjacent temporal blocks retained around sparse selections." />
+								<FormSelect label="Data path" fieldPath="training.h3_sparse_data_path" value={$projectConfig?.training?.h3_sparse_data_path || 'packed'} onchange={(e) => updateTraining('h3_sparse_data_path', e.target.value)} options={[{value:'packed',label:'Packed'}, {value:'mapped_int64',label:'Mapped int64'}]} tooltip="Sparse index representation consumed by the router." />
+								<FormField label="Teacher loss" type="number" fieldPath="training.h3_sparse_teacher_loss_weight" value={$projectConfig?.training?.h3_sparse_teacher_loss_weight ?? 0} oninput={(e) => updateTraining('h3_sparse_teacher_loss_weight', Number(e.target.value))} min={0} step="0.01" tooltip="Dense-reference compensation loss weight." />
+								<FormField label="Teacher budgets" fieldPath="training.h3_sparse_teacher_budgets" value={$projectConfig?.training?.h3_sparse_teacher_budgets ?? ''} oninput={(e) => updateTraining('h3_sparse_teacher_budgets', e.target.value)} placeholder="2,4,8" disabled={!$projectConfig?.training?.h3_sparse_router || ($projectConfig?.training?.h3_sparse_teacher_loss_weight ?? 0) <= 0} tooltip="Positive exact-block budgets applied to the sparse student during teacher compensation." />
+								<FormField label="Budget offset" type="number" fieldPath="training.h3_sparse_teacher_budget_offset" value={$projectConfig?.training?.h3_sparse_teacher_budget_offset ?? 0} oninput={(e) => updateTraining('h3_sparse_teacher_budget_offset', Number(e.target.value))} min={0} step="1" disabled={($projectConfig?.training?.h3_sparse_teacher_loss_weight ?? 0) <= 0} tooltip="Offset applied to teacher budgets." />
+						</div>
+						<div class="flex flex-wrap gap-4 mt-2">
+								<FormToggle label="Teacher only" fieldPath="training.h3_sparse_teacher_only" checked={$projectConfig?.training?.h3_sparse_teacher_only ?? false} onchange={(e) => updateTraining('h3_sparse_teacher_only', e.target.checked)} disabled={($projectConfig?.training?.h3_sparse_teacher_loss_weight ?? 0) <= 0} tooltip="Replace the data objective with sparse-teacher compensation." />
+								<FormToggle label="Evaluation only" fieldPath="training.h3_sparse_teacher_eval_only" checked={$projectConfig?.training?.h3_sparse_teacher_eval_only ?? false} onchange={(e) => updateTraining('h3_sparse_teacher_eval_only', e.target.checked)} disabled={!$projectConfig?.training?.h3_sparse_teacher_only} tooltip="Measure compensation without updating the adapter." />
+						</div>
+					</div>
+				</div>
+			</div>
+		{/if}
+		{#if $projectConfig?.training?.model_type === 'minimax_h3' && ($projectConfig?.training?.h3_training_type || 'lora') !== 'lora'}
+			<div class="p-4 text-[12px]" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); color: var(--text-secondary);">
+				H3 adapter objectives are available for ordinary LoRA training. Learned-context and slider training use their dedicated controls.
+			</div>
+		{/if}
+
+		{#if $projectConfig?.training?.model_type === 'minimax_h3' && ($projectConfig?.training?.h3_training_type || 'lora') === 'lora'}
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[12px] font-semibold mb-1" style="color: var(--text-primary);">H3 Two-Teacher Distillation</div>
+					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">At each supervised state the adapter is matched to a frozen concept teacher LoRA under the trigger and to the untouched base under the trigger-free caption. Needs the same trigger-free text cache as DOP (trigger set, caption mode bare).</p>
+					<div class="grid grid-cols-2 gap-2">
+						<FormField fieldPath="training.h3_two_teacher_weights" value={$projectConfig?.training?.h3_two_teacher_weights || ''} oninput={(e) => updateTraining('h3_two_teacher_weights', e.target.value)} placeholder="/path/to/teacher.safetensors" tooltip="LoRA of the concept teacher; frozen, live only on the teacher's forward" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_loss_weight" value={$projectConfig?.training?.h3_two_teacher_loss_weight ?? 0.0} oninput={(e) => updateTraining('h3_two_teacher_loss_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Weight of the distillation objective; 0 disables it" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_bare_weight" value={$projectConfig?.training?.h3_two_teacher_bare_weight ?? 1.0} oninput={(e) => updateTraining('h3_two_teacher_bare_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Relative weight of the trigger-free arm" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_data_weight" value={$projectConfig?.training?.h3_two_teacher_data_weight ?? 0.0} oninput={(e) => updateTraining('h3_two_teacher_data_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Multiplier on the ordinary data objective; 0 trains on the teachers alone" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_sigma_min" value={$projectConfig?.training?.h3_two_teacher_sigma_min ?? 0} oninput={(e) => updateTraining('h3_two_teacher_sigma_min', Number(e.target.value))} min={0} max={0.99} step="0.05" tooltip="Distil only at or above this shifted video sigma" />
+						<FormField type="number" fieldPath="training.h3_two_teacher_multiplier" value={$projectConfig?.training?.h3_two_teacher_multiplier ?? 1.0} oninput={(e) => updateTraining('h3_two_teacher_multiplier', Number(e.target.value))} min={0} step="0.1" tooltip="Strength of the teacher LoRA on its forward" />
+					</div>
+				</div>
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[12px] font-semibold mb-1" style="color: var(--text-primary);">H3 Differential Output Preservation</div>
+					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">Keeps the LoRA close to the frozen base under the trigger-free version of each training caption. Cache the same trigger and class phrase first.</p>
+					<div class="grid grid-cols-2 gap-2">
+						<FormField fieldPath="training.h3_dop_trigger" value={$projectConfig?.training?.h3_dop_trigger || ''} oninput={(e) => updateTraining('h3_dop_trigger', e.target.value)} placeholder="sks" tooltip="Standalone trigger in each caption." />
+						<FormField fieldPath="training.h3_dop_class_prompt" value={$projectConfig?.training?.h3_dop_class_prompt || ''} oninput={(e) => updateTraining('h3_dop_class_prompt', e.target.value)} placeholder="woman" tooltip="Class phrase replacing the trigger." />
+						<FormField type="number" fieldPath="training.h3_dop_loss_weight" value={$projectConfig?.training?.h3_dop_loss_weight ?? 0.0} oninput={(e) => updateTraining('h3_dop_loss_weight', Number(e.target.value))} step="0.01" min={0} tooltip="Zero disables H3 DOP." />
+						<FormField type="number" fieldPath="training.h3_dop_sigma_min" value={$projectConfig?.training?.h3_dop_sigma_min ?? 0} oninput={(e) => updateTraining('h3_dop_sigma_min', Number(e.target.value))} min={0} max={0.99} step="0.05" tooltip="Evaluate DOP only on steps at or above this shifted video sigma; 0 = every step" />
+						<FormField type="number" fieldPath="training.h3_dop_probability" value={$projectConfig?.training?.h3_dop_probability ?? 1.0} oninput={(e) => updateTraining('h3_dop_probability', Number(e.target.value))} step="0.05" min={0.01} max={1} tooltip="Fraction of steps using DOP; active losses are inverse-probability scaled." />
+					</div>
+				</div>
+			<CommandPanel processType="training" defaultFilename="train.bat" />
+		{/if}
+
+		{#if $projectConfig?.training?.model_type !== 'minimax_h3'}
 		<!-- CREPA -->
 		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
 			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent); opacity: 0.5;"></div>
@@ -600,36 +743,10 @@
 					</div>
 				</div>
 
-				<!-- Two-teacher distillation -->
-				{#if $projectConfig?.training?.model_type === 'minimax_h3'}
-				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-					<div class="text-[12px] font-semibold mb-1" style="color: var(--text-primary);">H3 Two-Teacher Distillation</div>
-					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">At each supervised state the adapter is matched to a frozen concept teacher LoRA under the trigger and to the untouched base under the trigger-free caption. Needs the same trigger-free text cache as DOP (trigger set, caption mode bare).</p>
-					<div class="grid grid-cols-2 gap-2">
-						<FormField fieldPath="training.h3_two_teacher_weights" value={$projectConfig?.training?.h3_two_teacher_weights || ''} oninput={(e) => updateTraining('h3_two_teacher_weights', e.target.value)} placeholder="/path/to/teacher.safetensors" tooltip="LoRA of the concept teacher; frozen, live only on the teacher's forward" />
-						<FormField type="number" fieldPath="training.h3_two_teacher_loss_weight" value={$projectConfig?.training?.h3_two_teacher_loss_weight ?? 0.0} oninput={(e) => updateTraining('h3_two_teacher_loss_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Weight of the distillation objective; 0 disables it" />
-						<FormField type="number" fieldPath="training.h3_two_teacher_bare_weight" value={$projectConfig?.training?.h3_two_teacher_bare_weight ?? 1.0} oninput={(e) => updateTraining('h3_two_teacher_bare_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Relative weight of the trigger-free arm" />
-						<FormField type="number" fieldPath="training.h3_two_teacher_data_weight" value={$projectConfig?.training?.h3_two_teacher_data_weight ?? 0.0} oninput={(e) => updateTraining('h3_two_teacher_data_weight', Number(e.target.value))} min={0} step="0.1" tooltip="Multiplier on the ordinary data objective; 0 trains on the teachers alone" />
-						<FormField type="number" fieldPath="training.h3_two_teacher_sigma_min" value={$projectConfig?.training?.h3_two_teacher_sigma_min ?? 0} oninput={(e) => updateTraining('h3_two_teacher_sigma_min', Number(e.target.value))} min={0} max={0.99} step="0.05" tooltip="Distil only at or above this shifted video sigma" />
-						<FormField type="number" fieldPath="training.h3_two_teacher_multiplier" value={$projectConfig?.training?.h3_two_teacher_multiplier ?? 1.0} oninput={(e) => updateTraining('h3_two_teacher_multiplier', Number(e.target.value))} min={0} step="0.1" tooltip="Strength of the teacher LoRA on its forward" />
-					</div>
-				</div>
-				{/if}
+
 
 				<!-- DOP -->
-				{#if $projectConfig?.training?.model_type === 'minimax_h3'}
-				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-					<div class="text-[12px] font-semibold mb-1" style="color: var(--text-primary);">H3 Differential Output Preservation</div>
-					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">Keeps the LoRA close to the frozen base under the trigger-free version of each training caption. Cache the same trigger and class phrase first.</p>
-					<div class="grid grid-cols-2 gap-2">
-						<FormField fieldPath="training.h3_dop_trigger" value={$projectConfig?.training?.h3_dop_trigger || ''} oninput={(e) => updateTraining('h3_dop_trigger', e.target.value)} placeholder="sks" tooltip="Standalone trigger in each caption." />
-						<FormField fieldPath="training.h3_dop_class_prompt" value={$projectConfig?.training?.h3_dop_class_prompt || ''} oninput={(e) => updateTraining('h3_dop_class_prompt', e.target.value)} placeholder="woman" tooltip="Class phrase replacing the trigger." />
-						<FormField type="number" fieldPath="training.h3_dop_loss_weight" value={$projectConfig?.training?.h3_dop_loss_weight ?? 0.0} oninput={(e) => updateTraining('h3_dop_loss_weight', Number(e.target.value))} step="0.01" min={0} tooltip="Zero disables H3 DOP." />
-						<FormField type="number" fieldPath="training.h3_dop_sigma_min" value={$projectConfig?.training?.h3_dop_sigma_min ?? 0} oninput={(e) => updateTraining('h3_dop_sigma_min', Number(e.target.value))} min={0} max={0.99} step="0.05" tooltip="Evaluate DOP only on steps at or above this shifted video sigma; 0 = every step" />
-						<FormField type="number" fieldPath="training.h3_dop_probability" value={$projectConfig?.training?.h3_dop_probability ?? 1.0} oninput={(e) => updateTraining('h3_dop_probability', Number(e.target.value))} step="0.05" min={0.01} max={1} tooltip="Fraction of steps using DOP; active losses are inverse-probability scaled." />
-					</div>
-				</div>
-				{:else}
+				{#if $projectConfig?.training?.model_type !== 'minimax_h3'}
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">DOP (Differential Output Preservation)</span>
@@ -797,6 +914,6 @@
 				</div>
 			</div>
 		</div>
-
+		{/if}
 	</div>
 {/if}
