@@ -873,11 +873,12 @@ def _route_encoder(task, route):
     encoder.output_dtype = torch.float32
     calls = []
 
-    def encode_prompt(prompt, images=None, references=None, null_instruction=False, qwen_controls=None):
+    def build_presentation(prompt, images=None, references=None, null_instruction=False, qwen_controls=None, vision_cache=None):
         calls.append((images, references))
-        return torch.zeros(2, 8), torch.ones(2, dtype=torch.long)
+        return {"tags": torch.ones(2, dtype=torch.long)}
 
-    encoder._encode_prompt = encode_prompt
+    encoder._build_presentation = build_presentation
+    encoder._run_presentation_jobs = lambda jobs: [torch.zeros(2, 8) for _ in jobs]
     return encoder, calls
 
 

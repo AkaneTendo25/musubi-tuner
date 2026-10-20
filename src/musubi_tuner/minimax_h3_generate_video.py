@@ -6,6 +6,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+from musubi_tuner.minimax_h3.architecture import AUDIO_FLOW_SHIFT, VIDEO_FLOW_SHIFT
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_generator
 from musubi_tuner.minimax_h3.one_frame import (
@@ -45,6 +46,47 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", type=int, help="explicit non-native canvas height; requires --width")
     parser.add_argument("--width", type=int, help="explicit non-native canvas width; requires --height")
     parser.add_argument("--steps", type=int, default=20, help="sigma grid points, including terminal zero")
+    parser.add_argument(
+        "--sampler",
+        choices=("euler", "sde", "res_2s", "res_2m"),
+        default="euler",
+        help="FL2VA solver; res_2s adds an interior model evaluation on non-degenerate steps",
+    )
+    parser.add_argument(
+        "--base_schedule",
+        "--base-schedule",
+        choices=("linear", "beta", "beta57"),
+        default="linear",
+        help="FL2VA spacing of unshifted sigma points before the modality-specific flow shifts",
+    )
+    parser.add_argument(
+        "--sde_eta",
+        "--sde-eta",
+        type=float,
+        default=0.0,
+        help="fresh-noise share for --sampler sde in [0, 1]; 0 is deterministic",
+    )
+    parser.add_argument(
+        "--video_shift",
+        "--video-shift",
+        type=float,
+        default=VIDEO_FLOW_SHIFT,
+        help=f"FL2VA video flow shift; the released value is {VIDEO_FLOW_SHIFT:g}",
+    )
+    parser.add_argument(
+        "--audio_shift",
+        "--audio-shift",
+        type=float,
+        default=AUDIO_FLOW_SHIFT,
+        help=f"FL2VA audio flow shift; the released value is {AUDIO_FLOW_SHIFT:g}",
+    )
+    parser.add_argument(
+        "--res_c2",
+        "--res-c2",
+        type=float,
+        default=0.5,
+        help="interior lambda-space node for --sampler res_2s in (0, 1]",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--first_frame")
     parser.add_argument("--last_frame")
@@ -432,6 +474,12 @@ def generator_from_args(args: argparse.Namespace, request: H3GenerationRequest):
         dtype=args.dtype,
         request=request,
         num_inference_steps=args.steps,
+        sampler=args.sampler,
+        base_schedule=args.base_schedule,
+        video_shift=args.video_shift,
+        audio_shift=args.audio_shift,
+        sde_eta=args.sde_eta,
+        res_c2=args.res_c2,
         height=args.height,
         width=args.width,
         fp8_scaled=args.fp8_base,

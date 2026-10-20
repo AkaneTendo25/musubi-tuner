@@ -6,6 +6,7 @@ from typing import Any, Literal, Protocol
 
 import torch
 
+from musubi_tuner.minimax_h3.architecture import AUDIO_FLOW_SHIFT, VIDEO_FLOW_SHIFT
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
     REFERENCE_IMAGE_SIZE_MODE,
@@ -218,6 +219,12 @@ def create_generator(
     dtype: str,
     request: H3GenerationRequest,
     num_inference_steps: int = 20,
+    sampler: str = "euler",
+    base_schedule: str = "linear",
+    video_shift: float = VIDEO_FLOW_SHIFT,
+    audio_shift: float = AUDIO_FLOW_SHIFT,
+    sde_eta: float = 0.0,
+    res_c2: float = 0.5,
     height: int | None = None,
     width: int | None = None,
     fp8_scaled: bool = False,
@@ -275,6 +282,12 @@ def create_generator(
         dtype=dtype,
         request=request,
         num_inference_steps=num_inference_steps,
+        sampler=sampler,
+        base_schedule=base_schedule,
+        video_shift=video_shift,
+        audio_shift=audio_shift,
+        sde_eta=sde_eta,
+        res_c2=res_c2,
         height=height,
         width=width,
         fp8_scaled=fp8_scaled,

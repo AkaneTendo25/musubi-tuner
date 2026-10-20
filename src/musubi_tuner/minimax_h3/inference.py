@@ -187,15 +187,90 @@ def _guided_transformer_call(transformer, null_guidance: "H3NullGuidance | None"
     )
 
 
-def shifted_flow_schedule(num_inference_steps: int, shift: float, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return H3's shifted sigmas and model timesteps, including terminal sigma zero."""
+_H3_BASE_SCHEDULES = frozenset(("linear", "beta", "beta57"))
+_H3_SAMPLERS = frozenset(("euler", "sde", "res_2s", "res_2m"))
+
+
+def _beta_base(num_inference_steps: int, alpha: float = 0.6, beta: float = 0.6) -> torch.Tensor:
+    """Return descending approximate Beta quantiles without an optional SciPy dependency."""
+    resolution = 20001
+    thetas = torch.linspace(0.0, 0.5 * math.pi, resolution, dtype=torch.float64)
+    integrand = 2.0 * thetas.sin() ** (2.0 * alpha - 1.0) * thetas.cos() ** (2.0 * beta - 1.0)
+    integrand[0] = 0.0
+    integrand[-1] = 0.0
+    widths = thetas[1:] - thetas[:-1]
+    cdf = torch.cat([torch.zeros(1, dtype=torch.float64), (0.5 * widths * (integrand[1:] + integrand[:-1])).cumsum(0)])
+    cdf = cdf / cdf[-1]
+    grid = thetas.sin() ** 2
+    quantiles = torch.linspace(1.0, 0.0, num_inference_steps, dtype=torch.float64)
+    order = torch.argsort(quantiles)
+    index = torch.searchsorted(cdf, quantiles[order].contiguous()).clamp(1, resolution - 1)
+    low, high = cdf[index - 1], cdf[index]
+    span = (high - low).clamp_min(torch.finfo(torch.float64).tiny)
+    weight = ((quantiles[order] - low) / span).clamp(0.0, 1.0)
+    values = grid[index - 1] + weight * (grid[index] - grid[index - 1])
+    result = torch.empty_like(values)
+    result[order] = values
+    return result.to(torch.float32)
+
+
+def _validate_sampler_options(
+    *,
+    sampler: str,
+    base_schedule: str,
+    sde_eta: float,
+    res_c2: float,
+    video_shift: float = VIDEO_FLOW_SHIFT,
+    audio_shift: float = AUDIO_FLOW_SHIFT,
+) -> None:
+    if sampler not in _H3_SAMPLERS:
+        raise ValueError(f"unknown MiniMax H3 sampler: {sampler!r}")
+    if base_schedule not in _H3_BASE_SCHEDULES:
+        raise ValueError(f"unknown MiniMax H3 base schedule: {base_schedule!r}")
+    if not math.isfinite(sde_eta) or not 0.0 <= sde_eta <= 1.0:
+        raise ValueError(f"MiniMax H3 SDE eta must be finite and lie in [0, 1], got {sde_eta}")
+    _validate_res_c2(res_c2)
+    if sampler != "sde" and sde_eta != 0.0:
+        raise ValueError("MiniMax H3 SDE eta is only used by the sde sampler")
+    if sampler != "res_2s" and res_c2 != 0.5:
+        raise ValueError("MiniMax H3 res_2s node is only used by the res_2s sampler")
+    if not math.isfinite(video_shift) or video_shift <= 0.0:
+        raise ValueError(f"MiniMax H3 video flow shift must be finite and positive, got {video_shift}")
+    if not math.isfinite(audio_shift) or audio_shift <= 0.0:
+        raise ValueError(f"MiniMax H3 audio flow shift must be finite and positive, got {audio_shift}")
+
+
+def shifted_flow_schedule(
+    num_inference_steps: int,
+    shift: float,
+    device: torch.device,
+    base_schedule: str = "linear",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return shifted sigmas and model timesteps, including terminal sigma zero."""
     if num_inference_steps < 2:
         raise ValueError("MiniMax H3 inference requires at least two sigma points")
-    if shift <= 0:
-        raise ValueError("MiniMax H3 flow shift must be positive")
-    base = torch.linspace(1.0, 0.0, num_inference_steps, dtype=torch.float32)
+    if not math.isfinite(shift) or shift <= 0:
+        raise ValueError("MiniMax H3 flow shift must be finite and positive")
+    if base_schedule == "linear":
+        base = torch.linspace(1.0, 0.0, num_inference_steps, dtype=torch.float32)
+    elif base_schedule == "beta":
+        base = _beta_base(num_inference_steps)
+    elif base_schedule == "beta57":
+        base = _beta_base(num_inference_steps, alpha=0.5, beta=0.7)
+    else:
+        raise ValueError(f"unknown MiniMax H3 base schedule: {base_schedule!r}")
     sigmas = shift * base / (1.0 + (shift - 1.0) * base)
+    sigmas[0] = 1.0
+    sigmas[-1] = 0.0
+    if not bool(torch.isfinite(sigmas).all()):
+        raise ValueError(f"MiniMax H3 flow shift {shift} is not representable on the float32 sigma grid")
+    if not bool((sigmas[1:] < sigmas[:-1]).all()):
+        raise ValueError(f"MiniMax H3 flow shift {shift} does not produce a strictly descending float32 sigma grid")
     sigmas = torch.unique_consecutive(sigmas).to(device)
+    if sigmas.numel() != num_inference_steps:
+        raise ValueError(
+            f"MiniMax H3 {base_schedule} schedule collapsed to {sigmas.numel()} distinct float32 points from {num_inference_steps}"
+        )
     return sigmas, 1.0 - sigmas[:-1]
 
 
@@ -221,6 +296,20 @@ def noise_to_sigma(sample: torch.Tensor, noise: torch.Tensor, sigma: torch.Tenso
     return (1.0 - sigma) * sample + sigma * noise
 
 
+def denoised_estimate(sample: torch.Tensor, prediction: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+    """Recover the model's clean-sample estimate from its data-ward velocity."""
+    sigma_from_timestep = 1.0 - timestep.to(device=sample.device, dtype=sample.dtype)
+    return sample + sigma_from_timestep * prediction.to(sample.dtype)
+
+
+def _step_from_denoised(sample: torch.Tensor, denoised: torch.Tensor, sigma, sigma_next) -> torch.Tensor:
+    """Take one first-order rectified-flow step from a clean-sample estimate."""
+    ratio = torch.as_tensor(sigma_next, device=sample.device, dtype=torch.float32) / torch.as_tensor(
+        sigma, device=sample.device, dtype=torch.float32
+    )
+    return (ratio * sample.float() + (1.0 - ratio) * denoised.float()).to(sample.dtype)
+
+
 def data_ward_euler_step(
     sample: torch.Tensor,
     prediction: torch.Tensor,
@@ -229,11 +318,133 @@ def data_ward_euler_step(
     sigma_next: torch.Tensor,
 ) -> torch.Tensor:
     """One deterministic H3 rectified-flow step for a data-ward velocity."""
-    sigma_from_timestep = 1.0 - timestep.to(device=sample.device, dtype=sample.dtype)
-    denoised = sample + sigma_from_timestep * prediction.to(sample.dtype)
-    ratio = sigma_next.to(device=sample.device, dtype=torch.float32) / sigma.to(device=sample.device, dtype=torch.float32)
-    result = ratio * sample.float() + (1.0 - ratio) * denoised.float()
-    return result.to(sample.dtype)
+    return _step_from_denoised(sample, denoised_estimate(sample, prediction, timestep), sigma, sigma_next)
+
+
+def data_ward_sde_step(
+    sample: torch.Tensor,
+    denoised: torch.Tensor,
+    sigma: float,
+    sigma_next: float,
+    eta: float,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Replace an ``eta`` share of implied noise while preserving the next marginal."""
+    if not math.isfinite(eta) or not 0.0 <= eta <= 1.0:
+        raise ValueError(f"MiniMax H3 SDE eta must be finite and lie in [0, 1], got {eta}")
+    result = _step_from_denoised(sample, denoised, sigma, sigma_next)
+    if eta == 0.0 or sigma_next <= 0.0:
+        return result
+    fresh = torch.randn(sample.shape, generator=generator, device=sample.device, dtype=torch.float32)
+    implied = (result.float() - (1.0 - sigma_next) * denoised.float()) / sigma_next
+    mixed = math.sqrt(1.0 - eta**2) * implied + eta * fresh
+    return ((1.0 - sigma_next) * denoised.float() + sigma_next * mixed).to(sample.dtype)
+
+
+def _flow_lambda(sigma: float) -> float:
+    """Return the exponential-solver coordinate ``log((1 - sigma) / sigma)``."""
+    if sigma >= 1.0:
+        return float("-inf")
+    if sigma <= 0.0:
+        return float("inf")
+    return math.log((1.0 - sigma) / sigma)
+
+
+_LAMBDA_SATURATION = 700.0
+
+
+def _sigma_from_flow_lambda(value: float) -> float:
+    if value >= _LAMBDA_SATURATION:
+        return 0.0
+    if value <= -_LAMBDA_SATURATION:
+        return 1.0
+    return 1.0 / (1.0 + math.exp(value))
+
+
+def _validate_res_c2(c2: float) -> None:
+    if not math.isfinite(c2) or not 0.0 < c2 <= 1.0:
+        raise ValueError(f"MiniMax H3 res_2s node must be finite and lie in (0, 1], got {c2}")
+    if c2 < 0.5 / torch.finfo(torch.float32).max:
+        raise ValueError(f"MiniMax H3 res_2s node {c2} produces an unrepresentable stage weight")
+
+
+def res_2s_stage_sigma(sigma: float, sigma_next: float, c2: float) -> float:
+    """Place the RES 2S interior stage at fraction ``c2`` in lambda space."""
+    _validate_res_c2(c2)
+    if c2 == 1.0:
+        return sigma_next
+    lambda_current = _flow_lambda(sigma)
+    step = _flow_lambda(sigma_next) - lambda_current
+    stage_sigma = _sigma_from_flow_lambda(lambda_current + c2 * step)
+    if 0.0 < sigma_next < sigma < 1.0:
+        sigma32 = torch.tensor(sigma, dtype=torch.float32).item()
+        sigma_next32 = torch.tensor(sigma_next, dtype=torch.float32).item()
+        stage_sigma32 = torch.tensor(stage_sigma, dtype=torch.float32).item()
+        if not sigma_next32 < stage_sigma32 < sigma32:
+            raise ValueError(f"MiniMax H3 res_2s node {c2} collapses on the float sigma grid")
+    return stage_sigma
+
+
+def _res_2s_stage_weight(step: float, c2: float) -> float:
+    _validate_res_c2(c2)
+    if abs(step) < 1e-6:
+        weight = 1.0 / (2.0 * c2)
+    else:
+        phi1 = math.expm1(step) / step
+        phi2 = (math.expm1(step) - step) / step**2
+        weight = (phi1 - phi2) / (c2 * phi1)
+    if not math.isfinite(weight) or abs(weight) > torch.finfo(torch.float32).max:
+        raise ValueError(f"MiniMax H3 res_2s node {c2} produces an unrepresentable stage weight")
+    return weight
+
+
+def data_ward_res_2s_step(
+    sample: torch.Tensor,
+    denoised: torch.Tensor,
+    stage_denoised: torch.Tensor | None,
+    sigma: float,
+    sigma_next: float,
+    c2: float = 0.5,
+) -> torch.Tensor:
+    """Take one second-order single-step update from an interior x0 estimate."""
+    _validate_res_c2(c2)
+    if stage_denoised is None or sigma_next <= 0.0 or sigma >= 1.0:
+        return _step_from_denoised(sample, denoised, sigma, sigma_next)
+    step = _flow_lambda(sigma_next) - _flow_lambda(sigma)
+    weight = _res_2s_stage_weight(step, c2)
+    blended = ((1.0 - weight) * denoised.float() + weight * stage_denoised.float().to(denoised.device)).to(sample.dtype)
+    return _step_from_denoised(sample, blended, sigma, sigma_next)
+
+
+def data_ward_res_2m_step(
+    sample: torch.Tensor,
+    denoised: torch.Tensor,
+    previous_denoised: torch.Tensor | None,
+    sigma_previous: float | None,
+    sigma: float,
+    sigma_next: float,
+) -> torch.Tensor:
+    """Take one second-order multistep update using the preceding x0 estimate."""
+    first_order = previous_denoised is None or sigma_previous is None or sigma_next <= 0.0
+    if not first_order:
+        h = _flow_lambda(sigma_next) - _flow_lambda(sigma)
+        h_previous = _flow_lambda(sigma) - _flow_lambda(sigma_previous)
+        ratio = h_previous / h if h != 0.0 else float("inf")
+        weight = 0.0 if not math.isfinite(ratio) or ratio == 0.0 else 1.0 / (2.0 * ratio)
+        if weight != 0.0:
+            denoised = (1.0 + weight) * denoised.float() - weight * previous_denoised.float().to(denoised.device)
+            denoised = denoised.to(sample.dtype)
+    return _step_from_denoised(sample, denoised, sigma, sigma_next)
+
+
+def _validate_res_2s_schedule(sigmas: torch.Tensor, c2: float) -> None:
+    for index in range(sigmas.numel() - 1):
+        sigma = float(sigmas[index])
+        sigma_next = float(sigmas[index + 1])
+        if sigma >= 1.0 or sigma_next <= 0.0:
+            continue
+        res_2s_stage_sigma(sigma, sigma_next, c2)
+        _res_2s_stage_weight(_flow_lambda(sigma_next) - _flow_lambda(sigma), c2)
 
 
 def _validate_geometry(height: int, width: int, frame_count: int) -> None:
@@ -502,6 +713,12 @@ def denoise_fl2va(
     one_frame_target_indices: tuple[int, ...] | None = None,
     target_noise_coupling: str = "independent",
     one_frame_placement_indices: tuple[int, ...] = (),
+    base_schedule: str = "linear",
+    sampler: str = "euler",
+    video_shift: float = VIDEO_FLOW_SHIFT,
+    audio_shift: float = AUDIO_FLOW_SHIFT,
+    sde_eta: float = 0.0,
+    res_c2: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate FL2VA joint latents with optional first/last keyframe conditioning.
 
@@ -516,7 +733,22 @@ def denoise_fl2va(
     are controls a reference route keeps out of the DiT: they emit no rows but
     keep their part in the slot placement.
     """
+    _validate_sampler_options(
+        sampler=sampler,
+        base_schedule=base_schedule,
+        sde_eta=sde_eta,
+        res_c2=res_c2,
+        video_shift=video_shift,
+        audio_shift=audio_shift,
+    )
     _validate_geometry(height, width, frame_count)
+    video_sigmas, video_timesteps = shifted_flow_schedule(num_inference_steps, video_shift, device, base_schedule)
+    audio_sigmas, audio_timesteps = shifted_flow_schedule(num_inference_steps, audio_shift, device, base_schedule)
+    if video_timesteps.shape != audio_timesteps.shape:
+        raise RuntimeError("MiniMax H3 video and audio schedules produced different step counts")
+    if sampler == "res_2s":
+        _validate_res_2s_schedule(video_sigmas, res_c2)
+        _validate_res_2s_schedule(audio_sigmas, res_c2)
     shape = temporal_shape(frame_count)
     config = transformer.config
     latent_height = height // VIDEO_SPATIAL_COMPRESSION
@@ -572,11 +804,6 @@ def denoise_fl2va(
     video_indices = layout.video_indices.to(device)
     audio_indices = layout.audio_indices.to(device)
     text_indices = layout.text_indices.to(device)
-    video_sigmas, video_timesteps = shifted_flow_schedule(num_inference_steps, VIDEO_FLOW_SHIFT, device)
-    audio_sigmas, audio_timesteps = shifted_flow_schedule(num_inference_steps, AUDIO_FLOW_SHIFT, device)
-    if video_timesteps.shape != audio_timesteps.shape:
-        raise RuntimeError("MiniMax H3 video and audio schedules produced different step counts")
-
     if (init_video is None) != (init_audio is None):
         raise ValueError("MiniMax H3 refinement needs both video and audio latents")
     if init_video is not None:
@@ -595,11 +822,19 @@ def denoise_fl2va(
     if show_progress:
         iterator = tqdm(iterator, total=video_timesteps.numel(), desc="MiniMax H3 denoising")
     autocast_enabled = device.type == "cuda"
-    for index, (video_timestep, audio_timestep) in enumerate(iterator):
-        video_rows = patchify_video_latents(video, tuple(config.patch_size))
+    previous_video_denoised: torch.Tensor | None = None
+    previous_audio_denoised: torch.Tensor | None = None
+
+    def x0_estimates(
+        video_sample: torch.Tensor,
+        audio_sample: torch.Tensor,
+        video_timestep: torch.Tensor,
+        audio_timestep: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        video_rows = patchify_video_latents(video_sample, tuple(config.patch_size))
         if keyframe_rows is not None:
             video_rows = torch.cat((keyframe_rows[None], video_rows), dim=1)
-        audio_rows = pack_audio_latents(audio)
+        audio_rows = pack_audio_latents(audio_sample)
         condition_timestep = (
             torch.maximum(video_timestep.reshape(1), torch.tensor([0.999], device=device)) if keyframe_rows is not None else None
         )
@@ -637,20 +872,69 @@ def denoise_fl2va(
             output.audio[:, layout.num_condition_audio_rows :],
             num_audio_latents=shape.audio_latent_frames,
         )
-        video = data_ward_euler_step(
-            video,
-            video_prediction,
-            video_timestep,
-            video_sigmas[index],
-            video_sigmas[index + 1],
+        return (
+            denoised_estimate(video_sample, video_prediction, video_timestep),
+            denoised_estimate(audio_sample, audio_prediction, audio_timestep),
         )
-        audio = data_ward_euler_step(
-            audio,
-            audio_prediction,
-            audio_timestep,
-            audio_sigmas[index],
-            audio_sigmas[index + 1],
-        )
+
+    for index, (video_timestep, audio_timestep) in enumerate(iterator):
+        video_denoised, audio_denoised = x0_estimates(video, audio, video_timestep, audio_timestep)
+        if sampler == "euler":
+            video = _step_from_denoised(video, video_denoised, video_sigmas[index], video_sigmas[index + 1])
+            audio = _step_from_denoised(audio, audio_denoised, audio_sigmas[index], audio_sigmas[index + 1])
+        elif sampler == "sde":
+            video = data_ward_sde_step(
+                video,
+                video_denoised,
+                float(video_sigmas[index]),
+                float(video_sigmas[index + 1]),
+                sde_eta,
+                generator,
+            )
+            audio = data_ward_sde_step(
+                audio,
+                audio_denoised,
+                float(audio_sigmas[index]),
+                float(audio_sigmas[index + 1]),
+                sde_eta,
+                generator,
+            )
+        elif sampler == "res_2s":
+            video_sigma, video_sigma_next = float(video_sigmas[index]), float(video_sigmas[index + 1])
+            audio_sigma, audio_sigma_next = float(audio_sigmas[index]), float(audio_sigmas[index + 1])
+            video_stage = audio_stage = None
+            degenerate = video_sigma_next <= 0.0 or audio_sigma_next <= 0.0 or video_sigma >= 1.0 or audio_sigma >= 1.0
+            if not degenerate:
+                video_stage_sigma = res_2s_stage_sigma(video_sigma, video_sigma_next, res_c2)
+                audio_stage_sigma = res_2s_stage_sigma(audio_sigma, audio_sigma_next, res_c2)
+                video_stage_sample = _step_from_denoised(video, video_denoised, video_sigma, video_stage_sigma)
+                audio_stage_sample = _step_from_denoised(audio, audio_denoised, audio_sigma, audio_stage_sigma)
+                video_stage, audio_stage = x0_estimates(
+                    video_stage_sample,
+                    audio_stage_sample,
+                    torch.full_like(video_timestep, 1.0 - video_stage_sigma),
+                    torch.full_like(audio_timestep, 1.0 - audio_stage_sigma),
+                )
+            video = data_ward_res_2s_step(video, video_denoised, video_stage, video_sigma, video_sigma_next, res_c2)
+            audio = data_ward_res_2s_step(audio, audio_denoised, audio_stage, audio_sigma, audio_sigma_next, res_c2)
+        else:
+            video = data_ward_res_2m_step(
+                video,
+                video_denoised,
+                previous_video_denoised,
+                None if index == 0 else float(video_sigmas[index - 1]),
+                float(video_sigmas[index]),
+                float(video_sigmas[index + 1]),
+            )
+            audio = data_ward_res_2m_step(
+                audio,
+                audio_denoised,
+                previous_audio_denoised,
+                None if index == 0 else float(audio_sigmas[index - 1]),
+                float(audio_sigmas[index]),
+                float(audio_sigmas[index + 1]),
+            )
+            previous_video_denoised, previous_audio_denoised = video_denoised, audio_denoised
     return video, audio
 
 

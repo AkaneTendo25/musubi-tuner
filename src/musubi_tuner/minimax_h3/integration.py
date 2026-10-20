@@ -19,9 +19,11 @@ from PIL import Image
 from safetensors import safe_open
 
 from musubi_tuner.minimax_h3.architecture import (
+    AUDIO_FLOW_SHIFT,
     AUDIO_LATENT_CHANNELS,
     IMAGE_FRAME_COUNT,
     VIDEO_DIT_PATCH_SIZE,
+    VIDEO_FLOW_SHIFT,
     VIDEO_LATENT_CHANNELS,
     temporal_shape,
 )
@@ -84,6 +86,7 @@ from musubi_tuner.minimax_h3.inference import (
     VIDEO_SPATIAL_COMPRESSION,
     H3EncodedReferences,
     H3NullGuidance,
+    _validate_sampler_options,
     decode_latents_sequentially,
     denoise_fl2va,
     denoise_ref2va,
@@ -350,6 +353,12 @@ def create_generator(
     dtype: str,
     request: H3GenerationRequest,
     num_inference_steps: int = 20,
+    sampler: str = "euler",
+    base_schedule: str = "linear",
+    video_shift: float = VIDEO_FLOW_SHIFT,
+    audio_shift: float = AUDIO_FLOW_SHIFT,
+    sde_eta: float = 0.0,
+    res_c2: float = 0.5,
     height: int | None = None,
     width: int | None = None,
     fp8_scaled: bool = False,
@@ -404,6 +413,12 @@ def create_generator(
         audio_vae=audio_vae,
         device=torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu")),
         num_inference_steps=num_inference_steps,
+        sampler=sampler,
+        base_schedule=base_schedule,
+        video_shift=video_shift,
+        audio_shift=audio_shift,
+        sde_eta=sde_eta,
+        res_c2=res_c2,
         height=height,
         width=width,
         fp8_scaled=fp8_scaled,
@@ -459,6 +474,12 @@ class _NativeGenerator:
         audio_vae: Path | None,
         device: torch.device,
         num_inference_steps: int,
+        sampler: str = "euler",
+        base_schedule: str = "linear",
+        video_shift: float = VIDEO_FLOW_SHIFT,
+        audio_shift: float = AUDIO_FLOW_SHIFT,
+        sde_eta: float = 0.0,
+        res_c2: float = 0.5,
         height: int | None,
         width: int | None,
         fp8_scaled: bool,
@@ -501,6 +522,26 @@ class _NativeGenerator:
         latent_upscaler: Path | None = None,
         latent_upscale_scale: float = 1.0,
     ) -> None:
+        _validate_sampler_options(
+            sampler=sampler,
+            base_schedule=base_schedule,
+            sde_eta=sde_eta,
+            res_c2=res_c2,
+            video_shift=video_shift,
+            audio_shift=audio_shift,
+        )
+        if mode == "ref2va" and (
+            sampler != "euler"
+            or base_schedule != "linear"
+            or video_shift != VIDEO_FLOW_SHIFT
+            or audio_shift != AUDIO_FLOW_SHIFT
+            or sde_eta != 0.0
+            or res_c2 != 0.5
+        ):
+            raise ValueError(
+                "MiniMax H3 Ref2VA generation currently supports only the euler sampler with a linear base schedule "
+                "and released video/audio flow shifts"
+            )
         self.model = Path(model)
         self.text_encoder = Path(text_encoder)
         self.tokenizer = Path(tokenizer)
@@ -508,6 +549,12 @@ class _NativeGenerator:
         self.audio_vae = Path(audio_vae) if audio_vae is not None else None
         self.device = device
         self.num_inference_steps = num_inference_steps
+        self.sampler = sampler
+        self.base_schedule = base_schedule
+        self.video_shift = video_shift
+        self.audio_shift = audio_shift
+        self.sde_eta = sde_eta
+        self.res_c2 = res_c2
         # A second pass costs a whole canvas of denoising, so it stays off unless
         # a scale is given. Speed adapters are the reason it exists: the first
         # pass settles motion without one, the second sharpens with one.
@@ -617,8 +664,7 @@ class _NativeGenerator:
             )
             null_conditioning = None
             if self.null_guidance_scale > 0:
-                # Encoded in the same encoder session: loading the text encoder
-                # twice would cost more than the whole denoise.
+                # Encode both presentations in the same encoder session.
                 null_conditioning = encoder.encode_null_conditioning(prompt, images, references)
         finally:
             encoder.close()
@@ -1158,7 +1204,16 @@ class _NativeGenerator:
                 return denoise_ref2va(transformer, conditioning, merged.pop("references"), **merged)
 
         else:
-            base_kwargs.update(keyframe_rows=keyframe_rows, keyframe_anchors=anchors)
+            base_kwargs.update(
+                keyframe_rows=keyframe_rows,
+                keyframe_anchors=anchors,
+                sampler=self.sampler,
+                base_schedule=self.base_schedule,
+                video_shift=self.video_shift,
+                audio_shift=self.audio_shift,
+                sde_eta=self.sde_eta,
+                res_c2=self.res_c2,
+            )
 
             def denoise(**overrides):
                 return denoise_fl2va(transformer, conditioning, **{**base_kwargs, **overrides})
@@ -1184,8 +1239,7 @@ class _NativeGenerator:
         gc.collect()
         clean_memory_on_device(self.device)
 
-        # After the transformer is gone, not before: it holds tens of gigabytes,
-        # and enlarging the latent allocates several more for its activations.
+        # Release the transformer before allocating upscaler activations.
         if self.latent_upscaler is not None and self.latent_upscale_scale > 1.0:
             video_latents = self._measure("latent_upscale", lambda: self._upscale_latents(video_latents), metrics).cpu()
 
@@ -1237,7 +1291,15 @@ class _NativeGenerator:
                 "fps": media.fps,
                 "sample_rate": media.sample_rate,
                 "sigma_points": self.num_inference_steps,
-                "model_evaluations": self.num_inference_steps - 1,
+                "model_evaluations": self.num_inference_steps
+                - 1
+                + (max(0, self.num_inference_steps - 3) if self.sampler == "res_2s" else 0),
+                "sampler": self.sampler,
+                "base_schedule": self.base_schedule,
+                "video_shift": self.video_shift,
+                "audio_shift": self.audio_shift,
+                "sde_eta": self.sde_eta,
+                "res_c2": self.res_c2,
                 "lora_weights": [path.name for path in self.lora_weights],
                 "keyframe_anchors": list(anchors),
                 "reference_kinds": reference_kinds,
@@ -2609,9 +2671,7 @@ class _NativeTrainingBackend:
             if aligned.shape != kinds.shape:
                 raise ValueError("H3 Ref2VA cache has inconsistent aligned-reference metadata")
         else:
-            # Caches created before aligned external guides existed are ordinary
-            # references by definition. Keeping this optional preserves their
-            # exact packing and avoids a needless recache.
+            # Caches without aligned-guide metadata retain ordinary reference packing.
             aligned = torch.zeros_like(kinds, dtype=torch.bool)
         if video_shapes.shape != (kinds.numel(), 3) or audio_lengths.shape != kinds.shape:
             raise ValueError("H3 Ref2VA cache has inconsistent reference metadata")
@@ -3035,8 +3095,7 @@ class _NativeLatentEncoder:
                     encode_indices(chunk[:midpoint])
                     encode_indices(chunk[midpoint:])
 
-            # Bound the peak input and VAE activation size independently of the
-            # dataset bucket size. A split also rescues batches that exceed VRAM.
+            # Bound encoder input and activation size independently of the dataset bucket size.
             for start in range(0, len(indices), 4):
                 encode_indices(indices[start : start + 4])
 
