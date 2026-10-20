@@ -1524,3 +1524,26 @@ def test_h3_refiner_cache_preserves_backward_graph():
 
     assert inputs["video_hidden_states"].grad is not None
     assert torch.isfinite(inputs["video_hidden_states"].grad).all()
+
+
+def test_h3_refiner_cache_bypasses_mutable_inference_text(monkeypatch):
+    model = MiniMaxH3Transformer(_tiny_config()).requires_grad_(False).eval()
+    text = _tiny_inputs()["encoder_hidden_states"]
+    calls = _count_refiner_calls(model, monkeypatch)
+    model._refined_text(text)
+    assert model._refiner_cache is not None
+
+    with torch.inference_mode():
+        inference_text = text.clone()
+        assert torch.is_inference(inference_text)
+        first = model._refined_text(inference_text)
+        assert model._refiner_cache is None
+        inference_text.add_(1)
+        second = model._refined_text(inference_text)
+        assert not torch.equal(first, second)
+        assert model._refiner_cache is None
+
+    assert len(calls) == 3
+    model._refined_text(text)
+    model._refined_text(text)
+    assert len(calls) == 4

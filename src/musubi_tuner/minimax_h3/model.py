@@ -1705,8 +1705,9 @@ class MiniMaxH3Transformer(nn.Module):
         frozen = all(not p.requires_grad for p in self.condition_proj.parameters()) and all(
             not p.requires_grad for p in self.token_refiner.parameters()
         )
+        cacheable = frozen and not encoder_hidden_states.requires_grad and not torch.is_inference(encoder_hidden_states)
         cached = self._refiner_cache
-        if not frozen or encoder_hidden_states.requires_grad:
+        if not cacheable:
             self._refiner_cache = None
         elif (
             cached is not None
@@ -1718,7 +1719,7 @@ class MiniMaxH3Transformer(nn.Module):
         text = self.condition_proj(encoder_hidden_states.to(self.condition_proj.weight.dtype))
         with h3_profile_scope("h3.refiner"):
             text = self.token_refiner(text, self.gradient_checkpointing)
-        if frozen and not encoder_hidden_states.requires_grad:
+        if cacheable:
             self._refiner_cache = (encoder_hidden_states, encoder_hidden_states._version, autocast_dtype, text)
         return text
 
