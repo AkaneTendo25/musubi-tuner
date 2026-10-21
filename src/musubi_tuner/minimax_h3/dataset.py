@@ -58,6 +58,12 @@ TARGET_DIRECTORY_KEYS = {
     "video": "target_video_directory",
     "audio": "target_audio_directory",
 }
+SOURCE_REFERENCE_MODES = frozenset({"av", "video", "audio"})
+SOURCE_REFERENCE_POLICY_KEYS = (
+    "source_video_audio_mode",
+    "source_reference_modality",
+    "source_reference_modalities",
+)
 LEGACY_H3_DATASET_KEYS = frozenset(
     {
         "image_directory",
@@ -128,6 +134,39 @@ def _modality_list(value: Any, key: str) -> tuple[str, ...] | None:
     return modalities
 
 
+def _source_reference_mode(value: Any, key: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value.lower() not in SOURCE_REFERENCE_MODES:
+        raise ValueError(f"{key} must be av, video, or audio")
+    return value.lower()
+
+
+def _source_reference_mode_list(value: Any, key: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{key} must be a non-empty TOML array")
+    modes = tuple(str(item).lower() for item in value)
+    if any(mode not in SOURCE_REFERENCE_MODES for mode in modes):
+        raise ValueError(f"{key} entries must be av, video, or audio")
+    return modes
+
+
+def _source_reference_policy(source: dict[str, Any], general: dict[str, Any]) -> tuple[str | None, tuple[str, ...] | None]:
+    fixed = _source_reference_mode(
+        _effective(source, general, "source_reference_modality"),
+        "source_reference_modality",
+    )
+    ordered = _source_reference_mode_list(
+        _effective(source, general, "source_reference_modalities"),
+        "source_reference_modalities",
+    )
+    if fixed is not None and ordered is not None:
+        raise ValueError("use source_reference_modality or source_reference_modalities, not both")
+    return fixed, ordered
+
+
 def _translate_one_frame_image_aliases(user_config: dict[str, Any]) -> dict[str, Any]:
     """Accept Musubi's documented image keys only for explicit one-frame runs."""
     translated = copy.deepcopy(user_config)
@@ -178,9 +217,6 @@ def _normalize_explicit_modality_config(user_config: dict[str, Any]) -> dict[str
     normalized = copy.deepcopy(user_config)
     general = normalized.get("general", {})
     for index, dataset in enumerate(normalized.get("datasets", [])):
-        source_probabilities = dataset.get("source_modality_probabilities")
-        if source_probabilities is not None:
-            dataset["control_modality_probabilities"] = source_probabilities
         target_dirs = {kind: dataset.get(key) for kind, key in TARGET_DIRECTORY_KEYS.items() if dataset.get(key)}
         jsonl_kinds = tuple(kind for kind in ("image", "video", "audio") if dataset.get(f"{kind}_jsonl_file"))
         for kind in ("image", "video", "audio"):
@@ -226,14 +262,34 @@ def _normalize_explicit_modality_config(user_config: dict[str, Any]) -> dict[str
         )
         dataset["h3_target_mode"] = resolved_mode
 
-        declared_sources = tuple(kind for kind, key in SOURCE_DIRECTORY_KEYS.items() if dataset.get(key))
-        requested_sources = _modality_list(dataset.get("source_modalities"), "source_modalities")
+        declared_sources = tuple(kind for kind, key in SOURCE_DIRECTORY_KEYS.items() if _effective(dataset, general, key))
+        requested_sources = _modality_list(_effective(dataset, general, "source_modalities"), "source_modalities")
         if declared_sources and requested_sources is None:
             raise ValueError(f"datasets[{index}] requires source_modalities when source_*_directory is configured")
-        embedded_av = bool(dataset.get("source_video_audio_embedded"))
-        paired_av = bool(dataset.get("source_video_audio_paired"))
+        embedded_av = bool(_effective(dataset, general, "source_video_audio_embedded"))
+        paired_av = bool(_effective(dataset, general, "source_video_audio_paired"))
+        video_mode = _source_reference_mode(
+            _effective(dataset, general, "source_video_audio_mode"),
+            "source_video_audio_mode",
+        )
+        fixed_role, ordered_roles = _source_reference_policy(dataset, general)
         if embedded_av and paired_av:
             raise ValueError(f"datasets[{index}] cannot combine source_video_audio_embedded and source_video_audio_paired")
+        if video_mode is not None and (embedded_av or paired_av):
+            raise ValueError(f"datasets[{index}] source_video_audio_mode cannot be combined with embedded or paired source AV")
+        if video_mode is not None and (fixed_role is not None or ordered_roles is not None):
+            raise ValueError(f"datasets[{index}] source_video_audio_mode cannot be combined with source reference modality roles")
+        if video_mode is not None and "video" not in declared_sources:
+            raise ValueError(f"datasets[{index}] source_video_audio_mode requires source_video_directory")
+        if video_mode in {"av", "audio"} and "audio" in declared_sources:
+            raise ValueError(
+                f"datasets[{index}] source_video_audio_mode={video_mode} cannot be combined with source_audio_directory"
+            )
+        source_probabilities = _effective(dataset, general, "source_modality_probabilities")
+        if source_probabilities is not None and (fixed_role is not None or ordered_roles is not None):
+            raise ValueError(
+                f"datasets[{index}] source_modality_probabilities cannot be combined with source reference modality roles"
+            )
         if embedded_av and ("video" not in declared_sources or "audio" in declared_sources):
             raise ValueError(
                 f"datasets[{index}] source_video_audio_embedded requires source_video_directory and no source_audio_directory"
@@ -245,12 +301,12 @@ def _normalize_explicit_modality_config(user_config: dict[str, Any]) -> dict[str
                 frozenset((*nonvideo_sources, "audio")),
                 frozenset((*nonvideo_sources, "video", "audio")),
             }
+        elif video_mode == "av":
+            expected_source_sets = {frozenset((*declared_sources, "audio"))}
+        elif video_mode == "audio":
+            expected_source_sets = {frozenset((*(set(declared_sources) - {"video"}), "audio"))}
         if requested_sources is not None and frozenset(requested_sources) not in expected_source_sets:
-            detail = (
-                "; with source_video_audio_embedded, the video directory may provide video+audio or audio only"
-                if embedded_av
-                else ""
-            )
+            detail = "; with embedded video audio, the video directory may provide video+audio or audio only" if embedded_av else ""
             raise ValueError(f"datasets[{index}] source_modalities do not match the configured source directories{detail}")
         if paired_av and not {"video", "audio"}.issubset(declared_sources):
             raise ValueError(f"datasets[{index}] source_video_audio_paired requires video and audio source directories")
@@ -380,6 +436,53 @@ def _select_reference_modality(asset: MediaAsset, mode: str, *, index: int) -> M
     if _modality_for_path(audio_path) not in {MediaModality.VIDEO, MediaModality.AUDIO}:
         raise ValueError(f"control_modality_{index}=audio requires a video or audio reference")
     return MediaAsset(audio_path, MediaModality.AUDIO, asset.role)
+
+
+def _select_dataset_reference_modality(asset: MediaAsset, mode: str, *, index: int) -> MediaAsset:
+    """Apply an explicit dataset role, including AV audio that legacy raw controls imply."""
+
+    label = f"source reference modality entry {index}"
+    if mode == "av":
+        if asset.modality is not MediaModality.VIDEO:
+            raise ValueError(f"{label}=av requires a video reference")
+        metadata = dict(asset.metadata)
+        metadata["include_audio"] = True
+        metadata.setdefault("audio_path", str(asset.path))
+        return MediaAsset(
+            asset.path,
+            asset.modality,
+            asset.role,
+            stream_index=asset.stream_index,
+            start_seconds=asset.start_seconds,
+            duration_seconds=asset.duration_seconds,
+            metadata=metadata,
+        )
+    if mode == "video":
+        if asset.modality not in {MediaModality.IMAGE, MediaModality.VIDEO}:
+            raise ValueError(f"{label}=video requires an image or video reference")
+        metadata = dict(asset.metadata)
+        metadata["include_audio"] = False
+        metadata.pop("audio_path", None)
+        return MediaAsset(
+            asset.path,
+            asset.modality,
+            asset.role,
+            stream_index=asset.stream_index,
+            start_seconds=asset.start_seconds,
+            duration_seconds=asset.duration_seconds,
+            metadata=metadata,
+        )
+    audio_path = Path(asset.metadata.get("audio_path", asset.path))
+    if _modality_for_path(audio_path) not in {MediaModality.VIDEO, MediaModality.AUDIO}:
+        raise ValueError(f"{label}=audio requires a video or audio reference")
+    return MediaAsset(
+        audio_path,
+        MediaModality.AUDIO,
+        asset.role,
+        stream_index=asset.stream_index,
+        start_seconds=asset.start_seconds,
+        duration_seconds=asset.duration_seconds,
+    )
 
 
 def _control_sort_key(path: Path, target_stem: str) -> int:
@@ -516,28 +619,26 @@ def _paired_references_from_directories(
 
 
 def _dataset_reference_modes(source: dict[str, Any], general: dict[str, Any], count: int) -> tuple[str | None, ...]:
-    mode = _effective(source, general, "control_modality")
-    modes = _effective(source, general, "control_modalities")
-    if mode is not None and modes is not None:
-        raise ValueError("use control_modality or control_modalities, not both")
-    if modes is not None:
-        if not isinstance(modes, list) or len(modes) != count:
-            raise ValueError(f"control_modalities must contain exactly {count} entries")
-        values = tuple(str(value).lower() for value in modes)
-    elif mode is not None:
-        values = (str(mode).lower(),) * count
+    fixed, ordered = _source_reference_policy(source, general)
+    if ordered is not None:
+        if len(ordered) != count:
+            raise ValueError(f"source_reference_modalities must contain exactly {count} entries")
+        values = ordered
+    elif fixed is not None:
+        if count == 0:
+            raise ValueError("source_reference_modality requires at least one resolved source reference")
+        values = (fixed,) * count
     else:
         return (None,) * count
-    if any(value not in {"av", "video", "audio"} for value in values):
-        raise ValueError("control modality values must be av, video, or audio")
     return values
 
 
 def _dataset_reference_probabilities(source: dict[str, Any], general: dict[str, Any]) -> tuple[float, float, float] | None:
-    values = _effective(source, general, "control_modality_probabilities")
+    values = _effective(source, general, "source_modality_probabilities")
     if values is None:
         return None
-    if _effective(source, general, "control_modality") is not None or _effective(source, general, "control_modalities") is not None:
+    fixed, ordered = _source_reference_policy(source, general)
+    if fixed is not None or ordered is not None:
         raise ValueError("source_modality_probabilities cannot be combined with fixed per-reference modality overrides")
     if not isinstance(values, list) or len(values) != 3:
         raise ValueError("source_modality_probabilities must be [av, video, audio]")
@@ -644,6 +745,12 @@ def _explicit_source_references(
     """Resolve independently stored image, video, and audio conditioning sides."""
     paired = bool(_effective(source, general, "source_video_audio_paired"))
     embedded = bool(_effective(source, general, "source_video_audio_embedded"))
+    video_mode = _source_reference_mode(
+        _effective(source, general, "source_video_audio_mode"),
+        "source_video_audio_mode",
+    )
+    if video_mode is not None and (paired or embedded):
+        raise ValueError("source_video_audio_mode cannot be combined with embedded or paired source AV")
     requested_sources = set(_effective(source, general, "source_modalities") or ())
     by_modality: dict[str, dict[str, tuple[Path, ...]]] = {}
     for kind, key in SOURCE_DIRECTORY_KEYS.items():
@@ -669,10 +776,17 @@ def _explicit_source_references(
                 modality = _modality_for_path(path)
                 if modality.name.lower() != kind:
                     raise ValueError(f"{SOURCE_DIRECTORY_KEYS[kind]} must contain {kind} references, got {path}")
-                if modality is MediaModality.VIDEO and embedded and "video" not in requested_sources:
+                if modality is MediaModality.VIDEO and video_mode == "audio":
+                    assets.append(MediaAsset(path, MediaModality.AUDIO, "reference"))
+                elif modality is MediaModality.VIDEO and embedded and "video" not in requested_sources:
                     assets.append(MediaAsset(path, MediaModality.AUDIO, "reference"))
                 else:
-                    metadata = {"include_audio": embedded} if modality is MediaModality.VIDEO else {}
+                    if modality is MediaModality.VIDEO and video_mode == "av":
+                        metadata = {"include_audio": True, "audio_path": str(path)}
+                    elif modality is MediaModality.VIDEO:
+                        metadata = {"include_audio": embedded}
+                    else:
+                        metadata = {}
                     assets.append(MediaAsset(path, modality, "reference", metadata=metadata))
         if paired:
             assets.extend(paired_assets[target])
@@ -725,6 +839,18 @@ def _record_references(records: Sequence[dict[str, Any]], target_keys: Sequence[
     return reference_paths
 
 
+def _reject_mixed_record_and_dataset_reference_roles(
+    records: Sequence[dict[str, Any]] | None,
+    source: dict[str, Any],
+    general: dict[str, Any],
+) -> None:
+    if records is None:
+        return
+    fixed, ordered = _source_reference_policy(source, general)
+    if (fixed is not None or ordered is not None) and any(_reference_modes(record) for record in records):
+        raise ValueError("source_reference_modality/source_reference_modalities cannot be combined with JSONL control_modality_N")
+
+
 def _dataset_references(
     source: dict[str, Any],
     general: dict[str, Any],
@@ -736,7 +862,17 @@ def _dataset_references(
         reference if isinstance(reference, MediaAsset) else MediaAsset(reference, _modality_for_path(reference), "reference")
         for reference in raw_references
     )
+    modes = _dataset_reference_modes(source, general, len(references))
+    probabilities = _dataset_reference_probabilities(source, general)
     aligned_indices = _effective(source, general, "aligned_guide_indices")
+    if aligned_indices and probabilities is not None:
+        raise ValueError("aligned_guide_indices cannot be combined with source_modality_probabilities")
+    if probabilities is not None:
+        _validate_reference_modality_probabilities(target, references, probabilities)
+    references = tuple(
+        _select_dataset_reference_modality(reference, mode, index=index) if mode is not None else reference
+        for index, (reference, mode) in enumerate(zip(references, modes))
+    )
     if aligned_indices is not None:
         if not isinstance(aligned_indices, list) or any(
             isinstance(index, bool) or not isinstance(index, int) for index in aligned_indices
@@ -770,16 +906,6 @@ def _dataset_references(
                 )
             )
         references = tuple(updated)
-    modes = _dataset_reference_modes(source, general, len(references))
-    probabilities = _dataset_reference_probabilities(source, general)
-    if aligned_indices and probabilities is not None:
-        raise ValueError("aligned_guide_indices cannot be combined with source_modality_probabilities")
-    if probabilities is not None:
-        _validate_reference_modality_probabilities(target, references, probabilities)
-    references = tuple(
-        _select_reference_modality(reference, mode, index=index) if mode is not None else reference
-        for index, (reference, mode) in enumerate(zip(references, modes))
-    )
     return references, probabilities
 
 
@@ -861,6 +987,7 @@ class H3DatasetAdapter:
             *TARGET_DIRECTORY_KEYS.values(),
             "source_video_audio_paired",
             "source_video_audio_embedded",
+            *SOURCE_REFERENCE_POLICY_KEYS,
             "source_modality_probabilities",
             "aligned_guide_indices",
             ONE_FRAME_TARGET_INDICES_KEY,
@@ -877,6 +1004,7 @@ class H3DatasetAdapter:
                 "target_modalities",
                 "source_video_audio_paired",
                 "source_video_audio_embedded",
+                *SOURCE_REFERENCE_POLICY_KEYS,
                 "source_modality_probabilities",
                 "aligned_guide_indices",
                 ONE_FRAME_TARGET_INDICES_KEY,
@@ -925,6 +1053,7 @@ class H3DatasetAdapter:
                 if bool(audio_control_video_directory) != bool(audio_control_audio_directory):
                     raise ValueError("control_video_directory and control_audio_directory must be specified together")
                 audio_records = _read_media_jsonl(audio_jsonl_file) if audio_jsonl_file else None
+                _reject_mixed_record_and_dataset_reference_roles(audio_records, source, general)
                 if audio_records is not None and len(audio_records) != len(paths):
                     raise ValueError("H3 audio JSONL control parsing disagrees with the audio dataset records")
                 if (
@@ -1098,6 +1227,8 @@ class H3DatasetAdapter:
                     target_sources[target_path] = tuple(paths)
             else:
                 raise ValueError("MiniMax H3 requires a Musubi image or video dataset")
+
+            _reject_mixed_record_and_dataset_reference_roles(records, source, general)
 
             if image_directory or image_jsonl_file:
                 # H3 uses this only to size a separately stored companion-audio

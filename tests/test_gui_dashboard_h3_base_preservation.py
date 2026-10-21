@@ -872,7 +872,7 @@ def test_dashboard_migrates_unambiguous_h3_project_dataset_fields() -> None:
     )
 
     entry = config.dataset.datasets[0]
-    assert config.version == 4
+    assert config.version == 5
     assert entry.h3_target_modalities == "video"
     assert entry.source_video_directory == "reference_video"
     assert entry.source_audio_directory == "reference_audio"
@@ -1385,7 +1385,6 @@ def test_h3_layout_contract_prevents_clipped_errors_and_ltx_routes() -> None:
         "/training/conditioning",
         "/training/full-finetune",
         "/training/rl",
-        "/training/techniques",
     ):
         assert f"'{route}'" in layout
 

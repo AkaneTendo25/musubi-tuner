@@ -61,6 +61,19 @@ def _has_text(value: str | None) -> bool:
     return bool(value and value.strip())
 
 
+def _reference_modalities(raw: str | None) -> tuple[list[str], str | None]:
+    if not _has_text(raw):
+        return [], None
+    parts = str(raw).replace(",", ";").split(";")
+    if any(not part.strip() for part in parts):
+        return [], "per-reference roles must not contain empty entries"
+    values = [part.strip().lower() for part in parts]
+    invalid = sorted({value for value in values if value not in {"av", "video", "audio"}})
+    if invalid:
+        return [], f"per-reference roles must be av, video, or audio, got {invalid}"
+    return values, None
+
+
 def _split_cli_args(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -277,12 +290,123 @@ def _validate_h3_dataset_entry(
             _make_issue(
                 "error",
                 f"{field_base}.control_modalities",
-                f"{label}: H3 source modalities are defined by the explicit source directories and AV toggles.",
+                f"{label}: migrate legacy control roles to the explicit source reference role fields.",
                 label=label,
                 page="dataset",
             )
         )
     source_modalities = {modality for modality in ("image", "video", "audio") if getattr(entry, f"source_{modality}_directory", "")}
+    fixed_role = entry.source_reference_modality or ""
+    ordered_roles, ordered_roles_error = _reference_modalities(entry.source_reference_modalities)
+    video_mode = entry.source_video_audio_mode or ""
+    if fixed_role and fixed_role not in {"av", "video", "audio"}:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_reference_modality",
+                f"{label}: fixed source-reference role must be av, video, or audio.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if video_mode and video_mode not in {"video", "av", "audio"}:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_video_audio_mode",
+                f"{label}: video contribution mode must be video, av, or audio.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if ordered_roles_error:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_reference_modalities",
+                f"{label}: {ordered_roles_error}.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if fixed_role and ordered_roles:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_reference_modalities",
+                f"{label}: choose either one fixed source-reference role or an ordered role list.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if (fixed_role or ordered_roles) and not source_modalities and not _has_text(entry.jsonl_file):
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_reference_modality",
+                f"{label}: source-reference roles require explicit source directories or JSONL references.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if video_mode and (fixed_role or ordered_roles):
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_video_audio_mode",
+                f"{label}: video contribution mode cannot be combined with fixed/per-reference roles.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if video_mode and (entry.source_video_audio_embedded or entry.source_video_audio_paired):
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_video_audio_mode",
+                f"{label}: video contribution mode cannot be combined with embedded or paired source AV.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if video_mode and "video" not in source_modalities:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_video_audio_mode",
+                f"{label}: video contribution mode requires a source video directory.",
+                label=label,
+                page="dataset",
+            )
+        )
+    if video_mode in {"av", "audio"} and "audio" in source_modalities:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_video_audio_mode",
+                f"{label}: {video_mode} video contribution cannot use a separate source audio directory.",
+                label=label,
+                page="dataset",
+            )
+        )
+    fixed_role_incompatible = (
+        (
+            fixed_role == "av"
+            and ("image" in source_modalities or ("audio" in source_modalities and not entry.source_video_audio_paired))
+        )
+        or (fixed_role == "video" and "audio" in source_modalities and not entry.source_video_audio_paired)
+        or (fixed_role == "audio" and "image" in source_modalities)
+    )
+    if fixed_role_incompatible:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.source_reference_modality",
+                f"{label}: fixed {fixed_role} role is incompatible with the configured source directory types.",
+                label=label,
+                page="dataset",
+            )
+        )
     probabilities = (
         entry.control_modality_probability_av,
         entry.control_modality_probability_video,
@@ -325,7 +449,52 @@ def _validate_h3_dataset_entry(
                         page="dataset",
                     )
                 )
+            if fixed_role == "audio" or video_mode == "audio":
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"{field_base}.aligned_guide_indices",
+                        f"{label}: aligned guides must resolve to video, not an audio-only role.",
+                        label=label,
+                        page="dataset",
+                    )
+                )
+            if ordered_roles:
+                missing_roles = [value for value in aligned_guide_indices if value >= len(ordered_roles)]
+                audio_roles = [
+                    value for value in aligned_guide_indices if value < len(ordered_roles) and ordered_roles[value] == "audio"
+                ]
+                if missing_roles:
+                    errors.append(
+                        _make_issue(
+                            "error",
+                            f"{field_base}.aligned_guide_indices",
+                            f"{label}: aligned guide indices have no matching ordered source roles: {missing_roles}.",
+                            label=label,
+                            page="dataset",
+                        )
+                    )
+                if audio_roles:
+                    errors.append(
+                        _make_issue(
+                            "error",
+                            f"{field_base}.aligned_guide_indices",
+                            f"{label}: aligned guide indices select audio-only roles: {audio_roles}.",
+                            label=label,
+                            page="dataset",
+                        )
+                    )
     if any(value is not None for value in probabilities):
+        if fixed_role or ordered_roles:
+            errors.append(
+                _make_issue(
+                    "error",
+                    f"{field_base}.control_modality_probability_av",
+                    f"{label}: stochastic source probabilities cannot be combined with fixed/per-reference roles.",
+                    label=label,
+                    page="dataset",
+                )
+            )
         if any(value is None for value in probabilities):
             errors.append(
                 _make_issue(
@@ -372,8 +541,14 @@ def _validate_h3_dataset_entry(
             )
         )
     if numeric_probabilities is not None and source_modalities:
-        has_visual_source = bool(source_modalities.intersection({"image", "video"}))
-        has_audio_source = bool(source_modalities.intersection({"image", "audio"})) or entry.source_video_audio_embedded
+        effective_sources = set(source_modalities)
+        if video_mode == "audio":
+            effective_sources.discard("video")
+            effective_sources.add("audio")
+        elif video_mode == "av":
+            effective_sources.add("audio")
+        has_visual_source = bool(effective_sources.intersection({"image", "video"}))
+        has_audio_source = bool(effective_sources.intersection({"image", "audio"})) or entry.source_video_audio_embedded
         if numeric_probabilities[1] > 0 and not has_visual_source:
             errors.append(
                 _make_issue(
@@ -511,11 +686,34 @@ def _h3_required_vaes(config: ProjectConfig) -> tuple[bool, bool]:
         requires_video |= target_mode != "audio"
         requires_audio |= entry.type in {"video", "audio"} and target_mode != "video"
 
-        # Explicit source directories determine which reference encoders are needed.
-        if entry.source_image_directory or entry.source_video_directory:
-            requires_video = True
-        if entry.source_audio_directory or entry.source_video_audio_embedded:
-            requires_audio = True
+        ordered_roles, _ = _reference_modalities(entry.source_reference_modalities)
+        fixed_role = entry.source_reference_modality or ""
+        if ordered_roles:
+            aligned_indices: set[int] = set()
+            aligned_values = [part.strip() for part in entry.aligned_guide_indices.replace(";", ",").split(",") if part.strip()]
+            if aligned_values:
+                try:
+                    parsed_indices = tuple(int(value) for value in aligned_values)
+                except ValueError:
+                    pass
+                else:
+                    if all(value >= 0 for value in parsed_indices) and len(set(parsed_indices)) == len(parsed_indices):
+                        aligned_indices = set(parsed_indices)
+            requires_video |= any(role in {"av", "video"} for role in ordered_roles)
+            requires_audio |= any(
+                role == "audio" or (role == "av" and index not in aligned_indices) for index, role in enumerate(ordered_roles)
+            )
+        elif fixed_role:
+            requires_video |= fixed_role in {"av", "video"}
+            requires_audio |= fixed_role in {"av", "audio"}
+        else:
+            if entry.source_image_directory:
+                requires_video = True
+            if entry.source_video_directory:
+                requires_video |= entry.source_video_audio_mode != "audio"
+                requires_audio |= entry.source_video_audio_mode in {"av", "audio"}
+            if entry.source_audio_directory or entry.source_video_audio_embedded:
+                requires_audio = True
     return requires_video, requires_audio
 
 

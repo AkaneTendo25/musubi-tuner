@@ -138,6 +138,13 @@ def _h3_reference_video_rows_per_frame(width: int, height: int, short_edge: int 
     return _h3_spatial_rows(resolved_width, resolved_height)
 
 
+def _h3_ordered_reference_roles(dataset: dict) -> tuple[str, ...]:
+    raw = str(dataset.get("source_reference_modalities") or "")
+    if not raw.strip():
+        return ()
+    return tuple(value for part in raw.replace(",", ";").split(";") if (value := part.strip().lower()) in {"av", "video", "audio"})
+
+
 def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
     """Approximate the largest packed H3 sequence represented by one row."""
     dataset_type = str(dataset.get("type", "video"))
@@ -179,15 +186,47 @@ def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
                 side = max(round(target_pixels**0.5 / 16) * 16, 16)
             else:
                 side = max(_coerce_int(training.get("reference_image_short_edge", 2048), 2048), 16)
-            condition_rows += _h3_spatial_rows(side, side)
-        if dataset.get("source_video_directory"):
-            reference_short_edge = max(_coerce_int(training.get("reference_video_short_edge", 768), 768), 16)
-            reference_max_pixels = max(_coerce_int(training.get("reference_video_max_pixels", 768 * 1344), 768 * 1344), 256)
-            condition_rows += ref_video_latents * _h3_reference_video_rows_per_frame(
-                width, height, reference_short_edge, reference_max_pixels
-            )
-        if dataset.get("source_audio_directory") or dataset.get("source_video_audio_embedded"):
-            condition_rows += 2 * ref_audio_latents
+            reference_image_rows = _h3_spatial_rows(side, side)
+        else:
+            reference_image_rows = 0
+        reference_short_edge = max(_coerce_int(training.get("reference_video_short_edge", 768), 768), 16)
+        reference_max_pixels = max(_coerce_int(training.get("reference_video_max_pixels", 768 * 1344), 768 * 1344), 256)
+        reference_video_rows = ref_video_latents * _h3_reference_video_rows_per_frame(
+            width, height, reference_short_edge, reference_max_pixels
+        )
+        reference_audio_rows = 2 * ref_audio_latents
+        ordered_roles = _h3_ordered_reference_roles(dataset)
+        fixed_role = str(dataset.get("source_reference_modality") or "").lower()
+        if ordered_roles:
+            # The project does not scan reference dimensions/counts. Treat every
+            # visual role as a reference video so the estimate is conservative.
+            condition_rows += sum(role in {"av", "video"} for role in ordered_roles) * reference_video_rows
+            condition_rows += sum(role in {"av", "audio"} for role in ordered_roles) * reference_audio_rows
+        elif fixed_role in {"av", "video", "audio"}:
+            paired = bool(dataset.get("source_video_audio_paired"))
+            carriers = int(bool(dataset.get("source_image_directory")))
+            if paired and dataset.get("source_video_directory") and dataset.get("source_audio_directory"):
+                carriers += 1
+            else:
+                carriers += int(bool(dataset.get("source_video_directory")))
+                carriers += int(bool(dataset.get("source_audio_directory")))
+            if carriers == 0 and dataset.get("jsonl_file"):
+                carriers = 1
+            if fixed_role in {"av", "video"}:
+                condition_rows += carriers * reference_video_rows
+            if fixed_role in {"av", "audio"}:
+                condition_rows += carriers * reference_audio_rows
+        else:
+            condition_rows += reference_image_rows
+            video_mode = str(dataset.get("source_video_audio_mode") or "")
+            if dataset.get("source_video_directory") and video_mode != "audio":
+                condition_rows += reference_video_rows
+            if (
+                dataset.get("source_audio_directory")
+                or dataset.get("source_video_audio_embedded")
+                or (dataset.get("source_video_directory") and video_mode in {"av", "audio"})
+            ):
+                condition_rows += reference_audio_rows
 
     keyframe_count = max(_coerce_int(training.get("h3_keyframe_random_count", 0), 0), 0)
     if not keyframe_count:

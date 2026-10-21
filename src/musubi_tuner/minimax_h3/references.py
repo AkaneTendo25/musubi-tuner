@@ -109,6 +109,8 @@ def reference_fingerprint(assets: Sequence[MediaAsset]) -> str | None:
     entries: list[dict[str, Any]] = []
     for order, asset in enumerate(references):
         entry = {"order": order, "kind": int(_kind(asset)), **file_identity(asset.path)}
+        if asset.modality is MediaModality.VIDEO:
+            entry["include_audio"] = bool(asset.metadata.get("include_audio", True))
         if asset.metadata.get("aligned_to_target", False):
             # Omit false so ordinary-reference fingerprints remain byte-for-byte
             # compatible with caches created before aligned guides existed.

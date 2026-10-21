@@ -89,6 +89,19 @@ def _split_path_list(raw: str) -> list[str]:
     return values
 
 
+def _split_reference_modalities(raw: str) -> list[str]:
+    if not raw or not raw.strip():
+        return []
+    parts = raw.replace(",", ";").split(";")
+    if any(not part.strip() for part in parts):
+        raise ValueError("H3 per-reference roles must not contain empty entries")
+    values = [part.strip().lower() for part in parts]
+    invalid = sorted({value for value in values if value not in {"av", "video", "audio"}})
+    if invalid:
+        raise ValueError(f"H3 per-reference roles must be av, video, or audio, got {invalid}")
+    return values
+
+
 def _merge_path_values(*groups: list[str]) -> list[str]:
     values: list[str] = []
     seen: set[str] = set()
@@ -295,14 +308,43 @@ def _h3_dataset_entry_to_dict(entry) -> dict:
         if path:
             d[f"source_{modality}_directory"] = path
             source_modalities.append(modality)
-    if source_modalities:
-        if entry.source_video_audio_embedded and "audio" not in source_modalities:
+    video_mode = entry.source_video_audio_mode or ""
+    fixed_role = entry.source_reference_modality or ""
+    ordered_roles = _split_reference_modalities(entry.source_reference_modalities)
+    if video_mode and video_mode not in {"video", "av", "audio"}:
+        raise ValueError("H3 source_video_audio_mode must be video, av, or audio")
+    if fixed_role and fixed_role not in {"av", "video", "audio"}:
+        raise ValueError("H3 source_reference_modality must be av, video, or audio")
+    if fixed_role and ordered_roles:
+        raise ValueError("H3 source_reference_modality and source_reference_modalities are mutually exclusive")
+    if video_mode and (fixed_role or ordered_roles):
+        raise ValueError("H3 source video contribution mode cannot be combined with fixed/per-reference roles")
+    if video_mode and (entry.source_video_audio_embedded or entry.source_video_audio_paired):
+        raise ValueError("H3 source video contribution mode cannot be combined with embedded or paired source AV")
+    if video_mode and not entry.source_video_directory:
+        raise ValueError("H3 source video contribution mode requires a source video directory")
+    if video_mode in {"av", "audio"} and entry.source_audio_directory:
+        raise ValueError(f"H3 source video contribution mode {video_mode} cannot use a separate source audio directory")
+    if video_mode == "av" and "audio" not in source_modalities:
+        source_modalities.append("audio")
+    elif video_mode == "audio":
+        source_modalities = [modality for modality in source_modalities if modality != "video"]
+        if "audio" not in source_modalities:
             source_modalities.append("audio")
+    elif entry.source_video_audio_embedded and "audio" not in source_modalities:
+        source_modalities.append("audio")
+    if source_modalities:
         d["source_modalities"] = source_modalities
     if entry.source_video_audio_embedded:
         d["source_video_audio_embedded"] = True
     if entry.source_video_audio_paired:
         d["source_video_audio_paired"] = True
+    if video_mode:
+        d["source_video_audio_mode"] = video_mode
+    if fixed_role:
+        d["source_reference_modality"] = fixed_role
+    if ordered_roles:
+        d["source_reference_modalities"] = ordered_roles
     aligned_guides = [part.strip() for part in entry.aligned_guide_indices.replace(";", ",").split(",") if part.strip()]
     if aligned_guides:
         try:
@@ -321,6 +363,8 @@ def _h3_dataset_entry_to_dict(entry) -> dict:
         entry.control_modality_probability_audio,
     )
     if any(value is not None for value in probabilities):
+        if fixed_role or ordered_roles:
+            raise ValueError("H3 source modality probabilities cannot be combined with fixed/per-reference roles")
         if any(value is None for value in probabilities):
             raise ValueError("H3 control modality probabilities require AV, video, and audio values")
         d["source_modality_probabilities"] = [float(value) for value in probabilities]

@@ -127,6 +127,9 @@ class DatasetEntry(BaseModel):
     source_audio_directory: str = ""
     source_video_audio_embedded: bool = False
     source_video_audio_paired: bool = False
+    source_video_audio_mode: Literal["", "video", "av", "audio"] = ""
+    source_reference_modality: Literal["", "av", "video", "audio"] = ""
+    source_reference_modalities: str = ""
     # Comma-separated indices into the ordered source-reference bundle.
     aligned_guide_indices: str = ""
     control_modality: Literal["", "av", "video", "audio"] = ""
@@ -1670,7 +1673,7 @@ class RLConfig(BaseModel):
 
 
 class ProjectConfig(BaseModel):
-    version: int = 4
+    version: int = 5
     name: str = "New Project"
     project_dir: str = ""
     model_dir: str = ""  # directory where downloaded models are stored
@@ -1695,7 +1698,7 @@ class ProjectConfig(BaseModel):
             data["inference"] = data.pop("sampling")
         if isinstance(data, dict):
             source_version = int(data.get("version") or 1)
-            if source_version < 4 and isinstance(data.get("dataset"), dict):
+            if source_version < 5 and isinstance(data.get("dataset"), dict):
                 dataset_config = dict(data["dataset"])
                 for collection in ("datasets", "validation_datasets"):
                     rows = dataset_config.get(collection)
@@ -1707,36 +1710,32 @@ class ProjectConfig(BaseModel):
                             migrated_rows.append(raw_row)
                             continue
                         row = dict(raw_row)
-                        legacy_target_mode = row.pop("h3_target_mode", None)
-                        if legacy_target_mode and not row.get("h3_target_modalities"):
-                            row["h3_target_modalities"] = legacy_target_mode
-
-                        legacy_video = row.pop("control_video_directory", "")
-                        legacy_audio = row.pop("control_audio_directory", "")
-                        fixed_modality = str(row.get("control_modality") or "").lower()
-                        per_reference_modalities = bool(str(row.get("control_modalities") or "").strip())
-                        if (legacy_video or legacy_audio) and not per_reference_modalities:
+                        legacy_video = ""
+                        legacy_audio = ""
+                        if source_version < 4:
+                            legacy_target_mode = row.pop("h3_target_mode", None)
+                            if legacy_target_mode and not row.get("h3_target_modalities"):
+                                row["h3_target_modalities"] = legacy_target_mode
+                            legacy_video = row.pop("control_video_directory", "")
+                            legacy_audio = row.pop("control_audio_directory", "")
+                            if legacy_video and not row.get("source_video_directory"):
+                                row["source_video_directory"] = legacy_video
+                            if legacy_audio and not row.get("source_audio_directory"):
+                                row["source_audio_directory"] = legacy_audio
                             if legacy_video and legacy_audio:
-                                if fixed_modality == "video":
-                                    if not row.get("source_video_directory"):
-                                        row["source_video_directory"] = legacy_video
-                                elif fixed_modality == "audio":
-                                    if not row.get("source_audio_directory"):
-                                        row["source_audio_directory"] = legacy_audio
-                                else:
-                                    if not row.get("source_video_directory"):
-                                        row["source_video_directory"] = legacy_video
-                                    if not row.get("source_audio_directory"):
-                                        row["source_audio_directory"] = legacy_audio
-                                    row["source_video_audio_paired"] = True
-                            elif legacy_video:
-                                if not row.get("source_video_directory"):
-                                    row["source_video_directory"] = legacy_video
-                                if fixed_modality in {"av", "audio"}:
-                                    row["source_video_audio_embedded"] = True
-                            else:
-                                if not row.get("source_audio_directory"):
-                                    row["source_audio_directory"] = legacy_audio
+                                row["source_video_audio_paired"] = True
+
+                        fixed_modality = str(row.get("control_modality") or "").lower()
+                        ordered_modalities = str(row.get("control_modalities") or "").strip()
+                        both_roles = bool(fixed_modality and ordered_modalities)
+                        if ordered_modalities and not both_roles:
+                            row["source_reference_modalities"] = ordered_modalities
+                            row["control_modalities"] = ""
+                        if fixed_modality and not both_roles:
+                            if source_version < 4 and legacy_video and not legacy_audio:
+                                row["source_video_audio_mode"] = fixed_modality
+                            elif not (source_version < 4 and legacy_audio and not legacy_video and fixed_modality == "audio"):
+                                row["source_reference_modality"] = fixed_modality
                             row["control_modality"] = ""
                         migrated_rows.append(row)
                     dataset_config[collection] = migrated_rows
@@ -1844,7 +1843,7 @@ class ProjectConfig(BaseModel):
                     if has_old_generation_values and "sampling_preset" not in section:
                         section["sampling_preset"] = "legacy"
                 data[section_name] = section
-            data["version"] = max(source_version, 4)
+            data["version"] = max(source_version, 5)
         return data
 
     def save(self, path: Optional[Path] = None):

@@ -6,7 +6,9 @@ from fastapi import APIRouter, HTTPException, Request
 
 from musubi_tuner.gui_dashboard.toml_export import (
     build_dataset_toml_document,
+    build_h3_dataset_toml_document,
     export_dataset_toml,
+    export_h3_cache_dataset_toml,
     render_toml,
 )
 from musubi_tuner.gui_dashboard.project_schema import DatasetConfig, ProjectConfig
@@ -46,7 +48,7 @@ async def export_toml(request: Request):
         raise HTTPException(status_code=400, detail="project_dir not set")
 
     try:
-        path = export_dataset_toml(config)
+        path = export_h3_cache_dataset_toml(config) if config.training.model_type == "minimax_h3" else export_dataset_toml(config)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -57,5 +59,9 @@ async def export_toml(request: Request):
 async def preview_toml(request: Request):
     """Return what the TOML file would look like without writing it."""
     config = _get_config(request)
-    doc = build_dataset_toml_document(config)
+    doc = (
+        build_h3_dataset_toml_document(config, include_training=True, include_validation=True)
+        if config.training.model_type == "minimax_h3"
+        else build_dataset_toml_document(config)
+    )
     return {"toml": render_toml(doc)}
