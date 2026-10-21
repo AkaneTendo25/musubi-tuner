@@ -41,6 +41,16 @@ function h3TemporalLatents(frameCount) {
 	};
 }
 
+function h3OrderedReferenceRoles(dataset) {
+	const raw = String(dataset?.source_reference_modalities || '');
+	if (!raw.trim()) return [];
+	return raw
+		.replaceAll(',', ';')
+		.split(';')
+		.map((value) => value.trim().toLowerCase())
+		.filter((value) => ['av', 'video', 'audio'].includes(value));
+}
+
 function h3DatasetRows(cfg, dataset) {
 	const t = cfg?.training || {};
 	const c = cfg?.caching || {};
@@ -65,10 +75,38 @@ function h3DatasetRows(cfg, dataset) {
 	else if (task.startsWith('ref2va')) {
 		const referenceFrames = Math.max(Number(ds.reference_frames || frames), 1);
 		const refLatents = h3TemporalLatents(referenceFrames);
-		if (ds.source_image_directory) rows += rowsPerVideoFrame;
-		if (ds.source_video_directory) rows += rowsPerVideoFrame * refLatents.video;
-		if (ds.source_audio_directory || ds.source_video_audio_embedded) {
-			rows += 2 * refLatents.audio;
+		const referenceImageRows = ds.source_image_directory ? rowsPerVideoFrame : 0;
+		const referenceVideoRows = rowsPerVideoFrame * refLatents.video;
+		const referenceAudioRows = 2 * refLatents.audio;
+		const orderedRoles = h3OrderedReferenceRoles(ds);
+		const fixedRole = String(ds.source_reference_modality || '').toLowerCase();
+		if (orderedRoles.length) {
+			// The editor does not scan exact media dimensions. Treat every visual
+			// ordered role as video-sized, matching the server's conservative policy.
+			rows += orderedRoles.filter((role) => ['av', 'video'].includes(role)).length * referenceVideoRows;
+			rows += orderedRoles.filter((role) => ['av', 'audio'].includes(role)).length * referenceAudioRows;
+		} else if (['av', 'video', 'audio'].includes(fixedRole)) {
+			const paired = Boolean(ds.source_video_audio_paired);
+			let carriers = ds.source_image_directory ? 1 : 0;
+			if (paired && ds.source_video_directory && ds.source_audio_directory) carriers += 1;
+			else {
+				if (ds.source_video_directory) carriers += 1;
+				if (ds.source_audio_directory) carriers += 1;
+			}
+			if (!carriers && ds.jsonl_file) carriers = 1;
+			if (['av', 'video'].includes(fixedRole)) rows += carriers * referenceVideoRows;
+			if (['av', 'audio'].includes(fixedRole)) rows += carriers * referenceAudioRows;
+		} else {
+			rows += referenceImageRows;
+			const videoMode = String(ds.source_video_audio_mode || '');
+			if (ds.source_video_directory && videoMode !== 'audio') rows += referenceVideoRows;
+			if (
+				ds.source_audio_directory ||
+				ds.source_video_audio_embedded ||
+				(ds.source_video_directory && ['av', 'audio'].includes(videoMode))
+			) {
+				rows += referenceAudioRows;
+			}
 		}
 	}
 

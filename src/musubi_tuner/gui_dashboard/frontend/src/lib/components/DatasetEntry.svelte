@@ -63,6 +63,20 @@
 			? 'Optional extra reference image/video directories, separated by commas or semicolons.'
 			: 'Optional extra control directories, separated by commas or semicolons.'
 	);
+	const sourceVideoAudioMode = $derived(
+		entry.source_video_audio_mode || (entry.source_video_audio_embedded ? 'av' : '')
+	);
+	const orderedReferenceRoles = $derived(String(entry.source_reference_modalities || '').trim());
+	const hasReferenceRole = $derived(Boolean(entry.source_reference_modality || orderedReferenceRoles));
+	const referenceOrderTooltip = 'For directory sources, reference indices are all stem-matched images, then videos, then audio files. Each group orders target.ext first, followed by target_0.ext, target_1.ext, and so on; paired video + audio occupies one video-backed slot. JSONL references order control_path[_N] before paired control video/audio slots. Every target must resolve exactly the same number of references as this list.';
+
+	function updateSourceVideoAudioMode(value) {
+		emit({
+			...entry,
+			source_video_audio_mode: value,
+			source_video_audio_embedded: false
+		});
+	}
 </script>
 
 <div class="overflow-visible" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); box-shadow: var(--shadow-sm);">
@@ -78,7 +92,7 @@
 	</div>
 
 	<div class="p-4 space-y-3">
-		<div class="grid grid-cols-2 gap-3">
+		<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 			<FormSelect
 				label="Type"
 				value={entry.type}
@@ -124,7 +138,7 @@
 		/>
 
 		{#if !isAudio}
-			<div class="grid grid-cols-3 gap-3">
+			<div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
 				<FormField
 					label="Width"
 					type="number"
@@ -184,11 +198,11 @@
 					tooltip="Outputs supervised by this dashboard dataset row. Use TOML for image + audio targets."
 				/>
 				{#if !isVideo && !isAudio}
-					<div class="grid grid-cols-2 gap-3">
+					<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 						<FormField label="One-frame control indices" value={(entry.fp_1f_clean_indices || []).join(', ')} oninput={(e) => updateField('fp_1f_clean_indices', e.target.value.trim() ? e.target.value.split(/[,;\s]+/).filter(Boolean).map(Number) : null)} placeholder="0, 48, 96" tooltip="For one-frame FL2VA, one 24 fps pixel-frame index per control image, in file order. Leave empty for untimed references." />
 						<FormField label="One-frame target index" type="number" value={entry.fp_1f_target_index ?? ''} oninput={(e) => updateNumberField('fp_1f_target_index', e.target.value, true)} min={0} placeholder="24" tooltip="Required with timed controls. Enable one-frame images in caching and training." />
 					</div>
-					<div class="grid grid-cols-2 gap-3">
+					<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 						<FormField
 							label="Image Target Frames"
 							type="number"
@@ -232,7 +246,7 @@
 					placeholder="Optional"
 					tooltip="Stem-matched Ref2VA source images."
 				/>
-				<div class="grid grid-cols-2 gap-3">
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 					<PathInput
 						label="Source Video Directory"
 						value={entry.source_video_directory || ''}
@@ -255,15 +269,39 @@
 					placeholder="Example: 1"
 					tooltip="Source-video reference indices to train on the target temporal/spatial grid. Directory sources are ordered image, video, then audio; JSONL sources follow control_path_N order."
 				/>
-				<div class="grid grid-cols-2 gap-3">
-					<FormToggle label="Embedded Video Audio" checked={entry.source_video_audio_embedded ?? false} onchange={(e) => updateField('source_video_audio_embedded', e.target.checked)} tooltip="Read the source video's own soundtrack. Do not also set a source audio directory." />
-					<FormToggle label="Paired Video + Audio" checked={entry.source_video_audio_paired ?? false} onchange={(e) => updateField('source_video_audio_paired', e.target.checked)} tooltip="Pair separate source video and audio files by stem." />
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+					<FormSelect
+						label="Video reference contribution"
+						value={sourceVideoAudioMode}
+						onchange={(e) => updateSourceVideoAudioMode(e.target.value)}
+						options={[{value:'',label:'Default (visual only)'},{value:'video',label:'Visual only (explicit)'},{value:'av',label:'Video + audio'},{value:'audio',label:'Audio only'}]}
+						disabled={entry.source_video_audio_paired ?? false}
+						tooltip="What each source video contributes. Existing embedded-audio projects display Video + audio until you explicitly choose a value. Paired external audio disables this selector without changing saved settings."
+					/>
+					<FormToggle label="Paired Video + Audio" checked={entry.source_video_audio_paired ?? false} onchange={(e) => updateField('source_video_audio_paired', e.target.checked)} tooltip="Pair separate source video and audio files by stem. Persisted conflicts remain visible for validation." />
 				</div>
+				<FormSelect
+					label="Reference role"
+					value={entry.source_reference_modality || ''}
+					onchange={(e) => updateField('source_reference_modality', e.target.value)}
+					options={[{value:'',label:'Use declared source'},{value:'av',label:'AV'},{value:'video',label:'Visual only'},{value:'audio',label:'Audio only'}]}
+					disabled={Boolean(orderedReferenceRoles)}
+					tooltip="Apply one role to every resolved reference. Use the ordered field for different roles by index."
+				/>
+				{#if advanced || orderedReferenceRoles}
+					<FormField
+						label="Per-reference roles"
+						value={entry.source_reference_modalities || ''}
+						oninput={(e) => updateField('source_reference_modalities', e.target.value)}
+						placeholder="video;av;audio"
+						tooltip={referenceOrderTooltip}
+					/>
+				{/if}
 				{#if advanced}
-					<div class="grid grid-cols-3 gap-3">
-						<FormField label="Source AV" type="number" value={entry.control_modality_probability_av ?? ''} oninput={(e) => updateNumberField('control_modality_probability_av', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of retaining all declared source streams. Set all three probabilities; they must sum to 1." />
-						<FormField label="Source Video" type="number" value={entry.control_modality_probability_video ?? ''} oninput={(e) => updateNumberField('control_modality_probability_video', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of retaining visual source conditioning." />
-						<FormField label="Source Audio" type="number" value={entry.control_modality_probability_audio ?? ''} oninput={(e) => updateNumberField('control_modality_probability_audio', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of retaining audio-focused source conditioning." />
+					<div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+						<FormField label="Source AV" type="number" value={entry.control_modality_probability_av ?? ''} oninput={(e) => updateNumberField('control_modality_probability_av', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" disabled={hasReferenceRole} tooltip="Probability of retaining all declared source streams. Set all three probabilities; they must sum to 1. Fixed or ordered reference roles disable stochastic source variants." />
+						<FormField label="Source Video" type="number" value={entry.control_modality_probability_video ?? ''} oninput={(e) => updateNumberField('control_modality_probability_video', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" disabled={hasReferenceRole} tooltip="Probability of retaining visual source conditioning. Fixed or ordered reference roles disable stochastic source variants." />
+						<FormField label="Source Audio" type="number" value={entry.control_modality_probability_audio ?? ''} oninput={(e) => updateNumberField('control_modality_probability_audio', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" disabled={hasReferenceRole} tooltip="Probability of retaining audio-focused source conditioning. Fixed or ordered reference roles disable stochastic source variants." />
 					</div>
 				{/if}
 			</div>
@@ -272,7 +310,7 @@
 		{#if isVideo}
 			<div class="pt-3 space-y-3" style="border-top: 1px solid var(--border-subtle);">
 				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Video Options</span>
-				<div class="grid grid-cols-2 gap-3">
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 					<FormField
 						label="Target Frames"
 						type="number"
@@ -290,7 +328,7 @@
 					/>
 				</div>
 				{#if advanced}
-					<div class="grid grid-cols-3 gap-3">
+					<div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
 						<FormField
 							label="Frame Sample"
 							type="number"
@@ -316,7 +354,7 @@
 							tooltip="Stride between extracted frames"
 						/>
 					</div>
-					<div class="grid grid-cols-2 gap-3">
+					<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 						<FormField
 							label="Source FPS"
 							type="number"
@@ -403,7 +441,7 @@
 					placeholder="Optional"
 					tooltip="Fallback mask used when no per-item mask is found. For audio, use an interval file."
 				/>
-				<div class="grid grid-cols-2 gap-3">
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 					<FormToggle
 						label="Use Alpha"
 						checked={entry.loss_mask_use_alpha ?? false}
@@ -472,7 +510,7 @@
 					placeholder="Optional"
 					tooltip="Cache directory for encoded latent-idx guide latents. Required when Latent-Idx Guide Dir is set."
 				/>
-				<div class="grid grid-cols-2 gap-3">
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 					<FormField
 						label="Frame Idx (latent_idx)"
 						type="number"
@@ -505,7 +543,7 @@
 					placeholder="Optional"
 					tooltip="Cache directory for encoded keyframe guide latents. Required when Keyframe Guide Dir is set."
 				/>
-				<div class="grid grid-cols-2 gap-3">
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 					<FormField
 						label="Frame Idx (keyframe)"
 						type="number"
@@ -542,7 +580,7 @@
 					placeholder="/cache/k2;/cache/k3"
 					tooltip="Semicolon-separated list of cache directories matching the extra keyframe directories above."
 				/>
-				<div class="grid grid-cols-2 gap-3">
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 					<FormField
 						label="Extra Frame Idxs"
 						value={entry.keyframe_guide_extra_frame_idxs || ''}

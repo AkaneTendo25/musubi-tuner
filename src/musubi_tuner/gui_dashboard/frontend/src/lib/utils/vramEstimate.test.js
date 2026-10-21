@@ -138,6 +138,60 @@ test('H3 reference audio is counted for a video-only target', () => {
 	assert.ok(partValue(estimateTraining(audioReference), 'Activ.') > partValue(estimateTraining(baseConfig), 'Activ.'));
 });
 
+test('H3 source-video contribution modes match the server row policy', () => {
+	function withMode(mode) {
+		const cfg = config();
+		cfg.caching = { model_type: 'minimax_h3', h3_task: 'ref2va' };
+		cfg.dataset.datasets = [{
+			type: 'audio',
+			target_frames: 124,
+			...(mode === null ? {} : { source_video_directory: '/references' }),
+			source_video_audio_mode: mode,
+		}];
+		return estimateTraining(cfg);
+	}
+
+	const baseline = withMode(null);
+	const video = withMode('video');
+	const audio = withMode('audio');
+	const av = withMode('av');
+	const baseActivation = partValue(baseline, 'Activ.');
+	const expectedAvDelta =
+		(partValue(video, 'Activ.') - baseActivation) +
+		(partValue(audio, 'Activ.') - baseActivation);
+
+	assert.ok(Math.abs((partValue(av, 'Activ.') - baseActivation) - expectedAvDelta) < 1e-9);
+});
+
+test('H3 fixed and ordered reference roles preserve multiplicity and tolerate incomplete editor text', () => {
+	function withRoles(fields, includeSource = true) {
+		const cfg = config();
+		cfg.caching = { model_type: 'minimax_h3', h3_task: 'ref2va' };
+		cfg.dataset.datasets = [{
+			type: 'audio',
+			target_frames: 124,
+			...(includeSource ? { source_video_directory: '/references' } : {}),
+			...fields,
+		}];
+		return estimateTraining(cfg);
+	}
+
+	const video = withRoles({ source_reference_modality: 'video' });
+	const audio = withRoles({ source_reference_modality: 'audio' });
+	const av = withRoles({ source_reference_modality: 'av' });
+	const ordered = withRoles({ source_reference_modalities: 'video;av;audio' });
+	const incomplete = withRoles({ source_reference_modalities: 'video;;unfinished' });
+	const baseline = withRoles({}, false);
+	const baseActivation = partValue(baseline, 'Activ.');
+	const expectedOrderedDelta =
+		(partValue(video, 'Activ.') - baseActivation) +
+		(partValue(av, 'Activ.') - baseActivation) +
+		(partValue(audio, 'Activ.') - baseActivation);
+
+	assert.ok(Math.abs((partValue(ordered, 'Activ.') - baseActivation) - expectedOrderedDelta) < 1e-9);
+	assert.equal(partValue(incomplete, 'Activ.'), partValue(video, 'Activ.'));
+});
+
 test('H3 long-sequence estimate stays near the measured 73.2 GiB workbox baseline', () => {
 	const estimate = estimateTraining(config());
 
