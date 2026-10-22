@@ -409,8 +409,16 @@ references such as `X_0.png` and `X_1.png`.
   the base model's reference statistics; validate it carefully. Inference guards are unchanged: `--reference_audio`
   still requires `--reference_image` or `--reference_video`.
 
-Both caches record which reference files produced them, so swapping, reordering, or editing a reference rebuilds that item under
+`source_video_audio_mode = "video"`, `"av"`, or `"audio"` explicitly selects the contribution of every matched video in `source_video_directory`. Image sources remain independent. This option requires a video directory and cannot be combined with the embedded/paired flags or the reference-role options below. AV and audio modes cannot also declare a separate source-audio directory. Keep `source_modalities` consistent with the selected contribution: audio mode contributes audio, AV contributes video and audio.
+
+Use `source_reference_modality = "av"`, `"video"`, or `"audio"` for one role across the complete reference bundle, or `source_reference_modalities = ["video", "audio"]` for ordered roles. The fixed and ordered forms are mutually exclusive. Unpaired bundle order is all image matches, then video matches, then audio matches; paired video/audio is one asset after any images. Within a directory, the unnumbered basename comes first, followed by numeric suffix order. An ordered list must match every target's resolved reference count exactly. AV requires a video; visual roles accept images or videos; audio roles accept videos or audio. Audio from a paired asset uses its paired audio file; visual-only selection removes that audio contribution.
+
+Fixed or ordered reference roles cannot combine with `source_modality_probabilities` or per-record `control_modality_N` overrides. Aligned-guide indices refer to the final bundle and must select video assets. Dataset values override `general` values; conflicting inherited fixed/list choices are rejected. An embedded-video project without an explicit contribution mode retains its AV meaning; select audio mode for soundtrack-only references.
+
+Both caches record which reference files and roles produced them, so swapping, reordering, or editing a reference rebuilds that item under
 `--skip_existing`.
+
+Existing video-reference caches require re-encoding. Older embedded-video settings retain AV behavior; select audio contribution explicitly for soundtrack-only references.
 
 A dataset may read its latents from another dataset's cache: `latent_cache_directory` points at that directory while
 `cache_directory` keeps the dataset's own text-encoder outputs. It exists for rollout-teacher datasets that share the
@@ -776,6 +784,10 @@ versions.
 | `--h3_miowtion_predictor PATH` | off | Use a frozen Miowtion predictor for learned sparse training attention. Requires positive `--h3_block_sparse_kv_fraction`; incompatible with threshold/manual tile selection. |
 | `--h3_block_sparse_start_block N` | `0` | Index of the first main block to run block-sparse; earlier blocks stay dense, keeping their full-sequence mixing exact. |
 | `--h3_block_sparse_block_shape T,H,W` | off | Reorder target-video rows into 3D lattice tiles before block-sparse selection, then restore their original order. `T*H*W` must equal the 128-row block size; text, audio, and reference context remains dense. Has no effect without `--h3_block_sparse_kv_fraction` or `--h3_block_sparse_threshold`. |
+| `--h3_sparse_router PATH` | off | Use a frozen learned router to sparsify visual-reference self-attention during Ref2VA concept LoRA training. The router is not saved in the LoRA. Requires CUDA, Triton, batch size 1, and an unpadded `ref2va` or `ref2va_omni` batch. |
+| `--h3_sparse_exact_blocks N` | `64` | Number of learned 128-row reference blocks kept for each reference query block and head, before temporal neighbours are added. |
+| `--h3_sparse_temporal_radius N` | `2` | Always retain reference blocks whose exact per-reference frame spans lie within this temporal radius. |
+| `--h3_sparse_data_path {packed,mapped_int64}` | `packed` | Sparse data layout: `packed` favors speed; `mapped_int64` avoids packed Q/K/V copies. |
 
 | `--h3_null_anchor_reuse_empty` | off | Reuse the guidance step's frozen empty-prompt prediction for the null anchor, saving one transformer pass. Requires guidance distillation, `--h3_guidance_null_source frozen`, and positive null-anchor weight; inert otherwise. |
 | `--h3_null_anchor_shared_draws` | off | Replay the student's RNG for the frozen null-anchor reference so both use the same conditioning-noise draw. Requires positive null-anchor weight; unused with `--h3_null_anchor_reuse_empty`. |
@@ -829,6 +841,53 @@ lengths 37, 72, or 102. At 10% keep, expect roughly 1.5-2x faster steady trainin
 steps, with larger gains at larger token counts. Peak VRAM can increase, and the
 first run compiles sparse kernels. The predictor stays frozen and is not saved
 in or required by the trained LoRA. Its weights remain on CPU and are staged one layer at a time.
+
+**Learned reference sparse attention.** Use a frozen router while training a Ref2VA concept LoRA:
+
+```shell
+--h3_training_mode ref2va --h3_sparse_router path/to/h3_sparse_router.pt \
+--h3_sparse_exact_blocks 64 --h3_sparse_temporal_radius 2
+```
+
+Only attention between visual-reference tokens becomes sparse. Other attention stays dense.
+The router must match the transformer and is excluded from the saved LoRA; dense inference needs no router.
+Requires CUDA/Triton, batch size 1, and `ref2va` or `ref2va_omni` caches.
+Padded/masked sequences, compilation, INT8 attention, Miowtion, mean-scored block-sparse attention,
+selective checkpoint keep, and additional visual guides are unsupported.
+`--h3_sparse_data_path packed|mapped_int64` selects the sparse data path.
+
+Train a router from compatible precomputed dense-attention records:
+
+```shell
+python scripts/train_minimax_h3_sparse_router.py \
+  --cache-dir path/to/dense_teacher_records --output models/h3_sparse_router.pt
+```
+
+This fitter consumes layer-specific dot-product-router records; it does not collect them.
+Records are `sample_NNNNNN.pt`, numbered as `source_index * num_layers + layer_index`, with every layer present.
+Each contains `layer`, `query_summary`, `key_summary`, and `teacher_mass`; these are attention records, not ordinary latent caches.
+Query/key summaries use `[1, blocks, heads, summary_width]`; teacher mass uses `[heads, query_blocks, key_blocks]`.
+Use normalized, rotary-applied Q/K summaries from 128-row blocks, with the configured summary-subblock count.
+It saves the best validation checkpoint; `--initial` continues from an existing router.
+
+Alternatively, train directly from paired Ref2VA latent/text caches:
+
+```shell
+python scripts/train_minimax_h3_sparse_router_online.py \
+  --cache-dir path/to/h3_cache --dit path/to/minimax_h3_transformer.safetensors \
+  --output models/h3_sparse_router.pt
+```
+
+Use `--validation-cache-dir` for separate validation caches; otherwise a seeded subset is held out.
+`--base-precision fp8|bf16` defaults to FP8 and must remain unchanged on resume.
+`--resume-state` restores training state but does not select the next records:
+use `--train-offset`, `--shard-index`, or `--exclude-shard-index` for a non-overlapping continuation.
+
+For concept-LoRA compensation, add `--h3_sparse_teacher_loss_weight 1.0` to match dense-model predictions.
+`--h3_sparse_teacher_only` replaces the ordinary objective; otherwise the loss is additive.
+`--h3_sparse_teacher_budgets 8,16,24,32` cycles budgets; use `--h3_sparse_teacher_budget_offset`
+when restarting the step count. `--h3_sparse_teacher_eval_only` measures the loss without training.
+Compensation adds one dense frozen-model pass and inherits the sparse-path restrictions above.
 
 **`--h3_fused_elementwise`.** The product stays in the fp32 accumulator and is rounded once, so results can differ from the default operation order by BF16 rounding; validate before a long run. Precedence with `--h3_fused_indexed_adaln`: when that Triton kernel accepts the layout it handles the norm+modulation itself and the `addcmul` AdaLN path is bypassed for that call; the gated residual and LoRA fusions of this option remain active.
 
@@ -1114,6 +1173,14 @@ Every objective here is off unless its flag is given; a run that names none of t
 | `--h3_rollout_steps 2` | No-gradient Euler steps taken from pure noise to reach the supervised state. Default `2`. |
 | `--h3_rollout_window 1` | Supervised states taken from the stop sigma onward, on the same step size. Each one adds a gradient-bearing student forward and a no-gradient teacher forward, so this is the parameter that governs cost. Default `1`, maximum `3`. Above `1`, a window whose stride exceeds the drawn stop sigma puts several sub-steps on the same floor value, which supervises one state repeatedly. |
 | `--h3_rollout_probability 0.5` | Fraction of steps that take the rollout path; the rest train normally. `1` applies it every step. Default `0.5`. |
+| `--h3_rollout_inactive_supervision {off,teacher_velocity,teacher_gap,teacher_match}` | Optional supervision for prompted video steps where the on-policy rollout is inactive. `teacher_velocity` matches the privileged teacher's video prediction. `teacher_gap` matches the student's prompt-minus-empty field to the teacher's prompt-minus-empty field and requires guidance-empty teacher caches. `teacher_match` replaces the data objective with a decomposed video teacher target plus the ordinary audio target. Default `off`. |
+| `--h3_rollout_inactive_weight 1.0` | Positive weight for inactive supervision. It scales the additive video term in velocity/gap modes and the whole joint replacement, including its ordinary-audio component, in teacher-match mode. It is not divided by either branch probability. |
+| `--h3_rollout_inactive_probability 1.0` | Independent probability in `(0, 1]` for applying inactive supervision after an on-policy rollout step has not been selected. |
+| `--h3_teacher_ema_decay 0` | Fixed EMA decay in `(0, 1)` for a frozen copy of the trainable LoRA used only by privileged depth-zero inactive teacher arms. `0` disables it. |
+| `--h3_rollout_teacher_match_sigma_max 0.75` | Highest unshifted base sigma that uses the privileged teacher in `teacher_match`. Above it, the frozen teacher uses the student's own presentation as a preservation target. |
+| `--h3_rollout_teacher_match_dc_weight 1.0` | Weight of the per-channel DC residual on privileged teacher-match steps. Preservation steps always use `1`. |
+| `--h3_rollout_teacher_match_mag_weight 1.0` | Weight of the field-magnitude term on privileged teacher-match steps; direction weight remains `1`. Preservation steps always use `1`. |
+| `--h3_rollout_teacher_match_preservation_weight 1.0` | Additional weight for high-sigma preservation steps, applied with density compensation for timestep-focus sampling. |
 | `--h3_rollout_teacher_privilege {auto,qwen,reference,keyframe,caption}` | `auto` (default) reads the caches and resolves the channel. Every channel is a difference between the teacher's cache and the student's for the same item: a teacher whose Qwen assets or endpoint task the student also carries is not privileged. Only the resolved channel's presentation reaches the teacher, so pin one to measure a particular channel on a corpus that carries several. |
 | `--h3_rollout_stop_shifted` | Draw the stop sigma uniformly on the shifted video schedule instead of the shared unshifted one. Video and audio stay synchronized either way. |
 | `--h3_rollout_fused_teacher` | Compute the student and teacher predictions for one supervised state in a single pass over the blocks, so each swapped block is streamed once per state instead of once per arm. May increase transient memory. `--h3_int8_attention aux` composes with it -- each frozen arm's own context selects the INT8 kernel around its block calls while the student stays dense. Rejected together with block-sparse attention (`--h3_block_sparse_kv_fraction` or `--h3_block_sparse_threshold` above `0`), whose per-sequence attention plan the fused pass cannot keep separate per arm. |
@@ -1147,6 +1214,18 @@ Every objective here is off unless its flag is given; a run that names none of t
 | `--h3_two_teacher_multiplier 1.0` | Strength of the teacher LoRA on its forward. |
 | `--h3_two_teacher_snapshot_step 0` | Run both phases in one command: train the concept with the ordinary objective for this many steps, then freeze the adapter in memory as the teacher and distil for the rest of the run. `0` (default) is off. Rejected together with `--h3_two_teacher_weights`. |
 | `--crepa` | Temporal representation alignment for video training. |
+
+Inactive supervision applies to prompted video batches when rollout is not selected.
+`teacher_gap` requires both student branches and cannot combine with adapter prompt-only mode
+or classic block swap plus fused per-parameter optimizer stepping.
+`teacher_match` replaces the video objective with privileged-teacher matching below its sigma threshold
+and base-model preservation above it. Audio retains the data target; inactive/preservation weights scale the joint loss.
+Fused rollout arms require network, rank, and module dropout to be disabled.
+
+`--h3_teacher_ema_decay` enables an EMA LoRA teacher only for privileged inactive supervision.
+Active rollout teachers and high-sigma preservation still use their frozen references.
+The EMA is saved in training state and excluded from the exported LoRA.
+Requires the stock H3 LoRA network without SDS; `--resume_as_new_shard` is unsupported.
 
 **`--h3_guidance_scale_range`.** `LOWER` must exceed `1`. The draw uses its own distributed-synchronized generator, so adding it leaves every other random branch of a seeded run untouched; validation reads the midpoint so its loss stays comparable across evaluations. Composes with the sparse probability and with both loss forms and schedules.
 
@@ -1431,6 +1510,11 @@ the `qwen3vl_32b` tensor key.
 
 To train while a fixed LoRA is applied to H3, pass it with `--h3_overlay_weights`.
 
+For multiple frozen adapters, repeat `--base_weights` with matching `--base_weights_multiplier`
+values and enable `--h3_base_weights_runtime_attach`. Adapters may use different ranks and module subsets.
+Without this flag, base weights are merged as usual. Only the trainable LoRA is exported.
+Keep input adapter files, order, multipliers, and process count unchanged when resuming.
+
 ### Train a slider LoRA
 
 A slider LoRA learns opposite behavior at positive and negative adapter multipliers. H3 provides three opt-in objectives:
@@ -1658,6 +1742,30 @@ It adds LoRA computation but no extra transformer forward. For the FL2VA checkpo
 
 Use an adapter built for the checkpoint being trained. Do not apply these FL2VA adapters to Ref2VA weights.
 
+### Training a guidance-restoring adapter
+
+Cache text with `--cache_guidance_empty`, then add
+`--h3_repair_reference empty --h3_repair_scale 0.86,4.24` to the LoRA training command.
+This experimental objective reconstructs a less amplified prediction from the frozen checkpoint;
+it does not recover the original undistilled teacher. The example scale is checkpoint-specific.
+A constant scale must be at least 1; `intercept,slope` uses `max(1, intercept + slope*sigma)`.
+
+Optional settings:
+
+- `--h3_repair_sigma_weight`: two positive weights at sigma `.40/.95`, or three at `.40/.80/.95`.
+- `--h3_repair_target_multiplier`: three positive multipliers at `.40/.80/.95`; values that cross the empty prediction are rejected.
+- `--h3_repair_reference caption`: use other cached captions as the reference; `--h3_repair_caption_anchors` defaults to 4. The cache pool must contain more entries than this count.
+- `--h3_repair_caption_probability`: fraction of steps using caption anchors; remaining steps use the empty reference.
+- `--h3_repair_reference_weight`: additionally match the empty prediction to the caption reference.
+- `--h3_repair_null_anchor_weight`: preserve the base empty prediction when an empty branch is already evaluated.
+- `--h3_repair_preservation_probability q`: use base-model preservation instead of repair on a fraction `0 <= q < 1` of steps.
+
+Resume with unchanged caption caches, repair settings, dropout rate, and process count; keep the complete training-state directory.
+Repair supports LoRA only and adds frozen-model passes. It cannot combine with guidance distillation,
+teacher matching, rollout/SOAR, two-teacher training, preservation/DOP/general null-anchor losses,
+control dropout, frame sigma jitter, CREPA, adapter prompt-only mode, network dropout, or a training overlay.
+Validation still measures the ordinary data objective. Evaluate resulting concept LoRAs on the original checkpoint with the training adapter removed.
+
 ### Experimental alternatives
 
 The following objectives and combinations are research options, not recommended defaults. Plain LoRA is a baseline.
@@ -1746,6 +1854,43 @@ one.
   `--h3_guidance_null_anchor_probability`, `--h3_guidance_loss_schedule constant`,
   `--h3_caption_dropout_rate 0` (dropout trains the branch the anchor holds), `--h3_fuse_frozen_teachers` (only with
   `--h3_base_preservation_loss_weight` above 0, whose teacher it batches into the same forward; rejected otherwise).
+  Classic block swap cannot combine this anchor with `--fused_backward_pass`.
+
+#### Direct guidance-field preservation
+
+`--h3_field_preservation_weight W` penalizes changes to the prompted-minus-empty prediction field.
+Cache text with `--cache_guidance_empty`. `--h3_field_preservation_steps N` limits it to the first N steps;
+zero keeps it active throughout. The objective is off by default and adds model passes.
+It cannot combine with `--h3_adapter_prompt_only` or classic block swap plus `--fused_backward_pass`.
+
+#### Orthogonal projection target
+
+`--h3_projection_scale S` replaces the prompted data target with a projection that constrains changes
+along the frozen base guidance field. Requires `--cache_guidance_empty` and adds two frozen-model passes.
+Caption-dropout steps keep the ordinary objective. Removable overlays are supported; merged `--base_weights`
+and other replacement objectives (guidance distillation, repair, rollout supervision, two-teacher,
+teacher matching, sparse-teacher-only) are incompatible. Off when omitted.
+
+#### One-run adapter reamplification
+
+Set `--h3_reamplify_scale 2.0 --h3_reamplify_after N` to train normally for N updates,
+then amplify the frozen boundary adapter's prompted-minus-empty field.
+Comma-separated scales select equal-width sigma bins. `--h3_reamplify_probability P` controls
+the fraction of later steps using this target; other steps retain the data objective.
+
+`--h3_reamplify_scale auto` fixes factors from validation field measurements. It requires
+`--h3_validation_field_probe`, full-range validation (`0..1000`) at a positive step by the boundary,
+and valid measurements in every bin. EMA validation is unsupported.
+Factors are measured on video and applied to both video and audio.
+
+Use `--h3_overlay_weights collapsed.safetensors --h3_reamplify_after 0` for an existing adapter.
+Runtime-attached `--base_weights` are also supported; at a positive boundary they compose with the overlay
+and frozen warm-up adapter. Only the live LoRA is exported. Preserve complete training state and unchanged
+input adapters when resuming. Automatic scaling requires validation with those adapters active.
+
+Requires empty-conditioning caches and the stock H3 LoRA module. Merged base weights, SDS-LoRA,
+full fine-tuning, caption dropout, and other replacement objectives are unsupported.
+These objectives are experimental; compare output quality with ordinary LoRA training.
 
 #### SOAR correction training
 
@@ -2325,3 +2470,15 @@ On Windows, run `launch_musubi_dashboard.bat`, which passes `--host 127.0.0.1`. 
 > The dashboard can launch arbitrary training processes with the permissions of its user. Do not bind it to a public interface unless access is protected. For remote use, keep `--host 127.0.0.1` and use an SSH tunnel.
 
 Frontend developers can rebuild the bundled assets with `npm ci && npm run build` in `src/musubi_tuner/gui_dashboard/frontend`.
+
+### FL2VA sampling methods and schedules
+
+Choose `--sampler euler|sde|res_2s|res_2m` and `--base_schedule linear|beta|beta57`.
+Defaults are Euler and linear. `--video_shift` and `--audio_shift` default to 12 and 3;
+custom values must be finite and positive.
+
+SDE noise is controlled by `--sde_eta` in `[0, 1]`; zero is deterministic.
+RES 2S adds model evaluations and supports `--res_c2` tuning.
+Step count includes the terminal zero, so model-call counts differ between samplers.
+These options support FL2VA only. Ref2VA requires Euler, linear, and default shifts.
+Compare alternatives on your data; they do not guarantee better quality.
