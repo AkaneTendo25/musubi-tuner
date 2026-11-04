@@ -793,11 +793,25 @@ def test_training_flag_validation(argv, match):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
-def test_route_rejects_training_time_sampling():
-    args = create_training_parser().parse_args(["--sdpa", "--one_frame", "--h3_reference_route", "qwen_image_only"])
-    args.sample_prompts = "samples.txt"
-    with pytest.raises(ValueError, match="training-time sampling"):
-        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+@pytest.mark.parametrize("route", ["dual", "qwen_image_only", "dit_latent_only", "text_only"])
+def test_route_accepts_training_time_sampling(route):
+    args = create_training_parser().parse_args(
+        [
+            "--sdpa",
+            "--one_frame",
+            "--h3_reference_route",
+            route,
+            "--sample_prompts",
+            "samples.txt",
+            "--text_encoder",
+            "qwen.safetensors",
+            "--vae",
+            "vae.safetensors",
+            "--audio_vae",
+            "audio.safetensors",
+        ]
+    )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def test_slot_flags_pass_validation_with_one_frame():

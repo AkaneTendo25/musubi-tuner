@@ -2,6 +2,18 @@
 
 LoRA training and inference for MiniMax H3, a 50-block transformer that generates video and stereo audio jointly.
 
+> [!WARNING]
+> **Custom conditioning is not supported by stock ComfyUI inference.** Arbitrary timed one-frame controls/targets,
+> joint image slots, shared slot noise, non-default `--h3_reference_route` layouts and learned contexts combined with
+> multimodal Qwen conditioning require this trainer's inference implementation. Loading the weights alone into stock
+> ComfyUI does not reproduce these layouts. Use `minimax_h3_generate_video.py` or the training-time sampling path
+> described below, with matching layout, route and noise settings. These are experimental features: implementation
+> support does not establish a quality improvement.
+>
+> Ordinary FL2VA first/last endpoints, Ref2VA references and same-resolution aligned/timeline guides remain expressible
+> with stock H3 nodes. The custom layout warning does not apply to those ordinary paths.
+
+
 Media contract: 24 fps video on the `17k+5` frame grid, 24-channel latents at spatial compression 16 with a `(1, 2, 2)` patch;
 32 kHz stereo audio, 32-channel latents at 40 latent frames per second; video and audio flow shifts 12.0 and 3.0.
 
@@ -47,7 +59,7 @@ Two released transformers, with different conditioning contracts:
     - [Differential Output Preservation](#differential-output-preservation)
     - [CREPA](#crepa)
   - [Validation](#validation)
-  - [Sampling during FL2VA training](#sampling-during-fl2va-training)
+  - [Sampling during training](#sampling-during-training)
   - [Diagnostics](#diagnostics)
   - [Train a learned context](#train-a-learned-context)
     - [Without an existing dataset](#without-an-existing-dataset)
@@ -291,7 +303,7 @@ The example swaps 40 of the 50 main blocks.
   block-swap overhead; it costs locked host RAM.
 - [Memory and speed](#memory-and-speed) lists the quantization and kernel options.
 
-**Next.** Track the run with [Validation](#validation) and, once a checkpoint exists, generate with [Inference](#inference); FL2VA also supports [sampling during training](#sampling-during-fl2va-training). [Memory and speed](#memory-and-speed) lists what to reach for when the run does not fit or is too slow.
+**Next.** Track the run with [Validation](#validation) and, once a checkpoint exists, generate with [Inference](#inference); FL2VA also supports [sampling during training](#sampling-during-training). [Memory and speed](#memory-and-speed) lists what to reach for when the run does not fit or is too slow.
 
 ## Train Ref2VA
 
@@ -370,7 +382,7 @@ accelerate launch minimax_h3_train_network.py \
 
 For a `ref2va_omni` text cache, change the trainer option to `--h3_training_mode ref2va_omni`. Ref2VA reference rows lengthen the packed sequence, so it normally needs more activation memory than an otherwise identical FL2VA run. Reduce reference resolution or frame sampling first, then increase block swap if model-weight residency is still the problem; block swapping does not reduce attention activations.
 
-**Next.** Track the run with [Validation](#validation) and, once a checkpoint exists, generate with [Inference](#inference), which is the only way to sample Ref2VA. [Memory and speed](#memory-and-speed) lists what to reach for when the run does not fit or is too slow.
+**Next.** Track the run with [Validation](#validation) and, once a checkpoint exists, generate with [Inference](#inference) or use [training previews](#sampling-during-training). [Memory and speed](#memory-and-speed) lists what to reach for when the run does not fit or is too slow.
 
 ## Dataset
 
@@ -1388,10 +1400,11 @@ When generated or reference modalities are randomized during training, validatio
 and prefixes metrics with `joint`, `v2a`, `a2v`, and, when applicable, `ref_av`, `ref_video`, or `ref_audio`. This adds validation
 forwards only for the extra tasks.
 
-### Sampling during FL2VA training
+### Sampling during training
 
-Training-time sampling is accepted only for `--h3_training_mode fl2va`; every other mode rejects `--sample_prompts` at
-startup and is sampled with `minimax_h3_generate_video.py` instead.
+Training-time sampling supports FL2VA and Ref2VA/Ref2VA-Omni through our native generator paths, including the custom
+one-frame layouts below. It uses the live training adapter or learned context. Ref2VA preview `--ref` inputs are images;
+use the standalone generator for its broader media-input controls.
 
 ```shell
 accelerate launch minimax_h3_train_network.py ... \
@@ -1409,7 +1422,21 @@ A traveler walks through a sunlit valley while birds sing. --w 672 --h 384 --f 1
 A slow camera move across a coastal landscape. --i start.png --ei end.png --w 672 --h 384 --f 124 --d 42 --s 20
 ```
 
-Samples are written to `OUTPUT_DIR/sample` as synchronized MP4 files with JSON sidecars, using the LoRA currently attached.
+Samples are written to `OUTPUT_DIR/sample`: synchronized MP4 for video, PNG for a one-frame target, and a separate PNG
+per joint image slot. JSON sidecars record the layout, reference route, noise coupling and model evaluations.
+
+Custom one-frame sample prompts use the same placement syntax as standalone `--one_frame`, under the shared prompt-file `--of` option:
+
+```text
+A character changes pose. --w 512 --h 512 --f 1 --s 20 --d 42 --ci /images/control.png --of target_indices=-1;0;1,control_index=4
+A character in a new scene. --w 512 --h 512 --f 1 --s 20 --d 42 --ref /images/identity.png --of target_indices=-1;0;1
+```
+
+The first line is FL2VA; the second is Ref2VA. Set training `--h3_reference_route` and
+`--h3_target_noise_coupling` to the intended inference settings; previews inherit them. Shared noise requires explicit
+`target_indices`. Timed controls and joint slots require `--f 1`. A Ref2VA prompt can instead use `--f 124` without `--of`
+for an ordinary video preview. Learned-context previews inherit the current live context and its prepend/replace setting.
+The custom layouts are **not supported by stock ComfyUI inference**; use our preview or standalone path.
 
 ### Diagnostics
 
@@ -1431,6 +1458,9 @@ you intend to keep. The two validation probes cost extra no-grad forwards per va
 **`--h3_validation_rollout_probe`.** Costs `2N+4` no-grad forwards per validation. `0` (default) disables. Incompatible with `--base_weights` for the same reason as the field probe. Not available on a full fine-tune, which keeps no frozen base to evaluate at the walked-to state.
 
 ### Train a learned context
+
+`--h3_rollout_fused_teacher` is not supported for learned-context training: use ordinary teacher forwards instead.
+This restriction is on the fused training optimization, not on context inference or training previews.
 
 A learned context is a small trainable sequence composed with Qwen conditioning. Qwen and the H3 transformer remain frozen, and
 training writes one embedding file instead of a LoRA.
@@ -1508,7 +1538,7 @@ so every item retains its own cached caption alongside the shared learned contex
 To continue a saved embedding, reuse the command with `--h3_learned_context_init output/water_context.safetensors` instead of
 `--h3_learned_context_init_prompt` and its text-encoder options, and select a new `--output_name`.
 
-`--h3_learned_context_composition prepend` retains each cached caption; `replace` drops it and trains a self-contained
+`--h3_learned_context_composition prepend` retains each cached caption; `replace` replaces text-tagged rows while retaining the ordered non-text visual Qwen rows, and trains a self-contained
 context. The saved file contains the optimized Qwen rows under
 the `qwen3vl_32b` tensor key.
 
@@ -2281,7 +2311,7 @@ python minimax_h3_generate_video.py \
 | `--reference_video_max_pixels` | Maximum pixels per reference-video frame after aspect-preserving resize (default 768×1344, minimum 1024). The cap is enforced on the final 32-aligned dimensions, so extreme aspect ratios are downscaled rather than rounded back over it. |
 | `--reference_video_fps` | Caching and training only; no inference flag. Subsample every reference video to this many frames per **source** second so the whole clip conditions the model instead of only its opening span. `0` (default) truncates the reference to the target's frame count. Frame `k` is source frame `round(k × source_fps / F)`, and the result is snapped to the nearest legal reference length (`1` or `17n+5`) that still fits the target's frame budget, truncating or padding with the final frame to reach it. The subsampled reference video spans the whole clip while its paired soundtrack still covers only the clip's opening span. |
 | `--lora_weight` / `--lora_multiplier` | Attach saved adapters. ComfyUI key names are converted; incompatible module keys are rejected. |
-| `--h3_learned_context` | Prepend a ComfyUI-compatible H3 learned context to the Qwen prompt output. Repeat the option to concatenate contexts in command-line order. It composes with all attached LoRAs. |
+| `--h3_learned_context` | Prepend a post-Qwen H3 learned context; multimodal composition uses our inference, while text-only composition can use stock Load Conditioning. Repeat the option to concatenate contexts in command-line order. It composes with all attached LoRAs. |
 | `--h3_learned_context_multiplier` | Scale the corresponding learned context; omitted entries default to `1`. A value of `0` removes that context completely. Negative values are allowed for experimentation but are not a mathematically guaranteed inverse because context tokens influence nonlinear attention rather than adding a direction directly to the latent. |
 | `--steps` | Sigma grid points including terminal zero, so `20` runs 19 evaluations. |
 | `--latent_upscaler` / `--latent_upscale_scale` | Apply a trained latent upscaler before decoding. The default scale `1.0` leaves the latent unchanged. |
@@ -2323,8 +2353,16 @@ Repeat `--h3_learned_context` to prepend multiple learned contexts in command-li
 `--h3_learned_context_multiplier` to scale the corresponding files; omitted multipliers default to `1`, and `0` disables that
 context. Learned contexts can be used together with `--lora_weight`.
 
-The saved file also uses ComfyUI's H3 embedding format. Place it in a ComfyUI embeddings directory and use
-`embedding:my_context` in the prompt.
+New context files contain a post-Qwen `conditioning` tensor shaped `[1, tokens, 5120]`.
+For a **text-only** prompt, stock ComfyUI can load this file using **Load Conditioning** (`ConditioningLoader`), then
+prepend it with **Conditioning (Concat)**: context on `conditioning_to`, encoded prompt on `conditioning_from`.
+For text-only replace, use the loaded conditioning alone. Nonzero multipliers can use **Conditioning (Multiply)**; at zero,
+omit the prefix entirely rather than leaving zero-valued tokens. Concatenate multiple contexts in CLI order.
+Do not use `embedding:my_context`: textual inversion inserts values before Qwen, whereas these contexts are trained after Qwen.
+Legacy `qwen3vl_32b` context files remain readable locally.
+
+**Multimodal context composition requires our inference/sampling implementation.** Stock Concat does not combine the
+H3 token tags and reference metadata needed for multimodal reference-conditioned prompts.
 
 ## One-frame images and ordered FL2VA controls
 
@@ -2380,6 +2418,11 @@ Caption with numbered pictures --w 512 --h 512 --f 1 --s 30 --ci /images/a.png -
 In the dashboard, enable **One-frame images** for caching and training, then set the image dataset's control and target indices. For generation, enable **One-frame image**, enter the ordered condition paths and frame positions, and choose an output name; the output is a PNG.
 
 ### One-frame images with several target slots
+
+> [!WARNING]
+> This section uses custom H3 layouts. Stock ComfyUI nodes do not implement these joint slots, signed target/control
+> placement, coupled slot noise or non-dual ghost-reference layouts. Use our standalone generator or training previews
+> with the same settings used for training.
 
 One-frame mode can generate and train several target images jointly in one forward pass. Each target slot is its own
 single-frame latent, encoded and decoded separately by the video VAE, placed at its own 24 fps pixel-frame index. Slot
@@ -2440,8 +2483,8 @@ Generation writes one PNG per slot, named `<output stem>_<slot>_index<index>.png
 - The route's Qwen3-VL half is fixed when the text cache is written: pass the same `--h3_reference_route` to text caching,
   training, and inference. Training rejects a text cache written with a different route. Latent caches do not depend on the
   route. A route other than `dual` requires one-frame timed controls (`--one_frame --task fl2va`) or image-only Ref2VA
-  references, and cannot be combined with `source_modality_probabilities`, `--h3_image_mode`, teacher conditions, or
-  training-time sampling.
+  references, and cannot be combined with `source_modality_probabilities`, `--h3_image_mode`, or teacher conditions.
+  Training previews support these routes and inherit the training route; specify the matching sample layout above.
 - Training logs `loss/target_slot{k}` for each slot when a batch has two or more slots. A loss mask applies to every slot of
   its record.
 - The LoRA records `ss_h3_target_slots`, `ss_h3_target_indices`, `ss_h3_target_noise_coupling`, and a non-default

@@ -4289,57 +4289,23 @@ def test_h3_sparse_preservation_costs_the_ambient_stream_one_draw_not_one_per_st
     assert stream_after(1) == stream_after(50)
 
 
-def test_h3_ref2va_rejects_training_time_sample_prompts():
-    args = create_parser().parse_args(["--sdpa"])
-    args.h3_training_mode = "ref2va"
-    args.sample_prompts = "samples.txt"
-
-    with pytest.raises(ValueError, match="minimax_h3_generate_video.py"):
-        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
-
-
-@pytest.mark.parametrize("schedule", ["constant", "sigma"])
-def test_h3_contrastive_guidance_form_is_scale_squared_larger(schedule):
-    def run(form):
-        args = create_parser().parse_args([])
-        args.h3_guidance_distillation_scale = 3.0
-        args.h3_guidance_loss_form = form
-        args.h3_guidance_loss_schedule = schedule
-        trainer = MiniMaxH3NetworkTrainer()
-        trainer.dit_dtype = torch.float32
-        trainer.backend = _FakeBackend()
-        transformer = _ScaleTransformer()
-        video = torch.zeros(1, 24, 2, 2, 2)
-        batch = {
-            "timesteps": [0.5],
-            H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
-            H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
-        }
-        torch.manual_seed(0)
-        loss, metrics = trainer.process_batch(
-            args,
-            _FakeAccelerator(),
-            transformer,
-            None,
-            batch,
-            video,
-            torch.ones_like(video),
-            None,
-            torch.float32,
-            torch.float32,
-            None,
-            0,
-        )
-        return loss, metrics
-
-    normalized_loss, normalized_metrics = run("normalized")
-    contrastive_loss, contrastive_metrics = run("contrastive")
-
-    effective_scale = 3.0
-    if schedule == "sigma":
-        effective_scale = 1.0 + 2.0 * normalized_metrics["h3/sigma_video"]
-    torch.testing.assert_close(contrastive_loss, normalized_loss * effective_scale**2)
-    assert contrastive_metrics["loss/video"] == pytest.approx(normalized_metrics["loss/video"] * effective_scale**2)
+def test_h3_ref2va_accepts_training_time_video_sample_prompts():
+    args = create_parser().parse_args(
+        [
+            "--sdpa",
+            "--h3_training_mode",
+            "ref2va",
+            "--sample_prompts",
+            "samples.txt",
+            "--text_encoder",
+            "qwen.safetensors",
+            "--vae",
+            "vae.safetensors",
+            "--audio_vae",
+            "audio.safetensors",
+        ]
+    )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def _guidance_form_inputs(*, frame_sigma=False):

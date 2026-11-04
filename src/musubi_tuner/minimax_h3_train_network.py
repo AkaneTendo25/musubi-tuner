@@ -76,12 +76,17 @@ from musubi_tuner.minimax_h3.one_frame import (
     H3_REFERENCE_ROUTES,
     H3_TARGET_NOISE_COUPLINGS,
     couple_target_slot_noise,
+    parse_one_frame_options,
+    route_keeps_dit_rows,
+    route_presents_qwen_images,
+    target_slot_output_paths,
     validate_reference_route,
     validate_target_noise_coupling,
 )
 from musubi_tuner.training.resume_utils import recover_global_step
 from musubi_tuner.minimax_h3.dop import dop_config_identity
 from musubi_tuner.minimax_h3.inference import (
+    H3EncodedReferences,
     decode_latents_sequentially,
     denoise_fl2va,
     denoise_ref2va,
@@ -176,7 +181,7 @@ from musubi_tuner.minimax_h3.validation import (
     validation_sigma_bins,
 )
 from musubi_tuner.training.accelerator_setup import collator_class
-from musubi_tuner.training.sampling_prompts import load_prompts
+from musubi_tuner.training.sampling_prompts import load_prompts, should_sample_images
 from musubi_tuner.training.trainer_base import LOSS_FOR_AVERAGE_KEY
 from musubi_tuner.training.validation import derive_validation_seed
 from musubi_tuner.utils import model_utils
@@ -399,24 +404,11 @@ _SAMPLE_KEYFRAME_ROWS = "_h3_keyframe_rows"
 _SAMPLE_KEYFRAME_ANCHORS = "_h3_keyframe_anchors"
 
 
-def _parse_one_frame_sample_options(value: str | None) -> tuple[int, tuple[int, ...] | None]:
-    """Parse the generation CLI's ``--of target_index=N,control_index=A;B`` form."""
-    if value is None:
-        return 0, None
-    options: dict[str, str] = {}
-    for item in value.split(","):
-        key, separator, raw = item.strip().partition("=")
-        if not separator or key not in {"target_index", "control_index"} or key in options:
-            raise ValueError("MiniMax H3 sample --of must be target_index=N[,control_index=A;B]")
-        options[key] = raw.strip()
+def _parse_one_frame_sample_options(value: str | None) -> tuple[int | tuple[int, ...], tuple[int, ...] | None]:
     try:
-        target_index = int(options.get("target_index", "0"))
-        controls = tuple(int(index) for index in options["control_index"].split(";")) if "control_index" in options else None
+        return parse_one_frame_options(value)
     except ValueError as error:
-        raise ValueError("MiniMax H3 sample --of indices must be integers") from error
-    if target_index < 0 or (controls is not None and (not controls or any(index < 0 for index in controls))):
-        raise ValueError("MiniMax H3 sample --of indices must be nonnegative")
-    return target_index, controls
+        raise ValueError(f"MiniMax H3 sample --of: {error}") from error
 
 
 def _one_frame_sample_inputs(parameter: dict) -> tuple[int, tuple[int, ...] | None, list[str]]:
@@ -428,6 +420,8 @@ def _one_frame_sample_inputs(parameter: dict) -> tuple[int, tuple[int, ...] | No
         raise ValueError("MiniMax H3 one-frame sample cannot combine --ci with --i/--ei")
     if controls is None:
         controls = alias_controls
+    if not controls and control_indices is None:
+        return target_index, None, []
     if not isinstance(controls, list) or not controls or not all(isinstance(path, str) and path.strip() for path in controls):
         raise ValueError("MiniMax H3 one-frame FL2VA sample requires one or more control images (--ci, or --i/--ei)")
     if control_indices is None or len(control_indices) != len(controls):
@@ -5345,14 +5339,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError(
                     "--h3_reference_route other than dual requires --one_frame or --h3_training_mode ref2va/ref2va_omni"
                 )
-            if args.sample_prompts:
-                raise ValueError("--h3_reference_route other than dual does not support training-time sampling")
         if args.sample_prompts:
-            if args.h3_training_mode != "fl2va" and not getattr(args, "one_frame", False):
-                raise ValueError(
-                    "MiniMax H3 training-time Ref2VA sampling requires --one_frame; "
-                    "use minimax_h3_generate_video.py for Ref2VA video samples"
-                )
             required = {
                 "--text_encoder": args.text_encoder,
                 "--vae": args.vae,
@@ -6471,7 +6458,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         encoder = create_conditioning_encoder(
             text_encoder=Path(args.text_encoder),
             tokenizer=Path(args.tokenizer),
-            task="ref2va" if args.h3_training_mode in ("ref2va", "ref2va_omni") else "t2va",
+            task="ref2va" if args.h3_training_mode in ("ref2va", "ref2va_omni") else "fl2va",
             device=str(accelerator.device),
             dtype="bfloat16",
             quantization=args.text_encoder_quantization,
@@ -6479,69 +6466,94 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             nvfp4_scaled_mm=args.h3_nvfp4_scaled_mm,
             text_visual_max_pixels=args.h3_text_visual_max_pixels,
         )
+        reference_route = getattr(args, "h3_reference_route", "dual")
+        keep_dit = route_keeps_dit_rows(reference_route)
+        present_images = route_presents_qwen_images(reference_route)
         prepared_images: list[list[Image.Image]] = []
-        for prompt in prompts:
-            height = prompt.get("height", 192)
-            width = prompt.get("width", 320)
-            images = []
-            anchors = []
-            requested_frames = int(prompt.get("frame_count", 124))
-            if args.h3_training_mode in ("ref2va", "ref2va_omni"):
-                if requested_frames != 1:
-                    raise ValueError("MiniMax H3 Ref2VA training samples currently require --f 1")
-                reference_paths = prompt.get("reference_path")
-                if not isinstance(reference_paths, list) or not reference_paths:
-                    raise ValueError("MiniMax H3 Ref2VA one-frame sample requires at least one --ref image")
-                if prompt.get("image_path") or prompt.get("end_image_path") or prompt.get("control_image_path"):
-                    raise ValueError("MiniMax H3 Ref2VA sample uses --ref rather than --i/--ei/--ci")
-                target_index, control_indices = _parse_one_frame_sample_options(prompt.get("one_frame"))
-                if control_indices is not None:
-                    raise ValueError("MiniMax H3 Ref2VA one-frame sample does not accept control_index")
-                references = tuple(
-                    MediaAsset(Path(path), MediaModality.IMAGE, "reference", stream_index=index)
-                    for index, path in enumerate(reference_paths)
-                )
-                item = SimpleNamespace(
-                    h3_media_assets=references,
-                    frame_count=1,
-                    bucket_size=(width, height),
-                )
-                prompt["_h3_prepared_references"] = prepare_references(
-                    item,
-                    args.reference_image_short_edge,
-                    args.reference_image_size_mode,
-                    args.reference_image_max_pixels,
-                    args.reference_video_short_edge,
-                    args.reference_video_max_pixels,
-                    args.reference_video_fps,
-                )
-                prompt["one_frame_target_index"] = target_index
-            elif requested_frames == 1:
-                target_index, control_indices, control_paths = _one_frame_sample_inputs(prompt)
-                for path in control_paths:
-                    with Image.open(path) as image:
-                        images.append(prepare_keyframe_image(image, height, width, stretch=True))
-                anchors.extend(f"cond_{index:03d}" for index in range(len(images)))
-                prompt["one_frame_target_index"] = target_index
-                prompt["one_frame_control_indices"] = control_indices
-            else:
-                if prompt.get("one_frame") is not None or prompt.get("control_image_path"):
-                    raise ValueError("MiniMax H3 sample --of/--ci options require --f 1")
-                if prompt.get("image_path"):
-                    with Image.open(prompt["image_path"]) as image:
-                        images.append(prepare_keyframe_image(image, height, width, stretch=True))
-                    anchors.append("first")
-                if prompt.get("end_image_path"):
-                    with Image.open(prompt["end_image_path"]) as image:
-                        images.append(prepare_keyframe_image(image, height, width, stretch=False))
-                    anchors.append("last")
-            if args.h3_training_mode in ("ref2va", "ref2va_omni"):
-                prompt.update(encoder.encode_reference_prompt(prompt.get("prompt", ""), prompt["_h3_prepared_references"]))
-            else:
-                prompt.update(encoder.encode_prompt(prompt.get("prompt", ""), images))
-            prompt[_SAMPLE_KEYFRAME_ANCHORS] = tuple(anchors)
-            prepared_images.append(images)
-        encoder.close()
+        try:
+            for prompt in prompts:
+                height = prompt.get("height", 192)
+                width = prompt.get("width", 320)
+                images = []
+                anchors = []
+                requested_frames = int(prompt.get("frame_count", 124))
+                if reference_route != "dual" and args.h3_training_mode == "fl2va" and requested_frames != 1:
+                    raise ValueError("MiniMax H3 nondual FL2VA training samples require --f 1 with image controls")
+                if args.h3_training_mode in ("ref2va", "ref2va_omni"):
+                    reference_paths = prompt.get("reference_path")
+                    if not isinstance(reference_paths, list) or not reference_paths:
+                        raise ValueError("MiniMax H3 Ref2VA one-frame sample requires at least one --ref image")
+                    if prompt.get("image_path") or prompt.get("end_image_path") or prompt.get("control_image_path"):
+                        raise ValueError("MiniMax H3 Ref2VA sample uses --ref rather than --i/--ei/--ci")
+                    if requested_frames != 1 and prompt.get("one_frame") is not None:
+                        raise ValueError("MiniMax H3 sample --of requires --f 1")
+                    target_index, control_indices = _parse_one_frame_sample_options(prompt.get("one_frame"))
+                    if control_indices is not None:
+                        raise ValueError("MiniMax H3 Ref2VA one-frame sample does not accept control_index")
+                    references = tuple(
+                        MediaAsset(Path(path), MediaModality.IMAGE, "reference", stream_index=index)
+                        for index, path in enumerate(reference_paths)
+                    )
+                    item = SimpleNamespace(
+                        h3_media_assets=references,
+                        frame_count=requested_frames,
+                        bucket_size=(width, height),
+                    )
+                    prompt["_h3_prepared_references"] = prepare_references(
+                        item,
+                        args.reference_image_short_edge,
+                        args.reference_image_size_mode,
+                        args.reference_image_max_pixels,
+                        args.reference_video_short_edge,
+                        args.reference_video_max_pixels,
+                        args.reference_video_fps,
+                    )
+                    if requested_frames == 1:
+                        prompt["one_frame_target_indices" if isinstance(target_index, tuple) else "one_frame_target_index"] = (
+                            target_index
+                        )
+                elif requested_frames == 1:
+                    target_index, control_indices, control_paths = _one_frame_sample_inputs(prompt)
+                    for path in control_paths:
+                        with Image.open(path) as image:
+                            images.append(prepare_keyframe_image(image, height, width, stretch=True))
+                    anchors.extend(f"cond_{index:03d}" for index in range(len(images)))
+                    prompt["one_frame_target_indices" if isinstance(target_index, tuple) else "one_frame_target_index"] = (
+                        target_index
+                    )
+                    prompt["one_frame_control_indices"] = control_indices
+                else:
+                    if prompt.get("one_frame") is not None or prompt.get("control_image_path"):
+                        raise ValueError("MiniMax H3 sample --of/--ci options require --f 1")
+                    if prompt.get("image_path"):
+                        with Image.open(prompt["image_path"]) as image:
+                            images.append(prepare_keyframe_image(image, height, width, stretch=True))
+                        anchors.append("first")
+                    if prompt.get("end_image_path"):
+                        with Image.open(prompt["end_image_path"]) as image:
+                            images.append(prepare_keyframe_image(image, height, width, stretch=False))
+                        anchors.append("last")
+                if (
+                    getattr(args, "h3_target_noise_coupling", "independent") != "independent"
+                    and "one_frame_target_indices" not in prompt
+                ):
+                    raise ValueError("MiniMax H3 shared sample noise requires --of target_indices=A;B with --f 1")
+                if reference_route != "dual" and args.h3_training_mode == "fl2va" and not images:
+                    raise ValueError("MiniMax H3 nondual FL2VA training samples require image controls")
+                prompt["reference_route"] = reference_route
+                prompt["target_noise_coupling"] = getattr(args, "h3_target_noise_coupling", "independent")
+                if args.h3_training_mode in ("ref2va", "ref2va_omni"):
+                    prompt["_h3_reserved_reference_time"] = 0.0 if keep_dit else float(len(prompt["_h3_prepared_references"]))
+                    if present_images:
+                        prompt.update(encoder.encode_reference_prompt(prompt.get("prompt", ""), prompt["_h3_prepared_references"]))
+                    else:
+                        prompt.update(encoder.encode_prompt(prompt.get("prompt", "")))
+                else:
+                    prompt.update(encoder.encode_prompt(prompt.get("prompt", ""), images if present_images else []))
+                prompt[_SAMPLE_KEYFRAME_ANCHORS] = tuple(anchors)
+                prepared_images.append(images if keep_dit else [])
+        finally:
+            encoder.close()
         del encoder
         gc.collect()
         clean_memory_on_device(accelerator.device)
@@ -6554,12 +6566,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # Ref2VA conditions retain their own geometry, so encode them
                 # through the reference path rather than the target-canvas
                 # keyframe path used by FL2VA controls.
-                prompt["_h3_encoded_references"] = encode_reference_media(
-                    Path(args.vae),
-                    Path(args.audio_vae) if args.audio_vae else None,
-                    prompt.pop("_h3_prepared_references"),
-                    accelerator.device,
+                prompt["_h3_encoded_references"] = (
+                    encode_reference_media(
+                        Path(args.vae),
+                        Path(args.audio_vae) if args.audio_vae else None,
+                        prompt.pop("_h3_prepared_references"),
+                        accelerator.device,
+                    )
+                    if keep_dit
+                    else H3EncodedReferences((), torch.empty(0, 96), torch.empty(0, 32))
                 )
+                prompt.pop("_h3_prepared_references", None)
                 prompt[_SAMPLE_KEYFRAME_ROWS] = None
             else:
                 rows = [next(encoded) for _ in images]
@@ -6598,6 +6615,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             device=device,
             condition_seed=seed,
             one_frame_target_index=sample_parameter.get("one_frame_target_index"),
+            one_frame_target_indices=sample_parameter.get("one_frame_target_indices"),
+            target_noise_coupling=sample_parameter.get("target_noise_coupling", "independent"),
         )
         references = sample_parameter.get("_h3_encoded_references")
         with self._preview_overlay_disabled():
@@ -6606,6 +6625,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     transformer,
                     conditioning,
                     references,
+                    reference_route=sample_parameter.get("reference_route", "dual"),
+                    reserved_reference_time=sample_parameter.get("_h3_reserved_reference_time", 0.0),
                     **common_denoise,
                 )
             else:
@@ -6613,8 +6634,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     transformer,
                     conditioning,
                     keyframe_rows=sample_parameter.get(_SAMPLE_KEYFRAME_ROWS),
-                    keyframe_anchors=sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ()),
-                    one_frame_control_indices=sample_parameter.get("one_frame_control_indices"),
+                    keyframe_anchors=sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ())
+                    if route_keeps_dit_rows(sample_parameter.get("reference_route", "dual"))
+                    else (),
+                    one_frame_control_indices=sample_parameter.get("one_frame_control_indices")
+                    if route_keeps_dit_rows(sample_parameter.get("reference_route", "dual"))
+                    else None,
+                    one_frame_placement_indices=sample_parameter.get("one_frame_control_indices", ())
+                    if not route_keeps_dit_rows(sample_parameter.get("reference_route", "dual"))
+                    else (),
                     **common_denoise,
                 )
         if device.type == "cuda":
@@ -6649,8 +6677,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 # placeholder in image mode. Decoding it wastes memory and can
                 # shorten the decoded video through AV duration alignment.
                 decoder_bundle.video_decoder.to(device).eval()
-                video = decoder_bundle.video_decoder.decode(video_latents.to(device)).cpu()
-                decoder_bundle.video_decoder.to("cpu")
+                try:
+                    slots = sample_parameter.get("one_frame_target_indices")
+                    if slots is None:
+                        video = decoder_bundle.video_decoder.decode(video_latents.to(device)).cpu()
+                    else:
+                        video = torch.cat(
+                            [
+                                decoder_bundle.video_decoder.decode(video_latents[:, :, index : index + 1].to(device)).cpu()
+                                for index in range(len(slots))
+                            ],
+                            dim=2,
+                        )
+                finally:
+                    decoder_bundle.video_decoder.to("cpu")
                 clean_memory_on_device(device)
                 return SimpleNamespace(video=video, audio=None)
             return decode_latents_sequentially(
@@ -6694,6 +6734,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     transformer.to(device)
         return media, height, width, frame_count, sample_steps, seed
 
+    def sample_images(self, accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
+        if not should_sample_images(args, steps, epoch) or sample_parameters is None:
+            return
+        model = accelerator.unwrap_model(transformer)
+        states = [(module, module.training) for module in model.modules()]
+        rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            model.eval()
+            return super().sample_images(accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype)
+        finally:
+            for module, training in states:
+                module.training = training
+            torch.set_rng_state(rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            model.switch_block_swap_for_training()
+
     def sample_image_inference(
         self,
         accelerator,
@@ -6721,9 +6779,36 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         suffix = ".png" if frame_count == 1 else ".mp4"
         output = Path(save_dir) / f"{prefix}{checkpoint}_{prompt_index:02d}_{timestamp}_{seed}{suffix}"
         if frame_count == 1:
-            pixels = (media.video[0, :, 0].permute(1, 2, 0).clamp(0, 1).numpy() * 255.0).round().astype("uint8")
-            Image.fromarray(pixels).save(output)
-            logger.info("Saved MiniMax H3 image sample to %s", output)
+            slots = sample_parameter.get("one_frame_target_indices")
+            outputs = target_slot_output_paths(output, slots) if slots is not None else (output,)
+            for index, image_output in enumerate(outputs):
+                pixels = (media.video[0, :, index].permute(1, 2, 0).clamp(0, 1).numpy() * 255.0).round().astype("uint8")
+                Image.fromarray(pixels).save(image_output)
+                image_output.with_suffix(".json").write_text(
+                    json.dumps(
+                        {
+                            "training_step": steps,
+                            "epoch": epoch,
+                            "prompt": sample_parameter.get("prompt", ""),
+                            "seed": seed,
+                            "height": height,
+                            "width": width,
+                            "target_index": slots[index] if slots is not None else sample_parameter.get("one_frame_target_index"),
+                            "target_indices": slots,
+                            "control_indices": sample_parameter.get("one_frame_control_indices"),
+                            "reference_route": sample_parameter.get("reference_route", "dual"),
+                            "target_noise_coupling": sample_parameter.get("target_noise_coupling", "independent"),
+                            "sigma_points": sample_steps,
+                            "model_evaluations": sample_steps - 1,
+                            "learned_context_composition": sample_parameter.get("learned_context_composition"),
+                            "learned_context_tokens": sample_parameter.get("learned_context_tokens"),
+                            "metrics": self._last_sample_metrics,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                logger.info("Saved MiniMax H3 image sample to %s", image_output)
             return
         save_av_mp4(
             media,
@@ -6739,6 +6824,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "sigma_points": sample_steps,
                 "model_evaluations": sample_steps - 1,
                 "keyframe_anchors": list(sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ())),
+                "reference_route": sample_parameter.get("reference_route", "dual"),
+                "learned_context_composition": sample_parameter.get("learned_context_composition"),
+                "learned_context_tokens": sample_parameter.get("learned_context_tokens"),
                 "metrics": self._last_sample_metrics,
             },
         )

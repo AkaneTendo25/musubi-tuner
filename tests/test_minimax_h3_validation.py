@@ -748,7 +748,7 @@ def test_h3_null_anchor_weight_must_not_be_negative():
 
 def _dense_probe_trainer(step: int):
     """A trainer whose validation network is the dense module: nothing to switch off."""
-    trainer = MiniMaxH3NetworkTrainer.__new__(MiniMaxH3NetworkTrainer)
+    trainer = MiniMaxH3NetworkTrainer()
     trainer._validation_network = nn.Linear(1, 1)  # no set_enabled(): the full fine-tune shape
     trainer._validation_global_step = step
     trainer._merged_base_weight_paths = None

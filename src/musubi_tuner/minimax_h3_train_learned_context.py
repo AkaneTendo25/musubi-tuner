@@ -76,7 +76,7 @@ class H3LearnedContext(torch.nn.Module):
         if not torch.isfinite(self.weight).all():
             raise FloatingPointError("refusing to save a non-finite H3 learned-context parameter")
         snapshot = self.weight.detach().to(device="cpu", dtype=export_dtype, copy=True).contiguous()
-        return {COMFYUI_LEARNED_CONTEXT_KEY: snapshot}
+        return {COMFYUI_LEARNED_CONTEXT_KEY: snapshot.unsqueeze(0)}
 
     def save_weights(self, file: str, dtype: torch.dtype | None, metadata: dict | None) -> None:
         async_save.write_state_dict_file(self.snapshot_weights(dtype), file, metadata)
@@ -116,6 +116,10 @@ class MiniMaxH3LearnedContextTrainer(MiniMaxH3NetworkTrainer):
             raise ValueError("guidance-distillation is not supported for H3 learned-context training")
         if args.h3_caption_dropout_rate > 0:
             raise ValueError("caption dropout is not supported for H3 learned-context training")
+        if getattr(args, "h3_rollout_fused_teacher", False):
+            raise ValueError(
+                "H3 learned-context training does not support --h3_rollout_fused_teacher; use ordinary teacher forwards"
+            )
         if args.save_precision not in (None, "bf16", "float", "fp32"):
             raise ValueError("H3 learned contexts can be saved as BF16 or FP32")
 
@@ -168,7 +172,21 @@ class MiniMaxH3LearnedContextTrainer(MiniMaxH3NetworkTrainer):
                 transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
         return self._learned_context
 
-    def _predict(self, accelerator, transformer, batch, inputs, *, conditioning: str):
+    def _predict_call(self, accelerator, batch, inputs, *, conditioning: str | tuple[str, ...]):
+        if isinstance(conditioning, tuple):
+            conditioned = batch
+            for branch in dict.fromkeys(conditioning):
+                conditioned = self._compose_training_batch(conditioned, branch)
+        else:
+            conditioned = self._compose_training_batch(batch, conditioning)
+        return super()._predict_call(accelerator, conditioned, inputs, conditioning=conditioning)
+
+    def _try_batched_plain_step(self, *args, **kwargs):
+        # The base fast path groups by the cached, uncomposed caption lengths.
+        # Keep the ordinary per-item loop so its packing includes live contexts.
+        return None
+
+    def _compose_training_batch(self, batch, conditioning: str):
         if self._learned_context is None:
             raise RuntimeError("H3 learned context is not initialized")
         hidden_key = H3_TEXT_HIDDEN_KEY
@@ -194,7 +212,7 @@ class MiniMaxH3LearnedContextTrainer(MiniMaxH3NetworkTrainer):
             context = self._learned_context.weight if self._learned_context.enabled else None
             composed_hidden, composed_tags = compose_learned_context(hidden, tags, context, self._learned_context_composition)
             conditioned_batch = {**batch, hidden_key: composed_hidden, tags_key: composed_tags}
-        return super()._predict(accelerator, transformer, conditioned_batch, inputs, conditioning=conditioning)
+        return conditioned_batch
 
     def _generate_sample(self, accelerator, transformer, decoder_bundle, sample_parameter):
         if self._learned_context is None:
@@ -213,6 +231,14 @@ class MiniMaxH3LearnedContextTrainer(MiniMaxH3NetworkTrainer):
             decoder_bundle,
             {**sample_parameter, **conditioning},
         )
+
+    def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
+        parameter = {
+            **sample_parameter,
+            "learned_context_composition": self._learned_context_composition,
+            "learned_context_tokens": self._learned_context.weight.shape[0] if self._learned_context is not None else None,
+        }
+        return super().sample_image_inference(accelerator, args, transformer, dit_dtype, vae, save_dir, parameter, epoch, steps)
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         metadata = super().extra_metadata(args)

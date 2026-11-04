@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import math
 import re
@@ -1245,8 +1246,47 @@ class _NativeGenerator:
         if self.latent_upscaler is not None and self.latent_upscale_scale > 1.0:
             video_latents = self._measure("latent_upscale", lambda: self._upscale_latents(video_latents), metrics).cpu()
 
+        metadata = {
+            "prompt": request.prompt,
+            "seed": request.seed,
+            "height": height,
+            "width": width,
+            "frames": shape.frame_count,
+            "sigma_points": self.num_inference_steps,
+            "model_evaluations": evaluation_counts["model_evaluations"],
+            "sampler": self.sampler,
+            "base_schedule": self.base_schedule,
+            "video_shift": self.video_shift,
+            "audio_shift": self.audio_shift,
+            "sde_eta": self.sde_eta,
+            "res_c2": self.res_c2,
+            "lora_weights": [path.name for path in self.lora_weights],
+            "keyframe_anchors": list(anchors),
+            "reference_kinds": reference_kinds,
+            "one_frame_target_index": request.one_frame_target_index,
+            "one_frame_target_indices": request.one_frame_target_indices,
+            "one_frame_control_indices": request.one_frame_control_indices,
+            "target_noise_coupling": request.target_noise_coupling,
+            "reference_route": route,
+            "learned_context_composition": getattr(self, "learned_context_composition", "prepend"),
+            "first_pass_scale": self.first_pass_scale,
+            "first_pass_steps": self.first_pass_steps,
+            "second_pass_strength": self.second_pass_strength,
+            "null_guidance_scale": self.null_guidance_scale,
+            "metrics": metrics,
+        }
+
+        def save_image_metadata(paths):
+            metrics["total"] = {"seconds": time.perf_counter() - total_started}
+            for slot, path in enumerate(paths):
+                image_metadata = dict(metadata)
+                if request.one_frame_target_indices is not None:
+                    image_metadata.update(target_slot=slot, target_index=request.one_frame_target_indices[slot])
+                path.with_suffix(path.suffix + ".json").write_text(json.dumps(image_metadata, indent=2), encoding="utf-8")
+
         if request.one_frame_target_indices is not None:
             self._measure("video_decode", lambda: self._save_target_slots(request, video_latents), metrics)
+            save_image_metadata(target_slot_output_paths(request.output, request.one_frame_target_indices))
             return
 
         if request.output.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -1259,6 +1299,7 @@ class _NativeGenerator:
             frame = video[0, :, frame_index].permute(1, 2, 0).clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
             request.output.parent.mkdir(parents=True, exist_ok=True)
             Image.fromarray(frame).save(request.output)
+            save_image_metadata((request.output,))
             return
 
         video_decoder, audio_decoder = self._measure(
@@ -1284,27 +1325,7 @@ class _NativeGenerator:
         save_av_mp4(
             media,
             request.output,
-            {
-                "prompt": request.prompt,
-                "seed": request.seed,
-                "height": height,
-                "width": width,
-                "frames": shape.frame_count,
-                "fps": media.fps,
-                "sample_rate": media.sample_rate,
-                "sigma_points": self.num_inference_steps,
-                "model_evaluations": evaluation_counts["model_evaluations"],
-                "sampler": self.sampler,
-                "base_schedule": self.base_schedule,
-                "video_shift": self.video_shift,
-                "audio_shift": self.audio_shift,
-                "sde_eta": self.sde_eta,
-                "res_c2": self.res_c2,
-                "lora_weights": [path.name for path in self.lora_weights],
-                "keyframe_anchors": list(anchors),
-                "reference_kinds": reference_kinds,
-                "metrics": metrics,
-            },
+            {**metadata, "fps": media.fps, "sample_rate": media.sample_rate},
         )
 
 

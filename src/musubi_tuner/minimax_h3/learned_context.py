@@ -6,7 +6,8 @@ import torch
 from safetensors.torch import load_file
 
 
-COMFYUI_LEARNED_CONTEXT_KEY = "qwen3vl_32b"
+COMFYUI_LEARNED_CONTEXT_KEY = "conditioning"
+LEGACY_LEARNED_CONTEXT_KEY = "qwen3vl_32b"
 H3_TEXT_HIDDEN_SIZE = 5120
 
 
@@ -26,12 +27,18 @@ def validate_learned_context(weight: torch.Tensor) -> torch.Tensor:
 
 def load_learned_context(path: str | Path) -> torch.Tensor:
     state = load_file(str(path), device="cpu")
-    if COMFYUI_LEARNED_CONTEXT_KEY not in state:
+    key = COMFYUI_LEARNED_CONTEXT_KEY if COMFYUI_LEARNED_CONTEXT_KEY in state else LEGACY_LEARNED_CONTEXT_KEY
+    if key not in state:
         raise ValueError(f"H3 learned-context file must contain {COMFYUI_LEARNED_CONTEXT_KEY!r}")
     if len(state) != 1:
-        extras = sorted(set(state) - {COMFYUI_LEARNED_CONTEXT_KEY})
+        extras = sorted(set(state) - {key})
         raise ValueError("H3 learned-context file contains unexpected tensors: " + ", ".join(extras))
-    return validate_learned_context(state[COMFYUI_LEARNED_CONTEXT_KEY])
+    weight = state[key]
+    if key == COMFYUI_LEARNED_CONTEXT_KEY:
+        if weight.ndim != 3 or weight.shape[0] != 1:
+            raise ValueError("H3 native conditioning must have shape [1, tokens, 5120]")
+        weight = weight[0]
+    return validate_learned_context(weight)
 
 
 def load_learned_context_sequence(
@@ -79,9 +86,18 @@ def compose_learned_context(
     if learned_context is None:
         return text_hidden, text_token_tags
     validate_learned_context(learned_context)
+    if text_hidden.ndim != 2 or text_hidden.shape[1] != H3_TEXT_HIDDEN_SIZE:
+        raise ValueError(f"H3 text hidden states must have shape [tokens, {H3_TEXT_HIDDEN_SIZE}]")
+    if text_token_tags.ndim != 1 or text_token_tags.shape[0] != text_hidden.shape[0]:
+        raise ValueError("H3 text token tags must contain one row per hidden state")
     context = learned_context.to(device=text_hidden.device, dtype=text_hidden.dtype)
     tags = torch.ones(context.shape[0], device=text_token_tags.device, dtype=text_token_tags.dtype)
-    return context, tags
+    # Replace captions while retaining the reference's encoded video/audio rows.
+    keep = text_token_tags != 1
+    return (
+        torch.cat((context, text_hidden[keep.to(device=text_hidden.device)]), dim=0),
+        torch.cat((tags, text_token_tags[keep]), dim=0),
+    )
 
 
 def apply_learned_context(
