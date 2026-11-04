@@ -1,0 +1,14 @@
+#!/bin/sh
+# Install for this checkout: git config --local core.hooksPath .githooks
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+if [ -x .venv/Scripts/python.exe ]; then
+    PYTHON=.venv/Scripts/python.exe
+elif [ -x .venv/bin/python ]; then
+    PYTHON=.venv/bin/python
+else
+    echo 'Create the project .venv and install dev dependencies before committing.' >&2
+    exit 1
+fi
+# Use the pinned Ruff hooks on the entire repository, including unchanged files.
+exec "$PYTHON" -m pre_commit run --all-files --hook-stage pre-commit
