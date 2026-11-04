@@ -1701,6 +1701,7 @@ manual-learning-rate Adafactor arguments; if you replace `--optimizer_args`, inc
 | `--gradient_checkpointing_cpu_offload` | Offload checkpoint activations when long packed sequences still exceed VRAM. |
 | `--mem_eff_save` | Stream native transformer tensors during `.safetensors` output; enabled by default. |
 | `--no_mem_eff_save` | Write checkpoints with the ordinary safetensors writer instead of the streaming one; needs the whole checkpoint contiguous in host memory. |
+| `--skip_final_save` | Skip the automatic final model checkpoint and final training state on completion or dashboard stop, including with `--save_state` or `--save_state_on_train_end`. Off by default. Step/epoch checkpoints and manual save requests still save; an explicit save-and-stop request overrides this flag. Pending background saves finish before exit. |
 
 The combination `--blocks_to_swap 48`, the trainable ring, and `--block_swap_ring_size 2` minimizes resident model blocks for
 full-parameter training, but its host-memory and transfer requirements are high. Fit also depends on resolution, frame length,

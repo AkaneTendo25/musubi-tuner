@@ -1434,6 +1434,10 @@ class NetworkTrainer:
         Use for EMA updates or any post-step bookkeeping.
         """
 
+    def should_save_final_checkpoint(self, args: argparse.Namespace) -> bool:
+        """Whether automatic training completion writes final weights and state."""
+        return True
+
     def on_post_save(
         self,
         args: argparse.Namespace,
@@ -2709,7 +2713,7 @@ class NetworkTrainer:
                 last_step_in_epoch = 0
             if dashboard_stop_requested or checkpoint_stop_requested:
                 if dashboard_stop_requested:
-                    accelerator.print("\nDashboard stop requested; finishing and saving training state.")
+                    accelerator.print("\nDashboard stop requested; finishing training.")
                 break
 
             if len(accelerator.trackers) > 0:
@@ -2762,7 +2766,16 @@ class NetworkTrainer:
         if is_main_process:
             flush_async_saves()
 
-        if args.save_state or args.save_state_on_train_end:
+        # Explicit save-and-stop requests must still save even when automatic final
+        # saves are disabled. Periodic and manual save-now requests are independent.
+        save_final = self.should_save_final_checkpoint(args)
+        if checkpoint_stop_requested and not save_final:
+            accelerator.print("Save-and-stop request overrides --skip_final_save.")
+            save_final = True
+        if not save_final:
+            accelerator.print("Skipping automatic final model checkpoint and training state (--skip_final_save).")
+
+        if save_final and (args.save_state or args.save_state_on_train_end):
             train_utils.save_state_on_train_end(
                 args,
                 accelerator,
@@ -2771,7 +2784,7 @@ class NetworkTrainer:
                 step_in_epoch=last_step_in_epoch,
             )
 
-        if is_main_process:
+        if is_main_process and save_final:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
             final_epoch = current_epoch.value if dashboard_stop_requested or checkpoint_stop_requested else num_train_epochs
             save_model(ckpt_name, network, global_step, final_epoch, force_sync_upload=True)

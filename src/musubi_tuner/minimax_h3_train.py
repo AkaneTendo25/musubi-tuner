@@ -146,6 +146,9 @@ class MiniMaxH3FullFinetuneModule(torch.nn.Module):
 class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
     """Full-parameter BF16 MiniMax H3 trainer with fused Adafactor updates."""
 
+    def should_save_final_checkpoint(self, args: argparse.Namespace) -> bool:
+        return not getattr(args, "skip_final_save", False)
+
     def _validate_full_finetune_args(self, args: argparse.Namespace) -> None:
         if args.mixed_precision != "bf16" or not args.full_bf16:
             raise ValueError("MiniMax H3 full fine-tuning requires --mixed_precision bf16 and --full_bf16")
@@ -475,6 +478,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Full-parameter BF16 training for MiniMax H3 FL2VA and Ref2VA"
     parser.add_argument("--full_fp16", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--full_bf16", action="store_true", help="train MiniMax H3 weights directly in BF16")
+    parser.add_argument(
+        "--skip_final_save",
+        action="store_true",
+        help="skip automatic final weights and training state, including dashboard stop; periodic saves and explicit save-and-stop requests still save",
+    )
     parser.add_argument(
         "--block_swap_trainable_ring",
         action="store_true",
