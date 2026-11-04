@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -123,7 +124,9 @@ def save_state_manifest(
 ) -> None:
     """Write an atomic completion marker after every process finishes saving."""
     files = sorted(
-        name for name in os.listdir(state_dir) if os.path.isfile(os.path.join(state_dir, name)) and name != STATE_MANIFEST_NAME
+        name
+        for name in os.listdir(state_dir)
+        if os.path.isfile(os.path.join(state_dir, name)) and name not in {STATE_MANIFEST_NAME, "h3_dense_state.incomplete"}
     )
     manifest = {
         "format_version": 1,
@@ -159,6 +162,10 @@ def load_state_manifest(state_dir: str) -> dict | None:
 def is_complete_state_dir(state_dir: str, process_index: int | None = None) -> bool:
     """Return whether a directory contains a complete, resumable Accelerate state."""
     if not os.path.isdir(state_dir):
+        return False
+    # A failed overwrite can leave a valid old manifest beside new model weights
+    # and old optimizer files. Dense saves retain this marker until all parts finish.
+    if os.path.exists(os.path.join(state_dir, "h3_dense_state.incomplete")):
         return False
 
     try:
@@ -338,6 +345,11 @@ def get_remove_ckpt_no(
     return remove_no
 
 
+def _state_save_transaction(accelerator):
+    hooks = getattr(accelerator, "_h3_dense_state_hooks", None)
+    return hooks.defer_completion() if hooks is not None else nullcontext()
+
+
 def save_and_remove_state_on_epoch_end(
     args: argparse.Namespace,
     accelerator: accelerate.Accelerator,
@@ -355,17 +367,19 @@ def save_and_remove_state_on_epoch_end(
     accelerator.wait_for_everyone()
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
-    accelerator.save_state(state_dir)
-    accelerator.wait_for_everyone()
+    with _state_save_transaction(accelerator):
+        accelerator.save_state(state_dir)
+        accelerator.wait_for_everyone()
+        if is_main_process:
+            save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no, data_seed=getattr(args, "seed", None))
+            save_state_manifest(
+                state_dir,
+                state_type="epoch",
+                global_step=global_step,
+                step_in_epoch=step_in_epoch,
+                epoch=epoch_no,
+            )
     if is_main_process:
-        save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no, data_seed=getattr(args, "seed", None))
-        save_state_manifest(
-            state_dir,
-            state_type="epoch",
-            global_step=global_step,
-            step_in_epoch=step_in_epoch,
-            epoch=epoch_no,
-        )
         logger.info("state saved to %s; resume with --resume %s", state_dir, state_dir)
         if args.save_state_to_huggingface:
             logger.info("uploading state to huggingface.")
@@ -398,11 +412,13 @@ def save_and_remove_state_stepwise(
     accelerator.wait_for_everyone()
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
-    accelerator.save_state(state_dir)
-    accelerator.wait_for_everyone()
+    with _state_save_transaction(accelerator):
+        accelerator.save_state(state_dir)
+        accelerator.wait_for_everyone()
+        if is_main_process:
+            save_resume_metadata(state_dir, step_no, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
+            save_state_manifest(state_dir, state_type="step", global_step=step_no, step_in_epoch=step_in_epoch, epoch=epoch)
     if is_main_process:
-        save_resume_metadata(state_dir, step_no, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
-        save_state_manifest(state_dir, state_type="step", global_step=step_no, step_in_epoch=step_in_epoch, epoch=epoch)
         logger.info("state saved to %s; resume with --resume %s", state_dir, state_dir)
         if args.save_state_to_huggingface:
             logger.info("uploading state to huggingface.")
@@ -438,17 +454,19 @@ def save_state_on_train_end(
     accelerator.wait_for_everyone()
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
-    accelerator.save_state(state_dir)
-    accelerator.wait_for_everyone()
+    with _state_save_transaction(accelerator):
+        accelerator.save_state(state_dir)
+        accelerator.wait_for_everyone()
+        if is_main_process:
+            save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
+            save_state_manifest(
+                state_dir,
+                state_type="final",
+                global_step=global_step,
+                step_in_epoch=step_in_epoch,
+                epoch=epoch,
+            )
     if is_main_process:
-        save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
-        save_state_manifest(
-            state_dir,
-            state_type="final",
-            global_step=global_step,
-            step_in_epoch=step_in_epoch,
-            epoch=epoch,
-        )
         logger.info("state saved to %s; resume with --resume %s", state_dir, state_dir)
 
         if args.save_state_to_huggingface:

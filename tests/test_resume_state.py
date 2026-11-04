@@ -225,6 +225,25 @@ def test_resume_position_uses_exact_metadata_for_mid_epoch():
     assert train_utils.get_resume_position(10000, 116, metadata) == (86, 24)
 
 
+@pytest.mark.parametrize("old_manifest", [False, True])
+def test_dense_interrupted_save_is_not_a_resumable_state(tmp_path, old_manifest):
+    state_dir = tmp_path / "h3-step00000005-state"
+    state_dir.mkdir()
+    for name in ("model.safetensors", "optimizer.bin", "scheduler.bin", "random_states_0.pkl"):
+        (state_dir / name).write_bytes(b"old completed state")
+    if old_manifest:
+        train_utils.save_state_manifest(str(state_dir), state_type="step", global_step=5, step_in_epoch=5, epoch=1)
+    assert train_utils.is_complete_state_dir(str(state_dir), process_index=0)
+
+    (state_dir / "h3_dense_state.incomplete").touch()
+    (state_dir / "model.safetensors").write_bytes(b"new model, old optimizer")
+    assert not train_utils.is_complete_state_dir(str(state_dir), process_index=0)
+    args = SimpleNamespace(output_dir=str(tmp_path), output_name="h3")
+    assert find_latest_state_dir(args) is None
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_resume_state_dir(str(state_dir))
+
+
 def test_fresh_training_starts_at_zero():
     assert train_utils.get_resume_position(0, 116, None) == (0, 0)
 

@@ -380,7 +380,17 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
         transformer = accelerator.unwrap_model(network).transformer
         transformer.train()
         self._install_fused_optimizer(args, accelerator, optimizer)
+        from musubi_tuner.training.h3_dense_state import install_adafactor_state_restore
+
+        install_adafactor_state_restore(getattr(optimizer, "optimizer", optimizer))
+        self._dense_optimizer = optimizer
         return transformer, network, optimizer, train_dataloader, lr_scheduler, network, dit_dtype
+
+    def _register_hooks_and_resume(self, args, accelerator, network):
+        from musubi_tuner.training.h3_dense_state import register_dense_state_hooks
+
+        self._dense_state_hooks = register_dense_state_hooks(accelerator, network, self._dense_optimizer)
+        return super()._register_hooks_and_resume(args, accelerator, network)
 
     @staticmethod
     def _install_fused_optimizer(args, accelerator, optimizer) -> None:
@@ -411,19 +421,21 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
         # already-registered hooks.
         optimizer.step_param = raw_optimizer.step_param
 
-        def make_hook(parameter: torch.nn.Parameter, param_group: dict):
+        def make_hook(parameter: torch.nn.Parameter, group_index: int):
             def grad_hook(_tensor: torch.Tensor) -> None:
                 if not accelerator.sync_gradients:
                     return
-                optimizer.step_param(parameter, param_group)
+                # load_state_dict replaces group dictionaries; scheduler writes
+                # must reach the group actually used for this update.
+                optimizer.step_param(parameter, raw_optimizer.param_groups[group_index])
                 parameter.grad = None
 
             return grad_hook
 
-        for param_group in optimizer.param_groups:
+        for group_index, param_group in enumerate(raw_optimizer.param_groups):
             for parameter in param_group["params"]:
                 if parameter.requires_grad:
-                    parameter.register_post_accumulate_grad_hook(make_hook(parameter, param_group))
+                    parameter.register_post_accumulate_grad_hook(make_hook(parameter, group_index))
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         metadata = super().extra_metadata(args)

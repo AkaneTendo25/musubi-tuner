@@ -1643,6 +1643,13 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTORCH_ALLOC_CONF=expandable_s
 With block swap, use the trainable ring: at `--blocks_to_swap 48` the ordinary backward-capable swap took about 3.5x the
 ring's step time (table below). Fall back to the ordinary swap only when the host cannot pin the swapped blocks.
 
+For dense training, `--save_state` writes a standalone `*-state` directory containing the full transformer, optimizer,
+scheduler, RNG and training position. Budget disk space for a full model in each retained state, in addition to the ordinary
+weight checkpoints. Packed ring tensors are streamed without a whole-model CPU clone. Resume from the state directory,
+not the neighboring weight file. Incomplete legacy ring states are rejected; a complete legacy state is accepted only when
+all model names, shapes and dtypes match. Starting a new run from an ordinary checkpoint restores weights only.
+An interrupted dense save retains `h3_dense_state.incomplete`; `--resume` and `--autoresume` reject that directory.
+
 The dense entry point defaults to BF16 weights, gradient checkpointing, manual-learning-rate Adafactor
 (`scale_parameter=False relative_step=False warmup_init=False`), per-parameter optimizer steps during backward, stochastic
 rounding back to BF16, `max_grad_norm=0`, and memory-efficient checkpoint writing. `--adafactor_triton` accelerates supported

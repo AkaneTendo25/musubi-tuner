@@ -822,6 +822,32 @@ class TrainableBlockRingOffloader:
     def synchronize(self) -> None:
         self.copy_stream.synchronize()
 
+    def checkpoint_to_cpu(self) -> list[int | None]:
+        """Drain work and retire every owner before checkpoint reads/writes.
+
+        Keep ring allocations and Parameter objects intact. In particular, a
+        subsequent load must not see an old owner and skip the master-to-slot copy.
+        """
+        torch.cuda.synchronize(self.device)
+        self.copy_stream.synchronize()
+        owners = list(self.in_slot)
+        for slot in range(self.B):
+            self._evict(slot, writeback=True)
+        self.copy_stream.synchronize()
+        return owners
+
+    def checkpoint_restore_devices(self, owners: list[int | None] | None = None) -> None:
+        """Refill retired slots from masters, restoring save layout or fresh load layout."""
+        if owners is None:
+            owners = [self.stream_idx[rank] for rank in range(self.B)]
+            self._phase = "forward"
+            self._last_wait_rank = None
+        for slot, block_idx in enumerate(owners):
+            if block_idx is not None:
+                self._load(self.rank[block_idx], slot)
+        self.copy_stream.synchronize()
+        torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+
     def offload_to_cpu(self, blocks: list[nn.Module]) -> None:
         self.copy_stream.synchronize()
         for slot in range(self.B):
