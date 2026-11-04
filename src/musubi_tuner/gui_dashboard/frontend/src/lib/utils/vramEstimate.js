@@ -84,7 +84,15 @@ function h3DatasetRows(cfg, dataset) {
 			// The editor does not scan exact media dimensions. Treat every visual
 			// ordered role as video-sized, matching the server's conservative policy.
 			rows += orderedRoles.filter((role) => ['av', 'video'].includes(role)).length * referenceVideoRows;
-			rows += orderedRoles.filter((role) => ['av', 'audio'].includes(role)).length * referenceAudioRows;
+			const alignedValues = String(ds.aligned_guide_indices || '').replaceAll(';', ',').split(',')
+				.map((value) => value.trim()).filter(Boolean);
+			const aligned = alignedValues.map(Number);
+			const validAligned = alignedValues.every((value) => /^\+?\d+$/.test(value)) &&
+				aligned.every(Number.isSafeInteger) && new Set(aligned).size === aligned.length;
+			const alignedIndices = new Set(validAligned ? aligned : []);
+			rows += orderedRoles.filter((role, index) =>
+				role === 'audio' || (role === 'av' && !alignedIndices.has(index))
+			).length * referenceAudioRows;
 		} else if (['av', 'video', 'audio'].includes(fixedRole)) {
 			const paired = Boolean(ds.source_video_audio_paired);
 			let carriers = ds.source_image_directory ? 1 : 0;

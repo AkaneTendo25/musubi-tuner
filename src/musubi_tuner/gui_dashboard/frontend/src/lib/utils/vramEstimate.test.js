@@ -207,3 +207,22 @@ test('H3 estimators reject non-H3 configurations', () => {
 	assert.equal(estimateTextCaching(ltx), null);
 	assert.equal(estimateTraining(ltx), null);
 });
+
+test('H3 aligned ordered AV guides exclude audio rows but retain unaligned audio', () => {
+	const cfg = config();
+	cfg.caching = { model_type: 'minimax_h3', h3_task: 'ref2va' };
+	cfg.dataset.datasets[0].source_reference_modalities = 'av;audio;video';
+	const full = partValue(estimateTraining(cfg), 'Activ.');
+	const visual = structuredClone(cfg);
+	visual.dataset.datasets[0].source_reference_modalities = 'video;audio;video';
+	const expected = partValue(estimateTraining(visual), 'Activ.');
+	assert.ok(expected < full);
+	for (const indices of ['0', '+0', '0;2']) {
+		cfg.dataset.datasets[0].aligned_guide_indices = indices;
+		assert.equal(partValue(estimateTraining(cfg), 'Activ.'), expected);
+	}
+	for (const indices of ['unfinished', '0,0', '-1', '0,unfinished']) {
+		cfg.dataset.datasets[0].aligned_guide_indices = indices;
+		assert.equal(partValue(estimateTraining(cfg), 'Activ.'), full);
+	}
+});
