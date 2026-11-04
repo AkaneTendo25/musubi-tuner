@@ -2,7 +2,8 @@
 
 import copy
 import json
-from contextlib import nullcontext
+from collections import Counter
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from accelerate import Accelerator
 from safetensors.torch import load_file, save_file
 from transformers import Adafactor
 
+from musubi_tuner.training import h3_dense_state
 from musubi_tuner.minimax_h3_train import MiniMaxH3FullFinetuneModule, MiniMaxH3Trainer
 from musubi_tuner.modules.custom_offloading_utils import TrainableBlockRingOffloader
 from musubi_tuner.training.h3_dense_state import (
@@ -128,6 +130,42 @@ def assert_nested_equal(left, right):
         assert left == right
 
 
+@pytest.fixture
+def dense_tensor_reads(monkeypatch):
+    reads = []
+    original = h3_dense_state.safe_open
+
+    @contextmanager
+    def open_reader(*args, **kwargs):
+        with original(*args, **kwargs) as reader:
+
+            class TrackedReader:
+                def __getattr__(self, name):
+                    return getattr(reader, name)
+
+                def get_tensor(self, name):
+                    reads.append(name)
+                    return reader.get_tensor(name)
+
+            yield TrackedReader()
+
+    monkeypatch.setattr(h3_dense_state, "safe_open", open_reader)
+    return reads
+
+
+def test_dense_load_materializes_each_tensor_once_after_header_validation(tmp_path, dense_tensor_reads):
+    accelerator, model, _, _ = setup_run()
+    accelerator.save_state(str(tmp_path))
+    expected = {name: tensor.clone() for name, tensor in logical_state(model.transformer).items()}
+    with torch.no_grad():
+        for tensor in logical_state(model.transformer).values():
+            tensor.add_(1)
+    accelerator._h3_dense_state_hooks.load([model], str(tmp_path))
+    assert Counter(dense_tensor_reads) == Counter({name: 1 for name in expected})
+    assert_nested_equal(logical_state(model.transformer), expected)
+    accelerator.free_memory()
+
+
 def test_complete_accelerate_roundtrip_and_next_update(tmp_path):
     torch.manual_seed(514)
     accelerator, model, optimizer, scheduler = setup_run(compiled=True)
@@ -225,14 +263,14 @@ def test_legacy_accelerate_state_requires_complete_logical_payload(tmp_path, pac
 
 
 @pytest.mark.parametrize("damage", ["missing", "shape", "dtype", "manifest", "groups", "truncated"])
-def test_incompatible_state_rejected_before_tensor_writes(tmp_path, damage):
+def test_incompatible_state_rejected_before_tensor_writes(tmp_path, damage, dense_tensor_reads):
     accelerator, model, optimizer, _ = setup_run()
     accelerator.save_state(str(tmp_path))
     weights = tmp_path / "model.safetensors"
     manifest = tmp_path / MANIFEST
     if damage in {"missing", "shape", "dtype"}:
         tensors = {name: tensor.clone() for name, tensor in load_file(str(weights)).items()}
-        key = next(name for name in tensors if name.endswith("weight"))
+        key = list(logical_state(model.transformer))[-1]
         if damage == "missing":
             tensors.pop(key)
         elif damage == "shape":
@@ -248,12 +286,16 @@ def test_incompatible_state_rejected_before_tensor_writes(tmp_path, damage):
         manifest.write_text(json.dumps(data))
     else:
         weights.write_bytes(weights.read_bytes()[:32])
+    with torch.no_grad():
+        for tensor in logical_state(model.transformer).values():
+            tensor.add_(1)
     before = {name: tensor.clone() for name, tensor in logical_state(model.transformer).items()}
     owners = list(model.transformer.offloader.in_slot)
     with pytest.raises(Exception):
         accelerator.load_state(str(tmp_path))
     assert_nested_equal(logical_state(model.transformer), before)
     assert model.transformer.offloader.in_slot == owners
+    assert dense_tensor_reads == []
     accelerator.free_memory()
 
 

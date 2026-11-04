@@ -415,8 +415,12 @@ Use `source_reference_modality = "av"`, `"video"`, or `"audio"` for one role acr
 
 Fixed or ordered reference roles cannot combine with `source_modality_probabilities` or per-record `control_modality_N` overrides. Aligned-guide indices refer to the final bundle and must select video assets. Dataset values override `general` values; conflicting inherited fixed/list choices are rejected. An embedded-video project without an explicit contribution mode retains its AV meaning; select audio mode for soundtrack-only references.
 
+Aligned guides always contribute video only, including references explicitly assigned `av`: their embedded or paired audio is ignored with a warning. Use a separate unaligned reference to retain audio conditioning. The dashboard requires an audio VAE only when another target or unaligned reference contributes audio.
+
+When opening an older dashboard project with both legacy `control_modality` and `control_modalities`, the ordered list takes precedence with a warning and both legacy fields are cleared. Invalid ordered roles or conflicts with already configured source-reference roles are rejected.
+
 Both caches record which reference files and roles produced them, so swapping, reordering, or editing a reference rebuilds that item under
-`--skip_existing`.
+`--skip_existing`. Changing contribution modes, reference roles, or aligned-guide indices also changes cache identity; rerun both cache commands before training.
 
 Existing video-reference caches require re-encoding. Older embedded-video settings retain AV behavior; select audio contribution explicitly for soundtrack-only references.
 

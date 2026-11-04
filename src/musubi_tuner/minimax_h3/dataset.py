@@ -891,6 +891,14 @@ def _dataset_references(
             if reference.modality is not MediaModality.VIDEO:
                 raise ValueError(f"aligned_guide_indices entry {index} must select a video reference")
             metadata = dict(reference.metadata)
+            if metadata.get("include_audio") or metadata.get("audio_path"):
+                logger.warning(
+                    "aligned_guide_indices entry %s for target %s uses reference %s as a video-only guide; "
+                    "its audio contribution is ignored. Use a separate unaligned reference to retain audio.",
+                    index,
+                    target,
+                    reference.path,
+                )
             metadata["aligned_to_target"] = True
             metadata["include_audio"] = False
             metadata.pop("audio_path", None)

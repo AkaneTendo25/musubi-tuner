@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -12,6 +13,8 @@ from musubi_tuner.gui_dashboard.cli_defaults import (
     get_ltx2_training_output_dir_default,
 )
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
+
+logger = logging.getLogger(__name__)
 
 SamplingPreset = Literal["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"]
 SampleSigmaSchedule = Literal["auto", "ltx", "ltx_latent", "ltx23_distilled"]
@@ -1705,7 +1708,7 @@ class ProjectConfig(BaseModel):
                     if not isinstance(rows, list):
                         continue
                     migrated_rows = []
-                    for raw_row in rows:
+                    for row_index, raw_row in enumerate(rows):
                         if not isinstance(raw_row, dict):
                             migrated_rows.append(raw_row)
                             continue
@@ -1727,16 +1730,42 @@ class ProjectConfig(BaseModel):
 
                         fixed_modality = str(row.get("control_modality") or "").lower()
                         ordered_modalities = str(row.get("control_modalities") or "").strip()
-                        both_roles = bool(fixed_modality and ordered_modalities)
-                        if ordered_modalities and not both_roles:
+                        if ordered_modalities:
+                            roles = [role.strip().lower() for role in ordered_modalities.replace(",", ";").split(";")]
+                            if any(role not in {"av", "video", "audio"} for role in roles):
+                                raise ValueError(
+                                    f"{collection}[{row_index}].control_modalities must contain only av, video, or audio "
+                                    "roles without empty entries"
+                                )
+                            ordered_modalities = ";".join(roles)
+                            existing_roles = str(row.get("source_reference_modalities") or "").strip()
+                            existing_roles = ";".join(role.strip().lower() for role in existing_roles.replace(",", ";").split(";"))
+                            if row.get("source_reference_modality") or (existing_roles and existing_roles != ordered_modalities):
+                                raise ValueError(
+                                    f"{collection}[{row_index}].control_modalities conflicts with existing source reference roles"
+                                )
                             row["source_reference_modalities"] = ordered_modalities
-                            row["control_modalities"] = ""
-                        if fixed_modality and not both_roles:
+                            if fixed_modality:
+                                logger.warning(
+                                    "%s[%s]: migrating control_modalities to source_reference_modalities; "
+                                    "the explicit ordered roles take precedence over control_modality=%s.",
+                                    collection,
+                                    row_index,
+                                    fixed_modality,
+                                )
+                        elif fixed_modality:
                             if source_version < 4 and legacy_video and not legacy_audio:
                                 row["source_video_audio_mode"] = fixed_modality
                             elif not (source_version < 4 and legacy_audio and not legacy_video and fixed_modality == "audio"):
+                                if row.get("source_reference_modalities") or (
+                                    row.get("source_reference_modality") and row["source_reference_modality"] != fixed_modality
+                                ):
+                                    raise ValueError(
+                                        f"{collection}[{row_index}].control_modality conflicts with existing source reference roles"
+                                    )
                                 row["source_reference_modality"] = fixed_modality
-                            row["control_modality"] = ""
+                        row["control_modality"] = ""
+                        row["control_modalities"] = ""
                         migrated_rows.append(row)
                     dataset_config[collection] = migrated_rows
                 data["dataset"] = dataset_config

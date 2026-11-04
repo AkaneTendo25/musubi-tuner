@@ -201,7 +201,16 @@ def _h3_dataset_rows(training: dict, caching: dict, dataset: dict) -> int:
             # The project does not scan reference dimensions/counts. Treat every
             # visual role as a reference video so the estimate is conservative.
             condition_rows += sum(role in {"av", "video"} for role in ordered_roles) * reference_video_rows
-            condition_rows += sum(role in {"av", "audio"} for role in ordered_roles) * reference_audio_rows
+            raw_aligned = str(dataset.get("aligned_guide_indices") or "")
+            try:
+                aligned = [int(value.strip()) for value in raw_aligned.replace(";", ",").split(",") if value.strip()]
+            except ValueError:
+                aligned = []
+            aligned_indices = set(aligned) if all(value >= 0 for value in aligned) and len(set(aligned)) == len(aligned) else set()
+            condition_rows += (
+                sum(role == "audio" or (role == "av" and index not in aligned_indices) for index, role in enumerate(ordered_roles))
+                * reference_audio_rows
+            )
         elif fixed_role in {"av", "video", "audio"}:
             paired = bool(dataset.get("source_video_audio_paired"))
             carriers = int(bool(dataset.get("source_image_directory")))

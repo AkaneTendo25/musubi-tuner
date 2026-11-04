@@ -87,6 +87,7 @@ from musubi_tuner.minimax_h3.inference import (
     H3EncodedReferences,
     H3NullGuidance,
     _validate_sampler_options,
+    count_model_evaluations,
     decode_latents_sequentially,
     denoise_fl2va,
     denoise_ref2va,
@@ -1218,20 +1219,21 @@ class _NativeGenerator:
             def denoise(**overrides):
                 return denoise_fl2va(transformer, conditioning, **{**base_kwargs, **overrides})
 
-        if self.first_pass_scale:
-            video_latents, audio_latents = self._measure(
-                "two_pass_denoising",
-                # Bound by value: the name is deleted further down, and a lambda
-                # holding it by reference would depend on call order to survive.
-                lambda nets=networks: self._denoise_two_pass(denoise, nets, height, width, metrics, first_pass_kwargs),
-                metrics,
-            )
-        else:
-            video_latents, audio_latents = self._measure(
-                "joint_denoising",
-                denoise,
-                metrics,
-            )
+        with count_model_evaluations(transformer) as evaluation_counts:
+            if self.first_pass_scale:
+                video_latents, audio_latents = self._measure(
+                    "two_pass_denoising",
+                    # Bound by value: the name is deleted further down, and a lambda
+                    # holding it by reference would depend on call order to survive.
+                    lambda nets=networks: self._denoise_two_pass(denoise, nets, height, width, metrics, first_pass_kwargs),
+                    metrics,
+                )
+            else:
+                video_latents, audio_latents = self._measure(
+                    "joint_denoising",
+                    denoise,
+                    metrics,
+                )
         video_latents = video_latents.cpu()
         audio_latents = audio_latents.cpu()
         del networks
@@ -1291,9 +1293,7 @@ class _NativeGenerator:
                 "fps": media.fps,
                 "sample_rate": media.sample_rate,
                 "sigma_points": self.num_inference_steps,
-                "model_evaluations": self.num_inference_steps
-                - 1
-                + (max(0, self.num_inference_steps - 3) if self.sampler == "res_2s" else 0),
+                "model_evaluations": evaluation_counts["model_evaluations"],
                 "sampler": self.sampler,
                 "base_schedule": self.base_schedule,
                 "video_shift": self.video_shift,

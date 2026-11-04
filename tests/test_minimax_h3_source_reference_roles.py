@@ -343,7 +343,8 @@ def test_role_layer_enforces_dropout_and_aligned_guide_constraints(tmp_path: Pat
         h3_dataset.H3DatasetAdapter(config, Namespace(h3_image_mode="none"))
 
 
-def test_av_role_changes_same_path_fingerprint_and_alignment_strips_audio(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ordered", [False, True])
+def test_av_role_changes_same_path_fingerprint_and_alignment_strips_audio(tmp_path: Path, caplog, ordered: bool) -> None:
     targets = _media_dir(tmp_path / "targets", "scene.png")
     videos = _media_dir(tmp_path / "videos", "scene.mp4")
 
@@ -354,7 +355,7 @@ def test_av_role_changes_same_path_fingerprint_and_alignment_strips_audio(tmp_pa
             tmp_path / f"cache-{role}-{aligned}",
             source_video_directory=str(videos),
             source_modalities=["video"],
-            source_reference_modality=role,
+            **({"source_reference_modalities": [role]} if ordered else {"source_reference_modality": role}),
             **({"aligned_guide_indices": [0]} if aligned else {}),
         )
         adapter = h3_dataset.H3DatasetAdapter(config, Namespace(h3_image_mode="none"))
@@ -375,6 +376,9 @@ def test_av_role_changes_same_path_fingerprint_and_alignment_strips_audio(tmp_pa
     assert aligned.metadata["aligned_to_target"] is True
     assert reference_fingerprint((aligned,)) != reference_fingerprint((av,))
     assert aligned_adapter.requires_video is True
+    assert aligned_adapter.requires_audio is False
+    assert "video-only guide" in caplog.text
+    assert "audio contribution is ignored" in caplog.text
 
 
 def test_dashboard_required_vaes_account_for_aligned_ordered_av_roles(tmp_path: Path) -> None:
@@ -570,12 +574,13 @@ def test_default_v4_project_migration_preserves_legacy_visual_video_semantics() 
     assert document["source_modalities"] == ["video"]
 
 
-def test_v4_conflicting_legacy_fixed_and_ordered_roles_remain_visible_to_validation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("collection", ["datasets", "validation_datasets"])
+def test_v4_conflicting_legacy_roles_migrate_ordered_roles_with_warning(tmp_path: Path, caplog, collection: str) -> None:
     config = ProjectConfig.model_validate(
         {
             "version": 4,
             "dataset": {
-                "datasets": [
+                collection: [
                     {
                         "type": "video",
                         "directory": "targets",
@@ -589,13 +594,49 @@ def test_v4_conflicting_legacy_fixed_and_ordered_roles_remain_visible_to_validat
     )
     config.project_dir = str(tmp_path)
     config.caching.model_type = "minimax_h3"
-    row = config.dataset.datasets[0]
+    row = getattr(config.dataset, collection)[0]
 
-    assert row.control_modality == "video"
-    assert row.control_modalities == "video;audio"
+    assert row.control_modality == ""
+    assert row.control_modalities == ""
     assert row.source_reference_modality == ""
-    assert row.source_reference_modalities == ""
-    assert "dataset.datasets[0].control_modalities" in validate_cache_latents_config(config)["field_errors"]
+    assert row.source_reference_modalities == "video;audio"
+    assert "explicit ordered roles take precedence" in caplog.text
+    document = build_h3_dataset_toml_document(config, include_training=True, include_validation=True)
+    assert document["datasets"][0]["source_reference_modalities"] == ["video", "audio"]
+
+
+@pytest.mark.parametrize("roles", ["video;;audio", "video;depth", ";audio", "video;", "video audio"])
+def test_v4_legacy_ordered_roles_reject_invalid_entries(roles: str) -> None:
+    with pytest.raises(ValueError, match="control_modalities must contain only"):
+        ProjectConfig.model_validate(
+            {"version": 4, "dataset": {"datasets": [{"control_modality": "video", "control_modalities": roles}]}}
+        )
+
+
+@pytest.mark.parametrize(
+    "roles",
+    [
+        {"control_modalities": "video;audio", "source_reference_modality": "video"},
+        {"control_modalities": "video;audio", "source_reference_modalities": "av;audio"},
+        {"control_modality": "video", "source_reference_modality": "audio"},
+        {"control_modality": "video", "source_reference_modalities": "video;audio"},
+    ],
+)
+def test_v4_legacy_roles_reject_conflicting_new_fields(roles: dict) -> None:
+    with pytest.raises(ValueError, match="conflicts with existing source reference roles"):
+        ProjectConfig.model_validate({"version": 4, "dataset": {"datasets": [roles]}})
+
+
+def test_v4_legacy_ordered_roles_preserve_matching_new_roles() -> None:
+    config = ProjectConfig.model_validate(
+        {
+            "version": 4,
+            "dataset": {"datasets": [{"control_modalities": " VIDEO, audio ", "source_reference_modalities": "video;audio"}]},
+        }
+    )
+    row = config.dataset.datasets[0]
+    assert row.source_reference_modalities == "video;audio"
+    assert row.control_modalities == ""
 
 
 @pytest.mark.parametrize(

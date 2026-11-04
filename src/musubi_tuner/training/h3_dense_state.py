@@ -13,6 +13,7 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
+from safetensors.torch import _getdtype
 
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 
@@ -203,12 +204,12 @@ class DenseStateHooks:
                     "Legacy packed-ring states may have omitted tensors and cannot safely resume. "
                     "Use a complete matching ordinary checkpoint for a new run; omitted weights cannot be reconstructed."
                 )
-            # Validate the entire payload before retiring slots or writing a parameter.
+            # Validate every header entry before retiring slots or writing a
+            # parameter. Materialize each tensor only once, during the copy.
             for name, target in state.items():
-                source = reader.get_tensor(source_names[name])
-                if source.shape != target.shape or source.dtype != target.dtype:
+                source = reader.get_slice(source_names[name])
+                if source.get_shape() != list(target.shape) or _getdtype(source.get_dtype()) != target.dtype:
                     raise ValueError(f"dense H3 checkpoint shape/dtype mismatch: {name}")
-                del source
             if manifest is None:
                 logger.warning(
                     "Loading complete legacy dense H3 state without a named optimizer signature; "

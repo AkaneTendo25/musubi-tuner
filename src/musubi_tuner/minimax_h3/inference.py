@@ -18,6 +18,7 @@ import gc
 import json
 import math
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
 from fractions import Fraction
 from pathlib import Path
@@ -272,6 +273,21 @@ def shifted_flow_schedule(
             f"MiniMax H3 {base_schedule} schedule collapsed to {sigmas.numel()} distinct float32 points from {num_inference_steps}"
         )
     return sigmas, 1.0 - sigmas[:-1]
+
+
+@contextmanager
+def count_model_evaluations(transformer: torch.nn.Module):
+    """Count actual forward calls across all denoising passes and guidance branches."""
+    counts = {"model_evaluations": 0}
+
+    def record_call(_module, _args):
+        counts["model_evaluations"] += 1
+
+    hook = transformer.register_forward_pre_hook(record_call)
+    try:
+        yield counts
+    finally:
+        hook.remove()
 
 
 def start_index_for_strength(sigmas: torch.Tensor, strength: float) -> int:

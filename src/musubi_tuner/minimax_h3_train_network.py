@@ -5402,6 +5402,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if enabled == 0:
                 raise RuntimeError("--h3_lora_fused_bf16 found no LoRA modules to fuse")
             logger.info("--h3_lora_fused_bf16: addmm-epilogue LoRA path enabled on %d modules", enabled)
+        self._start_h3_profiler(args, accelerator)
+
+    def _start_h3_profiler(self, args, accelerator) -> None:
+        """Start shared profiling without installing optimizer or adapter hooks."""
         self._h3_profiler = None
         steps = int(getattr(args, "h3_profile_steps", 0) or 0)
         if steps <= 0:
@@ -5454,6 +5458,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if sync_gradients:
             self._update_adapter_ema(args, accelerator, network, global_step)
             self.snapshot_teacher(args, accelerator, network, transformer, global_step)
+        self._step_h3_profiler(sync_gradients)
+
+    def _step_h3_profiler(self, sync_gradients: bool) -> None:
         if self._h3_profiler is None or not sync_gradients:
             return
         self._h3_profiler.step()
@@ -13119,8 +13126,8 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "reduce the AdaLN timestep projection to this rank while loading, shrinking the frozen base by ~13B "
-            "parameters; the reduced weights stay in BF16 because they are no longer large enough to be worth quantizing"
+            "reduce the AdaLN timestep projection to this rank while loading, removing about 13B full-width "
+            "parameters at rank 16; reduced projections and the frozen timestep table stay in FP32"
         ),
     )
     parser.add_argument(

@@ -303,9 +303,16 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
         )
 
     def on_train_start(self, args, accelerator, network, transformer, optimizer) -> None:
-        del args, network, transformer, optimizer
+        del network, transformer, optimizer
+        # Dense preparation already installed optimizer hooks. Reuse only the
+        # profiler lifecycle, not the parent's adapter/teacher startup work.
+        self._start_h3_profiler(args, accelerator)
         self._dense_step_started_at = time.perf_counter()
         self._dense_step_metrics: dict[str, float] = {}
+        logger.info(
+            "MiniMax H3 dense telemetry measures optimizer-boundary intervals: wall time and peaks include "
+            "intervening validation, sampling, saves, logging and data waits; the first interval starts at train startup"
+        )
         if accelerator.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(accelerator.device)
 
@@ -321,6 +328,7 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
         del args, network, transformer
         if not sync_gradients:
             return
+        self._step_h3_profiler(sync_gradients)
         if accelerator.device.type == "cuda":
             torch.cuda.synchronize(accelerator.device)
         elapsed = time.perf_counter() - self._dense_step_started_at
@@ -334,7 +342,8 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
             )
         self._dense_step_metrics = metrics
         logger.info(
-            "MiniMax H3 dense step %d: %.3fs, peak allocated %.3f GiB, peak reserved %.3f GiB",
+            "MiniMax H3 dense optimizer-boundary interval %d (includes intervening non-training work): "
+            "%.3fs, peak allocated %.3f GiB, peak reserved %.3f GiB",
             global_step + 1,
             elapsed,
             metrics.get("dense_peak_allocated_gib", 0.0),
